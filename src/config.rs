@@ -55,9 +55,24 @@ pub struct Config {
     /// Number of WBlocks per file (1 WBlock = 1MB)
     #[arg(long, default_value = "1023")]
     pub wblocks_per_file: u32,
+
+    /// Number of worker threads (0 = auto-detect based on CPU count)
+    #[arg(long, default_value = "0")]
+    pub workers: usize,
 }
 
 impl Config {
+    /// Returns the number of worker threads.
+    pub fn num_workers(&self) -> usize {
+        if self.workers == 0 {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+        } else {
+            self.workers
+        }
+    }
+
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.compaction_threshold < 0.0 || self.compaction_threshold > 1.0 {
@@ -104,6 +119,7 @@ impl Default for Config {
             read_buffer_kb: 64,
             write_buffer_kb: 64,
             wblocks_per_file: 1023,
+            workers: 0,
         }
     }
 }

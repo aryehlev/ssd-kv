@@ -23,7 +23,7 @@ mod storage;
 use config::Config;
 use engine::{recover_index, Index};
 use perf::{HotCache, PerfTuning, pin_to_cpu};
-use server::{Handler, Server, ServerConfig, start_udp_server, start_redis_server};
+use server::{Handler, Server, ServerConfig, start_redis_server};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::file_manager::FileManager;
 use storage::write_buffer::WriteBuffer;
@@ -128,31 +128,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hot_cache,
     ));
 
-    // Configure server
+    // Configure server with optimized settings
     let server_config = ServerConfig {
         bind_addr: config.bind,
         max_connections: config.max_connections,
         read_buffer_size: config.read_buffer_size(),
         write_buffer_size: config.write_buffer_size(),
+        num_workers: config.num_workers(),
     };
 
     // Create and start TCP server
     let server = Arc::new(Server::new(server_config, Arc::clone(&handler)));
 
-    // Start UDP server on port + 1 for fast reads
-    let udp_addr: std::net::SocketAddr = format!(
-        "{}:{}",
-        config.bind.ip(),
-        config.bind.port() + 1
-    ).parse().unwrap();
-    let _udp_handle = start_udp_server(udp_addr, Arc::clone(&handler));
-    info!("UDP server (fast reads) on {}", udp_addr);
-
-    // Start Redis-compatible server on port + 2
+    // Start Redis-compatible server on port + 1
     let redis_addr: std::net::SocketAddr = format!(
         "{}:{}",
         config.bind.ip(),
-        config.bind.port() + 2
+        config.bind.port() + 1
     ).parse().unwrap();
     let _redis_handle = start_redis_server(redis_addr, Arc::clone(&handler));
     info!("Redis-compatible server on {}", redis_addr);

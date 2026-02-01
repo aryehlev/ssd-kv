@@ -18,6 +18,8 @@ crossbeam-channel = "0.5"
 memmap2 = "0.9"
 libc = "0.2"
 once_cell = "1.19"
+socket2 = "0.5"
+itoa = "1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
@@ -56,7 +58,3 @@ path = "benchmark/comparison_bench.rs"
 [[bin]]
 name = "validation_test"
 path = "benchmark/validation_test.rs"
-
-[[bin]]
-name = "udp_bench"
-path = "benchmark/udp_bench.rs"

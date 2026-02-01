@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  ssd-kv:
+    build: .
+    ports:
+      - "7777:7777"
+    volumes:
+      - ssd-kv-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+    environment:
+      - RUST_LOG=info
+
+  aerospike:
+    image: aerospike/aerospike-server:latest
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+    volumes:
+      - aerospike-data:/opt/aerospike/data
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+
+volumes:
+  ssd-kv-data:
+  aerospike-data:

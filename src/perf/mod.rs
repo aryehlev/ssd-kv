@@ -7,17 +7,25 @@
 //! - **Prefetch**: CPU cache prefetching and read-ahead
 //! - **NUMA**: NUMA-aware memory allocation and thread pinning
 //! - **XDP**: eBPF/XDP packet acceleration (Linux only)
+//! - **AF_XDP**: Zero-copy networking (Linux only)
+//! - **Huge Pages**: Reduce TLB misses for large allocations
 
 pub mod batch_writer;
 pub mod prefetch;
 pub mod numa;
 pub mod xdp;
+pub mod af_xdp;
+pub mod huge_pages;
+pub mod busy_poll;
 pub mod object_pool;
 
 pub use batch_writer::{BatchWriter, BatchWriterStats, WriteRequest};
 pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, LockFreeBloomFilter, ReadAhead};
 pub use numa::{CpuTopology, NumaThreadPool, pin_to_cpu, pin_to_numa_node, numa_alloc, numa_free};
 pub use xdp::{XdpAccelerator, XdpConfig, XdpStats};
+pub use af_xdp::{AfXdpConfig, AfXdpSocket, AfXdpStats, XdpDesc, is_af_xdp_available};
+pub use huge_pages::{HugePageAlloc, HugePageConfig, huge_page_alloc, huge_page_free, is_huge_pages_available};
+pub use busy_poll::{BusyPollConfig, BusyPoller, BusyPollStats, CpuIsolation, AdaptiveSpinner, enable_socket_busy_poll, set_system_busy_poll};
 pub use object_pool::{BufferPool, PooledBuffer, READ_BUFFER_POOL, WRITE_BUFFER_POOL};
 
 /// Performance tuning recommendations based on hardware.

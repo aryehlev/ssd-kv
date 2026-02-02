@@ -17,7 +17,7 @@
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crc32fast::Hasher;
+use crate::perf::simd::{crc32c, simd_memcpy};
 
 /// Magic number for records: "KV" in little-endian.
 pub const RECORD_MAGIC: u16 = 0x564B; // 'K' 'V'
@@ -209,27 +209,37 @@ impl Record {
         })
     }
 
-    /// Computes the CRC32 of the record.
+    /// Computes the CRC32 of the record using hardware acceleration.
     pub fn compute_crc(&self) -> u32 {
-        let mut hasher = Hasher::new();
         // CRC covers header (excluding CRC field) + key + value
+        // Build contiguous buffer for SIMD-accelerated CRC
         let header_bytes = self.header.to_bytes();
-        hasher.update(&header_bytes[..28]); // Exclude CRC field
-        hasher.update(&self.key);
-        hasher.update(&self.value);
-        hasher.finalize()
+        let total_len = 28 + self.key.len() + self.value.len();
+        let mut buf = vec![0u8; total_len];
+
+        buf[..28].copy_from_slice(&header_bytes[..28]); // Exclude CRC field
+        buf[28..28 + self.key.len()].copy_from_slice(&self.key);
+        buf[28 + self.key.len()..].copy_from_slice(&self.value);
+
+        // Hardware-accelerated CRC32C (SSE4.2 on x86_64)
+        crc32c(&buf)
     }
 
     /// Serializes the record to bytes with padding.
+    /// Uses SIMD-accelerated memory copy for large values.
     pub fn serialize(&mut self) -> Vec<u8> {
         self.header.crc32 = self.compute_crc();
         let total_size = self.header.total_size();
         let mut buf = vec![0u8; total_size];
 
         buf[..HEADER_SIZE].copy_from_slice(&self.header.to_bytes());
-        buf[HEADER_SIZE..HEADER_SIZE + self.key.len()].copy_from_slice(&self.key);
-        buf[HEADER_SIZE + self.key.len()..HEADER_SIZE + self.key.len() + self.value.len()]
-            .copy_from_slice(&self.value);
+
+        // Use SIMD memcpy for key and value (faster for larger data)
+        simd_memcpy(&mut buf[HEADER_SIZE..HEADER_SIZE + self.key.len()], &self.key);
+        simd_memcpy(
+            &mut buf[HEADER_SIZE + self.key.len()..HEADER_SIZE + self.key.len() + self.value.len()],
+            &self.value,
+        );
         // Remaining bytes are already zero (padding)
 
         buf

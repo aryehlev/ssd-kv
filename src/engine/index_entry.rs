@@ -239,10 +239,15 @@ impl IndexEntry {
     }
 
     /// Returns true if this entry matches the given key.
+    /// Uses SIMD-accelerated comparison for keys >= 16 bytes.
     #[inline]
     pub fn matches(&self, key: &[u8], key_hash: u64) -> bool {
-        // Fast path: compare hashes first
-        self.key_hash == key_hash && self.key.as_bytes() == key
+        // Fast path: compare hashes first (single u64 comparison)
+        if self.key_hash != key_hash {
+            return false;
+        }
+        // SIMD-accelerated key comparison for longer keys
+        crate::perf::simd::simd_key_eq(self.key.as_bytes(), key)
     }
 
     /// Returns true if this entry is deleted.

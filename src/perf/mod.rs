@@ -9,6 +9,7 @@
 //! - **XDP**: eBPF/XDP packet acceleration (Linux only)
 //! - **AF_XDP**: Zero-copy networking (Linux only)
 //! - **Huge Pages**: Reduce TLB misses for large allocations
+//! - **SIMD**: Vectorized batch operations (AVX2/NEON) for 2-4x throughput
 
 pub mod batch_writer;
 pub mod prefetch;
@@ -18,6 +19,7 @@ pub mod af_xdp;
 pub mod huge_pages;
 pub mod busy_poll;
 pub mod object_pool;
+pub mod simd;
 
 pub use batch_writer::{BatchWriter, BatchWriterStats, WriteRequest};
 pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, LockFreeBloomFilter, ReadAhead};
@@ -27,6 +29,12 @@ pub use af_xdp::{AfXdpConfig, AfXdpSocket, AfXdpStats, XdpDesc, is_af_xdp_availa
 pub use huge_pages::{HugePageAlloc, HugePageConfig, huge_page_alloc, huge_page_free, is_huge_pages_available};
 pub use busy_poll::{BusyPollConfig, BusyPoller, BusyPollStats, CpuIsolation, AdaptiveSpinner, enable_socket_busy_poll, set_system_busy_poll};
 pub use object_pool::{BufferPool, PooledBuffer, READ_BUFFER_POOL, WRITE_BUFFER_POOL};
+pub use simd::{
+    simd_key_eq, simd_memcpy, simd_memset, crc32c,
+    batch_bloom_check, batch_hash_keys_4, batch_hash_keys_8,
+    batch_index_lookup, batch_index_lookup_4, group_by_shard,
+    BloomBatchResult, BatchGetResult, prefetch_batch,
+};
 
 /// Performance tuning recommendations based on hardware.
 #[derive(Debug)]

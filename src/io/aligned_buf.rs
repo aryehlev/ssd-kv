@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
+use crate::perf::simd::{simd_memcpy, simd_memset};
+
 /// Alignment required for O_DIRECT (typically 4KB for most SSDs).
 pub const ALIGNMENT: usize = 4096;
 
@@ -105,32 +107,29 @@ impl AlignedBuffer {
     }
 
     /// Appends data to the buffer. Returns the number of bytes written.
+    /// Uses SIMD-accelerated copy for large data.
     pub fn extend_from_slice(&mut self, data: &[u8]) -> usize {
         let to_copy = data.len().min(self.remaining());
         if to_copy > 0 {
             // SAFETY: We checked bounds and the memory is valid.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    self.ptr.as_ptr().add(self.len),
-                    to_copy,
-                );
-            }
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(self.len), to_copy) };
+            simd_memcpy(dst, &data[..to_copy]);
             self.len += to_copy;
         }
         to_copy
     }
 
     /// Resizes the buffer, filling new space with zeros if growing.
+    /// Uses SIMD-accelerated memset for large fills.
     pub fn resize(&mut self, new_len: usize) {
         if new_len > self.capacity {
             panic!("Cannot resize beyond capacity");
         }
         if new_len > self.len {
-            // Zero-fill the new space
-            unsafe {
-                std::ptr::write_bytes(self.ptr.as_ptr().add(self.len), 0, new_len - self.len);
-            }
+            // Zero-fill the new space using SIMD
+            let fill_len = new_len - self.len;
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(self.len), fill_len) };
+            simd_memset(dst, 0);
         }
         self.len = new_len;
     }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::io::aligned_buf::{AlignedBuffer, ALIGNMENT};
+use crate::perf::simd::simd_key_eq;
 use crate::storage::record::{Record, RECORD_ALIGNMENT};
 
 /// Size of a write block (1MB).
@@ -303,6 +304,7 @@ impl WriteBuffer {
 
     /// Reads data from unflushed buffers (current + pending).
     /// Returns None if the data has been flushed to disk.
+    /// Uses SIMD-accelerated key comparison.
     pub fn read_unflushed(&self, location: &DiskLocation, key: &[u8]) -> Option<Vec<u8>> {
         use crate::storage::record::Record;
 
@@ -314,8 +316,8 @@ impl WriteBuffer {
                 let buffer = current.buffer();
                 if offset < buffer.len() {
                     if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
-                        // Verify key matches before returning value
-                        if record.key == key && !record.header.is_deleted() && !record.header.is_expired() {
+                        // SIMD-accelerated key comparison
+                        if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
                             return Some(record.value);
                         }
                     }
@@ -332,8 +334,8 @@ impl WriteBuffer {
                     let buffer = block.buffer();
                     if offset < buffer.len() {
                         if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
-                            // Verify key matches before returning value
-                            if record.key == key && !record.header.is_deleted() && !record.header.is_expired() {
+                            // SIMD-accelerated key comparison
+                            if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
                                 return Some(record.value);
                             }
                         }

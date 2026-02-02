@@ -22,7 +22,7 @@ mod storage;
 
 use config::Config;
 use engine::{recover_index, Index};
-use perf::{HotCache, PerfTuning, pin_to_cpu};
+use perf::{PerfTuning, pin_to_cpu};
 use server::{Handler, Server, ServerConfig, start_redis_server};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::file_manager::FileManager;
@@ -117,15 +117,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pin main thread to CPU 0
     let _ = pin_to_cpu(0);
 
-    // Create hot cache
-    let hot_cache = Arc::new(HotCache::new());
-
-    // Create request handler with hot cache
-    let handler = Arc::new(Handler::with_hot_cache(
+    // Create request handler
+    let handler = Arc::new(Handler::new(
         Arc::clone(&index),
         Arc::clone(&file_manager),
         Arc::clone(&write_buffer),
-        hot_cache,
     ));
 
     // Configure server with optimized settings

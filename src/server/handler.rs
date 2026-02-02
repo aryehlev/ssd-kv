@@ -8,7 +8,6 @@ use tracing::{error, trace};
 
 use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
-use crate::perf::hot_cache::HotCache;
 use crate::perf::prefetch::{prefetch_read, BloomFilter, LockFreeBloomFilter};
 use crate::server::protocol::{Opcode, Request, Response};
 use crate::storage::file_manager::{FileManager, ParallelFileManager, FILE_HEADER_SIZE};
@@ -47,7 +46,6 @@ pub struct Handler {
     index: Arc<Index>,
     file_manager: Arc<FileManager>,
     write_buffer: Arc<WriteBuffer>,
-    hot_cache: Arc<HotCache>,
     bloom_filter: parking_lot::RwLock<BloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
@@ -64,25 +62,6 @@ impl Handler {
             index,
             file_manager,
             write_buffer,
-            hot_cache: Arc::new(HotCache::new()),
-            bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
-            next_generation: AtomicU32::new(1),
-            stats: Arc::new(HandlerStats::default()),
-        }
-    }
-
-    /// Creates a handler with a custom hot cache.
-    pub fn with_hot_cache(
-        index: Arc<Index>,
-        file_manager: Arc<FileManager>,
-        write_buffer: Arc<WriteBuffer>,
-        hot_cache: Arc<HotCache>,
-    ) -> Self {
-        Self {
-            index,
-            file_manager,
-            write_buffer,
-            hot_cache,
             bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
@@ -92,11 +71,6 @@ impl Handler {
     /// Returns the handler statistics.
     pub fn stats(&self) -> Arc<HandlerStats> {
         Arc::clone(&self.stats)
-    }
-
-    /// Returns the hot cache.
-    pub fn hot_cache(&self) -> Arc<HotCache> {
-        Arc::clone(&self.hot_cache)
     }
 
     /// Synchronous PUT for Redis compatibility
@@ -122,16 +96,12 @@ impl Handler {
         // Update bloom filter
         self.bloom_filter.write().add(key_hash);
 
-        // Update hot cache
-        self.hot_cache.put(key, key_hash, value, generation);
-
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Synchronous DELETE for Redis compatibility
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
-        let key_hash = hash_key(key);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
         // Create tombstone record
@@ -143,36 +113,24 @@ impl Handler {
         // Update index
         let deleted = self.index.delete(key, generation);
 
-        // Invalidate hot cache
-        self.hot_cache.invalidate(key_hash);
-
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
         Ok(deleted)
     }
 
     /// Fast synchronous GET for UDP/Redis - returns value if found.
-    /// Priority: hot cache -> inline value -> write buffer -> disk
+    /// Priority: inline value -> write buffer -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let key_hash = hash_key(key);
-
-        // Fast path 1: Check hot cache
-        if let Some(value) = self.hot_cache.get(key, key_hash) {
-            return Some(value);
-        }
-
-        // Fast path 2: Check index
+        // Fast path 1: Check index
         let entry = self.index.get(key)?;
 
-        // Fast path 3: Inline value (no disk!)
+        // Fast path 2: Inline value (no disk!)
         if let Some(value) = entry.get_inline_value() {
-            self.hot_cache.put(key, key_hash, value, entry.generation);
             return Some(value.to_vec());
         }
 
-        // Fast path 4: Write buffer (not yet flushed)
+        // Fast path 3: Write buffer (not yet flushed)
         if let Some(value) = self.write_buffer.read_unflushed(&entry.location, key) {
-            self.hot_cache.put(key, key_hash, &value, entry.generation);
             return Some(value);
         }
 
@@ -191,7 +149,6 @@ impl Handler {
             return None;
         }
 
-        self.hot_cache.put(key, key_hash, &record.value, entry.generation);
         Some(record.value)
     }
 
@@ -213,7 +170,7 @@ impl Handler {
         }
     }
 
-    /// Handles a GET request with hot cache acceleration.
+    /// Handles a GET request.
     #[inline]
     async fn handle_get(&self, request_id: u32, request: &Request) -> Response {
         self.stats.gets.fetch_add(1, Ordering::Relaxed);
@@ -234,16 +191,7 @@ impl Handler {
             return Response::not_found(request_id);
         }
 
-        // Fast path 2: Check hot cache (lock-free read)
-        if let Some(value) = self.hot_cache.get(&key, key_hash) {
-            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-            return Response::success(request_id, &value);
-        }
-
-        trace!("GET key={:?} (cache miss)", String::from_utf8_lossy(&key));
-
-        // Slow path: Look up in index
+        // Look up in index
         let entry = match self.index.get(&key) {
             Some(e) => e,
             None => {
@@ -252,18 +200,15 @@ impl Handler {
             }
         };
 
-        // Fast path 3: Check for inline value (NO DISK READ!)
+        // Fast path 2: Check for inline value (NO DISK READ!)
         if let Some(value) = entry.get_inline_value() {
             self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-            self.hot_cache.put(&key, key_hash, value, entry.generation);
             return Response::success(request_id, value);
         }
 
-        // Fast path 4: Check write buffer for unflushed data
+        // Fast path 3: Check write buffer for unflushed data
         if let Some(value) = self.write_buffer.read_unflushed(&entry.location, &key) {
             self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-            // Update hot cache
-            self.hot_cache.put(&key, key_hash, &value, entry.generation);
             return Response::success(request_id, &value);
         }
 
@@ -274,10 +219,6 @@ impl Handler {
         match self.read_value(&entry.location, entry.value_len).await {
             Ok(value) => {
                 self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-
-                // Update hot cache for next access
-                self.hot_cache.put(&key, key_hash, &value, entry.generation);
-
                 Response::success(request_id, &value)
             }
             Err(e) => {
@@ -340,9 +281,6 @@ impl Handler {
         // Update bloom filter
         self.bloom_filter.write().add(key_hash);
 
-        // Update hot cache
-        self.hot_cache.put(&key, key_hash, &value, generation);
-
         // Periodically flush (every 1000 operations)
         if generation % 1000 == 0 {
             let _ = self.try_flush();
@@ -363,8 +301,6 @@ impl Handler {
                 return Response::invalid(request_id, &format!("Invalid DELETE: {}", e));
             }
         };
-
-        let key_hash = hash_key(&key);
 
         trace!("DELETE key={:?}", String::from_utf8_lossy(&key));
 
@@ -388,23 +324,17 @@ impl Handler {
         // Update index
         self.index.delete(&key, generation);
 
-        // Invalidate hot cache
-        self.hot_cache.invalidate(key_hash);
-
         Response::success(request_id, &[])
     }
 
     /// Handles a STATS request.
     fn handle_stats(&self, request_id: u32) -> Response {
         let index_stats = self.index.stats();
-        let cache_stats = self.hot_cache.stats();
         let json = format!(
-            r#"{{"index":{{"entries":{},"live":{},"tombstones":{}}},"cache":{{"capacity":{},"used":{}}},"ops":{}}}"#,
+            r#"{{"index":{{"entries":{},"live":{},"tombstones":{}}},"ops":{}}}"#,
             index_stats.total_entries,
             index_stats.live_entries,
             index_stats.tombstones,
-            cache_stats.capacity,
-            cache_stats.used,
             self.stats.to_json(),
         );
         Response::stats(request_id, &json)
@@ -501,11 +431,9 @@ pub struct OptimizedHandler {
     index: Arc<Index>,
     parallel_fm: Arc<ParallelFileManager>,
     write_buffers: Vec<Arc<WriteBuffer>>,
-    hot_cache: Arc<HotCache>,
     bloom_filter: Arc<LockFreeBloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
-    num_partitions: usize,
 }
 
 impl OptimizedHandler {
@@ -526,22 +454,15 @@ impl OptimizedHandler {
             index,
             parallel_fm,
             write_buffers,
-            hot_cache: Arc::new(HotCache::new()),
             bloom_filter: Arc::new(LockFreeBloomFilter::new(10_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
-            num_partitions,
         }
     }
 
     /// Returns the handler statistics.
     pub fn stats(&self) -> Arc<HandlerStats> {
         Arc::clone(&self.stats)
-    }
-
-    /// Returns the hot cache.
-    pub fn hot_cache(&self) -> Arc<HotCache> {
-        Arc::clone(&self.hot_cache)
     }
 
     /// Returns the partition for a key hash.
@@ -576,9 +497,6 @@ impl OptimizedHandler {
         // Update lock-free bloom filter (no write lock needed!)
         self.bloom_filter.add(key_hash);
 
-        // Update hot cache
-        self.hot_cache.put(key, key_hash, value, generation);
-
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -598,32 +516,23 @@ impl OptimizedHandler {
         // Update index
         let deleted = self.index.delete(key, generation);
 
-        // Invalidate hot cache
-        self.hot_cache.invalidate(key_hash);
-
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
         Ok(deleted)
     }
 
     /// Fast synchronous GET with all optimizations.
-    /// Priority: hot cache -> bloom filter -> inline value -> write buffer -> disk
+    /// Priority: bloom filter -> inline value -> write buffer -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
         let key_hash = hash_key(key);
 
-        // Fast path 1: Check hot cache (lock-free)
-        if let Some(value) = self.hot_cache.get(key, key_hash) {
-            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(value);
-        }
-
-        // Fast path 2: Check lock-free bloom filter for early rejection
+        // Fast path 1: Check lock-free bloom filter for early rejection
         if !self.bloom_filter.may_contain(key_hash) {
             self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
-        // Fast path 3: Check index
+        // Fast path 2: Check index
         let entry = match self.index.get(key) {
             Some(e) => e,
             None => {
@@ -632,17 +541,15 @@ impl OptimizedHandler {
             }
         };
 
-        // Fast path 4: Inline value (no disk!)
+        // Fast path 3: Inline value (no disk!)
         if let Some(value) = entry.get_inline_value() {
-            self.hot_cache.put(key, key_hash, value, entry.generation);
             self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
             return Some(value.to_vec());
         }
 
-        // Fast path 5: Check partition's write buffer (not yet flushed)
+        // Fast path 4: Check partition's write buffer (not yet flushed)
         let partition = self.partition_for(key_hash);
         if let Some(value) = self.write_buffers[partition].read_unflushed(&entry.location, key) {
-            self.hot_cache.put(key, key_hash, &value, entry.generation);
             self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
             return Some(value);
         }
@@ -674,7 +581,6 @@ impl OptimizedHandler {
             return None;
         }
 
-        self.hot_cache.put(key, key_hash, &record.value, entry.generation);
         self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
         Some(record.value)
     }
@@ -731,14 +637,14 @@ mod tests {
         // Flush to disk
         handler.flush().await.unwrap();
 
-        // GET (should hit hot cache)
+        // GET (should use inline value from index)
         let get_req = Request::get(2, b"key1");
         let get_resp = handler.handle(get_req).await;
         assert_eq!(get_resp.header.opcode, Opcode::Success);
         assert_eq!(get_resp.payload, b"value1");
 
-        // Check cache hit
-        assert!(handler.stats().cache_hits.load(Ordering::Relaxed) > 0);
+        // Check hit
+        assert!(handler.stats().get_hits.load(Ordering::Relaxed) > 0);
     }
 
     #[tokio::test]

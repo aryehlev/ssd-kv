@@ -1,12 +1,14 @@
 //! Server layer: protocol, TCP listener, and request handling.
 
-pub mod protocol;
+pub mod async_tcp;
 pub mod handler;
-pub mod tcp;
-pub mod redis;
 pub mod pipeline;
+pub mod protocol;
+pub mod redis;
+pub mod tcp;
 
+pub use async_tcp::{AsyncServer, AsyncServerConfig, AsyncServerStats};
+pub use handler::{Handler, HandlerStats, OptimizedHandler};
 pub use protocol::{Header, Opcode, Request, Response, PROTOCOL_MAGIC, PROTOCOL_VERSION};
-pub use handler::{Handler, HandlerStats};
-pub use tcp::{Server, ServerConfig, ServerStats};
 pub use redis::start_redis_server;
+pub use tcp::{Server, ServerConfig, ServerStats};

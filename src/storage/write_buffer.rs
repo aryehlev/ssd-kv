@@ -152,6 +152,8 @@ pub struct DiskLocation {
     pub wblock_id: u16,
     /// Offset within the WBlock (up to 1MB = 20 bits, using u32 for safety).
     pub offset: u32,
+    /// Record size for partial reads (0 means unknown, read full WBlock).
+    pub record_size: u32,
 }
 
 impl DiskLocation {
@@ -160,12 +162,28 @@ impl DiskLocation {
             file_id,
             wblock_id,
             offset,
+            record_size: 0,
+        }
+    }
+
+    /// Creates a new DiskLocation with known record size for partial reads.
+    pub fn with_size(file_id: u32, wblock_id: u16, offset: u32, record_size: u32) -> Self {
+        Self {
+            file_id,
+            wblock_id,
+            offset,
+            record_size,
         }
     }
 
     /// Calculates the absolute file offset.
     pub fn file_offset(&self, file_header_size: u64) -> u64 {
         file_header_size + (self.wblock_id as u64 * WBLOCK_SIZE as u64) + self.offset as u64
+    }
+
+    /// Returns true if partial reads are possible (record size is known).
+    pub fn supports_partial_read(&self) -> bool {
+        self.record_size > 0
     }
 }
 
@@ -374,6 +392,11 @@ mod tests {
         let offset = loc.file_offset(4096);
         // file_header(4096) + 5 * 1MB + 128
         assert_eq!(offset, 4096 + 5 * 1024 * 1024 + 128);
+        assert!(!loc.supports_partial_read());
+
+        let loc_with_size = DiskLocation::with_size(1, 5, 128, 256);
+        assert!(loc_with_size.supports_partial_read());
+        assert_eq!(loc_with_size.record_size, 256);
     }
 
     #[test]

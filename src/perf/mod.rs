@@ -18,7 +18,7 @@ pub mod object_pool;
 
 pub use hot_cache::{HotCache, CacheStats};
 pub use batch_writer::{BatchWriter, BatchWriterStats, WriteRequest};
-pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, ReadAhead};
+pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, LockFreeBloomFilter, ReadAhead};
 pub use numa::{CpuTopology, NumaThreadPool, pin_to_cpu, pin_to_numa_node, numa_alloc, numa_free};
 pub use xdp::{XdpAccelerator, XdpConfig, XdpStats};
 pub use object_pool::{BufferPool, PooledBuffer, READ_BUFFER_POOL, WRITE_BUFFER_POOL};

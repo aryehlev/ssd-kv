@@ -10,16 +10,25 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 /// Number of cache shards (power of 2 for fast modulo).
-const NUM_SHARDS: usize = 64;
+/// Increased from 64 to 256 for higher concurrency.
+const NUM_SHARDS: usize = 256;
 
 /// Entries per shard.
-const ENTRIES_PER_SHARD: usize = 4096;
+/// Increased from 4096 to 8192 for 2M total entries.
+const ENTRIES_PER_SHARD: usize = 8192;
 
 /// Cache entry states.
 const STATE_EMPTY: u8 = 0;
 const STATE_WRITING: u8 = 1;
 const STATE_VALID: u8 = 2;
 const STATE_EVICTING: u8 = 3;
+
+/// Maximum inline key size for cache entries.
+const MAX_CACHE_KEY_SIZE: usize = 24;
+
+/// Maximum inline value size for cache entries.
+/// Increased from 128 to 256 bytes for larger hot values.
+const MAX_CACHE_VALUE_SIZE: usize = 256;
 
 /// A single cache entry with atomic state management.
 #[repr(C, align(64))] // Cache-line aligned
@@ -34,10 +43,12 @@ pub struct CacheEntry {
     generation: AtomicU32,
     /// Value length.
     value_len: AtomicU32,
+    /// Key length for proper key matching.
+    key_len: AtomicU8,
     /// Inline key (up to 24 bytes).
-    key: [u8; 24],
-    /// Inline value (up to 128 bytes for hot data).
-    value: [u8; 128],
+    key: [u8; MAX_CACHE_KEY_SIZE],
+    /// Inline value (up to 256 bytes for hot data).
+    value: [u8; MAX_CACHE_VALUE_SIZE],
 }
 
 impl CacheEntry {
@@ -48,8 +59,9 @@ impl CacheEntry {
             key_hash: AtomicU64::new(0),
             generation: AtomicU32::new(0),
             value_len: AtomicU32::new(0),
-            key: [0; 24],
-            value: [0; 128],
+            key_len: AtomicU8::new(0),
+            key: [0; MAX_CACHE_KEY_SIZE],
+            value: [0; MAX_CACHE_VALUE_SIZE],
         }
     }
 
@@ -68,7 +80,8 @@ impl CacheEntry {
         }
 
         // Verify key length
-        if key.len() > 24 || key.len() != self.key[..key.len()].len() {
+        let stored_key_len = self.key_len.load(Ordering::Relaxed) as usize;
+        if key.len() > MAX_CACHE_KEY_SIZE || key.len() != stored_key_len {
             return None;
         }
 
@@ -84,7 +97,7 @@ impl CacheEntry {
 
         // Read value
         let value_len = self.value_len.load(Ordering::Relaxed) as usize;
-        if value_len > 128 {
+        if value_len > MAX_CACHE_VALUE_SIZE {
             return None; // Value too large for inline cache
         }
 
@@ -102,7 +115,7 @@ impl CacheEntry {
     #[inline]
     pub fn try_write(&mut self, key: &[u8], key_hash: u64, value: &[u8], generation: u32) -> bool {
         // Only cache small keys and values
-        if key.len() > 24 || value.len() > 128 {
+        if key.len() > MAX_CACHE_KEY_SIZE || value.len() > MAX_CACHE_VALUE_SIZE {
             return false;
         }
 
@@ -140,6 +153,7 @@ impl CacheEntry {
         self.key[..key.len()].copy_from_slice(key);
         self.value[..value.len()].copy_from_slice(value);
         self.key_hash.store(key_hash, Ordering::Relaxed);
+        self.key_len.store(key.len() as u8, Ordering::Relaxed);
         self.value_len.store(value.len() as u32, Ordering::Relaxed);
         self.generation.store(generation, Ordering::Relaxed);
         self.access_count.store(1, Ordering::Relaxed);
@@ -308,7 +322,7 @@ impl HotCache {
     #[inline]
     pub fn put(&self, key: &[u8], key_hash: u64, value: &[u8], generation: u32) {
         // Only cache small values
-        if key.len() > 24 || value.len() > 128 {
+        if key.len() > MAX_CACHE_KEY_SIZE || value.len() > MAX_CACHE_VALUE_SIZE {
             return;
         }
 

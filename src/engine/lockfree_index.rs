@@ -163,15 +163,16 @@ impl Bucket {
     pub fn get_disk_location(&self) -> Option<DiskLocation> {
         if self.flags & FLAG_ON_DISK != 0 {
             // Deserialize DiskLocation from data
+            // Layout: file_id (4 bytes) | wblock_id (2 bytes) | offset (4 bytes) | record_size (4 bytes)
             Some(DiskLocation {
-                file_id: u16::from_le_bytes([self.data[0], self.data[1]]),
-                wblock_id: u16::from_le_bytes([self.data[2], self.data[3]]),
-                offset: u32::from_le_bytes([self.data[4], self.data[5], self.data[6], self.data[7]]),
+                file_id: u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]),
+                wblock_id: u16::from_le_bytes([self.data[4], self.data[5]]),
+                offset: u32::from_le_bytes([self.data[6], self.data[7], self.data[8], self.data[9]]),
                 record_size: u32::from_le_bytes([
-                    self.data[8],
-                    self.data[9],
                     self.data[10],
                     self.data[11],
+                    self.data[12],
+                    self.data[13],
                 ]),
             })
         } else {
@@ -207,10 +208,11 @@ impl Bucket {
                 self.flags |= FLAG_INLINE_VALUE;
             }
         } else if let Some(loc) = location {
-            self.data[0..2].copy_from_slice(&loc.file_id.to_le_bytes());
-            self.data[2..4].copy_from_slice(&loc.wblock_id.to_le_bytes());
-            self.data[4..8].copy_from_slice(&loc.offset.to_le_bytes());
-            self.data[8..12].copy_from_slice(&loc.record_size.to_le_bytes());
+            // Layout: file_id (4 bytes) | wblock_id (2 bytes) | offset (4 bytes) | record_size (4 bytes)
+            self.data[0..4].copy_from_slice(&loc.file_id.to_le_bytes());
+            self.data[4..6].copy_from_slice(&loc.wblock_id.to_le_bytes());
+            self.data[6..10].copy_from_slice(&loc.offset.to_le_bytes());
+            self.data[10..14].copy_from_slice(&loc.record_size.to_le_bytes());
             self.flags |= FLAG_ON_DISK;
         }
     }

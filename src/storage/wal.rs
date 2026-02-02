@@ -439,10 +439,11 @@ impl WriteAheadLog {
         files.sort();
 
         let current_seq = self.file_seq.load(Ordering::Relaxed);
+        let total_files = files.len();
         let mut removed = 0;
 
         for seq in files {
-            if seq < current_seq && files.len() - removed > keep_files {
+            if seq < current_seq && total_files - removed > keep_files {
                 let path = Self::wal_file_path(&self.config.dir, seq);
                 if std::fs::remove_file(&path).is_ok() {
                     removed += 1;
@@ -533,8 +534,12 @@ mod tests {
 
         let bytes = header.to_bytes();
         let restored = WalEntryHeader::from_bytes(&bytes);
-        assert_eq!(restored.key_len, 5);
-        assert_eq!(restored.value_len, 10);
-        assert_eq!(restored.generation, 42);
+        // Copy fields from packed struct to avoid unaligned reference issues
+        let key_len = restored.key_len;
+        let value_len = restored.value_len;
+        let generation = restored.generation;
+        assert_eq!(key_len, 5);
+        assert_eq!(value_len, 10);
+        assert_eq!(generation, 42);
     }
 }

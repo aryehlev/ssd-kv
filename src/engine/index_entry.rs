@@ -1,15 +1,10 @@
-//! Index entry: 48-byte cache-aligned structure for in-memory key lookup.
-
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+//! Index entry: cache-aligned structure for in-memory key lookup.
+//! Only keys and metadata are stored in memory; values always go to disk.
 
 use crate::storage::write_buffer::DiskLocation;
 
 /// Maximum inline key size (keys larger than this are heap-allocated).
 pub const MAX_INLINE_KEY_SIZE: usize = 23;
-
-/// Maximum inline value size (values larger than this go to disk).
-/// Small values stored in index = no disk read needed!
-pub const MAX_INLINE_VALUE_SIZE: usize = 64;
 
 /// Key storage: either inline (≤23 bytes) or heap-allocated.
 #[derive(Clone)]
@@ -108,54 +103,9 @@ impl From<u8> for EntryFlags {
     }
 }
 
-/// Value storage: inline for small values, otherwise on disk.
-#[derive(Clone)]
-pub enum ValueStorage {
-    /// Value stored inline (up to 64 bytes) - NO DISK READ NEEDED!
-    Inline { len: u8, data: [u8; MAX_INLINE_VALUE_SIZE] },
-    /// Value stored on disk at the given location.
-    OnDisk,
-}
-
-impl ValueStorage {
-    /// Creates inline storage if value fits, otherwise OnDisk.
-    pub fn new(value: Option<&[u8]>) -> Self {
-        match value {
-            Some(v) if v.len() <= MAX_INLINE_VALUE_SIZE => {
-                let mut data = [0u8; MAX_INLINE_VALUE_SIZE];
-                data[..v.len()].copy_from_slice(v);
-                Self::Inline { len: v.len() as u8, data }
-            }
-            _ => Self::OnDisk,
-        }
-    }
-
-    /// Returns the inline value if available.
-    #[inline]
-    pub fn get_inline(&self) -> Option<&[u8]> {
-        match self {
-            Self::Inline { len, data } => Some(&data[..*len as usize]),
-            Self::OnDisk => None,
-        }
-    }
-
-    /// Returns true if value is stored inline.
-    #[inline]
-    pub fn is_inline(&self) -> bool {
-        matches!(self, Self::Inline { .. })
-    }
-}
-
-impl std::fmt::Debug for ValueStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inline { len, .. } => write!(f, "Inline({})", len),
-            Self::OnDisk => write!(f, "OnDisk"),
-        }
-    }
-}
 
 /// Index entry: represents a key's metadata in the in-memory index.
+/// Values are always stored on disk, only keys and metadata are kept in memory.
 #[derive(Clone)]
 pub struct IndexEntry {
     /// Hash of the key for fast comparison.
@@ -170,8 +120,6 @@ pub struct IndexEntry {
     pub value_len: u32,
     /// Entry flags.
     pub flags: EntryFlags,
-    /// Inline value storage for small values (≤64 bytes).
-    pub inline_value: ValueStorage,
 }
 
 impl IndexEntry {
@@ -190,26 +138,6 @@ impl IndexEntry {
             generation,
             value_len,
             flags: EntryFlags::None,
-            inline_value: ValueStorage::OnDisk,
-        }
-    }
-
-    /// Creates a new index entry with an inline value.
-    pub fn new_with_value(
-        key: &[u8],
-        key_hash: u64,
-        location: DiskLocation,
-        generation: u32,
-        value: &[u8],
-    ) -> Self {
-        Self {
-            key_hash,
-            key: KeyStorage::new(key),
-            location,
-            generation,
-            value_len: value.len() as u32,
-            flags: EntryFlags::None,
-            inline_value: ValueStorage::new(Some(value)),
         }
     }
 
@@ -222,20 +150,7 @@ impl IndexEntry {
             generation,
             value_len: 0,
             flags: EntryFlags::Deleted,
-            inline_value: ValueStorage::OnDisk,
         }
-    }
-
-    /// Returns the inline value if available (avoids disk read!).
-    #[inline]
-    pub fn get_inline_value(&self) -> Option<&[u8]> {
-        self.inline_value.get_inline()
-    }
-
-    /// Returns true if value is stored inline.
-    #[inline]
-    pub fn has_inline_value(&self) -> bool {
-        self.inline_value.is_inline()
     }
 
     /// Returns true if this entry matches the given key.

@@ -22,8 +22,8 @@ const CACHE_LINE_SIZE: usize = 64;
 /// Maximum key size for inline storage.
 const MAX_INLINE_KEY: usize = 24;
 
-/// Maximum value size for inline storage.
-const MAX_INLINE_VALUE: usize = 64;
+/// Size of disk location data.
+const DISK_LOCATION_SIZE: usize = 16;
 
 /// Bucket states.
 const BUCKET_EMPTY: u8 = 0;
@@ -33,15 +33,16 @@ const BUCKET_LOCKED: u8 = 3;
 
 /// A single bucket in the hash table.
 /// Designed to fit in a cache line (64 bytes).
+/// Values are always stored on disk, only keys and metadata in memory.
 #[repr(C, align(64))]
 pub struct Bucket {
     /// Bucket state (empty, occupied, deleted, locked)
     state: AtomicU8,
     /// Key length
     key_len: u8,
-    /// Value length (if inline)
-    value_len: u8,
-    /// Flags (inline_key, inline_value, on_disk)
+    /// Reserved for alignment
+    _reserved: u8,
+    /// Flags (inline_key)
     flags: u8,
     /// Generation number
     generation: AtomicU32,
@@ -49,16 +50,14 @@ pub struct Bucket {
     key_hash: u64,
     /// Inline key (up to 24 bytes)
     inline_key: [u8; MAX_INLINE_KEY],
-    /// Inline value (up to 64 bytes) OR disk location (16 bytes)
-    data: [u8; MAX_INLINE_VALUE],
+    /// Disk location (16 bytes)
+    disk_location: [u8; DISK_LOCATION_SIZE],
 }
 
-const _: () = assert!(mem::size_of::<Bucket>() <= 128); // Fits in 2 cache lines
+const _: () = assert!(mem::size_of::<Bucket>() <= 64); // Fits in 1 cache line
 
 /// Flags for bucket data.
 const FLAG_INLINE_KEY: u8 = 0x01;
-const FLAG_INLINE_VALUE: u8 = 0x02;
-const FLAG_ON_DISK: u8 = 0x04;
 
 impl Bucket {
     /// Create an empty bucket.
@@ -66,12 +65,12 @@ impl Bucket {
         Self {
             state: AtomicU8::new(BUCKET_EMPTY),
             key_len: 0,
-            value_len: 0,
+            _reserved: 0,
             flags: 0,
             generation: AtomicU32::new(0),
             key_hash: 0,
             inline_key: [0; MAX_INLINE_KEY],
-            data: [0; MAX_INLINE_VALUE],
+            disk_location: [0; DISK_LOCATION_SIZE],
         }
     }
 
@@ -148,45 +147,39 @@ impl Bucket {
         }
     }
 
-    /// Get inline value (if available).
+    /// Get disk location.
     #[inline]
-    pub fn get_inline_value(&self) -> Option<&[u8]> {
-        if self.flags & FLAG_INLINE_VALUE != 0 {
-            Some(&self.data[..self.value_len as usize])
-        } else {
-            None
+    pub fn get_disk_location(&self) -> DiskLocation {
+        // Layout: file_id (4 bytes) | wblock_id (2 bytes) | offset (4 bytes) | record_size (4 bytes)
+        DiskLocation {
+            file_id: u32::from_le_bytes([
+                self.disk_location[0],
+                self.disk_location[1],
+                self.disk_location[2],
+                self.disk_location[3],
+            ]),
+            wblock_id: u16::from_le_bytes([self.disk_location[4], self.disk_location[5]]),
+            offset: u32::from_le_bytes([
+                self.disk_location[6],
+                self.disk_location[7],
+                self.disk_location[8],
+                self.disk_location[9],
+            ]),
+            record_size: u32::from_le_bytes([
+                self.disk_location[10],
+                self.disk_location[11],
+                self.disk_location[12],
+                self.disk_location[13],
+            ]),
         }
     }
 
-    /// Get disk location (if value is on disk).
-    #[inline]
-    pub fn get_disk_location(&self) -> Option<DiskLocation> {
-        if self.flags & FLAG_ON_DISK != 0 {
-            // Deserialize DiskLocation from data
-            // Layout: file_id (4 bytes) | wblock_id (2 bytes) | offset (4 bytes) | record_size (4 bytes)
-            Some(DiskLocation {
-                file_id: u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]),
-                wblock_id: u16::from_le_bytes([self.data[4], self.data[5]]),
-                offset: u32::from_le_bytes([self.data[6], self.data[7], self.data[8], self.data[9]]),
-                record_size: u32::from_le_bytes([
-                    self.data[10],
-                    self.data[11],
-                    self.data[12],
-                    self.data[13],
-                ]),
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Set entry data.
+    /// Set entry data (values always on disk).
     pub fn set(
         &mut self,
         key: &[u8],
         key_hash: u64,
-        value: Option<&[u8]>,
-        location: Option<&DiskLocation>,
+        location: &DiskLocation,
         generation: u32,
     ) {
         self.key_hash = key_hash;
@@ -200,21 +193,12 @@ impl Bucket {
             self.flags |= FLAG_INLINE_KEY;
         }
 
-        // Store value or location
-        if let Some(value) = value {
-            if value.len() <= MAX_INLINE_VALUE {
-                self.data[..value.len()].copy_from_slice(value);
-                self.value_len = value.len() as u8;
-                self.flags |= FLAG_INLINE_VALUE;
-            }
-        } else if let Some(loc) = location {
-            // Layout: file_id (4 bytes) | wblock_id (2 bytes) | offset (4 bytes) | record_size (4 bytes)
-            self.data[0..4].copy_from_slice(&loc.file_id.to_le_bytes());
-            self.data[4..6].copy_from_slice(&loc.wblock_id.to_le_bytes());
-            self.data[6..10].copy_from_slice(&loc.offset.to_le_bytes());
-            self.data[10..14].copy_from_slice(&loc.record_size.to_le_bytes());
-            self.flags |= FLAG_ON_DISK;
-        }
+        // Store disk location
+        // Layout: file_id (4 bytes) | wblock_id (2 bytes) | offset (4 bytes) | record_size (4 bytes)
+        self.disk_location[0..4].copy_from_slice(&location.file_id.to_le_bytes());
+        self.disk_location[4..6].copy_from_slice(&location.wblock_id.to_le_bytes());
+        self.disk_location[6..10].copy_from_slice(&location.offset.to_le_bytes());
+        self.disk_location[10..14].copy_from_slice(&location.record_size.to_le_bytes());
     }
 }
 
@@ -314,9 +298,9 @@ impl LockFreeIndex {
         None
     }
 
-    /// GET - Lock-free read!
+    /// GET - Lock-free read! Returns disk location for value.
     #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<GetResult> {
+    pub fn get(&self, key: &[u8]) -> Option<DiskLocation> {
         let key_hash = hash_key(key);
 
         if let Some(index) = self.find_bucket(key, key_hash) {
@@ -325,13 +309,7 @@ impl LockFreeIndex {
             // Read generation before and after to detect concurrent modification
             let gen1 = bucket.generation.load(Ordering::Acquire);
 
-            let result = if let Some(value) = bucket.get_inline_value() {
-                Some(GetResult::Inline(value.to_vec()))
-            } else if let Some(location) = bucket.get_disk_location() {
-                Some(GetResult::OnDisk(location))
-            } else {
-                None
-            };
+            let location = bucket.get_disk_location();
 
             let gen2 = bucket.generation.load(Ordering::Acquire);
 
@@ -340,18 +318,17 @@ impl LockFreeIndex {
                 return self.get(key); // Recursive retry
             }
 
-            return result;
+            return Some(location);
         }
 
         None
     }
 
-    /// PUT - Uses fine-grained per-bucket locking.
+    /// PUT - Uses fine-grained per-bucket locking. Values always on disk.
     pub fn put(
         &self,
         key: &[u8],
-        value: Option<&[u8]>,
-        location: Option<&DiskLocation>,
+        location: &DiskLocation,
         generation: u32,
     ) -> io::Result<()> {
         let key_hash = hash_key(key);
@@ -367,7 +344,7 @@ impl LockFreeIndex {
 
             // Update existing entry
             let bucket_mut = self.bucket_mut(index);
-            bucket_mut.set(key, key_hash, value, location, generation);
+            bucket_mut.set(key, key_hash, location, generation);
             bucket.unlock(true);
 
             return Ok(());
@@ -385,12 +362,12 @@ impl LockFreeIndex {
             // Double-check it's still available
             if !self.bucket(index).is_available() {
                 bucket.unlock(false);
-                return self.put(key, value, location, generation); // Retry
+                return self.put(key, location, generation); // Retry
             }
 
             // Insert new entry
             let bucket_mut = self.bucket_mut(index);
-            bucket_mut.set(key, key_hash, value, location, generation);
+            bucket_mut.set(key, key_hash, location, generation);
             bucket.unlock(true);
 
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -447,14 +424,6 @@ impl Drop for LockFreeIndex {
     }
 }
 
-/// Result of a GET operation.
-#[derive(Debug, Clone)]
-pub enum GetResult {
-    /// Value stored inline
-    Inline(Vec<u8>),
-    /// Value on disk
-    OnDisk(DiskLocation),
-}
 
 // SIMD-accelerated key comparison (x86_64)
 #[cfg(target_arch = "x86_64")]
@@ -521,27 +490,34 @@ mod tests {
         let mut bucket = Bucket::empty();
         assert!(bucket.is_available());
 
-        bucket.set(b"key", hash_key(b"key"), Some(b"value"), None, 1);
+        let location = DiskLocation::new(1, 2, 100);
+        bucket.set(b"key", hash_key(b"key"), &location, 1);
         bucket.state.store(BUCKET_OCCUPIED, Ordering::Release);
 
         assert!(bucket.is_occupied());
         assert!(bucket.key_matches(b"key", hash_key(b"key")));
-        assert_eq!(bucket.get_inline_value(), Some(b"value".as_slice()));
+        let disk_loc = bucket.get_disk_location();
+        assert_eq!(disk_loc.file_id, 1);
+        assert_eq!(disk_loc.wblock_id, 2);
+        assert_eq!(disk_loc.offset, 100);
     }
 
     #[test]
     fn test_lockfree_index() {
         let index = LockFreeIndex::new(1024);
 
+        let loc1 = DiskLocation::new(1, 1, 100);
+        let loc2 = DiskLocation::new(2, 2, 200);
+
         // PUT
-        index.put(b"key1", Some(b"value1"), None, 1).unwrap();
-        index.put(b"key2", Some(b"value2"), None, 2).unwrap();
+        index.put(b"key1", &loc1, 1).unwrap();
+        index.put(b"key2", &loc2, 2).unwrap();
 
         // GET
-        match index.get(b"key1") {
-            Some(GetResult::Inline(v)) => assert_eq!(v, b"value1"),
-            _ => panic!("Expected inline value"),
-        }
+        let result = index.get(b"key1").expect("Expected disk location");
+        assert_eq!(result.file_id, 1);
+        assert_eq!(result.wblock_id, 1);
+        assert_eq!(result.offset, 100);
 
         // DELETE
         assert!(index.delete(b"key1"));

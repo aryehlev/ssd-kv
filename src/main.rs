@@ -23,7 +23,7 @@ mod storage;
 use config::Config;
 use engine::{recover_index, Index};
 use perf::{PerfTuning, pin_to_cpu};
-use server::{Handler, Server, ServerConfig, start_redis_server};
+use server::{Handler, start_redis_server, UringTcpServer, UringServerConfig};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::file_manager::FileManager;
 use storage::write_buffer::WriteBuffer;
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         };
 
-        let (compactor, stop) = start_compaction_thread(
+        let (_compactor, stop) = start_compaction_thread(
             compaction_config,
             Arc::clone(&index),
             Arc::clone(&file_manager),
@@ -125,16 +125,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Configure server with optimized settings
-    let server_config = ServerConfig {
+    let server_config = UringServerConfig {
         bind_addr: config.bind,
         max_connections: config.max_connections,
-        read_buffer_size: config.read_buffer_size(),
-        write_buffer_size: config.write_buffer_size(),
-        num_workers: config.num_workers(),
+        recv_buffer_size: config.read_buffer_size(),
+        ..Default::default()
     };
 
+    let shutdown_signal = Arc::new(AtomicBool::new(false));
+
     // Create and start TCP server
-    let server = Arc::new(Server::new(server_config, Arc::clone(&handler)));
+    let mut server = UringTcpServer::new(server_config.clone(), Arc::clone(&handler), Arc::clone(&shutdown_signal))?;
 
     // Start Redis-compatible server on port + 1
     let redis_addr: std::net::SocketAddr = format!(
@@ -146,7 +147,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Redis-compatible server on {}", redis_addr);
 
     // Handle shutdown signals
-    let server_clone = Arc::clone(&server);
     let handler_clone = Arc::clone(&handler);
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
@@ -159,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Error flushing on shutdown: {}", e);
         }
 
-        server_clone.shutdown();
+        shutdown_signal.store(true, Ordering::SeqCst);
     });
 
     // Run server

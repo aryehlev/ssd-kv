@@ -197,27 +197,6 @@ impl Index {
         old
     }
 
-    /// Inserts with inline value (for small values, avoids disk read on GET).
-    pub fn insert_with_value(
-        &self,
-        key: &[u8],
-        location: DiskLocation,
-        generation: u32,
-        value: &[u8],
-    ) -> Option<IndexEntry> {
-        let key_hash = hash_key(key);
-        let entry = IndexEntry::new_with_value(key, key_hash, location, generation, value);
-
-        let shard_idx = self.shard_for(key_hash);
-        let mut shard = self.shards[shard_idx].write();
-
-        let old = shard.insert(entry);
-        if old.is_none() {
-            self.total_entries.fetch_add(1, Ordering::Relaxed);
-        }
-        old
-    }
-
     /// Marks a key as deleted.
     pub fn delete(&self, key: &[u8], generation: u32) -> bool {
         let key_hash = hash_key(key);

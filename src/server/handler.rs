@@ -76,8 +76,6 @@ impl Handler {
 
     /// Synchronous PUT for Redis compatibility
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
-        use crate::engine::index_entry::MAX_INLINE_VALUE_SIZE;
-
         let key_hash = hash_key(key);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
@@ -87,12 +85,8 @@ impl Handler {
         // Append to write buffer
         let location = self.write_buffer.append(&mut record)?;
 
-        // Update index (with inline value for small values)
-        if value.len() <= MAX_INLINE_VALUE_SIZE {
-            self.index.insert_with_value(key, location, generation, value);
-        } else {
-            self.index.insert(key, location, generation, record.header.value_len);
-        }
+        // Update index (values always on disk, only keys in memory)
+        self.index.insert(key, location, generation, record.header.value_len);
 
         // Update bloom filter
         self.bloom_filter.write().add(key_hash);
@@ -119,18 +113,13 @@ impl Handler {
     }
 
     /// Fast synchronous GET for UDP/Redis - returns value if found.
-    /// Priority: inline value -> write buffer -> disk
+    /// Priority: write buffer -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Fast path 1: Check index
         let entry = self.index.get(key)?;
 
-        // Fast path 2: Inline value (no disk!)
-        if let Some(value) = entry.get_inline_value() {
-            return Some(value.to_vec());
-        }
-
-        // Fast path 3: Write buffer (not yet flushed)
+        // Fast path 2: Write buffer (not yet flushed)
         if let Some(value) = self.write_buffer.read_unflushed(&entry.location, key) {
             return Some(value);
         }
@@ -201,13 +190,7 @@ impl Handler {
             }
         };
 
-        // Fast path 2: Check for inline value (NO DISK READ!)
-        if let Some(value) = entry.get_inline_value() {
-            self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-            return Response::success(request_id, value);
-        }
-
-        // Fast path 3: Check write buffer for unflushed data
+        // Fast path 2: Check write buffer for unflushed data
         if let Some(value) = self.write_buffer.read_unflushed(&entry.location, &key) {
             self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
             return Response::success(request_id, &value);
@@ -271,13 +254,8 @@ impl Handler {
             }
         };
 
-        // Update index (with inline value for small values)
-        use crate::engine::index_entry::MAX_INLINE_VALUE_SIZE;
-        if value.len() <= MAX_INLINE_VALUE_SIZE {
-            self.index.insert_with_value(&key, location, generation, &value);
-        } else {
-            self.index.insert(&key, location, generation, record.header.value_len);
-        }
+        // Update index (values always on disk, only keys in memory)
+        self.index.insert(&key, location, generation, record.header.value_len);
 
         // Update bloom filter
         self.bloom_filter.write().add(key_hash);
@@ -474,8 +452,6 @@ impl OptimizedHandler {
 
     /// Synchronous PUT optimized for high throughput.
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
-        use crate::engine::index_entry::MAX_INLINE_VALUE_SIZE;
-
         let key_hash = hash_key(key);
         let partition = self.partition_for(key_hash);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
@@ -488,12 +464,8 @@ impl OptimizedHandler {
         let mut location = self.write_buffers[partition].append(&mut record)?;
         location.record_size = record_size as u32;
 
-        // Update index (with inline value for small values)
-        if value.len() <= MAX_INLINE_VALUE_SIZE {
-            self.index.insert_with_value(key, location, generation, value);
-        } else {
-            self.index.insert(key, location, generation, record.header.value_len);
-        }
+        // Update index (values always on disk, only keys in memory)
+        self.index.insert(key, location, generation, record.header.value_len);
 
         // Update lock-free bloom filter (no write lock needed!)
         self.bloom_filter.add(key_hash);
@@ -522,7 +494,7 @@ impl OptimizedHandler {
     }
 
     /// Fast synchronous GET with all optimizations.
-    /// Priority: bloom filter -> inline value -> write buffer -> disk
+    /// Priority: bloom filter -> write buffer -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
         let key_hash = hash_key(key);
@@ -542,13 +514,7 @@ impl OptimizedHandler {
             }
         };
 
-        // Fast path 3: Inline value (no disk!)
-        if let Some(value) = entry.get_inline_value() {
-            self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(value.to_vec());
-        }
-
-        // Fast path 4: Check partition's write buffer (not yet flushed)
+        // Fast path 3: Check partition's write buffer (not yet flushed)
         let partition = self.partition_for(key_hash);
         if let Some(value) = self.write_buffers[partition].read_unflushed(&entry.location, key) {
             self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
@@ -615,13 +581,6 @@ impl OptimizedHandler {
                 }
             };
 
-            // Fast path: inline value
-            if let Some(value) = entry.get_inline_value() {
-                self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-                results[i] = Some(value.to_vec());
-                continue;
-            }
-
             // Fast path: write buffer
             let partition = self.partition_for(hashes[i]);
             if let Some(value) = self.write_buffers[partition].read_unflushed(&entry.location, keys[i]) {
@@ -670,13 +629,6 @@ impl OptimizedHandler {
                     continue;
                 }
             };
-
-            // Fast path: inline value
-            if let Some(value) = entry.get_inline_value() {
-                self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-                results[i] = Some(value.to_vec());
-                continue;
-            }
 
             // Fast path: write buffer
             let partition = self.partition_for(hash);
@@ -734,13 +686,6 @@ impl OptimizedHandler {
                         continue;
                     }
                 };
-
-                // Fast path: inline value
-                if let Some(value) = entry.get_inline_value() {
-                    self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-                    results[i] = Some(value.to_vec());
-                    continue;
-                }
 
                 // Fast path: write buffer
                 let partition = self.partition_for(hash);

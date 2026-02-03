@@ -280,10 +280,8 @@ use crate::engine::index_entry::IndexEntry;
 pub struct BatchGetResult<'a> {
     /// Results for each key: Some(entry) if found, None if not found
     pub entries: Vec<Option<IndexEntry>>,
-    /// Keys that need disk reads (not inline)
+    /// Keys that need disk reads (all found keys need disk read)
     pub need_disk_read: Vec<(usize, &'a [u8], IndexEntry)>,
-    /// Keys with inline values (no disk read needed)
-    pub inline_hits: Vec<(usize, &'a [u8], Vec<u8>)>,
     /// Keys not found
     pub misses: Vec<(usize, &'a [u8])>,
 }
@@ -293,7 +291,7 @@ pub struct BatchGetResult<'a> {
 /// This is optimized for the common case where many keys don't exist:
 /// 1. First, batch check bloom filter to eliminate definite misses
 /// 2. Only look up keys that pass the bloom filter
-/// 3. Separate results into inline hits (fast) and disk reads needed (slow)
+/// 3. All found keys need disk reads (values always on disk)
 pub fn batch_index_lookup<'a>(
     index: &Index,
     bloom: &LockFreeBloomFilter,
@@ -301,7 +299,6 @@ pub fn batch_index_lookup<'a>(
 ) -> BatchGetResult<'a> {
     let mut entries = Vec::with_capacity(keys.len());
     let mut need_disk_read = Vec::new();
-    let mut inline_hits = Vec::new();
     let mut misses = Vec::new();
 
     // Compute all hashes first (better cache behavior)
@@ -313,7 +310,7 @@ pub fn batch_index_lookup<'a>(
     // Batch bloom filter check
     let bloom_result = batch_bloom_check(bloom, &hashes);
 
-    for (i, (&key, &hash)) in keys.iter().zip(hashes.iter()).enumerate() {
+    for (i, (&key, &_hash)) in keys.iter().zip(hashes.iter()).enumerate() {
         // Skip definite misses from bloom filter
         if !bloom_result.may_contain(i) {
             entries.push(None);
@@ -324,12 +321,8 @@ pub fn batch_index_lookup<'a>(
         // Look up in index
         match index.get(key) {
             Some(entry) => {
-                // Check if value is inline
-                if let Some(value) = entry.get_inline_value() {
-                    inline_hits.push((i, key, value.to_vec()));
-                } else {
-                    need_disk_read.push((i, key, entry.clone()));
-                }
+                // All values are on disk
+                need_disk_read.push((i, key, entry.clone()));
                 entries.push(Some(entry));
             }
             None => {
@@ -342,7 +335,6 @@ pub fn batch_index_lookup<'a>(
     BatchGetResult {
         entries,
         need_disk_read,
-        inline_hits,
         misses,
     }
 }

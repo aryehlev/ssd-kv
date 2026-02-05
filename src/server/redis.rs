@@ -18,8 +18,11 @@ use crate::server::handler::Handler;
 /// Maximum pipeline depth before forcing flush
 const MAX_PIPELINE_DEPTH: usize = 128;
 
-/// Read buffer size
-const READ_BUFFER_SIZE: usize = 64 * 1024;
+/// Initial read buffer size (64KB - efficient for small values)
+const INITIAL_READ_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Maximum read buffer size (64MB - supports arbitrarily large values)
+const MAX_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
 /// Write buffer size
 const WRITE_BUFFER_SIZE: usize = 64 * 1024;
@@ -121,13 +124,13 @@ pub struct RespParser {
 impl RespParser {
     pub fn new() -> Self {
         Self {
-            buf: vec![0u8; READ_BUFFER_SIZE],
+            buf: vec![0u8; INITIAL_READ_BUFFER_SIZE],
             pos: 0,
             len: 0,
         }
     }
 
-    /// Read more data from the stream
+    /// Read more data from the stream, growing the buffer if needed
     #[inline]
     fn fill_buffer(&mut self, stream: &mut impl Read) -> io::Result<bool> {
         // Compact buffer if needed
@@ -141,6 +144,18 @@ impl RespParser {
             self.pos = 0;
         }
 
+        // Grow buffer if full after compaction
+        if self.len == self.buf.len() {
+            let new_size = (self.buf.len() * 2).min(MAX_BUFFER_SIZE);
+            if new_size <= self.buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "RESP message exceeds maximum buffer size",
+                ));
+            }
+            self.buf.resize(new_size, 0);
+        }
+
         // Read more data
         let n = stream.read(&mut self.buf[self.len..])?;
         if n == 0 {
@@ -150,10 +165,28 @@ impl RespParser {
         Ok(true)
     }
 
+    /// Shrink buffer back toward initial size when it's oversized and mostly empty.
+    #[inline]
+    fn maybe_shrink(&mut self) {
+        let remaining = self.len - self.pos;
+        // Only shrink if buffer is larger than initial and less than 1/4 used
+        if self.buf.len() > INITIAL_READ_BUFFER_SIZE && remaining < self.buf.len() / 4 {
+            let new_size = (self.buf.len() / 2).max(INITIAL_READ_BUFFER_SIZE);
+            if remaining > 0 {
+                self.buf.copy_within(self.pos..self.len, 0);
+            }
+            self.len = remaining;
+            self.pos = 0;
+            self.buf.truncate(new_size);
+            self.buf.resize(new_size, 0);
+        }
+    }
+
     /// Try to parse a complete RESP value
     pub fn try_parse(&mut self, stream: &mut impl Read) -> io::Result<Option<RespValue>> {
         loop {
             if let Some(value) = self.parse_value()? {
+                self.maybe_shrink();
                 return Ok(Some(value));
             }
 

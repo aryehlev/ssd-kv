@@ -3,7 +3,6 @@
 //! An Aerospike-inspired KV store with:
 //! - Index in RAM for fast lookups
 //! - Data on SSD with O_DIRECT for consistent latency
-//! - io_uring for async I/O
 //! - Sharded hashmap index with 256 shards
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +22,7 @@ mod storage;
 use config::Config;
 use engine::{recover_index, Index};
 use perf::{PerfTuning, pin_to_cpu};
-use server::{Handler, start_redis_server, UringTcpServer, UringServerConfig};
+use server::{Handler, start_redis_server};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::file_manager::FileManager;
 use storage::write_buffer::WriteBuffer;
@@ -124,30 +123,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&write_buffer),
     ));
 
-    // Configure server with optimized settings
-    let server_config = UringServerConfig {
-        bind_addr: config.bind,
-        max_connections: config.max_connections,
-        recv_buffer_size: config.read_buffer_size(),
-        ..Default::default()
-    };
+    // Start Redis-compatible server on main port
+    let _redis_handle = start_redis_server(config.bind, Arc::clone(&handler));
+    info!("Redis-compatible server on {}", config.bind);
 
     let shutdown_signal = Arc::new(AtomicBool::new(false));
 
-    // Create and start TCP server
-    let mut server = UringTcpServer::new(server_config.clone(), Arc::clone(&handler), Arc::clone(&shutdown_signal))?;
-
-    // Start Redis-compatible server on port + 1
-    let redis_addr: std::net::SocketAddr = format!(
-        "{}:{}",
-        config.bind.ip(),
-        config.bind.port() + 1
-    ).parse().unwrap();
-    let _redis_handle = start_redis_server(redis_addr, Arc::clone(&handler));
-    info!("Redis-compatible server on {}", redis_addr);
-
     // Handle shutdown signals
     let handler_clone = Arc::clone(&handler);
+    let shutdown_clone = Arc::clone(&shutdown_signal);
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
             .await
@@ -159,13 +143,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Error flushing on shutdown: {}", e);
         }
 
-        shutdown_signal.store(true, Ordering::SeqCst);
+        shutdown_clone.store(true, Ordering::SeqCst);
     });
 
-    // Run server
-    info!("Server starting on {}", config.bind);
-    if let Err(e) = server.run().await {
-        error!("Server error: {}", e);
+    // Wait for shutdown signal
+    while !shutdown_signal.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     // Stop compaction thread

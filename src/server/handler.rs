@@ -8,12 +8,11 @@ use tracing::{error, trace};
 
 use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
-use crate::perf::prefetch::{prefetch_read, BloomFilter, LockFreeBloomFilter};
-use crate::perf::simd::{batch_bloom_check, batch_hash_keys_4, group_by_shard, simd_key_eq};
-use crate::server::protocol::{Opcode, Request, Response};
-use crate::storage::file_manager::{FileManager, ParallelFileManager, FILE_HEADER_SIZE};
+use crate::perf::prefetch::{BloomFilter, LockFreeBloomFilter};
+use crate::perf::simd::{batch_bloom_check, batch_hash_keys_4, group_by_shard};
+use crate::storage::file_manager::{FileManager, ParallelFileManager};
 use crate::storage::record::Record;
-use crate::storage::write_buffer::{DiskLocation, WriteBuffer, WBLOCK_SIZE};
+use crate::storage::write_buffer::{WriteBuffer, WBLOCK_SIZE};
 
 /// Statistics for the handler.
 #[derive(Debug, Default)]
@@ -140,232 +139,6 @@ impl Handler {
         }
 
         Some(record.value)
-    }
-
-    /// Handles a request and returns a response.
-    #[inline]
-    pub async fn handle(&self, request: Request) -> Response {
-        let request_id = request.header.request_id;
-
-        match request.header.opcode {
-            Opcode::Get => self.handle_get(request_id, &request).await,
-            Opcode::Put => self.handle_put(request_id, &request).await,
-            Opcode::Delete => self.handle_delete(request_id, &request).await,
-            Opcode::Ping => Response::pong(request_id),
-            Opcode::Stats => self.handle_stats(request_id),
-            _ => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                Response::invalid(request_id, "Unknown opcode")
-            }
-        }
-    }
-
-    /// Handles a GET request.
-    #[inline]
-    async fn handle_get(&self, request_id: u32, request: &Request) -> Response {
-        self.stats.gets.fetch_add(1, Ordering::Relaxed);
-
-        let key = match request.parse_get() {
-            Ok(k) => k,
-            Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Response::invalid(request_id, &format!("Invalid GET: {}", e));
-            }
-        };
-
-        let key_hash = hash_key(&key);
-
-        // Fast path 1: Check bloom filter for early rejection
-        if !self.bloom_filter.read().may_contain(key_hash) {
-            self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
-            return Response::not_found(request_id);
-        }
-
-        // Look up in index
-        let entry = match self.index.get(&key) {
-            Some(e) => e,
-            None => {
-                self.stats.get_misses.fetch_add(1, Ordering::Relaxed);
-                return Response::not_found(request_id);
-            }
-        };
-
-        // Fast path 2: Check write buffer for unflushed data
-        if let Some(value) = self.write_buffer.read_unflushed(&entry.location, &key) {
-            self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-            return Response::success(request_id, &value);
-        }
-
-        // Prefetch the disk location data
-        prefetch_read(&entry.location as *const DiskLocation);
-
-        // Slow path: Read value from disk (only for large values)
-        match self.read_value(&entry.location, entry.value_len).await {
-            Ok(value) => {
-                self.stats.get_hits.fetch_add(1, Ordering::Relaxed);
-                Response::success(request_id, &value)
-            }
-            Err(e) => {
-                error!("Failed to read value: {}", e);
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                Response::error(request_id, &format!("Read error: {}", e))
-            }
-        }
-    }
-
-    /// Handles a PUT request.
-    #[inline]
-    async fn handle_put(&self, request_id: u32, request: &Request) -> Response {
-        self.stats.puts.fetch_add(1, Ordering::Relaxed);
-
-        let (key, value, ttl) = match request.parse_put() {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Response::invalid(request_id, &format!("Invalid PUT: {}", e));
-            }
-        };
-
-        let key_hash = hash_key(&key);
-        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
-
-        trace!(
-            "PUT key={:?} value_len={} ttl={}",
-            String::from_utf8_lossy(&key),
-            value.len(),
-            ttl
-        );
-
-        // Create record
-        let mut record = match Record::new(key.clone(), value.clone(), generation, ttl) {
-            Ok(r) => r,
-            Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Response::error(request_id, &format!("Record creation failed: {}", e));
-            }
-        };
-
-        // Append to write buffer
-        let location = match self.write_buffer.append(&mut record) {
-            Ok(loc) => loc,
-            Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Response::error(request_id, &format!("Write failed: {}", e));
-            }
-        };
-
-        // Update index (values always on disk, only keys in memory)
-        self.index.insert(&key, location, generation, record.header.value_len);
-
-        // Update bloom filter
-        self.bloom_filter.write().add(key_hash);
-
-        // Periodically flush (every 1000 operations)
-        if generation % 1000 == 0 {
-            let _ = self.try_flush();
-        }
-
-        Response::success(request_id, &[])
-    }
-
-    /// Handles a DELETE request.
-    #[inline]
-    async fn handle_delete(&self, request_id: u32, request: &Request) -> Response {
-        self.stats.deletes.fetch_add(1, Ordering::Relaxed);
-
-        let key = match request.parse_delete() {
-            Ok(k) => k,
-            Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Response::invalid(request_id, &format!("Invalid DELETE: {}", e));
-            }
-        };
-
-        trace!("DELETE key={:?}", String::from_utf8_lossy(&key));
-
-        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
-
-        // Create tombstone record
-        let mut record = match Record::tombstone(key.clone(), generation) {
-            Ok(r) => r,
-            Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Response::error(request_id, &format!("Tombstone creation failed: {}", e));
-            }
-        };
-
-        // Append tombstone to write buffer
-        if let Err(e) = self.write_buffer.append(&mut record) {
-            self.stats.errors.fetch_add(1, Ordering::Relaxed);
-            return Response::error(request_id, &format!("Write failed: {}", e));
-        }
-
-        // Update index
-        self.index.delete(&key, generation);
-
-        Response::success(request_id, &[])
-    }
-
-    /// Handles a STATS request.
-    fn handle_stats(&self, request_id: u32) -> Response {
-        let index_stats = self.index.stats();
-        let json = format!(
-            r#"{{"index":{{"entries":{},"live":{},"tombstones":{}}},"ops":{}}}"#,
-            index_stats.total_entries,
-            index_stats.live_entries,
-            index_stats.tombstones,
-            self.stats.to_json(),
-        );
-        Response::stats(request_id, &json)
-    }
-
-    /// Reads a value from disk.
-    /// Uses partial reads when record_size is known to avoid reading full 1MB WBlocks.
-    #[inline]
-    async fn read_value(&self, location: &DiskLocation, value_len: u32) -> io::Result<Vec<u8>> {
-        let file = self
-            .file_manager
-            .get_file(location.file_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Data file not found"))?;
-
-        let file_guard = file.lock();
-
-        // Use partial read if record size is known (optimization for small records)
-        let wblock_data = if location.supports_partial_read() {
-            file_guard.read_partial_wblock(
-                location.wblock_id as u32,
-                location.offset,
-                location.record_size,
-            )?
-        } else {
-            // Fall back to reading entire WBlock
-            file_guard.read_wblock(location.wblock_id as u32)?
-        };
-
-        // Parse record from the correct offset within the buffer
-        // For partial reads, offset adjustment is handled in read_partial_wblock
-        let data_offset = if location.supports_partial_read() {
-            // Partial read: data starts at the alignment boundary adjustment
-            let abs_offset = (FILE_HEADER_SIZE as u64
-                + location.wblock_id as u64 * WBLOCK_SIZE as u64
-                + location.offset as u64) as usize;
-            let aligned_offset = abs_offset & !(4096 - 1);
-            abs_offset - aligned_offset
-        } else {
-            location.offset as usize
-        };
-
-        if data_offset >= wblock_data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid record offset"));
-        }
-
-        let record = Record::from_bytes(&wblock_data[data_offset..])?;
-
-        if record.header.is_deleted() || record.header.is_expired() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Record deleted or expired"));
-        }
-
-        Ok(record.value)
     }
 
     /// Tries to flush pending writes to disk (non-blocking, best effort).
@@ -777,65 +550,40 @@ mod tests {
         (Handler::new(index, file_manager, write_buffer), dir)
     }
 
-    #[tokio::test]
-    async fn test_put_get() {
+    #[test]
+    fn test_put_get() {
         let (handler, _dir) = create_test_handler();
 
         // PUT
-        let put_req = Request::put(1, b"key1", b"value1", 0);
-        let put_resp = handler.handle(put_req).await;
-        assert_eq!(put_resp.header.opcode, Opcode::Success);
+        handler.put_sync(b"key1", b"value1", 0).unwrap();
 
-        // Flush to disk
-        handler.flush().await.unwrap();
-
-        // GET (should use inline value from index)
-        let get_req = Request::get(2, b"key1");
-        let get_resp = handler.handle(get_req).await;
-        assert_eq!(get_resp.header.opcode, Opcode::Success);
-        assert_eq!(get_resp.payload, b"value1");
-
-        // Check hit
-        assert!(handler.stats().get_hits.load(Ordering::Relaxed) > 0);
+        // GET
+        let value = handler.get_value(b"key1");
+        assert_eq!(value, Some(b"value1".to_vec()));
     }
 
-    #[tokio::test]
-    async fn test_get_not_found() {
+    #[test]
+    fn test_get_not_found() {
         let (handler, _dir) = create_test_handler();
 
-        let get_req = Request::get(1, b"nonexistent");
-        let get_resp = handler.handle(get_req).await;
-        assert_eq!(get_resp.header.opcode, Opcode::NotFound);
+        let value = handler.get_value(b"nonexistent");
+        assert_eq!(value, None);
     }
 
-    #[tokio::test]
-    async fn test_delete() {
+    #[test]
+    fn test_delete() {
         let (handler, _dir) = create_test_handler();
 
         // PUT
-        let put_req = Request::put(1, b"del_key", b"del_value", 0);
-        handler.handle(put_req).await;
-        handler.flush().await.unwrap();
+        handler.put_sync(b"del_key", b"del_value", 0).unwrap();
 
         // DELETE
-        let del_req = Request::delete(2, b"del_key");
-        let del_resp = handler.handle(del_req).await;
-        assert_eq!(del_resp.header.opcode, Opcode::Success);
+        let deleted = handler.delete_sync(b"del_key").unwrap();
+        assert!(deleted);
 
         // GET should return not found
-        let get_req = Request::get(3, b"del_key");
-        let get_resp = handler.handle(get_req).await;
-        assert_eq!(get_resp.header.opcode, Opcode::NotFound);
-    }
-
-    #[tokio::test]
-    async fn test_ping() {
-        let (handler, _dir) = create_test_handler();
-
-        let ping_req = Request::ping(42);
-        let pong_resp = handler.handle(ping_req).await;
-        assert_eq!(pong_resp.header.opcode, Opcode::Success);
-        assert_eq!(pong_resp.header.request_id, 42);
+        let value = handler.get_value(b"del_key");
+        assert_eq!(value, None);
     }
 
     #[test]

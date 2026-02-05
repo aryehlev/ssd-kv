@@ -365,13 +365,10 @@ mod tests {
         let config = BusyPollConfig::default();
         let mut poller = BusyPoller::new(config);
 
-        let mut count = 0;
-        let events = poller.poll(|| {
-            count += 1;
-            if count < 3 { 0 } else { 5 }
-        });
-
-        assert_eq!(events, 5);
+        // poll() calls the closure once per invocation
+        assert_eq!(poller.poll(|| 0), 0);
+        assert_eq!(poller.poll(|| 0), 0);
+        assert_eq!(poller.poll(|| 5), 5);
     }
 
     #[test]

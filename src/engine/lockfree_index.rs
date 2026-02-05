@@ -118,13 +118,16 @@ impl Bucket {
                 .is_ok()
     }
 
-    /// Unlock the bucket.
+    /// Unlock the bucket, setting it to occupied.
     #[inline]
-    pub fn unlock(&self, occupied: bool) {
-        self.state.store(
-            if occupied { BUCKET_OCCUPIED } else { BUCKET_EMPTY },
-            Ordering::Release,
-        );
+    pub fn unlock_occupied(&self) {
+        self.state.store(BUCKET_OCCUPIED, Ordering::Release);
+    }
+
+    /// Unlock the bucket, marking it as deleted (preserves linear probing chains).
+    #[inline]
+    pub fn unlock_deleted(&self) {
+        self.state.store(BUCKET_DELETED, Ordering::Release);
     }
 
     /// Check if key matches (fast path: compare hash first).
@@ -306,19 +309,19 @@ impl LockFreeIndex {
         if let Some(index) = self.find_bucket(key, key_hash) {
             let bucket = self.bucket(index);
 
-            // Read generation before and after to detect concurrent modification
-            let gen1 = bucket.generation.load(Ordering::Acquire);
+            loop {
+                // Read generation before and after to detect concurrent modification
+                let gen1 = bucket.generation.load(Ordering::Acquire);
+                let location = bucket.get_disk_location();
+                let gen2 = bucket.generation.load(Ordering::Acquire);
 
-            let location = bucket.get_disk_location();
-
-            let gen2 = bucket.generation.load(Ordering::Acquire);
-
-            // If generation changed, retry
-            if gen1 != gen2 {
-                return self.get(key); // Recursive retry
+                // If generation is stable, return the location
+                if gen1 == gen2 {
+                    return Some(location);
+                }
+                // Otherwise retry (concurrent write in progress)
+                std::hint::spin_loop();
             }
-
-            return Some(location);
         }
 
         None
@@ -345,7 +348,7 @@ impl LockFreeIndex {
             // Update existing entry
             let bucket_mut = self.bucket_mut(index);
             bucket_mut.set(key, key_hash, location, generation);
-            bucket.unlock(true);
+            bucket.unlock_occupied();
 
             return Ok(());
         }
@@ -359,16 +362,10 @@ impl LockFreeIndex {
                 std::hint::spin_loop();
             }
 
-            // Double-check it's still available
-            if !self.bucket(index).is_available() {
-                bucket.unlock(false);
-                return self.put(key, location, generation); // Retry
-            }
-
-            // Insert new entry
+            // Insert new entry (we hold the lock, so the bucket is ours)
             let bucket_mut = self.bucket_mut(index);
             bucket_mut.set(key, key_hash, location, generation);
-            bucket.unlock(true);
+            bucket.unlock_occupied();
 
             self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -391,7 +388,7 @@ impl LockFreeIndex {
             }
 
             // Mark as deleted
-            bucket.unlock(false);
+            bucket.unlock_deleted();
             self.count.fetch_sub(1, Ordering::Relaxed);
 
             return true;

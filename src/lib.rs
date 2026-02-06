@@ -9,6 +9,7 @@
 //! - Bloom filter for fast negative lookups
 //! - CPU prefetching and NUMA awareness
 
+pub mod cluster;
 pub mod config;
 pub mod engine;
 pub mod io;

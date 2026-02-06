@@ -7,11 +7,14 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
+use parking_lot::RwLock;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod cluster;
 mod config;
 mod engine;
 mod io;
@@ -19,10 +22,16 @@ mod perf;
 mod server;
 mod storage;
 
+use cluster::node::NodeInfo;
+use cluster::peer_pool::PeerConnectionPool;
+use cluster::replication::{PeerServer, ReplicationManager};
+use cluster::router::ClusterRouter;
+use cluster::topology::ClusterTopology;
+use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
 use engine::{recover_index, Index};
 use perf::{PerfTuning, pin_to_cpu};
-use server::{Handler, start_redis_server};
+use server::{Handler, start_redis_server, start_redis_server_clustered};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::file_manager::FileManager;
 use storage::write_buffer::WriteBuffer;
@@ -55,6 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("SSD-KV starting...");
     info!("Data directory: {:?}", config.data_dir);
     info!("Bind address: {}", config.bind);
+    if config.cluster_mode {
+        info!(
+            "Cluster mode: node_id={}, total_nodes={}, replication_factor={}",
+            config.node_id.unwrap(),
+            config.total_nodes.unwrap(),
+            config.replication_factor
+        );
+    }
 
     // Create data directory
     std::fs::create_dir_all(&config.data_dir)?;
@@ -123,9 +140,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&write_buffer),
     ));
 
-    // Start Redis-compatible server on main port
-    let _redis_handle = start_redis_server(config.bind, Arc::clone(&handler));
-    info!("Redis-compatible server on {}", config.bind);
+    // Initialize cluster components or standalone
+    let _health_stop = if config.cluster_mode {
+        let node_id = config.node_id.unwrap();
+        let total_nodes = config.total_nodes.unwrap();
+        let bind_ip = config.bind.ip();
+
+        // Build node list
+        let mut nodes = Vec::new();
+        let peer_addrs: Vec<String> = config
+            .cluster_peers
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for i in 0..total_nodes {
+            let redis_port = config.bind.port();
+            let cluster_port = config.cluster_port;
+
+            let (redis_addr, cluster_addr) = if i as usize >= peer_addrs.len() {
+                // No peer address provided, use localhost with offset
+                let addr = format!("{}:{}", bind_ip, redis_port);
+                let caddr = format!("{}:{}", bind_ip, cluster_port);
+                (addr.parse().unwrap(), caddr.parse().unwrap())
+            } else {
+                // Parse peer address (host:cluster_port)
+                let peer = &peer_addrs[i as usize];
+                let cluster_addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|_| {
+                    format!("{}:{}", bind_ip, cluster_port + i as u16)
+                        .parse()
+                        .unwrap()
+                });
+                let redis_addr = format!("{}:{}", cluster_addr.ip(), redis_port)
+                    .parse()
+                    .unwrap();
+                (redis_addr, cluster_addr)
+            };
+
+            nodes.push(NodeInfo::new(i, redis_addr, cluster_addr));
+        }
+
+        // Create topology
+        let topology = Arc::new(RwLock::new(ClusterTopology::new(
+            node_id,
+            nodes.clone(),
+            config.replication_factor,
+        )));
+
+        // Create peer connection pool
+        let peers = Arc::new(PeerConnectionPool::new());
+        for node in &nodes {
+            if node.id != node_id {
+                peers.add_peer(node.id, node.cluster_addr);
+            }
+        }
+
+        // Create router
+        let router = Arc::new(ClusterRouter::new(
+            Arc::clone(&topology),
+            Arc::clone(&handler),
+            Arc::clone(&peers),
+        ));
+
+        // Create replication manager
+        let replication = Arc::new(ReplicationManager::new(
+            Arc::clone(&topology),
+            Arc::clone(&handler),
+            Arc::clone(&peers),
+        ));
+
+        // Start peer server
+        let peer_addr = format!("0.0.0.0:{}", config.cluster_port).parse().unwrap();
+        let peer_server = Arc::new(PeerServer::new(
+            Arc::clone(&handler),
+            Arc::clone(&replication),
+            Arc::clone(&topology),
+        ));
+        tokio::spawn(async move {
+            if let Err(e) = peer_server.run(peer_addr).await {
+                error!("Peer server error: {}", e);
+            }
+        });
+        info!("Cluster peer server on 0.0.0.0:{}", config.cluster_port);
+
+        // Start health checker
+        let health_config = HealthConfig {
+            check_interval: Duration::from_millis(config.health_check_interval_ms),
+            suspect_threshold: config.health_check_threshold.saturating_sub(1).max(1),
+            dead_threshold: config.health_check_threshold,
+        };
+        let health_checker = Arc::new(HealthChecker::new(
+            Arc::clone(&topology),
+            Arc::clone(&peers),
+            health_config,
+        ));
+        let health_stop = health_checker.stop_handle();
+        let hc = Arc::clone(&health_checker);
+        tokio::spawn(async move {
+            hc.run().await;
+        });
+        info!("Health checker started");
+
+        // Start Redis server with cluster routing
+        let _redis_handle = start_redis_server_clustered(
+            config.bind,
+            Arc::clone(&handler),
+            router,
+        );
+        info!("Redis-compatible server (clustered) on {}", config.bind);
+
+        // Log shard ownership
+        let topo = topology.read();
+        let local_shards = topo.shards_for_node(node_id);
+        info!(
+            "Node {} owns {} shards as primary (topology v{})",
+            node_id,
+            local_shards.len(),
+            topo.current_version()
+        );
+
+        Some(health_stop)
+    } else {
+        // Standalone mode
+        let _redis_handle = start_redis_server(config.bind, Arc::clone(&handler));
+        info!("Redis-compatible server on {}", config.bind);
+        None
+    };
 
     let shutdown_signal = Arc::new(AtomicBool::new(false));
 
@@ -149,6 +292,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for shutdown signal
     while !shutdown_signal.load(Ordering::SeqCst) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Stop health checker
+    if let Some(stop) = _health_stop {
+        stop.store(true, Ordering::SeqCst);
     }
 
     // Stop compaction thread

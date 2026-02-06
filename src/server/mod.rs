@@ -4,4 +4,4 @@ pub mod handler;
 pub mod redis;
 
 pub use handler::{Handler, HandlerStats, OptimizedHandler};
-pub use redis::start_redis_server;
+pub use redis::{start_redis_server, start_redis_server_clustered};

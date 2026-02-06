@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tracing::{debug, error, info, trace};
 
+use crate::cluster::router::ClusterRouter;
 use crate::server::handler::Handler;
 
 /// Maximum pipeline depth before forcing flush
@@ -346,11 +347,19 @@ impl RespParser {
 /// High-performance Redis command handler
 pub struct RedisHandler {
     handler: Arc<Handler>,
+    router: Option<Arc<ClusterRouter>>,
 }
 
 impl RedisHandler {
     pub fn new(handler: Arc<Handler>) -> Self {
-        Self { handler }
+        Self { handler, router: None }
+    }
+
+    pub fn with_router(handler: Arc<Handler>, router: Arc<ClusterRouter>) -> Self {
+        Self {
+            handler,
+            router: Some(router),
+        }
     }
 
     /// Handles a Redis command and writes response to buffer
@@ -390,6 +399,7 @@ impl RedisHandler {
             b"COMMAND" | b"command" => self.cmd_command(out),
             b"INFO" | b"info" => self.cmd_info(out),
             b"DBSIZE" | b"dbsize" => self.cmd_dbsize(out),
+            b"CLUSTER" | b"cluster" => self.cmd_cluster(&args, out),
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd);
                 RespValue::err(&format!("Unknown command: {}", cmd_str)).serialize_into(out);
@@ -423,7 +433,13 @@ impl RedisHandler {
             }
         };
 
-        match self.handler.get_value(key) {
+        let result = if let Some(router) = &self.router {
+            router.get(key)
+        } else {
+            self.handler.get_value(key)
+        };
+
+        match result {
             Some(value) => RespValue::bulk(value).serialize_into(out),
             None => RespValue::null().serialize_into(out),
         }
@@ -455,7 +471,13 @@ impl RedisHandler {
         // Parse optional EX/PX for TTL
         let ttl = self.parse_set_options(&args[3..]);
 
-        match self.handler.put_sync(key, value, ttl) {
+        let result = if let Some(router) = &self.router {
+            router.put(key, value, ttl)
+        } else {
+            self.handler.put_sync(key, value, ttl)
+        };
+
+        match result {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -508,7 +530,12 @@ impl RedisHandler {
         let mut deleted = 0i64;
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                if self.handler.delete_sync(key).is_ok() {
+                let result = if let Some(router) = &self.router {
+                    router.delete(key)
+                } else {
+                    self.handler.delete_sync(key)
+                };
+                if let Ok(true) = result {
                     deleted += 1;
                 }
             }
@@ -531,7 +558,12 @@ impl RedisHandler {
 
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                match self.handler.get_value(key) {
+                let result = if let Some(router) = &self.router {
+                    router.get(key)
+                } else {
+                    self.handler.get_value(key)
+                };
+                match result {
                     Some(value) => {
                         out.push(b'$');
                         out.extend_from_slice(itoa::Buffer::new().format(value.len()).as_bytes());
@@ -571,7 +603,13 @@ impl RedisHandler {
                 }
             };
 
-            if let Err(e) = self.handler.put_sync(key, value, 0) {
+            let result = if let Some(router) = &self.router {
+                router.put(key, value, 0)
+            } else {
+                self.handler.put_sync(key, value, 0)
+            };
+
+            if let Err(e) = result {
                 RespValue::err(&e.to_string()).serialize_into(out);
                 return;
             }
@@ -591,7 +629,12 @@ impl RedisHandler {
         let mut count = 0i64;
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                if self.handler.get_value(key).is_some() {
+                let exists = if let Some(router) = &self.router {
+                    router.get(key).is_some()
+                } else {
+                    self.handler.get_value(key).is_some()
+                };
+                if exists {
                     count += 1;
                 }
             }
@@ -607,11 +650,16 @@ impl RedisHandler {
 
     #[inline]
     fn cmd_info(&self, out: &mut Vec<u8>) {
-        let info = b"# Server\r\nredis_version:7.0.0-ssd-kv\r\nredis_mode:standalone\r\n# Keyspace\r\n";
+        let mode = if self.router.is_some() { "cluster" } else { "standalone" };
+        let info = format!(
+            "# Server\r\nredis_version:7.0.0-ssd-kv\r\nredis_mode:{}\r\n# Keyspace\r\n",
+            mode
+        );
+        let info_bytes = info.as_bytes();
         out.push(b'$');
-        out.extend_from_slice(itoa::Buffer::new().format(info.len()).as_bytes());
+        out.extend_from_slice(itoa::Buffer::new().format(info_bytes.len()).as_bytes());
         out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(info);
+        out.extend_from_slice(info_bytes);
         out.extend_from_slice(b"\r\n");
     }
 
@@ -619,17 +667,83 @@ impl RedisHandler {
     fn cmd_dbsize(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(b":0\r\n");
     }
+
+    #[inline]
+    fn cmd_cluster(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        let subcmd = if args.len() > 1 {
+            match &args[1] {
+                RespValue::BulkString(Some(data)) => data.as_slice(),
+                _ => b"",
+            }
+        } else {
+            b""
+        };
+
+        match subcmd {
+            b"INFO" | b"info" => {
+                if let Some(router) = &self.router {
+                    let topo = router.topology().read();
+                    let info = format!(
+                        "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:256\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\nlocal_node_id:{}\r\ntopology_version:{}\r\n",
+                        topo.nodes.len(),
+                        topo.active_node_count(),
+                        topo.local_node_id,
+                        topo.current_version(),
+                    );
+                    RespValue::bulk(info.into_bytes()).serialize_into(out);
+                } else {
+                    let info = "cluster_enabled:0\r\n";
+                    RespValue::bulk(info.as_bytes().to_vec()).serialize_into(out);
+                }
+            }
+            b"MYID" | b"myid" => {
+                if let Some(router) = &self.router {
+                    let topo = router.topology().read();
+                    RespValue::bulk(topo.local_node_id.to_string().into_bytes()).serialize_into(out);
+                } else {
+                    RespValue::bulk(b"0".to_vec()).serialize_into(out);
+                }
+            }
+            b"NODES" | b"nodes" => {
+                if let Some(router) = &self.router {
+                    let topo = router.topology().read();
+                    let mut nodes_info = String::new();
+                    for node in &topo.nodes {
+                        let shards = topo.shards_for_node(node.id);
+                        nodes_info.push_str(&format!(
+                            "{}  {}  {:?}  shards:{}\r\n",
+                            node.id,
+                            node.cluster_addr,
+                            node.status,
+                            shards.len(),
+                        ));
+                    }
+                    RespValue::bulk(nodes_info.into_bytes()).serialize_into(out);
+                } else {
+                    RespValue::bulk(b"standalone mode".to_vec()).serialize_into(out);
+                }
+            }
+            _ => {
+                RespValue::err("Unknown CLUSTER subcommand").serialize_into(out);
+            }
+        }
+    }
 }
 
 /// High-performance Redis server with pipelining
 pub struct RedisServer {
     addr: SocketAddr,
     handler: Arc<Handler>,
+    router: Option<Arc<ClusterRouter>>,
 }
 
 impl RedisServer {
     pub fn new(addr: SocketAddr, handler: Arc<Handler>) -> Self {
-        Self { addr, handler }
+        Self { addr, handler, router: None }
+    }
+
+    pub fn with_router(addr: SocketAddr, handler: Arc<Handler>, router: Arc<ClusterRouter>) -> Self {
+        Self { addr, handler, router: Some(router) }
     }
 
     pub fn run(&self) -> io::Result<()> {
@@ -643,8 +757,9 @@ impl RedisServer {
             match stream {
                 Ok(stream) => {
                     let handler = Arc::clone(&self.handler);
+                    let router = self.router.clone();
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_redis_client_fast(stream, handler) {
+                        if let Err(e) = handle_redis_client_fast(stream, handler, router) {
                             debug!("Redis client error: {}", e);
                         }
                     });
@@ -660,7 +775,11 @@ impl RedisServer {
 }
 
 /// High-performance client handler with pipelining
-fn handle_redis_client_fast(mut stream: TcpStream, handler: Arc<Handler>) -> io::Result<()> {
+fn handle_redis_client_fast(
+    mut stream: TcpStream,
+    handler: Arc<Handler>,
+    router: Option<Arc<ClusterRouter>>,
+) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
 
@@ -668,7 +787,11 @@ fn handle_redis_client_fast(mut stream: TcpStream, handler: Arc<Handler>) -> io:
     debug!("Redis client connected: {}", peer);
 
     let mut parser = RespParser::new();
-    let redis_handler = RedisHandler::new(handler);
+    let redis_handler = if let Some(router) = router {
+        RedisHandler::with_router(handler, router)
+    } else {
+        RedisHandler::new(handler)
+    };
     let mut write_buf = Vec::with_capacity(WRITE_BUFFER_SIZE);
     let mut commands_in_batch = 0;
 
@@ -725,6 +848,20 @@ fn handle_redis_client_fast(mut stream: TcpStream, handler: Arc<Handler>) -> io:
 pub fn start_redis_server(addr: SocketAddr, handler: Arc<Handler>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let server = RedisServer::new(addr, handler);
+        if let Err(e) = server.run() {
+            error!("Redis server error: {}", e);
+        }
+    })
+}
+
+/// Starts the Redis server with cluster routing on a separate thread
+pub fn start_redis_server_clustered(
+    addr: SocketAddr,
+    handler: Arc<Handler>,
+    router: Arc<ClusterRouter>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let server = RedisServer::with_router(addr, handler, router);
         if let Err(e) = server.run() {
             error!("Redis server error: {}", e);
         }

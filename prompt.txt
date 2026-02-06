@@ -1,0 +1,3 @@
+run the plan in /Users/aryehlev/Documents/ssd-kv/CLUSTER_MODE_PLAN.md
+and dont ask any questions just implement each step one by one, i want to be able to support cluster mode,
+i want you also to do extensive testing after you are done.

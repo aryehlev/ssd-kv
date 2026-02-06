@@ -59,6 +59,41 @@ pub struct Config {
     /// Number of worker threads (0 = auto-detect based on CPU count)
     #[arg(long, default_value = "0")]
     pub workers: usize,
+
+    // --- Cluster mode options ---
+
+    /// Enable cluster mode
+    #[arg(long)]
+    pub cluster_mode: bool,
+
+    /// This node's ID (required in cluster mode, typically the StatefulSet ordinal)
+    #[arg(long)]
+    pub node_id: Option<u32>,
+
+    /// Total number of nodes in the cluster
+    #[arg(long)]
+    pub total_nodes: Option<u32>,
+
+    /// Replication factor (number of copies including primary)
+    #[arg(long, default_value = "2")]
+    pub replication_factor: u8,
+
+    /// Port for inter-node gRPC communication
+    #[arg(long, default_value = "7780")]
+    pub cluster_port: u16,
+
+    /// Comma-separated list of peer addresses (host:cluster_port)
+    /// e.g. "ssdkv-0:7780,ssdkv-1:7780,ssdkv-2:7780"
+    #[arg(long)]
+    pub cluster_peers: Option<String>,
+
+    /// Health check interval in milliseconds
+    #[arg(long, default_value = "1000")]
+    pub health_check_interval_ms: u64,
+
+    /// Number of missed heartbeats before marking a node as dead
+    #[arg(long, default_value = "3")]
+    pub health_check_threshold: u32,
 }
 
 impl Config {
@@ -91,6 +126,21 @@ impl Config {
             return Err("Write buffer size must be positive".to_string());
         }
 
+        if self.cluster_mode {
+            if self.node_id.is_none() {
+                return Err("--node-id is required in cluster mode".to_string());
+            }
+            if self.total_nodes.is_none() {
+                return Err("--total-nodes is required in cluster mode".to_string());
+            }
+            if self.total_nodes.unwrap() == 0 {
+                return Err("--total-nodes must be at least 1".to_string());
+            }
+            if self.replication_factor as u32 > self.total_nodes.unwrap() {
+                return Err("Replication factor cannot exceed total nodes".to_string());
+            }
+        }
+
         Ok(())
     }
 
@@ -120,6 +170,14 @@ impl Default for Config {
             write_buffer_kb: 64,
             wblocks_per_file: 1023,
             workers: 0,
+            cluster_mode: false,
+            node_id: None,
+            total_nodes: None,
+            replication_factor: 2,
+            cluster_port: 7780,
+            cluster_peers: None,
+            health_check_interval_ms: 1000,
+            health_check_threshold: 3,
         }
     }
 }

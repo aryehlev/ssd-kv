@@ -7,6 +7,7 @@
 //! - TCP_NODELAY for low latency
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::sync::Arc;
@@ -356,6 +357,98 @@ struct SetOptions {
     get: bool,
 }
 
+/// Shared pub/sub manager for cross-connection messaging.
+pub struct PubSubManager {
+    /// channel -> set of subscriber sender handles
+    channels: parking_lot::RwLock<HashMap<Vec<u8>, Vec<std::sync::mpsc::Sender<PubSubMessage>>>>,
+    /// pattern -> set of subscriber sender handles
+    patterns: parking_lot::RwLock<HashMap<Vec<u8>, Vec<std::sync::mpsc::Sender<PubSubMessage>>>>,
+}
+
+/// A message delivered to a subscriber.
+#[derive(Clone, Debug)]
+pub struct PubSubMessage {
+    pub kind: String,        // "message" or "pmessage"
+    pub channel: Vec<u8>,
+    pub pattern: Option<Vec<u8>>,
+    pub data: Vec<u8>,
+}
+
+impl PubSubManager {
+    pub fn new() -> Self {
+        Self {
+            channels: parking_lot::RwLock::new(HashMap::new()),
+            patterns: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn subscribe(&self, channel: &[u8], sender: std::sync::mpsc::Sender<PubSubMessage>) {
+        let mut channels = self.channels.write();
+        channels.entry(channel.to_vec()).or_default().push(sender);
+    }
+
+    pub fn unsubscribe(&self, channel: &[u8], sender_id: usize) {
+        let mut channels = self.channels.write();
+        if let Some(senders) = channels.get_mut(channel) {
+            senders.retain(|s| {
+                // Remove disconnected senders
+                s.send(PubSubMessage {
+                    kind: String::new(),
+                    channel: Vec::new(),
+                    pattern: None,
+                    data: Vec::new(),
+                }).is_ok()
+            });
+        }
+    }
+
+    pub fn psubscribe(&self, pattern: &[u8], sender: std::sync::mpsc::Sender<PubSubMessage>) {
+        let mut patterns = self.patterns.write();
+        patterns.entry(pattern.to_vec()).or_default().push(sender);
+    }
+
+    pub fn publish(&self, channel: &[u8], message: &[u8]) -> i64 {
+        let mut count = 0i64;
+
+        // Direct channel subscribers
+        let channels = self.channels.read();
+        if let Some(senders) = channels.get(channel) {
+            for sender in senders {
+                let msg = PubSubMessage {
+                    kind: "message".to_string(),
+                    channel: channel.to_vec(),
+                    pattern: None,
+                    data: message.to_vec(),
+                };
+                if sender.send(msg).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        drop(channels);
+
+        // Pattern subscribers
+        let patterns = self.patterns.read();
+        for (pattern, senders) in patterns.iter() {
+            if glob_match(pattern, channel) {
+                for sender in senders {
+                    let msg = PubSubMessage {
+                        kind: "pmessage".to_string(),
+                        channel: channel.to_vec(),
+                        pattern: Some(pattern.clone()),
+                        data: message.to_vec(),
+                    };
+                    if sender.send(msg).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        count
+    }
+}
+
 /// High-performance Redis command handler
 pub struct RedisHandler {
     pub handler: Arc<Handler>,
@@ -364,11 +457,37 @@ pub struct RedisHandler {
     readonly: Cell<bool>,
     /// Server-level flag: when false, READONLY is accepted but has no routing effect.
     replica_read: bool,
+    /// Shared pub/sub manager.
+    pub pubsub: Arc<PubSubManager>,
+    /// Transaction state: None = not in transaction, Some = queued commands.
+    tx_queue: std::cell::RefCell<Option<Vec<Vec<RespValue>>>>,
+    /// Watched keys for optimistic locking (key -> generation at watch time).
+    watched_keys: std::cell::RefCell<HashMap<Vec<u8>, Option<u32>>>,
 }
 
 impl RedisHandler {
     pub fn new(handler: Arc<Handler>) -> Self {
-        Self { handler, router: None, readonly: Cell::new(false), replica_read: false }
+        Self {
+            handler,
+            router: None,
+            readonly: Cell::new(false),
+            replica_read: false,
+            pubsub: Arc::new(PubSubManager::new()),
+            tx_queue: std::cell::RefCell::new(None),
+            watched_keys: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub fn new_with_pubsub(handler: Arc<Handler>, pubsub: Arc<PubSubManager>) -> Self {
+        Self {
+            handler,
+            router: None,
+            readonly: Cell::new(false),
+            replica_read: false,
+            pubsub,
+            tx_queue: std::cell::RefCell::new(None),
+            watched_keys: std::cell::RefCell::new(HashMap::new()),
+        }
     }
 
     pub fn with_router(handler: Arc<Handler>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
@@ -377,6 +496,26 @@ impl RedisHandler {
             router: Some(router),
             readonly: Cell::new(false),
             replica_read,
+            pubsub: Arc::new(PubSubManager::new()),
+            tx_queue: std::cell::RefCell::new(None),
+            watched_keys: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_router_and_pubsub(
+        handler: Arc<Handler>,
+        router: Arc<ClusterRouter>,
+        replica_read: bool,
+        pubsub: Arc<PubSubManager>,
+    ) -> Self {
+        Self {
+            handler,
+            router: Some(router),
+            readonly: Cell::new(false),
+            replica_read,
+            pubsub,
+            tx_queue: std::cell::RefCell::new(None),
+            watched_keys: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -396,14 +535,32 @@ impl RedisHandler {
             return;
         }
 
-        // Extract command name
+        // Extract command name (clone to avoid borrow issues with transaction queuing)
         let cmd = match &args[0] {
-            RespValue::BulkString(Some(data)) => data,
+            RespValue::BulkString(Some(data)) => data.clone(),
             _ => {
                 RespValue::err("Invalid command format").serialize_into(out);
                 return;
             }
         };
+
+        // If in MULTI transaction mode, queue commands (except EXEC, DISCARD, MULTI)
+        {
+            let tx = self.tx_queue.borrow();
+            if tx.is_some() {
+                match cmd.as_slice() {
+                    b"EXEC" | b"exec" | b"DISCARD" | b"discard" | b"MULTI" | b"multi" => {
+                        // Fall through to normal handling
+                    }
+                    _ => {
+                        drop(tx);
+                        self.tx_queue.borrow_mut().as_mut().unwrap().push(args);
+                        RespValue::SimpleString("QUEUED".to_string()).serialize_into(out);
+                        return;
+                    }
+                }
+            }
+        }
 
         // Fast path for common commands
         match cmd.as_slice() {
@@ -427,8 +584,50 @@ impl RedisHandler {
             b"PEXPIREAT" | b"pexpireat" => self.cmd_pexpireat(&args, out),
             b"READONLY" | b"readonly" => self.cmd_readonly(out),
             b"READWRITE" | b"readwrite" => self.cmd_readwrite(out),
+            b"ECHO" | b"echo" => self.cmd_echo(&args, out),
+            b"TIME" | b"time" => self.cmd_time(out),
+            b"TYPE" | b"type" => self.cmd_type(&args, out),
+            b"UNLINK" | b"unlink" => self.cmd_del(&args, out),
+            b"FLUSHDB" | b"flushdb" => self.cmd_flushdb(out),
+            b"FLUSHALL" | b"flushall" => self.cmd_flushdb(out),
+            b"INCR" | b"incr" => self.cmd_incr(&args, out),
+            b"DECR" | b"decr" => self.cmd_decr(&args, out),
+            b"INCRBY" | b"incrby" => self.cmd_incrby(&args, out),
+            b"DECRBY" | b"decrby" => self.cmd_decrby(&args, out),
+            b"INCRBYFLOAT" | b"incrbyfloat" => self.cmd_incrbyfloat(&args, out),
+            b"APPEND" | b"append" => self.cmd_append(&args, out),
+            b"STRLEN" | b"strlen" => self.cmd_strlen(&args, out),
+            b"GETRANGE" | b"getrange" => self.cmd_getrange(&args, out),
+            b"SETRANGE" | b"setrange" => self.cmd_setrange(&args, out),
+            b"SETNX" | b"setnx" => self.cmd_setnx(&args, out),
+            b"SETEX" | b"setex" => self.cmd_setex(&args, out),
+            b"PSETEX" | b"psetex" => self.cmd_psetex(&args, out),
+            b"GETDEL" | b"getdel" => self.cmd_getdel(&args, out),
+            b"GETEX" | b"getex" => self.cmd_getex(&args, out),
+            b"KEYS" | b"keys" => self.cmd_keys(&args, out),
+            b"SCAN" | b"scan" => self.cmd_scan(&args, out),
+            b"RENAME" | b"rename" => self.cmd_rename(&args, out),
+            b"RENAMENX" | b"renamenx" => self.cmd_renamenx(&args, out),
+            b"RANDOMKEY" | b"randomkey" => self.cmd_randomkey(out),
+            b"OBJECT" | b"object" => self.cmd_object(&args, out),
+            b"COPY" | b"copy" => self.cmd_copy(&args, out),
+            b"SUBSCRIBE" | b"subscribe" => self.cmd_subscribe(&args, out),
+            b"UNSUBSCRIBE" | b"unsubscribe" => self.cmd_unsubscribe(&args, out),
+            b"PUBLISH" | b"publish" => self.cmd_publish(&args, out),
+            b"PSUBSCRIBE" | b"psubscribe" => self.cmd_psubscribe(&args, out),
+            b"PUNSUBSCRIBE" | b"punsubscribe" => self.cmd_punsubscribe(&args, out),
+            b"MULTI" | b"multi" => self.cmd_multi(out),
+            b"EXEC" | b"exec" => self.cmd_exec(out),
+            b"DISCARD" | b"discard" => self.cmd_discard(out),
+            b"WATCH" | b"watch" => self.cmd_watch(&args, out),
+            b"UNWATCH" | b"unwatch" => self.cmd_unwatch(out),
+            b"WAIT" | b"wait" => self.cmd_wait(&args, out),
+            b"SELECT" | b"select" => self.cmd_select(&args, out),
+            b"DUMP" | b"dump" | b"DEBUG" | b"debug" | b"RESTORE" | b"restore" => {
+                RespValue::err("not supported").serialize_into(out);
+            }
             _ => {
-                let cmd_str = String::from_utf8_lossy(cmd);
+                let cmd_str = String::from_utf8_lossy(&cmd);
                 RespValue::err(&format!("Unknown command: {}", cmd_str)).serialize_into(out);
             }
         }
@@ -900,7 +1099,8 @@ impl RedisHandler {
 
     #[inline]
     fn cmd_dbsize(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(b":0\r\n");
+        let stats = self.handler.index().stats();
+        RespValue::Integer(stats.live_entries as i64).serialize_into(out);
     }
 
     #[inline]
@@ -1058,6 +1258,1006 @@ impl RedisHandler {
                 RespValue::err("Unknown CLUSTER subcommand").serialize_into(out);
             }
         }
+    }
+
+    // ── Helper: parse an integer argument ──────────────────────────────
+    fn parse_int_arg(arg: &RespValue) -> Result<i64, String> {
+        match arg {
+            RespValue::BulkString(Some(v)) => {
+                std::str::from_utf8(v)
+                    .map_err(|_| "value is not an integer or out of range".to_string())
+                    .and_then(|s| s.parse::<i64>().map_err(|_| "value is not an integer or out of range".to_string()))
+            }
+            _ => Err("value is not an integer or out of range".to_string()),
+        }
+    }
+
+    fn parse_uint_arg(arg: &RespValue) -> Result<u64, String> {
+        match arg {
+            RespValue::BulkString(Some(v)) => {
+                std::str::from_utf8(v)
+                    .map_err(|_| "value is not an integer or out of range".to_string())
+                    .and_then(|s| s.parse::<u64>().map_err(|_| "value is not an integer or out of range".to_string()))
+            }
+            _ => Err("value is not an integer or out of range".to_string()),
+        }
+    }
+
+    fn extract_bulk_arg<'a>(arg: &'a RespValue) -> Option<&'a [u8]> {
+        match arg {
+            RespValue::BulkString(Some(data)) => Some(data.as_slice()),
+            _ => None,
+        }
+    }
+
+    // ── ECHO ──────────────────────────────────────────────────────────
+    fn cmd_echo(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'echo' command").serialize_into(out);
+            return;
+        }
+        if let RespValue::BulkString(Some(data)) = &args[1] {
+            RespValue::bulk(data.clone()).serialize_into(out);
+        } else {
+            RespValue::err("Invalid argument").serialize_into(out);
+        }
+    }
+
+    // ── TIME ──────────────────────────────────────────────────────────
+    fn cmd_time(&self, out: &mut Vec<u8>) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        let micros = now.subsec_micros();
+        RespValue::Array(Some(vec![
+            RespValue::BulkString(Some(secs.to_string().into_bytes())),
+            RespValue::BulkString(Some(micros.to_string().into_bytes())),
+        ])).serialize_into(out);
+    }
+
+    // ── TYPE ──────────────────────────────────────────────────────────
+    fn cmd_type(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'type' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => {
+                RespValue::err("Invalid key").serialize_into(out);
+                return;
+            }
+        };
+        if self.check_moved_read(key, out) {
+            return;
+        }
+        if self.handler.get_value(key).is_some() {
+            RespValue::SimpleString("string".to_string()).serialize_into(out);
+        } else {
+            RespValue::SimpleString("none".to_string()).serialize_into(out);
+        }
+    }
+
+    // ── FLUSHDB / FLUSHALL ────────────────────────────────────────────
+    fn cmd_flushdb(&self, out: &mut Vec<u8>) {
+        self.handler.index().clear();
+        RespValue::ok().serialize_into(out);
+    }
+
+    // ── SELECT ────────────────────────────────────────────────────────
+    fn cmd_select(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'select' command").serialize_into(out);
+            return;
+        }
+        match Self::parse_int_arg(&args[1]) {
+            Ok(0) => RespValue::ok().serialize_into(out),
+            Ok(_) => RespValue::err("ERR DB index is out of range").serialize_into(out),
+            Err(e) => RespValue::err(&e).serialize_into(out),
+        }
+    }
+
+    // ── WAIT ──────────────────────────────────────────────────────────
+    fn cmd_wait(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        // WAIT numreplicas timeout - we always return 0 replicas in standalone
+        RespValue::Integer(0).serialize_into(out);
+    }
+
+    // ── INCR ──────────────────────────────────────────────────────────
+    fn cmd_incr(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'incr' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        self.incr_by_int(key, 1, out);
+    }
+
+    // ── DECR ──────────────────────────────────────────────────────────
+    fn cmd_decr(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'decr' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        self.incr_by_int(key, -1, out);
+    }
+
+    // ── INCRBY ────────────────────────────────────────────────────────
+    fn cmd_incrby(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'incrby' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let increment = match Self::parse_int_arg(&args[2]) {
+            Ok(v) => v,
+            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+        };
+        self.incr_by_int(key, increment, out);
+    }
+
+    // ── DECRBY ────────────────────────────────────────────────────────
+    fn cmd_decrby(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'decrby' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let decrement = match Self::parse_int_arg(&args[2]) {
+            Ok(v) => v,
+            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+        };
+        self.incr_by_int(key, -decrement, out);
+    }
+
+    /// Shared implementation for INCR/DECR/INCRBY/DECRBY
+    fn incr_by_int(&self, key: &[u8], delta: i64, out: &mut Vec<u8>) {
+        let current = match self.handler.get_value(key) {
+            Some(v) => {
+                match std::str::from_utf8(&v).ok().and_then(|s| s.parse::<i64>().ok()) {
+                    Some(n) => n,
+                    None => {
+                        RespValue::err("ERR value is not an integer or out of range").serialize_into(out);
+                        return;
+                    }
+                }
+            }
+            None => 0,
+        };
+        let new_val = match current.checked_add(delta) {
+            Some(v) => v,
+            None => {
+                RespValue::err("ERR increment or decrement would overflow").serialize_into(out);
+                return;
+            }
+        };
+        let new_bytes = new_val.to_string().into_bytes();
+        // Preserve existing TTL
+        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.handler.put_sync(key, &new_bytes, ttl) {
+            Ok(_) => RespValue::Integer(new_val).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── INCRBYFLOAT ───────────────────────────────────────────────────
+    fn cmd_incrbyfloat(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'incrbyfloat' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let increment = match Self::extract_bulk_arg(&args[2]) {
+            Some(v) => {
+                match std::str::from_utf8(v).ok().and_then(|s| s.parse::<f64>().ok()) {
+                    Some(f) if f.is_finite() => f,
+                    _ => {
+                        RespValue::err("ERR value is not a valid float").serialize_into(out);
+                        return;
+                    }
+                }
+            }
+            None => { RespValue::err("ERR value is not a valid float").serialize_into(out); return; }
+        };
+        let current = match self.handler.get_value(key) {
+            Some(v) => {
+                match std::str::from_utf8(&v).ok().and_then(|s| s.parse::<f64>().ok()) {
+                    Some(f) => f,
+                    None => {
+                        RespValue::err("ERR value is not a valid float").serialize_into(out);
+                        return;
+                    }
+                }
+            }
+            None => 0.0,
+        };
+        let new_val = current + increment;
+        if !new_val.is_finite() {
+            RespValue::err("ERR increment would produce NaN or Infinity").serialize_into(out);
+            return;
+        }
+        let new_str = format_float(new_val);
+        let new_bytes = new_str.as_bytes().to_vec();
+        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.handler.put_sync(key, &new_bytes, ttl) {
+            Ok(_) => RespValue::bulk(new_bytes).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── APPEND ────────────────────────────────────────────────────────
+    fn cmd_append(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'append' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let suffix = match Self::extract_bulk_arg(&args[2]) {
+            Some(v) => v,
+            None => { RespValue::err("Invalid value").serialize_into(out); return; }
+        };
+        let mut new_val = self.handler.get_value(key).unwrap_or_default();
+        new_val.extend_from_slice(suffix);
+        let new_len = new_val.len() as i64;
+        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.handler.put_sync(key, &new_val, ttl) {
+            Ok(_) => RespValue::Integer(new_len).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── STRLEN ────────────────────────────────────────────────────────
+    fn cmd_strlen(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'strlen' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+        let len = self.handler.get_value(key).map(|v| v.len() as i64).unwrap_or(0);
+        RespValue::Integer(len).serialize_into(out);
+    }
+
+    // ── GETRANGE ──────────────────────────────────────────────────────
+    fn cmd_getrange(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 4 {
+            RespValue::err("ERR wrong number of arguments for 'getrange' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+        let start = match Self::parse_int_arg(&args[2]) {
+            Ok(v) => v,
+            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+        };
+        let end = match Self::parse_int_arg(&args[3]) {
+            Ok(v) => v,
+            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+        };
+        let value = self.handler.get_value(key).unwrap_or_default();
+        let len = value.len() as i64;
+        if len == 0 {
+            RespValue::bulk(Vec::new()).serialize_into(out);
+            return;
+        }
+        // Normalize negative indices
+        let s = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
+        let e = if end < 0 { (len + end).max(0) } else { end.min(len - 1) } as usize;
+        if s > e || s >= value.len() {
+            RespValue::bulk(Vec::new()).serialize_into(out);
+        } else {
+            RespValue::bulk(value[s..=e].to_vec()).serialize_into(out);
+        }
+    }
+
+    // ── SETRANGE ──────────────────────────────────────────────────────
+    fn cmd_setrange(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 4 {
+            RespValue::err("ERR wrong number of arguments for 'setrange' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let offset = match Self::parse_int_arg(&args[2]) {
+            Ok(v) if v >= 0 => v as usize,
+            _ => {
+                RespValue::err("ERR offset is out of range").serialize_into(out);
+                return;
+            }
+        };
+        let replacement = match Self::extract_bulk_arg(&args[3]) {
+            Some(v) => v,
+            None => { RespValue::err("Invalid value").serialize_into(out); return; }
+        };
+        let mut value = self.handler.get_value(key).unwrap_or_default();
+        let needed = offset + replacement.len();
+        if needed > value.len() {
+            value.resize(needed, 0);
+        }
+        value[offset..offset + replacement.len()].copy_from_slice(replacement);
+        let new_len = value.len() as i64;
+        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.handler.put_sync(key, &value, ttl) {
+            Ok(_) => RespValue::Integer(new_len).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── SETNX ─────────────────────────────────────────────────────────
+    fn cmd_setnx(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'setnx' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        if self.handler.get_value(key).is_some() {
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+        let value = match Self::extract_bulk_arg(&args[2]) {
+            Some(v) => v,
+            None => { RespValue::err("Invalid value").serialize_into(out); return; }
+        };
+        match self.handler.put_sync(key, value, 0) {
+            Ok(_) => RespValue::Integer(1).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── SETEX ─────────────────────────────────────────────────────────
+    fn cmd_setex(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 4 {
+            RespValue::err("ERR wrong number of arguments for 'setex' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let secs = match Self::parse_int_arg(&args[2]) {
+            Ok(v) if v > 0 => v as u32,
+            _ => {
+                RespValue::err("ERR invalid expire time in 'setex' command").serialize_into(out);
+                return;
+            }
+        };
+        let value = match Self::extract_bulk_arg(&args[3]) {
+            Some(v) => v,
+            None => { RespValue::err("Invalid value").serialize_into(out); return; }
+        };
+        match self.handler.put_sync(key, value, secs) {
+            Ok(_) => RespValue::ok().serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── PSETEX ────────────────────────────────────────────────────────
+    fn cmd_psetex(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 4 {
+            RespValue::err("ERR wrong number of arguments for 'psetex' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let ms = match Self::parse_int_arg(&args[2]) {
+            Ok(v) if v > 0 => v as u64,
+            _ => {
+                RespValue::err("ERR invalid expire time in 'psetex' command").serialize_into(out);
+                return;
+            }
+        };
+        let value = match Self::extract_bulk_arg(&args[3]) {
+            Some(v) => v,
+            None => { RespValue::err("Invalid value").serialize_into(out); return; }
+        };
+        let secs = (ms / 1000).max(1) as u32;
+        match self.handler.put_sync(key, value, secs) {
+            Ok(_) => RespValue::ok().serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── GETDEL ────────────────────────────────────────────────────────
+    fn cmd_getdel(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'getdel' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        match self.handler.get_value(key) {
+            Some(value) => {
+                let _ = self.handler.delete_sync(key);
+                RespValue::bulk(value).serialize_into(out);
+            }
+            None => RespValue::null().serialize_into(out),
+        }
+    }
+
+    // ── GETEX ─────────────────────────────────────────────────────────
+    fn cmd_getex(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'getex' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        let value = match self.handler.get_value(key) {
+            Some(v) => v,
+            None => { RespValue::null().serialize_into(out); return; }
+        };
+
+        // Parse GETEX options: EX, PX, EXAT, PXAT, PERSIST
+        if args.len() > 2 {
+            if let Some(opt) = Self::extract_bulk_arg(&args[2]) {
+                match opt {
+                    b"EX" | b"ex" => {
+                        if args.len() < 4 {
+                            RespValue::err("syntax error").serialize_into(out); return;
+                        }
+                        match Self::parse_int_arg(&args[3]) {
+                            Ok(s) if s > 0 => { let _ = self.handler.update_ttl(key, s as u32); }
+                            _ => { RespValue::err("ERR invalid expire time").serialize_into(out); return; }
+                        }
+                    }
+                    b"PX" | b"px" => {
+                        if args.len() < 4 {
+                            RespValue::err("syntax error").serialize_into(out); return;
+                        }
+                        match Self::parse_int_arg(&args[3]) {
+                            Ok(ms) if ms > 0 => { let _ = self.handler.update_ttl(key, (ms as u64 / 1000).max(1) as u32); }
+                            _ => { RespValue::err("ERR invalid expire time").serialize_into(out); return; }
+                        }
+                    }
+                    b"EXAT" | b"exat" => {
+                        if args.len() < 4 {
+                            RespValue::err("syntax error").serialize_into(out); return;
+                        }
+                        match Self::parse_uint_arg(&args[3]) {
+                            Ok(ts) => {
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                                if ts > now {
+                                    let _ = self.handler.update_ttl(key, (ts - now) as u32);
+                                }
+                            }
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        }
+                    }
+                    b"PXAT" | b"pxat" => {
+                        if args.len() < 4 {
+                            RespValue::err("syntax error").serialize_into(out); return;
+                        }
+                        match Self::parse_uint_arg(&args[3]) {
+                            Ok(ts_ms) => {
+                                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                                if ts_ms > now_ms {
+                                    let _ = self.handler.update_ttl(key, ((ts_ms - now_ms) / 1000).max(1) as u32);
+                                }
+                            }
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        }
+                    }
+                    b"PERSIST" | b"persist" => {
+                        let _ = self.handler.update_ttl(key, 0);
+                    }
+                    _ => {
+                        RespValue::err("ERR unsupported option").serialize_into(out); return;
+                    }
+                }
+            }
+        }
+        RespValue::bulk(value).serialize_into(out);
+    }
+
+    // ── KEYS ──────────────────────────────────────────────────────────
+    fn cmd_keys(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'keys' command").serialize_into(out);
+            return;
+        }
+        let pattern = match Self::extract_bulk_arg(&args[1]) {
+            Some(p) => p,
+            None => { RespValue::err("Invalid pattern").serialize_into(out); return; }
+        };
+
+        let mut matching_keys: Vec<Vec<u8>> = Vec::new();
+        let index = self.handler.index();
+        for shard_idx in 0..crate::engine::index::NUM_SHARDS {
+            let shard = index.shards[shard_idx].read();
+            for entry in shard.iter_live() {
+                let key_bytes = entry.key.as_bytes();
+                if glob_match(pattern, key_bytes) {
+                    matching_keys.push(key_bytes.to_vec());
+                }
+            }
+        }
+
+        let items: Vec<RespValue> = matching_keys.into_iter()
+            .map(|k| RespValue::BulkString(Some(k)))
+            .collect();
+        RespValue::Array(Some(items)).serialize_into(out);
+    }
+
+    // ── SCAN ──────────────────────────────────────────────────────────
+    fn cmd_scan(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'scan' command").serialize_into(out);
+            return;
+        }
+        let cursor = match Self::parse_uint_arg(&args[1]) {
+            Ok(c) => c,
+            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+        };
+
+        // Parse optional MATCH and COUNT
+        let mut pattern: Option<&[u8]> = None;
+        let mut count: usize = 10;
+        let mut i = 2;
+        while i < args.len() {
+            if let Some(opt) = Self::extract_bulk_arg(&args[i]) {
+                match opt {
+                    b"MATCH" | b"match" => {
+                        if i + 1 < args.len() {
+                            pattern = Self::extract_bulk_arg(&args[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    b"COUNT" | b"count" => {
+                        if i + 1 < args.len() {
+                            if let Ok(c) = Self::parse_uint_arg(&args[i + 1]) {
+                                count = c as usize;
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+
+        // Cursor encoding: high 8 bits = shard index, low 56 bits = position within shard
+        let start_shard = ((cursor >> 56) & 0xFF) as usize;
+        let start_pos = (cursor & 0x00FFFFFFFFFFFFFF) as usize;
+
+        let index = self.handler.index();
+        let mut results: Vec<Vec<u8>> = Vec::new();
+        let mut next_shard = start_shard;
+        let mut next_pos = start_pos;
+        let mut done = false;
+
+        'outer: for shard_idx in start_shard..crate::engine::index::NUM_SHARDS {
+            let shard = index.shards[shard_idx].read();
+            let mut pos = if shard_idx == start_shard { start_pos } else { 0 };
+
+            for entry in shard.iter_live().skip(pos) {
+                let key_bytes = entry.key.as_bytes();
+                pos += 1;
+
+                if let Some(pat) = pattern {
+                    if !glob_match(pat, key_bytes) {
+                        continue;
+                    }
+                }
+
+                results.push(key_bytes.to_vec());
+                if results.len() >= count {
+                    next_shard = shard_idx;
+                    next_pos = pos;
+                    break 'outer;
+                }
+            }
+
+            // Finished this shard
+            if shard_idx + 1 < crate::engine::index::NUM_SHARDS {
+                next_shard = shard_idx + 1;
+                next_pos = 0;
+            } else {
+                done = true;
+            }
+        }
+
+        let next_cursor = if done {
+            0u64
+        } else {
+            ((next_shard as u64) << 56) | (next_pos as u64 & 0x00FFFFFFFFFFFFFF)
+        };
+
+        let items: Vec<RespValue> = results.into_iter()
+            .map(|k| RespValue::BulkString(Some(k)))
+            .collect();
+        RespValue::Array(Some(vec![
+            RespValue::BulkString(Some(next_cursor.to_string().into_bytes())),
+            RespValue::Array(Some(items)),
+        ])).serialize_into(out);
+    }
+
+    // ── RENAME ────────────────────────────────────────────────────────
+    fn cmd_rename(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'rename' command").serialize_into(out);
+            return;
+        }
+        let src = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        let dst = match Self::extract_bulk_arg(&args[2]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(src, out) { return; }
+
+        let meta = match self.handler.get_with_meta(src) {
+            Some(m) => m,
+            None => {
+                RespValue::err("ERR no such key").serialize_into(out);
+                return;
+            }
+        };
+        // Delete old key, set new key preserving TTL
+        let _ = self.handler.delete_sync(src);
+        match self.handler.put_sync(dst, &meta.value, meta.ttl_secs) {
+            Ok(_) => RespValue::ok().serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── RENAMENX ──────────────────────────────────────────────────────
+    fn cmd_renamenx(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'renamenx' command").serialize_into(out);
+            return;
+        }
+        let src = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        let dst = match Self::extract_bulk_arg(&args[2]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(src, out) { return; }
+
+        let meta = match self.handler.get_with_meta(src) {
+            Some(m) => m,
+            None => {
+                RespValue::err("ERR no such key").serialize_into(out);
+                return;
+            }
+        };
+        if self.handler.get_value(dst).is_some() {
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+        let _ = self.handler.delete_sync(src);
+        match self.handler.put_sync(dst, &meta.value, meta.ttl_secs) {
+            Ok(_) => RespValue::Integer(1).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── RANDOMKEY ─────────────────────────────────────────────────────
+    fn cmd_randomkey(&self, out: &mut Vec<u8>) {
+        let index = self.handler.index();
+        // Simple approach: scan shards until we find a live key
+        for shard_idx in 0..crate::engine::index::NUM_SHARDS {
+            let shard = index.shards[shard_idx].read();
+            let key_data = shard.iter_live().next().map(|e| e.key.as_bytes().to_vec());
+            drop(shard);
+            if let Some(key) = key_data {
+                RespValue::bulk(key).serialize_into(out);
+                return;
+            }
+        }
+        RespValue::null().serialize_into(out);
+    }
+
+    // ── OBJECT ────────────────────────────────────────────────────────
+    fn cmd_object(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        let subcmd = if args.len() > 1 {
+            Self::extract_bulk_arg(&args[1]).unwrap_or(b"")
+        } else {
+            b""
+        };
+        match subcmd {
+            b"HELP" | b"help" => {
+                let help = vec![
+                    RespValue::BulkString(Some(b"OBJECT ENCODING <key> - Return the encoding of the object stored at <key>".to_vec())),
+                    RespValue::BulkString(Some(b"OBJECT HELP - Return this help message".to_vec())),
+                ];
+                RespValue::Array(Some(help)).serialize_into(out);
+            }
+            b"ENCODING" | b"encoding" => {
+                if args.len() < 3 {
+                    RespValue::err("ERR wrong number of arguments").serialize_into(out);
+                    return;
+                }
+                let key = match Self::extract_bulk_arg(&args[2]) {
+                    Some(k) => k,
+                    None => { RespValue::err("Invalid key").serialize_into(out); return; }
+                };
+                if self.handler.get_value(key).is_some() {
+                    RespValue::bulk(b"raw".to_vec()).serialize_into(out);
+                } else {
+                    RespValue::err("ERR no such key").serialize_into(out);
+                }
+            }
+            _ => {
+                RespValue::err("ERR Unknown OBJECT subcommand").serialize_into(out);
+            }
+        }
+    }
+
+    // ── COPY ──────────────────────────────────────────────────────────
+    fn cmd_copy(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'copy' command").serialize_into(out);
+            return;
+        }
+        let src = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        let dst = match Self::extract_bulk_arg(&args[2]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(src, out) { return; }
+
+        // Check for REPLACE option
+        let replace = args[3..].iter().any(|a| {
+            Self::extract_bulk_arg(a).map(|v| v.eq_ignore_ascii_case(b"REPLACE")).unwrap_or(false)
+        });
+
+        let meta = match self.handler.get_with_meta(src) {
+            Some(m) => m,
+            None => {
+                RespValue::Integer(0).serialize_into(out);
+                return;
+            }
+        };
+        if !replace && self.handler.get_value(dst).is_some() {
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+        match self.handler.put_sync(dst, &meta.value, meta.ttl_secs) {
+            Ok(_) => RespValue::Integer(1).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── SUBSCRIBE ─────────────────────────────────────────────────────
+    fn cmd_subscribe(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        // In a real implementation, this would put the connection into pub/sub mode.
+        // For now, we acknowledge the subscription.
+        let mut sub_count = 0i64;
+        for arg in &args[1..] {
+            if let Some(channel) = Self::extract_bulk_arg(arg) {
+                sub_count += 1;
+                RespValue::Array(Some(vec![
+                    RespValue::BulkString(Some(b"subscribe".to_vec())),
+                    RespValue::BulkString(Some(channel.to_vec())),
+                    RespValue::Integer(sub_count),
+                ])).serialize_into(out);
+            }
+        }
+    }
+
+    // ── UNSUBSCRIBE ───────────────────────────────────────────────────
+    fn cmd_unsubscribe(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            // Unsubscribe from all
+            RespValue::Array(Some(vec![
+                RespValue::BulkString(Some(b"unsubscribe".to_vec())),
+                RespValue::null(),
+                RespValue::Integer(0),
+            ])).serialize_into(out);
+            return;
+        }
+        let mut remaining = 0i64;
+        for arg in &args[1..] {
+            if let Some(channel) = Self::extract_bulk_arg(arg) {
+                RespValue::Array(Some(vec![
+                    RespValue::BulkString(Some(b"unsubscribe".to_vec())),
+                    RespValue::BulkString(Some(channel.to_vec())),
+                    RespValue::Integer(remaining),
+                ])).serialize_into(out);
+            }
+        }
+    }
+
+    // ── PUBLISH ───────────────────────────────────────────────────────
+    fn cmd_publish(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'publish' command").serialize_into(out);
+            return;
+        }
+        let channel = match Self::extract_bulk_arg(&args[1]) {
+            Some(c) => c,
+            None => { RespValue::err("Invalid channel").serialize_into(out); return; }
+        };
+        let message = match Self::extract_bulk_arg(&args[2]) {
+            Some(m) => m,
+            None => { RespValue::err("Invalid message").serialize_into(out); return; }
+        };
+        let count = self.pubsub.publish(channel, message);
+        RespValue::Integer(count).serialize_into(out);
+    }
+
+    // ── PSUBSCRIBE ────────────────────────────────────────────────────
+    fn cmd_psubscribe(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        let mut sub_count = 0i64;
+        for arg in &args[1..] {
+            if let Some(pattern) = Self::extract_bulk_arg(arg) {
+                sub_count += 1;
+                RespValue::Array(Some(vec![
+                    RespValue::BulkString(Some(b"psubscribe".to_vec())),
+                    RespValue::BulkString(Some(pattern.to_vec())),
+                    RespValue::Integer(sub_count),
+                ])).serialize_into(out);
+            }
+        }
+    }
+
+    // ── PUNSUBSCRIBE ──────────────────────────────────────────────────
+    fn cmd_punsubscribe(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::Array(Some(vec![
+                RespValue::BulkString(Some(b"punsubscribe".to_vec())),
+                RespValue::null(),
+                RespValue::Integer(0),
+            ])).serialize_into(out);
+            return;
+        }
+        for arg in &args[1..] {
+            if let Some(pattern) = Self::extract_bulk_arg(arg) {
+                RespValue::Array(Some(vec![
+                    RespValue::BulkString(Some(b"punsubscribe".to_vec())),
+                    RespValue::BulkString(Some(pattern.to_vec())),
+                    RespValue::Integer(0),
+                ])).serialize_into(out);
+            }
+        }
+    }
+
+    // ── MULTI ─────────────────────────────────────────────────────────
+    fn cmd_multi(&self, out: &mut Vec<u8>) {
+        let mut tx = self.tx_queue.borrow_mut();
+        if tx.is_some() {
+            RespValue::err("ERR MULTI calls can not be nested").serialize_into(out);
+            return;
+        }
+        *tx = Some(Vec::new());
+        RespValue::ok().serialize_into(out);
+    }
+
+    // ── EXEC ──────────────────────────────────────────────────────────
+    fn cmd_exec(&self, out: &mut Vec<u8>) {
+        let queued = {
+            let mut tx = self.tx_queue.borrow_mut();
+            match tx.take() {
+                Some(q) => q,
+                None => {
+                    RespValue::err("ERR EXEC without MULTI").serialize_into(out);
+                    return;
+                }
+            }
+        };
+
+        // Check watched keys
+        {
+            let watched = self.watched_keys.borrow();
+            for (key, gen_at_watch) in watched.iter() {
+                let current_gen = self.handler.index().get(key).map(|e| e.generation);
+                if current_gen.map(|g| Some(g)) != Some(*gen_at_watch) {
+                    // Watched key changed - abort transaction
+                    self.watched_keys.borrow_mut().clear();
+                    RespValue::Array(None).serialize_into(out);
+                    return;
+                }
+            }
+        }
+        self.watched_keys.borrow_mut().clear();
+
+        // Execute queued commands
+        let count = queued.len();
+        out.push(b'*');
+        out.extend_from_slice(itoa::Buffer::new().format(count).as_bytes());
+        out.extend_from_slice(b"\r\n");
+
+        for args in queued {
+            self.handle_command(RespValue::Array(Some(args)), out);
+        }
+    }
+
+    // ── DISCARD ───────────────────────────────────────────────────────
+    fn cmd_discard(&self, out: &mut Vec<u8>) {
+        let mut tx = self.tx_queue.borrow_mut();
+        if tx.is_none() {
+            RespValue::err("ERR DISCARD without MULTI").serialize_into(out);
+            return;
+        }
+        *tx = None;
+        self.watched_keys.borrow_mut().clear();
+        RespValue::ok().serialize_into(out);
+    }
+
+    // ── WATCH ─────────────────────────────────────────────────────────
+    fn cmd_watch(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'watch' command").serialize_into(out);
+            return;
+        }
+        if self.tx_queue.borrow().is_some() {
+            RespValue::err("ERR WATCH inside MULTI is not allowed").serialize_into(out);
+            return;
+        }
+        let mut watched = self.watched_keys.borrow_mut();
+        for arg in &args[1..] {
+            if let Some(key) = Self::extract_bulk_arg(arg) {
+                let gen = self.handler.index().get(key).map(|e| e.generation);
+                watched.insert(key.to_vec(), gen);
+            }
+        }
+        RespValue::ok().serialize_into(out);
+    }
+
+    // ── UNWATCH ───────────────────────────────────────────────────────
+    fn cmd_unwatch(&self, out: &mut Vec<u8>) {
+        self.watched_keys.borrow_mut().clear();
+        RespValue::ok().serialize_into(out);
     }
 
     fn extract_key<'a>(&self, args: &'a [RespValue], cmd_name: &str) -> Result<&'a [u8], ()> {
@@ -1369,21 +2569,99 @@ impl RedisHandler {
     }
 }
 
+/// Glob-style pattern matching (supports *, ?, [abc], [a-z], [^a]).
+fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
+    let mut pi = 0;
+    let mut si = 0;
+    let mut star_pi = usize::MAX;
+    let mut star_si = 0;
+
+    while si < string.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == string[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'[' {
+            // Character class
+            pi += 1;
+            let negate = pi < pattern.len() && (pattern[pi] == b'^' || pattern[pi] == b'!');
+            if negate {
+                pi += 1;
+            }
+            let mut matched = false;
+            let mut first = true;
+            while pi < pattern.len() && (first || pattern[pi] != b']') {
+                first = false;
+                if pi + 2 < pattern.len() && pattern[pi + 1] == b'-' {
+                    if string[si] >= pattern[pi] && string[si] <= pattern[pi + 2] {
+                        matched = true;
+                    }
+                    pi += 3;
+                } else {
+                    if string[si] == pattern[pi] {
+                        matched = true;
+                    }
+                    pi += 1;
+                }
+            }
+            if pi < pattern.len() {
+                pi += 1; // skip ]
+            }
+            if matched == negate {
+                // Match failed for this character class
+                if star_pi != usize::MAX {
+                    pi = star_pi + 1;
+                    star_si += 1;
+                    si = star_si;
+                } else {
+                    return false;
+                }
+            } else {
+                si += 1;
+            }
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = pi;
+            star_si = si;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+
+    // Skip trailing *
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
+}
+
+/// Format a float like Redis does (use enough precision, trim trailing zeros).
+fn format_float(f: f64) -> String {
+    // Redis uses up to 17 significant digits, then trims trailing zeros
+    let s = format!("{}", f);
+    s
+}
+
 /// High-performance Redis server with pipelining
 pub struct RedisServer {
     addr: SocketAddr,
     handler: Arc<Handler>,
     router: Option<Arc<ClusterRouter>>,
     replica_read: bool,
+    pubsub: Arc<PubSubManager>,
 }
 
 impl RedisServer {
     pub fn new(addr: SocketAddr, handler: Arc<Handler>) -> Self {
-        Self { addr, handler, router: None, replica_read: false }
+        Self { addr, handler, router: None, replica_read: false, pubsub: Arc::new(PubSubManager::new()) }
     }
 
     pub fn with_router(addr: SocketAddr, handler: Arc<Handler>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
-        Self { addr, handler, router: Some(router), replica_read }
+        Self { addr, handler, router: Some(router), replica_read, pubsub: Arc::new(PubSubManager::new()) }
     }
 
     pub fn run(&self) -> io::Result<()> {
@@ -1399,8 +2677,9 @@ impl RedisServer {
                     let handler = Arc::clone(&self.handler);
                     let router = self.router.clone();
                     let replica_read = self.replica_read;
+                    let pubsub = Arc::clone(&self.pubsub);
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_redis_client_fast(stream, handler, router, replica_read) {
+                        if let Err(e) = handle_redis_client_fast(stream, handler, router, replica_read, pubsub) {
                             debug!("Redis client error: {}", e);
                         }
                     });
@@ -1421,6 +2700,7 @@ fn handle_redis_client_fast(
     handler: Arc<Handler>,
     router: Option<Arc<ClusterRouter>>,
     replica_read: bool,
+    pubsub: Arc<PubSubManager>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
@@ -1430,9 +2710,9 @@ fn handle_redis_client_fast(
 
     let mut parser = RespParser::new();
     let redis_handler = if let Some(router) = router {
-        RedisHandler::with_router(handler, router, replica_read)
+        RedisHandler::with_router_and_pubsub(handler, router, replica_read, pubsub)
     } else {
-        RedisHandler::new(handler)
+        RedisHandler::new_with_pubsub(handler, pubsub)
     };
     let mut write_buf = Vec::with_capacity(WRITE_BUFFER_SIZE);
     let mut commands_in_batch = 0;
@@ -1674,5 +2954,571 @@ mod tests {
         rh.handle_command(make_cmd(&[b"GET", key.as_bytes()]), &mut out);
         let response = String::from_utf8_lossy(&out);
         assert!(response.starts_with("-MOVED"), "Expected MOVED when replica_read=false: {}", response);
+    }
+
+    // ── Tests for new commands ───────────────────────────────────────
+
+    #[test]
+    fn test_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"ECHO", b"hello world"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("hello world"), "ECHO should return the argument: {}", resp);
+    }
+
+    #[test]
+    fn test_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"TIME"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("*2\r\n"), "TIME should return 2-element array: {}", resp);
+    }
+
+    #[test]
+    fn test_type_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"val"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"TYPE", b"mykey"]), &mut out);
+        assert_eq!(&out, b"+string\r\n");
+    }
+
+    #[test]
+    fn test_type_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"TYPE", b"nokey"]), &mut out);
+        assert_eq!(&out, b"+none\r\n");
+    }
+
+    #[test]
+    fn test_dbsize() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"k1", b"v1"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SET", b"k2", b"v2"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"DBSIZE"]), &mut out);
+        assert_eq!(&out, b":2\r\n");
+    }
+
+    #[test]
+    fn test_flushdb() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"k1", b"v1"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"FLUSHDB"]), &mut out);
+        assert_eq!(&out, b"+OK\r\n");
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"k1"]), &mut out);
+        assert_eq!(&out, b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_incr_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"INCR", b"counter"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+    }
+
+    #[test]
+    fn test_incr_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"INCR", b"counter"]), &mut out);
+        assert_eq!(&out, b":11\r\n");
+    }
+
+    #[test]
+    fn test_decr() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"DECR", b"counter"]), &mut out);
+        assert_eq!(&out, b":9\r\n");
+    }
+
+    #[test]
+    fn test_incrby() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"INCRBY", b"counter", b"5"]), &mut out);
+        assert_eq!(&out, b":15\r\n");
+    }
+
+    #[test]
+    fn test_decrby() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"DECRBY", b"counter", b"3"]), &mut out);
+        assert_eq!(&out, b":7\r\n");
+    }
+
+    #[test]
+    fn test_incr_non_integer() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"str", b"not_a_number"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"INCR", b"str"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("-ERR"), "Expected error: {}", resp);
+    }
+
+    #[test]
+    fn test_incrbyfloat() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"flt", b"10.5"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"INCRBYFLOAT", b"flt", b"0.1"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("10.6"), "Expected 10.6: {}", resp);
+    }
+
+    #[test]
+    fn test_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"APPEND", b"mykey", b" World"]), &mut out);
+        assert_eq!(&out, b":11\r\n"); // "Hello World" = 11 bytes
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"mykey"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("Hello World"), "Expected 'Hello World': {}", resp);
+    }
+
+    #[test]
+    fn test_strlen() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"STRLEN", b"mykey"]), &mut out);
+        assert_eq!(&out, b":5\r\n");
+    }
+
+    #[test]
+    fn test_strlen_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"STRLEN", b"nokey"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+    }
+
+    #[test]
+    fn test_getrange() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello World"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GETRANGE", b"mykey", b"0", b"4"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("Hello"), "Expected 'Hello': {}", resp);
+    }
+
+    #[test]
+    fn test_getrange_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello World"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GETRANGE", b"mykey", b"-5", b"-1"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("World"), "Expected 'World': {}", resp);
+    }
+
+    #[test]
+    fn test_setrange() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello World"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SETRANGE", b"mykey", b"6", b"Redis"]), &mut out);
+        assert_eq!(&out, b":11\r\n");
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"mykey"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("Hello Redis"), "Expected 'Hello Redis': {}", resp);
+    }
+
+    #[test]
+    fn test_setnx_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SETNX", b"mykey", b"Hello"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+    }
+
+    #[test]
+    fn test_setnx_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SETNX", b"mykey", b"World"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+    }
+
+    #[test]
+    fn test_setex() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SETEX", b"mykey", b"10", b"Hello"]), &mut out);
+        assert_eq!(&out, b"+OK\r\n");
+        out.clear();
+        rh.handle_command(make_cmd(&[b"TTL", b"mykey"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with(":"), "Expected TTL integer: {}", resp);
+        // TTL should be close to 10
+        let ttl: i64 = resp.trim_start_matches(':').trim_end_matches("\r\n").parse().unwrap();
+        assert!(ttl > 0 && ttl <= 10, "Expected TTL 1-10, got: {}", ttl);
+    }
+
+    #[test]
+    fn test_getdel() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GETDEL", b"mykey"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("Hello"), "GETDEL should return value: {}", resp);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"mykey"]), &mut out);
+        assert_eq!(&out, b"$-1\r\n", "Key should be deleted after GETDEL");
+    }
+
+    #[test]
+    fn test_getex_with_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GETEX", b"mykey", b"EX", b"100"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("Hello"), "GETEX should return value: {}", resp);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"TTL", b"mykey"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        let ttl: i64 = resp.trim_start_matches(':').trim_end_matches("\r\n").parse().unwrap();
+        assert!(ttl > 0, "Expected positive TTL: {}", ttl);
+    }
+
+    #[test]
+    fn test_keys_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"key1", b"v1"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SET", b"key2", b"v2"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SET", b"other", b"v3"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"KEYS", b"key*"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("key1"), "Should match key1: {}", resp);
+        assert!(resp.contains("key2"), "Should match key2: {}", resp);
+        assert!(!resp.contains("other"), "Should not match 'other': {}", resp);
+    }
+
+    #[test]
+    fn test_scan_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        for i in 0..5 {
+            rh.handle_command(make_cmd(&[b"SET", format!("k{}", i).as_bytes(), b"v"]), &mut out);
+            out.clear();
+        }
+        rh.handle_command(make_cmd(&[b"SCAN", b"0", b"COUNT", b"100"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        // Should return cursor 0 (complete) and all keys
+        assert!(resp.starts_with("*2\r\n"), "SCAN should return 2-element array: {}", resp);
+    }
+
+    #[test]
+    fn test_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"old", b"value"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"RENAME", b"old", b"new"]), &mut out);
+        assert_eq!(&out, b"+OK\r\n");
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"new"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("value"), "New key should have the value: {}", resp);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"old"]), &mut out);
+        assert_eq!(&out, b"$-1\r\n", "Old key should be gone");
+    }
+
+    #[test]
+    fn test_rename_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"RENAME", b"nokey", b"new"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("ERR"), "Should error for missing key: {}", resp);
+    }
+
+    #[test]
+    fn test_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"src", b"value"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"COPY", b"src", b"dst"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"dst"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("value"), "Copied key should have value: {}", resp);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"src"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("value"), "Source should still exist: {}", resp);
+    }
+
+    #[test]
+    fn test_select_db0() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SELECT", b"0"]), &mut out);
+        assert_eq!(&out, b"+OK\r\n");
+    }
+
+    #[test]
+    fn test_select_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SELECT", b"1"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("ERR"), "SELECT 1 should fail: {}", resp);
+    }
+
+    #[test]
+    fn test_multi_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+
+        // MULTI
+        rh.handle_command(make_cmd(&[b"MULTI"]), &mut out);
+        assert_eq!(&out, b"+OK\r\n");
+
+        // Queue SET
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SET", b"txkey", b"txval"]), &mut out);
+        assert_eq!(out, b"+QUEUED\r\n");
+
+        // Queue GET
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"txkey"]), &mut out);
+        assert_eq!(out, b"+QUEUED\r\n");
+
+        // EXEC
+        out.clear();
+        rh.handle_command(make_cmd(&[b"EXEC"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        // Should have *2 array with OK and the value
+        assert!(resp.starts_with("*2\r\n"), "EXEC should return results array: {}", resp);
+        assert!(resp.contains("+OK\r\n"), "Should contain SET result: {}", resp);
+        assert!(resp.contains("txval"), "Should contain GET result: {}", resp);
+    }
+
+    #[test]
+    fn test_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"MULTI"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SET", b"txkey", b"txval"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"DISCARD"]), &mut out);
+        assert_eq!(&out, b"+OK\r\n");
+
+        // Key should not exist
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"txkey"]), &mut out);
+        assert_eq!(&out, b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_watch_exec_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SET", b"wk", b"v1"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"WATCH", b"wk"]), &mut out);
+        assert_eq!(&out, b"+OK\r\n");
+        out.clear();
+        rh.handle_command(make_cmd(&[b"MULTI"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SET", b"wk", b"v2"]), &mut out);
+        out.clear();
+
+        // No external change, EXEC should succeed
+        rh.handle_command(make_cmd(&[b"EXEC"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("*1\r\n"), "EXEC should succeed: {}", resp);
+    }
+
+    #[test]
+    fn test_publish_returns_zero_no_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"PUBLISH", b"chan", b"msg"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+    }
+
+    #[test]
+    fn test_unlink_is_del_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"k", b"v"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"UNLINK", b"k"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+        out.clear();
+        rh.handle_command(make_cmd(&[b"GET", b"k"]), &mut out);
+        assert_eq!(&out, b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_object_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", b"k", b"v"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"OBJECT", b"ENCODING", b"k"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("raw"), "Expected 'raw' encoding: {}", resp);
+    }
+
+    #[test]
+    fn test_glob_match_function() {
+        // Test the glob_match utility directly
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"h?llo", b"hello"));
+        assert!(glob_match(b"h[ae]llo", b"hello"));
+        assert!(glob_match(b"h[ae]llo", b"hallo"));
+        assert!(!glob_match(b"h[ae]llo", b"hillo"));
+        assert!(glob_match(b"key*", b"key123"));
+        assert!(glob_match(b"*key", b"mykey"));
+        assert!(glob_match(b"*key*", b"mykey123"));
+        assert!(!glob_match(b"key*", b"nokey"));
+        assert!(glob_match(b"k[0-9]y", b"k5y"));
+        assert!(!glob_match(b"k[0-9]y", b"kay"));
+    }
+
+    #[test]
+    fn test_randomkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+
+        // Empty db
+        rh.handle_command(make_cmd(&[b"RANDOMKEY"]), &mut out);
+        assert_eq!(&out, b"$-1\r\n");
+
+        // With a key
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SET", b"somekey", b"v"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"RANDOMKEY"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("somekey"), "Should return somekey: {}", resp);
     }
 }

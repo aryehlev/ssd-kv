@@ -10,9 +10,17 @@ use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
 use crate::perf::prefetch::{BloomFilter, LockFreeBloomFilter};
 use crate::perf::simd::{batch_bloom_check, batch_hash_keys_4, group_by_shard};
+use crate::storage::eviction::EvictionPolicy;
 use crate::storage::file_manager::{FileManager, ParallelFileManager};
 use crate::storage::record::Record;
 use crate::storage::write_buffer::{WriteBuffer, WBLOCK_SIZE};
+
+/// Metadata about a stored record, returned by get_with_meta.
+pub struct RecordMeta {
+    pub value: Vec<u8>,
+    pub timestamp_micros: u64,
+    pub ttl_secs: u32,
+}
 
 /// Statistics for the handler.
 #[derive(Debug, Default)]
@@ -49,6 +57,9 @@ pub struct Handler {
     bloom_filter: parking_lot::RwLock<BloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
+    eviction_policy: EvictionPolicy,
+    max_entries: u64,
+    max_data_bytes: u64,
 }
 
 impl Handler {
@@ -65,7 +76,27 @@ impl Handler {
             bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
+            eviction_policy: EvictionPolicy::NoEviction,
+            max_entries: 0,
+            max_data_bytes: 0,
         }
+    }
+
+    /// Sets the eviction policy and capacity limits.
+    pub fn set_eviction_config(&mut self, policy: EvictionPolicy, max_entries: u64, max_data_mb: u64) {
+        self.eviction_policy = policy;
+        self.max_entries = max_entries;
+        self.max_data_bytes = max_data_mb * 1024 * 1024;
+    }
+
+    /// Returns a reference to the index.
+    pub fn index(&self) -> &Arc<Index> {
+        &self.index
+    }
+
+    /// Returns a reference to the file manager.
+    pub fn file_manager(&self) -> &Arc<FileManager> {
+        &self.file_manager
     }
 
     /// Returns the handler statistics.
@@ -75,6 +106,27 @@ impl Handler {
 
     /// Synchronous PUT for Redis compatibility
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
+        // Capacity check: reject writes if NoEviction and at capacity
+        if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
+            if self.max_entries > 0 {
+                let stats = self.index.stats();
+                if stats.live_entries >= self.max_entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "OOM command not allowed when used memory > 'maxmemory'",
+                    ));
+                }
+            }
+            if self.max_data_bytes > 0 {
+                if self.index.total_data_bytes() >= self.max_data_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "OOM command not allowed when used memory > 'maxmemory'",
+                    ));
+                }
+            }
+        }
+
         let key_hash = hash_key(key);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
@@ -139,6 +191,48 @@ impl Handler {
         }
 
         Some(record.value)
+    }
+
+    /// Returns the full record metadata for a key (value, timestamp, ttl).
+    /// Same read path as get_value but returns the full record info.
+    pub fn get_with_meta(&self, key: &[u8]) -> Option<RecordMeta> {
+        let entry = self.index.get(key)?;
+
+        // Check write buffer first - read_unflushed_record returns full Record
+        if let Some(meta) = self.write_buffer.read_unflushed_meta(&entry.location, key) {
+            return Some(meta);
+        }
+
+        // Disk read
+        let file = self.file_manager.get_file(entry.location.file_id)?;
+        let file_guard = file.lock();
+        let wblock_data = file_guard.read_wblock(entry.location.wblock_id as u32).ok()?;
+
+        let offset = entry.location.offset as usize;
+        if offset >= wblock_data.len() {
+            return None;
+        }
+
+        let record = Record::from_bytes(&wblock_data[offset..]).ok()?;
+        if record.header.is_deleted() || record.header.is_expired() {
+            return None;
+        }
+
+        Some(RecordMeta {
+            value: record.value,
+            timestamp_micros: record.header.timestamp,
+            ttl_secs: record.header.ttl,
+        })
+    }
+
+    /// Updates the TTL for an existing key. Returns false if key doesn't exist.
+    pub fn update_ttl(&self, key: &[u8], new_ttl: u32) -> io::Result<bool> {
+        let value = match self.get_value(key) {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        self.put_sync(key, &value, new_ttl)?;
+        Ok(true)
     }
 
     /// Tries to flush pending writes to disk (non-blocking, best effort).
@@ -737,5 +831,52 @@ mod tests {
             let expected = format!("shard_value_{}", i);
             assert_eq!(results[i], Some(expected.into_bytes()), "Key {} mismatch", i);
         }
+    }
+
+    #[test]
+    fn test_get_with_meta_returns_ttl() {
+        let (handler, _dir) = create_test_handler();
+        handler.put_sync(b"ttl_key", b"ttl_val", 3600).unwrap();
+
+        let meta = handler.get_with_meta(b"ttl_key").unwrap();
+        assert_eq!(meta.value, b"ttl_val");
+        assert_eq!(meta.ttl_secs, 3600);
+        assert!(meta.timestamp_micros > 0);
+    }
+
+    #[test]
+    fn test_get_with_meta_no_ttl() {
+        let (handler, _dir) = create_test_handler();
+        handler.put_sync(b"no_ttl_key", b"no_ttl_val", 0).unwrap();
+
+        let meta = handler.get_with_meta(b"no_ttl_key").unwrap();
+        assert_eq!(meta.value, b"no_ttl_val");
+        assert_eq!(meta.ttl_secs, 0);
+    }
+
+    #[test]
+    fn test_get_with_meta_nonexistent() {
+        let (handler, _dir) = create_test_handler();
+        assert!(handler.get_with_meta(b"missing").is_none());
+    }
+
+    #[test]
+    fn test_update_ttl() {
+        let (handler, _dir) = create_test_handler();
+        handler.put_sync(b"upd_key", b"upd_val", 0).unwrap();
+
+        // Update TTL
+        assert!(handler.update_ttl(b"upd_key", 7200).unwrap());
+
+        // Verify new TTL
+        let meta = handler.get_with_meta(b"upd_key").unwrap();
+        assert_eq!(meta.ttl_secs, 7200);
+        assert_eq!(meta.value, b"upd_val");
+    }
+
+    #[test]
+    fn test_update_ttl_nonexistent() {
+        let (handler, _dir) = create_test_handler();
+        assert!(!handler.update_ttl(b"missing", 100).unwrap());
     }
 }

@@ -9,11 +9,12 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, error, info, trace};
 
-use crate::cluster::router::ClusterRouter;
+use crate::cluster::router::{ClusterRouter, RouteDecision};
+use crate::cluster::topology::{key_hash_slot, NUM_SLOTS};
 use crate::server::handler::Handler;
 
 /// Maximum pipeline depth before forcing flush
@@ -344,6 +345,16 @@ impl RespParser {
     }
 }
 
+/// Parsed SET command options.
+#[derive(Debug, Default)]
+struct SetOptions {
+    ttl_secs: u32,
+    nx: bool,
+    xx: bool,
+    keepttl: bool,
+    get: bool,
+}
+
 /// High-performance Redis command handler
 pub struct RedisHandler {
     handler: Arc<Handler>,
@@ -400,6 +411,13 @@ impl RedisHandler {
             b"INFO" | b"info" => self.cmd_info(out),
             b"DBSIZE" | b"dbsize" => self.cmd_dbsize(out),
             b"CLUSTER" | b"cluster" => self.cmd_cluster(&args, out),
+            b"TTL" | b"ttl" => self.cmd_ttl(&args, out),
+            b"PTTL" | b"pttl" => self.cmd_pttl(&args, out),
+            b"EXPIRE" | b"expire" => self.cmd_expire(&args, out),
+            b"PEXPIRE" | b"pexpire" => self.cmd_pexpire(&args, out),
+            b"PERSIST" | b"persist" => self.cmd_persist(&args, out),
+            b"EXPIREAT" | b"expireat" => self.cmd_expireat(&args, out),
+            b"PEXPIREAT" | b"pexpireat" => self.cmd_pexpireat(&args, out),
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd);
                 RespValue::err(&format!("Unknown command: {}", cmd_str)).serialize_into(out);
@@ -418,6 +436,22 @@ impl RedisHandler {
         RespValue::pong().serialize_into(out);
     }
 
+    /// Checks if a key should be redirected via MOVED. Returns true if MOVED was written.
+    #[inline]
+    fn check_moved(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
+        if let Some(router) = &self.router {
+            let (slot, decision) = router.route_key_with_slot(key);
+            if let RouteDecision::Forward(node_id) = decision {
+                if let Some(addr) = router.redis_addr_for_slot(slot) {
+                    let msg = format!("MOVED {} {}:{}", slot, addr.ip(), addr.port());
+                    RespValue::Error(msg).serialize_into(out);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     #[inline]
     fn cmd_get(&self, args: &[RespValue], out: &mut Vec<u8>) {
         if args.len() < 2 {
@@ -433,13 +467,11 @@ impl RedisHandler {
             }
         };
 
-        let result = if let Some(router) = &self.router {
-            router.get(key)
-        } else {
-            self.handler.get_value(key)
-        };
+        if self.check_moved(key, out) {
+            return;
+        }
 
-        match result {
+        match self.handler.get_value(key) {
             Some(value) => RespValue::bulk(value).serialize_into(out),
             None => RespValue::null().serialize_into(out),
         }
@@ -460,6 +492,10 @@ impl RedisHandler {
             }
         };
 
+        if self.check_moved(key, out) {
+            return;
+        }
+
         let value = match &args[2] {
             RespValue::BulkString(Some(data)) => data,
             _ => {
@@ -468,56 +504,184 @@ impl RedisHandler {
             }
         };
 
-        // Parse optional EX/PX for TTL
-        let ttl = self.parse_set_options(&args[3..]);
-
-        let result = if let Some(router) = &self.router {
-            router.put(key, value, ttl)
-        } else {
-            self.handler.put_sync(key, value, ttl)
+        // Parse all SET options
+        let opts = match self.parse_set_options(&args[3..]) {
+            Ok(o) => o,
+            Err(msg) => {
+                RespValue::err(&msg).serialize_into(out);
+                return;
+            }
         };
 
-        match result {
-            Ok(_) => RespValue::ok().serialize_into(out),
+        // NX: only set if key does NOT exist
+        if opts.nx {
+            if self.handler.get_value(key).is_some() {
+                RespValue::null().serialize_into(out);
+                return;
+            }
+        }
+
+        // XX: only set if key EXISTS
+        if opts.xx {
+            if self.handler.get_value(key).is_none() {
+                RespValue::null().serialize_into(out);
+                return;
+            }
+        }
+
+        // GET: capture old value before writing
+        let old_value = if opts.get {
+            self.handler.get_value(key)
+        } else {
+            None
+        };
+
+        // Determine final TTL
+        let final_ttl = if opts.keepttl {
+            // Preserve existing TTL
+            self.handler
+                .get_with_meta(key)
+                .map(|m| m.ttl_secs)
+                .unwrap_or(0)
+        } else {
+            opts.ttl_secs
+        };
+
+        match self.handler.put_sync(key, value, final_ttl) {
+            Ok(_) => {
+                if opts.get {
+                    match old_value {
+                        Some(v) => RespValue::bulk(v).serialize_into(out),
+                        None => RespValue::null().serialize_into(out),
+                    }
+                } else {
+                    RespValue::ok().serialize_into(out);
+                }
+            }
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
     }
 
-    fn parse_set_options(&self, args: &[RespValue]) -> u32 {
+    fn parse_set_options(&self, args: &[RespValue]) -> Result<SetOptions, String> {
+        let mut opts = SetOptions::default();
         let mut i = 0;
         while i < args.len() {
             if let RespValue::BulkString(Some(opt)) = &args[i] {
                 match opt.as_slice() {
                     b"EX" | b"ex" => {
-                        if i + 1 < args.len() {
-                            if let RespValue::BulkString(Some(val)) = &args[i + 1] {
-                                if let Some(secs) = std::str::from_utf8(val)
-                                    .ok()
-                                    .and_then(|s| s.parse::<u32>().ok())
-                                {
-                                    return secs;
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        if let RespValue::BulkString(Some(val)) = &args[i + 1] {
+                            match std::str::from_utf8(val).ok().and_then(|s| s.parse::<u32>().ok()) {
+                                Some(secs) if secs > 0 => {
+                                    opts.ttl_secs = secs;
+                                    i += 2;
+                                    continue;
                                 }
+                                _ => return Err("value is not an integer or out of range".to_string()),
                             }
+                        } else {
+                            return Err("syntax error".to_string());
                         }
                     }
                     b"PX" | b"px" => {
-                        if i + 1 < args.len() {
-                            if let RespValue::BulkString(Some(val)) = &args[i + 1] {
-                                if let Some(ms) = std::str::from_utf8(val)
-                                    .ok()
-                                    .and_then(|s| s.parse::<u32>().ok())
-                                {
-                                    return ms / 1000;
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        if let RespValue::BulkString(Some(val)) = &args[i + 1] {
+                            match std::str::from_utf8(val).ok().and_then(|s| s.parse::<u64>().ok()) {
+                                Some(ms) if ms > 0 => {
+                                    opts.ttl_secs = (ms / 1000).max(1) as u32;
+                                    i += 2;
+                                    continue;
                                 }
+                                _ => return Err("value is not an integer or out of range".to_string()),
                             }
+                        } else {
+                            return Err("syntax error".to_string());
                         }
                     }
-                    _ => {}
+                    b"EXAT" | b"exat" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        if let RespValue::BulkString(Some(val)) = &args[i + 1] {
+                            match std::str::from_utf8(val).ok().and_then(|s| s.parse::<u64>().ok()) {
+                                Some(timestamp) => {
+                                    let now_secs = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    if timestamp <= now_secs {
+                                        return Err("invalid expire time in 'set' command".to_string());
+                                    }
+                                    opts.ttl_secs = (timestamp - now_secs) as u32;
+                                    i += 2;
+                                    continue;
+                                }
+                                _ => return Err("value is not an integer or out of range".to_string()),
+                            }
+                        } else {
+                            return Err("syntax error".to_string());
+                        }
+                    }
+                    b"PXAT" | b"pxat" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        if let RespValue::BulkString(Some(val)) = &args[i + 1] {
+                            match std::str::from_utf8(val).ok().and_then(|s| s.parse::<u64>().ok()) {
+                                Some(timestamp_ms) => {
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    if timestamp_ms <= now_ms {
+                                        return Err("invalid expire time in 'set' command".to_string());
+                                    }
+                                    opts.ttl_secs = ((timestamp_ms - now_ms) / 1000).max(1) as u32;
+                                    i += 2;
+                                    continue;
+                                }
+                                _ => return Err("value is not an integer or out of range".to_string()),
+                            }
+                        } else {
+                            return Err("syntax error".to_string());
+                        }
+                    }
+                    b"NX" | b"nx" => {
+                        opts.nx = true;
+                        i += 1;
+                        continue;
+                    }
+                    b"XX" | b"xx" => {
+                        opts.xx = true;
+                        i += 1;
+                        continue;
+                    }
+                    b"KEEPTTL" | b"keepttl" => {
+                        opts.keepttl = true;
+                        i += 1;
+                        continue;
+                    }
+                    b"GET" | b"get" => {
+                        opts.get = true;
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        return Err("syntax error".to_string());
+                    }
                 }
             }
             i += 1;
         }
-        0
+        // NX and XX are mutually exclusive
+        if opts.nx && opts.xx {
+            return Err("XX and NX options at the same time are not compatible".to_string());
+        }
+        Ok(opts)
     }
 
     #[inline]
@@ -530,12 +694,10 @@ impl RedisHandler {
         let mut deleted = 0i64;
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                let result = if let Some(router) = &self.router {
-                    router.delete(key)
-                } else {
-                    self.handler.delete_sync(key)
-                };
-                if let Ok(true) = result {
+                if self.check_moved(key, out) {
+                    return;
+                }
+                if let Ok(true) = self.handler.delete_sync(key) {
                     deleted += 1;
                 }
             }
@@ -551,6 +713,27 @@ impl RedisHandler {
             return;
         }
 
+        // In cluster mode, verify all keys hash to the same slot
+        if self.router.is_some() {
+            if let Some(first_key) = args[1..].iter().find_map(|a| {
+                if let RespValue::BulkString(Some(k)) = a { Some(k.as_slice()) } else { None }
+            }) {
+                let first_slot = key_hash_slot(first_key);
+                for arg in &args[2..] {
+                    if let RespValue::BulkString(Some(k)) = arg {
+                        if key_hash_slot(k) != first_slot {
+                            RespValue::Error("CROSSSLOT Keys in request don't hash to the same slot".to_string())
+                                .serialize_into(out);
+                            return;
+                        }
+                    }
+                }
+                if self.check_moved(first_key, out) {
+                    return;
+                }
+            }
+        }
+
         let count = args.len() - 1;
         out.push(b'*');
         out.extend_from_slice(itoa::Buffer::new().format(count).as_bytes());
@@ -558,12 +741,7 @@ impl RedisHandler {
 
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                let result = if let Some(router) = &self.router {
-                    router.get(key)
-                } else {
-                    self.handler.get_value(key)
-                };
-                match result {
+                match self.handler.get_value(key) {
                     Some(value) => {
                         out.push(b'$');
                         out.extend_from_slice(itoa::Buffer::new().format(value.len()).as_bytes());
@@ -586,6 +764,30 @@ impl RedisHandler {
             return;
         }
 
+        // In cluster mode, verify all keys hash to the same slot
+        if self.router.is_some() {
+            let mut first_slot = None;
+            let mut i = 1;
+            while i + 1 < args.len() {
+                if let RespValue::BulkString(Some(k)) = &args[i] {
+                    let slot = key_hash_slot(k);
+                    if let Some(fs) = first_slot {
+                        if slot != fs {
+                            RespValue::Error("CROSSSLOT Keys in request don't hash to the same slot".to_string())
+                                .serialize_into(out);
+                            return;
+                        }
+                    } else {
+                        first_slot = Some(slot);
+                        if self.check_moved(k, out) {
+                            return;
+                        }
+                    }
+                }
+                i += 2;
+            }
+        }
+
         let mut i = 1;
         while i + 1 < args.len() {
             let key = match &args[i] {
@@ -603,13 +805,7 @@ impl RedisHandler {
                 }
             };
 
-            let result = if let Some(router) = &self.router {
-                router.put(key, value, 0)
-            } else {
-                self.handler.put_sync(key, value, 0)
-            };
-
-            if let Err(e) = result {
+            if let Err(e) = self.handler.put_sync(key, value, 0) {
                 RespValue::err(&e.to_string()).serialize_into(out);
                 return;
             }
@@ -629,12 +825,10 @@ impl RedisHandler {
         let mut count = 0i64;
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                let exists = if let Some(router) = &self.router {
-                    router.get(key).is_some()
-                } else {
-                    self.handler.get_value(key).is_some()
-                };
-                if exists {
+                if self.check_moved(key, out) {
+                    return;
+                }
+                if self.handler.get_value(key).is_some() {
                     count += 1;
                 }
             }
@@ -683,8 +877,26 @@ impl RedisHandler {
             b"INFO" | b"info" => {
                 if let Some(router) = &self.router {
                     let topo = router.topology().read();
+                    let total_slots = NUM_SLOTS;
+                    let mut slots_ok = 0usize;
+                    let mut slots_pfail = 0usize;
+                    let mut slots_fail = 0usize;
+                    for assignment in &topo.shard_map {
+                        if let Some(node) = topo.get_node(assignment.primary) {
+                            match node.status {
+                                crate::cluster::node::NodeStatus::Active => slots_ok += 1,
+                                crate::cluster::node::NodeStatus::Suspect => slots_pfail += 1,
+                                crate::cluster::node::NodeStatus::Dead => slots_fail += 1,
+                                _ => slots_ok += 1,
+                            }
+                        }
+                    }
                     let info = format!(
-                        "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:256\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\nlocal_node_id:{}\r\ntopology_version:{}\r\n",
+                        "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:{}\r\ncluster_slots_ok:{}\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\nlocal_node_id:{}\r\ntopology_version:{}\r\n",
+                        total_slots,
+                        slots_ok,
+                        slots_pfail,
+                        slots_fail,
                         topo.nodes.len(),
                         topo.active_node_count(),
                         topo.local_node_id,
@@ -699,9 +911,9 @@ impl RedisHandler {
             b"MYID" | b"myid" => {
                 if let Some(router) = &self.router {
                     let topo = router.topology().read();
-                    RespValue::bulk(topo.local_node_id.to_string().into_bytes()).serialize_into(out);
+                    RespValue::bulk(format!("{:040x}", topo.local_node_id).into_bytes()).serialize_into(out);
                 } else {
-                    RespValue::bulk(b"0".to_vec()).serialize_into(out);
+                    RespValue::bulk(format!("{:040x}", 0u32).into_bytes()).serialize_into(out);
                 }
             }
             b"NODES" | b"nodes" => {
@@ -709,13 +921,38 @@ impl RedisHandler {
                     let topo = router.topology().read();
                     let mut nodes_info = String::new();
                     for node in &topo.nodes {
-                        let shards = topo.shards_for_node(node.id);
+                        let node_id_hex = format!("{:040x}", node.id);
+                        let flags = if node.id == topo.local_node_id {
+                            match node.status {
+                                crate::cluster::node::NodeStatus::Active => "myself,master",
+                                crate::cluster::node::NodeStatus::Suspect => "myself,master,fail?",
+                                crate::cluster::node::NodeStatus::Dead => "myself,master,fail",
+                                _ => "myself,master",
+                            }
+                        } else {
+                            match node.status {
+                                crate::cluster::node::NodeStatus::Active => "master",
+                                crate::cluster::node::NodeStatus::Suspect => "master,fail?",
+                                crate::cluster::node::NodeStatus::Dead => "master,fail",
+                                _ => "master",
+                            }
+                        };
+                        let ranges = topo.slot_ranges_for_node(node.id);
+                        let slot_str: Vec<String> = ranges
+                            .iter()
+                            .map(|(s, e)| {
+                                if s == e { format!("{}", s) } else { format!("{}-{}", s, e) }
+                            })
+                            .collect();
                         nodes_info.push_str(&format!(
-                            "{}  {}  {:?}  shards:{}\r\n",
-                            node.id,
-                            node.cluster_addr,
-                            node.status,
-                            shards.len(),
+                            "{} {}:{}@{} {} - 0 0 {} connected {}\n",
+                            node_id_hex,
+                            node.redis_addr.ip(),
+                            node.redis_addr.port(),
+                            node.cluster_addr.port(),
+                            flags,
+                            topo.current_version(),
+                            slot_str.join(" "),
                         ));
                     }
                     RespValue::bulk(nodes_info.into_bytes()).serialize_into(out);
@@ -723,9 +960,370 @@ impl RedisHandler {
                     RespValue::bulk(b"standalone mode".to_vec()).serialize_into(out);
                 }
             }
+            b"SLOTS" | b"slots" => {
+                if let Some(router) = &self.router {
+                    let topo = router.topology().read();
+                    // Build slot ranges per node, then generate RESP
+                    let mut all_ranges = Vec::new();
+                    for node in &topo.nodes {
+                        let ranges = topo.slot_ranges_for_node(node.id);
+                        for (start, end) in ranges {
+                            // Collect primary + replicas for these slots
+                            let assignment = &topo.shard_map[start as usize];
+                            let mut node_entries = Vec::new();
+                            // Primary
+                            if let Some(primary) = topo.get_node(assignment.primary) {
+                                node_entries.push(RespValue::Array(Some(vec![
+                                    RespValue::BulkString(Some(primary.redis_addr.ip().to_string().into_bytes())),
+                                    RespValue::Integer(primary.redis_addr.port() as i64),
+                                    RespValue::BulkString(Some(format!("{:040x}", primary.id).into_bytes())),
+                                ])));
+                            }
+                            // Replicas
+                            for &replica_id in &assignment.replicas {
+                                if let Some(replica) = topo.get_node(replica_id) {
+                                    node_entries.push(RespValue::Array(Some(vec![
+                                        RespValue::BulkString(Some(replica.redis_addr.ip().to_string().into_bytes())),
+                                        RespValue::Integer(replica.redis_addr.port() as i64),
+                                        RespValue::BulkString(Some(format!("{:040x}", replica.id).into_bytes())),
+                                    ])));
+                                }
+                            }
+                            let mut entry = vec![
+                                RespValue::Integer(start as i64),
+                                RespValue::Integer(end as i64),
+                            ];
+                            entry.extend(node_entries);
+                            all_ranges.push(RespValue::Array(Some(entry)));
+                        }
+                    }
+                    RespValue::Array(Some(all_ranges)).serialize_into(out);
+                } else {
+                    RespValue::Array(Some(Vec::new())).serialize_into(out);
+                }
+            }
+            b"KEYSLOT" | b"keyslot" => {
+                if args.len() < 3 {
+                    RespValue::err("CLUSTER KEYSLOT requires 1 argument").serialize_into(out);
+                    return;
+                }
+                if let RespValue::BulkString(Some(key)) = &args[2] {
+                    RespValue::Integer(key_hash_slot(key) as i64).serialize_into(out);
+                } else {
+                    RespValue::err("Invalid key").serialize_into(out);
+                }
+            }
             _ => {
                 RespValue::err("Unknown CLUSTER subcommand").serialize_into(out);
             }
+        }
+    }
+
+    fn extract_key<'a>(&self, args: &'a [RespValue], cmd_name: &str) -> Result<&'a [u8], ()> {
+        if args.len() < 2 {
+            return Err(());
+        }
+        match &args[1] {
+            RespValue::BulkString(Some(data)) => Ok(data.as_slice()),
+            _ => Err(()),
+        }
+    }
+
+    #[inline]
+    fn cmd_ttl(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        let key = match self.extract_key(args, "TTL") {
+            Ok(k) => k,
+            Err(_) => {
+                RespValue::err("TTL requires 1 argument").serialize_into(out);
+                return;
+            }
+        };
+
+        if self.check_moved(key, out) {
+            return;
+        }
+
+        match self.handler.get_with_meta(key) {
+            None => RespValue::Integer(-2).serialize_into(out),
+            Some(meta) => {
+                if meta.ttl_secs == 0 {
+                    RespValue::Integer(-1).serialize_into(out);
+                } else {
+                    let expiry_micros = meta.timestamp_micros + (meta.ttl_secs as u64 * 1_000_000);
+                    let now_micros = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+                    if now_micros >= expiry_micros {
+                        RespValue::Integer(-2).serialize_into(out);
+                    } else {
+                        let remaining_secs = ((expiry_micros - now_micros) / 1_000_000) as i64;
+                        RespValue::Integer(remaining_secs).serialize_into(out);
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn cmd_pttl(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        let key = match self.extract_key(args, "PTTL") {
+            Ok(k) => k,
+            Err(_) => {
+                RespValue::err("PTTL requires 1 argument").serialize_into(out);
+                return;
+            }
+        };
+
+        if self.check_moved(key, out) {
+            return;
+        }
+
+        match self.handler.get_with_meta(key) {
+            None => RespValue::Integer(-2).serialize_into(out),
+            Some(meta) => {
+                if meta.ttl_secs == 0 {
+                    RespValue::Integer(-1).serialize_into(out);
+                } else {
+                    let expiry_micros = meta.timestamp_micros + (meta.ttl_secs as u64 * 1_000_000);
+                    let now_micros = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+                    if now_micros >= expiry_micros {
+                        RespValue::Integer(-2).serialize_into(out);
+                    } else {
+                        let remaining_ms = ((expiry_micros - now_micros) / 1_000) as i64;
+                        RespValue::Integer(remaining_ms).serialize_into(out);
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn cmd_expire(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("EXPIRE requires 2 arguments").serialize_into(out);
+            return;
+        }
+
+        let key = match &args[1] {
+            RespValue::BulkString(Some(data)) => data.as_slice(),
+            _ => {
+                RespValue::err("Invalid key").serialize_into(out);
+                return;
+            }
+        };
+
+        if self.check_moved(key, out) {
+            return;
+        }
+
+        let secs = match &args[2] {
+            RespValue::BulkString(Some(v)) => {
+                match std::str::from_utf8(v).ok().and_then(|s| s.parse::<u32>().ok()) {
+                    Some(s) => s,
+                    None => {
+                        RespValue::err("value is not an integer or out of range").serialize_into(out);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                RespValue::err("value is not an integer or out of range").serialize_into(out);
+                return;
+            }
+        };
+
+        match self.handler.update_ttl(key, secs) {
+            Ok(true) => RespValue::Integer(1).serialize_into(out),
+            Ok(false) => RespValue::Integer(0).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    #[inline]
+    fn cmd_pexpire(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("PEXPIRE requires 2 arguments").serialize_into(out);
+            return;
+        }
+
+        let key = match &args[1] {
+            RespValue::BulkString(Some(data)) => data.as_slice(),
+            _ => {
+                RespValue::err("Invalid key").serialize_into(out);
+                return;
+            }
+        };
+
+        if self.check_moved(key, out) {
+            return;
+        }
+
+        let ms = match &args[2] {
+            RespValue::BulkString(Some(v)) => {
+                match std::str::from_utf8(v).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(m) => m,
+                    None => {
+                        RespValue::err("value is not an integer or out of range").serialize_into(out);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                RespValue::err("value is not an integer or out of range").serialize_into(out);
+                return;
+            }
+        };
+
+        let secs = (ms / 1000) as u32;
+        match self.handler.update_ttl(key, secs) {
+            Ok(true) => RespValue::Integer(1).serialize_into(out),
+            Ok(false) => RespValue::Integer(0).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    #[inline]
+    fn cmd_persist(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        let key = match self.extract_key(args, "PERSIST") {
+            Ok(k) => k,
+            Err(_) => {
+                RespValue::err("PERSIST requires 1 argument").serialize_into(out);
+                return;
+            }
+        };
+
+        if self.check_moved(key, out) {
+            return;
+        }
+
+        // Check if key has a TTL first
+        match self.handler.get_with_meta(key) {
+            None => RespValue::Integer(0).serialize_into(out),
+            Some(meta) => {
+                if meta.ttl_secs == 0 {
+                    // No TTL to remove
+                    RespValue::Integer(0).serialize_into(out);
+                } else {
+                    match self.handler.update_ttl(key, 0) {
+                        Ok(true) => RespValue::Integer(1).serialize_into(out),
+                        Ok(false) => RespValue::Integer(0).serialize_into(out),
+                        Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn cmd_expireat(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("EXPIREAT requires 2 arguments").serialize_into(out);
+            return;
+        }
+
+        let key = match &args[1] {
+            RespValue::BulkString(Some(data)) => data.as_slice(),
+            _ => {
+                RespValue::err("Invalid key").serialize_into(out);
+                return;
+            }
+        };
+
+        if self.check_moved(key, out) {
+            return;
+        }
+
+        let timestamp = match &args[2] {
+            RespValue::BulkString(Some(v)) => {
+                match std::str::from_utf8(v).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(t) => t,
+                    None => {
+                        RespValue::err("value is not an integer or out of range").serialize_into(out);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                RespValue::err("value is not an integer or out of range").serialize_into(out);
+                return;
+            }
+        };
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if timestamp <= now_secs {
+            // Already expired - delete
+            let _ = self.handler.delete_sync(key);
+            RespValue::Integer(1).serialize_into(out);
+            return;
+        }
+
+        let remaining = (timestamp - now_secs) as u32;
+        match self.handler.update_ttl(key, remaining) {
+            Ok(true) => RespValue::Integer(1).serialize_into(out),
+            Ok(false) => RespValue::Integer(0).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    #[inline]
+    fn cmd_pexpireat(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("PEXPIREAT requires 2 arguments").serialize_into(out);
+            return;
+        }
+
+        let key = match &args[1] {
+            RespValue::BulkString(Some(data)) => data.as_slice(),
+            _ => {
+                RespValue::err("Invalid key").serialize_into(out);
+                return;
+            }
+        };
+
+        if self.check_moved(key, out) {
+            return;
+        }
+
+        let timestamp_ms = match &args[2] {
+            RespValue::BulkString(Some(v)) => {
+                match std::str::from_utf8(v).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(t) => t,
+                    None => {
+                        RespValue::err("value is not an integer or out of range").serialize_into(out);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                RespValue::err("value is not an integer or out of range").serialize_into(out);
+                return;
+            }
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        if timestamp_ms <= now_ms {
+            let _ = self.handler.delete_sync(key);
+            RespValue::Integer(1).serialize_into(out);
+            return;
+        }
+
+        let remaining_secs = ((timestamp_ms - now_ms) / 1000) as u32;
+        match self.handler.update_ttl(key, remaining_secs) {
+            Ok(true) => RespValue::Integer(1).serialize_into(out),
+            Ok(false) => RespValue::Integer(0).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
     }
 }

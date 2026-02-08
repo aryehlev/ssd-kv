@@ -7,10 +7,11 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
+use std::net::SocketAddr;
+
 use crate::cluster::node::NodeId;
 use crate::cluster::peer_pool::{PeerConnectionPool, PeerMessage, PeerOp};
 use crate::cluster::topology::ClusterTopology;
-use crate::engine::index_entry::hash_key;
 use crate::server::handler::Handler;
 
 /// Result of routing a key to a node.
@@ -42,13 +43,12 @@ impl ClusterRouter {
         }
     }
 
-    /// Determines where a key should be routed.
+    /// Determines where a key should be routed using CRC16 hash slots.
     #[inline]
     pub fn route_key(&self, key: &[u8]) -> RouteDecision {
-        let key_hash = hash_key(key);
-        let shard = ClusterTopology::shard_for_key(key_hash);
+        let slot = ClusterTopology::slot_for_key(key);
         let topo = self.topology.read();
-        let owner = topo.primary_for_shard(shard);
+        let owner = topo.primary_for_shard(slot);
         if owner == topo.local_node_id {
             RouteDecision::Local
         } else {
@@ -56,11 +56,29 @@ impl ClusterRouter {
         }
     }
 
-    /// Returns the shard ID for a key.
+    /// Returns the slot + route decision for a key (used for MOVED responses).
     #[inline]
-    pub fn shard_for_key(&self, key: &[u8]) -> u16 {
-        let key_hash = hash_key(key);
-        ClusterTopology::shard_for_key(key_hash)
+    pub fn route_key_with_slot(&self, key: &[u8]) -> (u16, RouteDecision) {
+        let slot = ClusterTopology::slot_for_key(key);
+        let topo = self.topology.read();
+        let owner = topo.primary_for_shard(slot);
+        if owner == topo.local_node_id {
+            (slot, RouteDecision::Local)
+        } else {
+            (slot, RouteDecision::Forward(owner))
+        }
+    }
+
+    /// Returns the Redis address for a given slot's primary node.
+    pub fn redis_addr_for_slot(&self, slot: u16) -> Option<SocketAddr> {
+        let topo = self.topology.read();
+        topo.redis_addr_for_slot(slot)
+    }
+
+    /// Returns the hash slot for a key (CRC16-based).
+    #[inline]
+    pub fn slot_for_key(&self, key: &[u8]) -> u16 {
+        ClusterTopology::slot_for_key(key)
     }
 
     /// Handles a GET request, forwarding if necessary.
@@ -69,7 +87,7 @@ impl ClusterRouter {
             RouteDecision::Local => self.local_handler.get_value(key),
             RouteDecision::Forward(node_id) => {
                 // Forward via blocking runtime since Redis handler is sync
-                let shard = self.shard_for_key(key);
+                let shard = self.slot_for_key(key);
                 let msg = PeerMessage {
                     op: PeerOp::ForwardGet,
                     key: key.to_vec(),
@@ -99,7 +117,7 @@ impl ClusterRouter {
                 Ok(())
             }
             RouteDecision::Forward(node_id) => {
-                let shard = self.shard_for_key(key);
+                let shard = self.slot_for_key(key);
                 let msg = PeerMessage {
                     op: PeerOp::ForwardPut,
                     key: key.to_vec(),
@@ -129,7 +147,7 @@ impl ClusterRouter {
                 Ok(deleted)
             }
             RouteDecision::Forward(node_id) => {
-                let shard = self.shard_for_key(key);
+                let shard = self.slot_for_key(key);
                 let msg = PeerMessage {
                     op: PeerOp::ForwardDelete,
                     key: key.to_vec(),
@@ -148,7 +166,7 @@ impl ClusterRouter {
 
     /// Asynchronously replicates a PUT to replica nodes (fire-and-forget).
     fn replicate_put(&self, key: &[u8], value: &[u8], ttl: u32) {
-        let shard = self.shard_for_key(key);
+        let shard = self.slot_for_key(key);
         let replicas = {
             let topo = self.topology.read();
             let assignment = &topo.shard_map[shard as usize];
@@ -179,7 +197,7 @@ impl ClusterRouter {
 
     /// Asynchronously replicates a DELETE to replica nodes (fire-and-forget).
     fn replicate_delete(&self, key: &[u8]) {
-        let shard = self.shard_for_key(key);
+        let shard = self.slot_for_key(key);
         let replicas = {
             let topo = self.topology.read();
             let assignment = &topo.shard_map[shard as usize];

@@ -346,6 +346,56 @@ impl WriteBuffer {
 
         None
     }
+
+    /// Reads full record metadata from unflushed buffers.
+    /// Returns RecordMeta if the key is found in write buffers.
+    pub fn read_unflushed_meta(&self, location: &DiskLocation, key: &[u8]) -> Option<crate::server::handler::RecordMeta> {
+        use crate::storage::record::Record;
+
+        // Check current block first
+        {
+            let current = self.current.lock();
+            if current.file_id == location.file_id && current.block_id == location.wblock_id as u32 {
+                let offset = location.offset as usize;
+                let buffer = current.buffer();
+                if offset < buffer.len() {
+                    if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
+                        if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
+                            return Some(crate::server::handler::RecordMeta {
+                                value: record.value,
+                                timestamp_micros: record.header.timestamp,
+                                ttl_secs: record.header.ttl,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check pending blocks
+        {
+            let pending = self.pending.lock();
+            for block in pending.iter() {
+                if block.file_id == location.file_id && block.block_id == location.wblock_id as u32 {
+                    let offset = location.offset as usize;
+                    let buffer = block.buffer();
+                    if offset < buffer.len() {
+                        if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
+                            if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
+                                return Some(crate::server::handler::RecordMeta {
+                                    value: record.value,
+                                    timestamp_micros: record.header.timestamp,
+                                    ttl_secs: record.header.ttl,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]

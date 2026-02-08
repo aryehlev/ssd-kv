@@ -1,6 +1,5 @@
 //! SSD-KV: High-Performance Key-Value Store
 //!
-//! An Aerospike-inspired KV store with:
 //! - Index in RAM for fast lookups
 //! - Data on SSD with O_DIRECT for consistent latency
 //! - io_uring for async I/O (Linux)

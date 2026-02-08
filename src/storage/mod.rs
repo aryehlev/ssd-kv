@@ -12,6 +12,7 @@ pub mod record;
 pub mod write_buffer;
 pub mod file_manager;
 pub mod compaction;
+pub mod eviction;
 pub mod wal;
 
 pub use direct_io::DirectFile;

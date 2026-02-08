@@ -1,9 +1,4 @@
 //! SSD-KV: High-Performance Key-Value Store
-//!
-//! An Aerospike-inspired KV store with:
-//! - Index in RAM for fast lookups
-//! - Data on SSD with O_DIRECT for consistent latency
-//! - Sharded hashmap index with 256 shards
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,6 +28,7 @@ use engine::{recover_index, Index};
 use perf::{PerfTuning, pin_to_cpu};
 use server::{Handler, start_redis_server, start_redis_server_clustered};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
+use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
 use storage::file_manager::FileManager;
 use storage::write_buffer::WriteBuffer;
 
@@ -134,11 +130,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = pin_to_cpu(0);
 
     // Create request handler
-    let handler = Arc::new(Handler::new(
+    let eviction_policy = EvictionPolicy::from_str(&config.eviction_policy);
+    let mut handler_inner = Handler::new(
         Arc::clone(&index),
         Arc::clone(&file_manager),
         Arc::clone(&write_buffer),
-    ));
+    );
+    handler_inner.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
+    let handler = Arc::new(handler_inner);
+
+    // Start eviction thread if needed
+    let eviction_stop = if config.eviction_policy != "noeviction"
+        || config.max_entries > 0
+        || config.max_data_mb > 0
+    {
+        let eviction_config = EvictionConfig {
+            policy: eviction_policy,
+            max_entries: config.max_entries,
+            max_data_mb: config.max_data_mb,
+            check_interval_secs: config.eviction_interval,
+            sample_size: 16,
+        };
+        let (_evictor, stop) = start_eviction_thread(
+            eviction_config,
+            Arc::clone(&handler),
+            Arc::clone(&index),
+        );
+        info!("Eviction thread started (policy={})", config.eviction_policy);
+        Some(stop)
+    } else {
+        None
+    };
 
     // Initialize cluster components or standalone
     let _health_stop = if config.cluster_mode {
@@ -296,6 +318,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stop health checker
     if let Some(stop) = _health_stop {
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    // Stop eviction thread
+    if let Some(stop) = eviction_stop {
         stop.store(true, Ordering::SeqCst);
     }
 

@@ -23,7 +23,7 @@ use ssd_kv::cluster::peer_pool::{PeerConnectionPool, PeerMessage, PeerOp};
 use ssd_kv::cluster::rebalance::RebalanceManager;
 use ssd_kv::cluster::replication::{PeerServer, ReplicationManager};
 use ssd_kv::cluster::router::{ClusterRouter, RouteDecision};
-use ssd_kv::cluster::topology::{ClusterTopology, ShardState};
+use ssd_kv::cluster::topology::{ClusterTopology, ShardState, NUM_SLOTS};
 use ssd_kv::engine::index::Index;
 use ssd_kv::engine::index_entry::hash_key;
 use ssd_kv::server::handler::Handler;
@@ -64,17 +64,17 @@ fn make_handler_with_index(dir: &std::path::Path) -> (Arc<Handler>, Arc<Index>) 
 // =================== Topology Tests ===================
 
 #[test]
-fn test_topology_256_shards_fully_covered() {
+fn test_topology_slots_fully_covered() {
     for num_nodes in 1..=10 {
         let nodes = make_nodes(num_nodes);
         let topo = ClusterTopology::new(0, nodes, 1);
 
-        for shard_id in 0..256u16 {
-            let primary = topo.primary_for_shard(shard_id);
+        for slot_id in 0..NUM_SLOTS as u16 {
+            let primary = topo.primary_for_shard(slot_id);
             assert!(
                 (primary as usize) < num_nodes,
-                "Shard {} assigned to node {} but only {} nodes exist",
-                shard_id,
+                "Slot {} assigned to node {} but only {} nodes exist",
+                slot_id,
                 primary,
                 num_nodes
             );
@@ -89,16 +89,16 @@ fn test_topology_balanced_distribution() {
         let topo = ClusterTopology::new(0, nodes, 1);
 
         let mut counts = vec![0u32; num_nodes];
-        for shard_id in 0..256u16 {
-            counts[topo.primary_for_shard(shard_id) as usize] += 1;
+        for slot_id in 0..NUM_SLOTS as u16 {
+            counts[topo.primary_for_shard(slot_id) as usize] += 1;
         }
 
-        let expected = 256.0 / num_nodes as f64;
+        let expected = NUM_SLOTS as f64 / num_nodes as f64;
         for (node, count) in counts.iter().enumerate() {
             let deviation = (*count as f64 - expected).abs() / expected;
             assert!(
                 deviation < 0.2, // Allow 20% deviation
-                "Node {} has {} shards (expected ~{:.0}, deviation {:.0}%) in {}-node cluster",
+                "Node {} has {} slots (expected ~{:.0}, deviation {:.0}%) in {}-node cluster",
                 node,
                 count,
                 expected,
@@ -116,13 +116,13 @@ fn test_topology_replication_no_self_replicas() {
         let rf = num_nodes.min(3) as u8;
         let topo = ClusterTopology::new(0, nodes, rf);
 
-        for shard_id in 0..256u16 {
-            let all_nodes = topo.nodes_for_shard(shard_id);
+        for slot_id in 0..NUM_SLOTS as u16 {
+            let all_nodes = topo.nodes_for_shard(slot_id);
             assert_eq!(
                 all_nodes.len(),
                 rf as usize,
-                "Shard {} has {} nodes, expected {}",
-                shard_id,
+                "Slot {} has {} nodes, expected {}",
+                slot_id,
                 all_nodes.len(),
                 rf
             );
@@ -134,8 +134,8 @@ fn test_topology_replication_no_self_replicas() {
             assert_eq!(
                 sorted.len(),
                 all_nodes.len(),
-                "Shard {} has duplicate node assignments: {:?}",
-                shard_id,
+                "Slot {} has duplicate node assignments: {:?}",
+                slot_id,
                 all_nodes
             );
         }
@@ -143,34 +143,31 @@ fn test_topology_replication_no_self_replicas() {
 }
 
 #[test]
-fn test_topology_shard_for_key_deterministic() {
+fn test_topology_slot_for_key_deterministic() {
     let keys: Vec<&[u8]> = vec![b"hello", b"world", b"foo", b"bar", b"test123"];
     for key in &keys {
-        let hash = hash_key(key);
-        let shard1 = ClusterTopology::shard_for_key(hash);
-        let shard2 = ClusterTopology::shard_for_key(hash);
-        assert_eq!(shard1, shard2, "Shard for key {:?} is not deterministic", key);
-        assert!(shard1 < 256);
+        let slot1 = ClusterTopology::slot_for_key(key);
+        let slot2 = ClusterTopology::slot_for_key(key);
+        assert_eq!(slot1, slot2, "Slot for key {:?} is not deterministic", key);
+        assert!(slot1 < NUM_SLOTS as u16);
     }
 }
 
 #[test]
-fn test_topology_shard_for_key_distributes_well() {
-    let mut shard_counts = vec![0u32; 256];
-    for i in 0..10_000 {
+fn test_topology_slot_for_key_distributes_well() {
+    let mut slot_counts = vec![0u32; NUM_SLOTS];
+    for i in 0..100_000 {
         let key = format!("distribution_test_key_{}", i);
-        let hash = hash_key(key.as_bytes());
-        let shard = ClusterTopology::shard_for_key(hash) as usize;
-        shard_counts[shard] += 1;
+        let slot = ClusterTopology::slot_for_key(key.as_bytes()) as usize;
+        slot_counts[slot] += 1;
     }
 
-    // Each shard should get roughly 10000/256 ≈ 39 keys
-    let expected = 10_000.0 / 256.0;
-    let non_empty = shard_counts.iter().filter(|c| **c > 0).count();
+    let non_empty = slot_counts.iter().filter(|c| **c > 0).count();
     assert!(
-        non_empty > 200,
-        "Only {} of 256 shards got keys (expected >200 with 10k keys)",
-        non_empty
+        non_empty > 14000,
+        "Only {} of {} slots got keys (expected >14000 with 100k keys)",
+        non_empty,
+        NUM_SLOTS
     );
 }
 
@@ -480,16 +477,16 @@ fn test_rebalance_node_failure() {
     let moves = topo.rebalance();
 
     assert!(!moves.is_empty());
-    // No shard should be on dead node
-    for shard_id in 0..256u16 {
-        assert_ne!(topo.primary_for_shard(shard_id), 1);
+    // No slot should be on dead node
+    for slot_id in 0..NUM_SLOTS as u16 {
+        assert_ne!(topo.primary_for_shard(slot_id), 1);
     }
 }
 
 #[test]
 fn test_rebalance_scale_up() {
     let mut topo = ClusterTopology::new(0, make_nodes(3), 1);
-    let old_distribution: Vec<u32> = (0..256u16).map(|s| topo.primary_for_shard(s)).collect();
+    let _old_distribution: Vec<u32> = (0..NUM_SLOTS as u16).map(|s| topo.primary_for_shard(s)).collect();
 
     // Add node 3
     topo.nodes.push(NodeInfo::new(
@@ -516,14 +513,14 @@ fn test_rebalance_preserves_total_shards() {
         topo.nodes[num_nodes - 1].status = NodeStatus::Dead;
         topo.rebalance();
 
-        let total: usize = (0..num_nodes as u32)
+        let _total: usize = (0..num_nodes as u32)
             .map(|n| topo.shards_for_node(n).len())
             .sum();
-        // All 256 shards should still be assigned (though some to dead nodes that were reassigned)
-        let assigned: usize = (0..256u16)
+        // All slots should still be assigned
+        let assigned: usize = (0..NUM_SLOTS as u16)
             .filter(|&s| (topo.primary_for_shard(s) as usize) < num_nodes)
             .count();
-        assert_eq!(assigned, 256, "Not all shards assigned after rebalance");
+        assert_eq!(assigned, NUM_SLOTS, "Not all slots assigned after rebalance");
     }
 }
 
@@ -1040,4 +1037,212 @@ fn test_topology_version_stable_without_changes() {
     if moves.is_empty() {
         assert_eq!(topo.current_version(), v1);
     }
+}
+
+// =================== TTL Integration Tests ===================
+
+#[test]
+fn test_ttl_command_with_expiry() {
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    // SET with TTL
+    handler.put_sync(b"ttl_key", b"ttl_val", 3600).unwrap();
+
+    // get_with_meta should return TTL info
+    let meta = handler.get_with_meta(b"ttl_key").unwrap();
+    assert_eq!(meta.value, b"ttl_val");
+    assert_eq!(meta.ttl_secs, 3600);
+
+    // Compute remaining TTL (should be close to 3600)
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    let expiry = meta.timestamp_micros + (meta.ttl_secs as u64 * 1_000_000);
+    let remaining_secs = ((expiry - now_micros) / 1_000_000) as i64;
+    assert!(remaining_secs >= 3599 && remaining_secs <= 3600);
+}
+
+#[test]
+fn test_ttl_no_expiry() {
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    handler.put_sync(b"no_ttl_key", b"val", 0).unwrap();
+
+    let meta = handler.get_with_meta(b"no_ttl_key").unwrap();
+    assert_eq!(meta.ttl_secs, 0); // -1 in Redis semantics
+}
+
+#[test]
+fn test_ttl_nonexistent() {
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    assert!(handler.get_with_meta(b"missing").is_none()); // -2 in Redis semantics
+}
+
+#[test]
+fn test_pttl_returns_milliseconds() {
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    handler.put_sync(b"pttl_key", b"val", 10).unwrap();
+
+    let meta = handler.get_with_meta(b"pttl_key").unwrap();
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    let expiry = meta.timestamp_micros + (meta.ttl_secs as u64 * 1_000_000);
+    let remaining_ms = ((expiry - now_micros) / 1_000) as i64;
+    assert!(remaining_ms > 9000 && remaining_ms <= 10_000);
+}
+
+#[test]
+fn test_expire_sets_ttl() {
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    handler.put_sync(b"exp_key", b"exp_val", 0).unwrap();
+
+    // Initially no TTL
+    let meta = handler.get_with_meta(b"exp_key").unwrap();
+    assert_eq!(meta.ttl_secs, 0);
+
+    // Set TTL via update_ttl
+    assert!(handler.update_ttl(b"exp_key", 300).unwrap());
+
+    // Verify TTL was set
+    let meta = handler.get_with_meta(b"exp_key").unwrap();
+    assert_eq!(meta.ttl_secs, 300);
+}
+
+#[test]
+fn test_persist_removes_ttl() {
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    // Set with TTL
+    handler.put_sync(b"persist_key", b"persist_val", 600).unwrap();
+    let meta = handler.get_with_meta(b"persist_key").unwrap();
+    assert_eq!(meta.ttl_secs, 600);
+
+    // Remove TTL (persist)
+    assert!(handler.update_ttl(b"persist_key", 0).unwrap());
+
+    // Verify TTL removed
+    let meta = handler.get_with_meta(b"persist_key").unwrap();
+    assert_eq!(meta.ttl_secs, 0);
+}
+
+#[test]
+fn test_expireat_absolute_time() {
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    handler.put_sync(b"eat_key", b"eat_val", 0).unwrap();
+
+    // Set to expire 1 hour from now
+    let future_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) + 3600;
+    let remaining = future_secs - std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    assert!(handler.update_ttl(b"eat_key", remaining as u32).unwrap());
+
+    let meta = handler.get_with_meta(b"eat_key").unwrap();
+    assert!(meta.ttl_secs >= 3599 && meta.ttl_secs <= 3600);
+}
+
+// =================== Cluster Protocol Tests ===================
+
+#[test]
+fn test_cluster_keyslot_known_values() {
+    use ssd_kv::cluster::topology::key_hash_slot;
+
+    // The hash slot should be deterministic and in range
+    let slot = key_hash_slot(b"foo");
+    assert!(slot < NUM_SLOTS as u16);
+
+    // Same key always returns same slot
+    assert_eq!(key_hash_slot(b"foo"), key_hash_slot(b"foo"));
+
+    // Hash tags work
+    assert_eq!(key_hash_slot(b"user:{123}:name"), key_hash_slot(b"user:{123}:email"));
+}
+
+#[test]
+fn test_cluster_slots_all_covered() {
+    let nodes = make_nodes(3);
+    let topo = ClusterTopology::new(0, nodes, 2);
+
+    // Verify all 16384 slots have ranges
+    let mut covered = vec![false; NUM_SLOTS];
+    for node_id in 0..3u32 {
+        for (start, end) in topo.slot_ranges_for_node(node_id) {
+            for s in start..=end {
+                covered[s as usize] = true;
+            }
+        }
+    }
+    assert!(covered.iter().all(|c| *c), "Not all slots are covered by ranges");
+}
+
+#[test]
+fn test_cluster_nodes_format() {
+    let nodes = make_nodes(3);
+    let topo = ClusterTopology::new(0, nodes, 1);
+
+    // Verify local node has is_local_primary for some slots
+    let local_slots = topo.shards_for_node(0);
+    assert!(!local_slots.is_empty());
+    for &slot in &local_slots {
+        assert!(topo.is_local_primary(slot));
+    }
+}
+
+#[test]
+fn test_moved_redirection_format() {
+    // Verify that non-local keys would produce MOVED responses
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+    let nodes = make_nodes(3);
+    let topo = Arc::new(RwLock::new(ClusterTopology::new(0, nodes, 1)));
+    let peers = Arc::new(PeerConnectionPool::new());
+    let router = ClusterRouter::new(topo, handler, peers);
+
+    // Find a key that routes to another node
+    for i in 0..10_000 {
+        let key = format!("moved_key_{}", i);
+        let (slot, decision) = router.route_key_with_slot(key.as_bytes());
+        if let RouteDecision::Forward(node_id) = decision {
+            // Verify we can get the address
+            let addr = router.redis_addr_for_slot(slot);
+            assert!(addr.is_some(), "Should have address for slot {}", slot);
+            return; // Test passed
+        }
+    }
+    panic!("Could not find any key that routes to another node");
+}
+
+#[test]
+fn test_crossslot_detection() {
+    use ssd_kv::cluster::topology::key_hash_slot;
+
+    // Keys with different hash tags should (usually) have different slots
+    let slot1 = key_hash_slot(b"user:{1}:name");
+    let slot2 = key_hash_slot(b"user:{2}:name");
+    // These should be different since tags are different
+    assert_ne!(slot1, slot2, "Different hash tags should produce different slots");
+
+    // Keys with same hash tag should have same slot
+    let slot_a = key_hash_slot(b"a:{same}:x");
+    let slot_b = key_hash_slot(b"b:{same}:y");
+    assert_eq!(slot_a, slot_b);
 }

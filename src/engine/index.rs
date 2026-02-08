@@ -143,8 +143,9 @@ impl IndexShard {
 
 /// The main sharded index.
 pub struct Index {
-    shards: Vec<RwLock<IndexShard>>,
+    pub(crate) shards: Vec<RwLock<IndexShard>>,
     total_entries: AtomicU64,
+    total_data_bytes: AtomicU64,
 }
 
 impl Index {
@@ -158,6 +159,7 @@ impl Index {
         Self {
             shards,
             total_entries: AtomicU64::new(0),
+            total_data_bytes: AtomicU64::new(0),
         }
     }
 
@@ -191,8 +193,18 @@ impl Index {
         let mut shard = self.shards[shard_idx].write();
 
         let old = shard.insert(entry);
-        if old.is_none() {
+        if let Some(ref old_entry) = old {
+            // Replacing existing: adjust data bytes (subtract old, add new)
+            let old_size = old_entry.value_len as u64 + old_entry.key.len() as u64;
+            let new_size = value_len as u64 + key.len() as u64;
+            if new_size > old_size {
+                self.total_data_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
+            } else {
+                self.total_data_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
+            }
+        } else {
             self.total_entries.fetch_add(1, Ordering::Relaxed);
+            self.total_data_bytes.fetch_add(value_len as u64 + key.len() as u64, Ordering::Relaxed);
         }
         old
     }
@@ -212,8 +224,10 @@ impl Index {
         let mut shard = self.shards[shard_idx].write();
 
         let entry = shard.remove(key, key_hash);
-        if entry.is_some() {
+        if let Some(ref e) = entry {
             self.total_entries.fetch_sub(1, Ordering::Relaxed);
+            let size = e.value_len as u64 + e.key.len() as u64;
+            self.total_data_bytes.fetch_sub(size.min(self.total_data_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
         }
         entry
     }
@@ -226,6 +240,11 @@ impl Index {
     /// Returns true if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Returns the total tracked data bytes.
+    pub fn total_data_bytes(&self) -> u64 {
+        self.total_data_bytes.load(Ordering::Relaxed)
     }
 
     /// Returns statistics about the index.
@@ -243,6 +262,7 @@ impl Index {
             total_entries: self.len(),
             live_entries: live as u64,
             tombstones: tombstones as u64,
+            total_data_bytes: self.total_data_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -264,6 +284,7 @@ impl Index {
             s.tombstone_count = 0;
         }
         self.total_entries.store(0, Ordering::SeqCst);
+        self.total_data_bytes.store(0, Ordering::SeqCst);
     }
 }
 
@@ -279,6 +300,7 @@ pub struct IndexStats {
     pub total_entries: u64,
     pub live_entries: u64,
     pub tombstones: u64,
+    pub total_data_bytes: u64,
 }
 
 #[cfg(test)]

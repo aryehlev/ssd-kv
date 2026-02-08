@@ -1,36 +1,96 @@
-//! Shard-to-node mapping and cluster topology.
+//! Slot-to-node mapping and cluster topology.
 //!
-//! The cluster uses the existing 256-shard architecture. Each shard is
-//! assigned to a primary node and optionally replicated to other nodes.
-//! Routing is O(1): `shard_id = (key_hash >> 56) % 256`, then look up
-//! the owning node in the shard map.
+//! The cluster uses 16,384 hash slots (matching Redis Cluster protocol).
+//! Slot assignment: `slot = CRC16(key) % 16384`, with hash tag support
+//! for `{tag}` extraction. Routing is O(1) via the slot map.
+//!
+//! The internal storage engine still uses its 256-shard index independently.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cluster::node::{NodeId, NodeInfo, NodeStatus};
-use crate::engine::index::NUM_SHARDS;
 
-/// Assignment of a single shard to a primary and replica nodes.
+/// Total number of hash slots in a Redis Cluster.
+pub const NUM_SLOTS: usize = 16384;
+
+/// CRC16 lookup table (CCITT variant used by Redis Cluster).
+static CRC16_TAB: [u16; 256] = {
+    let mut tab = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+            j += 1;
+        }
+        tab[i] = crc;
+        i += 1;
+    }
+    tab
+};
+
+/// Computes the CRC16 hash of a byte slice (CCITT variant, same as Redis).
+#[inline]
+pub fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &b in data {
+        let idx = ((crc >> 8) ^ (b as u16)) as usize;
+        crc = (crc << 8) ^ CRC16_TAB[idx & 0xFF];
+    }
+    crc
+}
+
+/// Extracts the hash tag from a key, following Redis Cluster rules.
+/// If the key contains `{...}` with a non-empty substring between the
+/// first `{` and the first subsequent `}`, that substring is used.
+/// Otherwise the whole key is used.
+#[inline]
+pub fn extract_hash_tag(key: &[u8]) -> &[u8] {
+    if let Some(start) = key.iter().position(|&b| b == b'{') {
+        if let Some(end) = key[start + 1..].iter().position(|&b| b == b'}') {
+            if end > 0 {
+                return &key[start + 1..start + 1 + end];
+            }
+        }
+    }
+    key
+}
+
+/// Computes the Redis Cluster hash slot for a key.
+/// Supports `{hashtag}` syntax.
+#[inline]
+pub fn key_hash_slot(key: &[u8]) -> u16 {
+    let tag = extract_hash_tag(key);
+    crc16(tag) % NUM_SLOTS as u16
+}
+
+/// Assignment of a single slot to a primary and replica nodes.
 #[derive(Debug, Clone)]
 pub struct ShardAssignment {
-    /// The primary node that owns this shard.
+    /// The primary node that owns this slot.
     pub primary: NodeId,
-    /// Replica nodes for this shard (in priority order for failover).
+    /// Replica nodes for this slot (in priority order for failover).
     pub replicas: Vec<NodeId>,
-    /// Current state of the shard.
+    /// Current state of the slot.
     pub state: ShardState,
 }
 
-/// State of a shard during normal operation and migration.
+/// State of a slot during normal operation and migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardState {
-    /// Shard is serving normally.
+    /// Slot is serving normally.
     Active,
-    /// Shard is being migrated to a new node.
+    /// Slot is being migrated to a new node.
     Migrating {
-        /// Node the shard is migrating from.
+        /// Node the slot is migrating from.
         source: NodeId,
-        /// Node the shard is migrating to.
+        /// Node the slot is migrating to.
         target: NodeId,
     },
 }
@@ -45,11 +105,11 @@ impl Default for ShardAssignment {
     }
 }
 
-/// The full cluster topology: maps each of the 256 shards to nodes.
+/// The full cluster topology: maps each of the 16384 hash slots to nodes.
 pub struct ClusterTopology {
     /// All known nodes in the cluster.
     pub nodes: Vec<NodeInfo>,
-    /// Shard assignment map: shard_id -> assignment.
+    /// Slot assignment map: slot_id -> assignment.
     pub shard_map: Vec<ShardAssignment>,
     /// This node's ID.
     pub local_node_id: NodeId,
@@ -60,18 +120,19 @@ pub struct ClusterTopology {
 }
 
 impl ClusterTopology {
-    /// Creates a new topology with shards evenly distributed across `num_nodes` nodes.
+    /// Creates a new topology with slots evenly distributed across `num_nodes` nodes.
     pub fn new(
         local_node_id: NodeId,
         nodes: Vec<NodeInfo>,
         replication_factor: u8,
     ) -> Self {
         let num_nodes = nodes.len();
-        let mut shard_map = Vec::with_capacity(NUM_SHARDS);
+        let mut shard_map = Vec::with_capacity(NUM_SLOTS);
 
-        for shard_id in 0..NUM_SHARDS {
-            let primary = (shard_id / Self::shards_per_node(num_nodes)) as NodeId;
-            // Clamp to last node if rounding pushes past end
+        let slots_per = Self::slots_per_node(num_nodes);
+
+        for slot_id in 0..NUM_SLOTS {
+            let primary = (slot_id / slots_per) as NodeId;
             let primary = primary.min((num_nodes - 1) as NodeId);
 
             let mut replicas = Vec::new();
@@ -98,8 +159,8 @@ impl ClusterTopology {
 
     /// Creates a single-node topology (standalone mode equivalent).
     pub fn single_node(local_node_id: NodeId, node: NodeInfo) -> Self {
-        let mut shard_map = Vec::with_capacity(NUM_SHARDS);
-        for _ in 0..NUM_SHARDS {
+        let mut shard_map = Vec::with_capacity(NUM_SLOTS);
+        for _ in 0..NUM_SLOTS {
             shard_map.push(ShardAssignment {
                 primary: local_node_id,
                 replicas: Vec::new(),
@@ -116,49 +177,48 @@ impl ClusterTopology {
         }
     }
 
-    /// Returns the number of shards each node should own (approximately).
-    fn shards_per_node(num_nodes: usize) -> usize {
+    /// Returns the number of slots each node should own (approximately).
+    fn slots_per_node(num_nodes: usize) -> usize {
         if num_nodes == 0 {
-            NUM_SHARDS
+            NUM_SLOTS
         } else {
-            // Ceiling division to ensure all shards are covered
-            (NUM_SHARDS + num_nodes - 1) / num_nodes
+            (NUM_SLOTS + num_nodes - 1) / num_nodes
         }
     }
 
-    /// O(1) lookup: returns the primary node for a given shard.
+    /// O(1) lookup: returns the primary node for a given slot.
     #[inline]
-    pub fn primary_for_shard(&self, shard_id: u16) -> NodeId {
-        self.shard_map[shard_id as usize].primary
+    pub fn primary_for_shard(&self, slot_id: u16) -> NodeId {
+        self.shard_map[slot_id as usize].primary
     }
 
-    /// Returns the primary + replica nodes for a shard.
-    pub fn nodes_for_shard(&self, shard_id: u16) -> Vec<NodeId> {
-        let assignment = &self.shard_map[shard_id as usize];
+    /// Returns the primary + replica nodes for a slot.
+    pub fn nodes_for_shard(&self, slot_id: u16) -> Vec<NodeId> {
+        let assignment = &self.shard_map[slot_id as usize];
         let mut nodes = vec![assignment.primary];
         nodes.extend_from_slice(&assignment.replicas);
         nodes
     }
 
-    /// Returns true if this node is the primary for the given shard.
+    /// Returns true if this node is the primary for the given slot.
     #[inline]
-    pub fn is_local_primary(&self, shard_id: u16) -> bool {
-        self.shard_map[shard_id as usize].primary == self.local_node_id
+    pub fn is_local_primary(&self, slot_id: u16) -> bool {
+        self.shard_map[slot_id as usize].primary == self.local_node_id
     }
 
-    /// Returns true if this node is a replica for the given shard.
-    pub fn is_local_replica(&self, shard_id: u16) -> bool {
-        self.shard_map[shard_id as usize]
+    /// Returns true if this node is a replica for the given slot.
+    pub fn is_local_replica(&self, slot_id: u16) -> bool {
+        self.shard_map[slot_id as usize]
             .replicas
             .contains(&self.local_node_id)
     }
 
-    /// Returns true if this node owns (primary or replica) the given shard.
-    pub fn is_local_shard(&self, shard_id: u16) -> bool {
-        self.is_local_primary(shard_id) || self.is_local_replica(shard_id)
+    /// Returns true if this node owns (primary or replica) the given slot.
+    pub fn is_local_shard(&self, slot_id: u16) -> bool {
+        self.is_local_primary(slot_id) || self.is_local_replica(slot_id)
     }
 
-    /// Returns all shard IDs owned by the given node as primary.
+    /// Returns all slot IDs owned by the given node as primary.
     pub fn shards_for_node(&self, node_id: NodeId) -> Vec<u16> {
         self.shard_map
             .iter()
@@ -166,6 +226,28 @@ impl ClusterTopology {
             .filter(|(_, a)| a.primary == node_id)
             .map(|(i, _)| i as u16)
             .collect()
+    }
+
+    /// Returns contiguous slot ranges owned by a node as primary.
+    /// Each entry is (start_slot, end_slot) inclusive.
+    pub fn slot_ranges_for_node(&self, node_id: NodeId) -> Vec<(u16, u16)> {
+        let mut ranges = Vec::new();
+        let mut start: Option<u16> = None;
+
+        for (slot_id, assignment) in self.shard_map.iter().enumerate() {
+            if assignment.primary == node_id {
+                if start.is_none() {
+                    start = Some(slot_id as u16);
+                }
+            } else if let Some(s) = start {
+                ranges.push((s, (slot_id - 1) as u16));
+                start = None;
+            }
+        }
+        if let Some(s) = start {
+            ranges.push((s, (NUM_SLOTS - 1) as u16));
+        }
+        ranges
     }
 
     /// Returns a NodeInfo by ID, if it exists.
@@ -186,8 +268,8 @@ impl ClusterTopology {
             .count()
     }
 
-    /// Recalculates shard assignments after node changes.
-    /// Returns a list of (shard_id, old_primary, new_primary) for shards that moved.
+    /// Recalculates slot assignments after node changes.
+    /// Returns a list of (slot_id, old_primary, new_primary) for slots that moved.
     pub fn rebalance(&mut self) -> Vec<(u16, NodeId, NodeId)> {
         let active_nodes: Vec<NodeId> = self
             .nodes
@@ -201,20 +283,19 @@ impl ClusterTopology {
         }
 
         let num_active = active_nodes.len();
-        let spn = Self::shards_per_node(num_active);
+        let spn = Self::slots_per_node(num_active);
         let mut moves = Vec::new();
 
-        for (shard_id, assignment) in self.shard_map.iter_mut().enumerate() {
-            let ideal_owner_idx = (shard_id / spn).min(num_active - 1);
+        for (slot_id, assignment) in self.shard_map.iter_mut().enumerate() {
+            let ideal_owner_idx = (slot_id / spn).min(num_active - 1);
             let ideal_owner = active_nodes[ideal_owner_idx];
 
             if assignment.primary != ideal_owner {
                 let old = assignment.primary;
                 assignment.primary = ideal_owner;
-                moves.push((shard_id as u16, old, ideal_owner));
+                moves.push((slot_id as u16, old, ideal_owner));
             }
 
-            // Update replicas
             assignment.replicas.clear();
             for r in 1..self.replication_factor as usize {
                 let replica_idx = (ideal_owner_idx + r) % num_active;
@@ -229,15 +310,28 @@ impl ClusterTopology {
         moves
     }
 
-    /// Computes the shard ID for a given key hash.
+    /// Computes the hash slot for a key using CRC16 with hash tag support.
+    #[inline]
+    pub fn slot_for_key(key: &[u8]) -> u16 {
+        key_hash_slot(key)
+    }
+
+    /// Maps an xxHash3 key hash to an internal index shard (0..255).
+    /// Used by rebalance.rs which operates on the 256-shard storage index.
     #[inline]
     pub fn shard_for_key(key_hash: u64) -> u16 {
-        ((key_hash >> 56) as u16) % NUM_SHARDS as u16
+        (key_hash >> 56) as u16 % 256
     }
 
     /// Returns the current topology version.
     pub fn current_version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
+    }
+
+    /// Returns the Redis address of the primary for a given slot.
+    pub fn redis_addr_for_slot(&self, slot_id: u16) -> Option<SocketAddr> {
+        let node_id = self.primary_for_shard(slot_id);
+        self.get_node(node_id).map(|n| n.redis_addr)
     }
 }
 
@@ -259,16 +353,52 @@ mod tests {
     }
 
     #[test]
+    fn test_crc16_known_values() {
+        // Redis uses CRC16/CCITT. Known test vectors:
+        assert_eq!(crc16(b""), 0x0000);
+        assert_eq!(crc16(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn test_hash_tag_extraction() {
+        assert_eq!(extract_hash_tag(b"foo{bar}baz"), b"bar");
+        assert_eq!(extract_hash_tag(b"{bar}"), b"bar");
+        assert_eq!(extract_hash_tag(b"foo{bar}{zap}"), b"bar"); // first tag
+        assert_eq!(extract_hash_tag(b"foo{}bar"), b"foo{}bar"); // empty tag -> whole key
+        assert_eq!(extract_hash_tag(b"foobar"), b"foobar"); // no braces
+        assert_eq!(extract_hash_tag(b"foo{bar"), b"foo{bar"); // no closing brace
+        assert_eq!(extract_hash_tag(b"foo}bar{"), b"foo}bar{"); // wrong order
+    }
+
+    #[test]
+    fn test_hash_tag_same_slot() {
+        // Keys with same hash tag should map to same slot
+        let slot1 = key_hash_slot(b"user:{12345}:name");
+        let slot2 = key_hash_slot(b"user:{12345}:email");
+        let slot3 = key_hash_slot(b"order:{12345}:items");
+        assert_eq!(slot1, slot2);
+        assert_eq!(slot2, slot3);
+    }
+
+    #[test]
+    fn test_key_hash_slot_range() {
+        for i in 0..10_000 {
+            let key = format!("test_key_{}", i);
+            let slot = key_hash_slot(key.as_bytes());
+            assert!(slot < NUM_SLOTS as u16, "Slot {} >= {} for key {}", slot, NUM_SLOTS, key);
+        }
+    }
+
+    #[test]
     fn test_single_node_topology() {
         let nodes = make_nodes(1);
         let topo = ClusterTopology::single_node(0, nodes[0].clone());
 
-        // All 256 shards should belong to node 0
-        for shard_id in 0..NUM_SHARDS as u16 {
-            assert_eq!(topo.primary_for_shard(shard_id), 0);
-            assert!(topo.is_local_primary(shard_id));
+        for slot_id in 0..NUM_SLOTS as u16 {
+            assert_eq!(topo.primary_for_shard(slot_id), 0);
+            assert!(topo.is_local_primary(slot_id));
         }
-        assert_eq!(topo.shards_for_node(0).len(), NUM_SHARDS);
+        assert_eq!(topo.shards_for_node(0).len(), NUM_SLOTS);
     }
 
     #[test]
@@ -276,74 +406,58 @@ mod tests {
         let nodes = make_nodes(3);
         let topo = ClusterTopology::new(0, nodes, 2);
 
-        // All 256 shards should have a primary
-        let mut shard_counts = [0u32; 3];
-        for shard_id in 0..NUM_SHARDS as u16 {
-            let primary = topo.primary_for_shard(shard_id);
-            assert!(primary < 3, "Primary {} out of range for shard {}", primary, shard_id);
-            shard_counts[primary as usize] += 1;
+        let mut counts = [0u32; 3];
+        for slot_id in 0..NUM_SLOTS as u16 {
+            let primary = topo.primary_for_shard(slot_id);
+            assert!(primary < 3);
+            counts[primary as usize] += 1;
         }
 
-        // Each node should own roughly 256/3 ≈ 85-86 shards
-        for (node, count) in shard_counts.iter().enumerate() {
+        // Each node should own roughly 16384/3 ≈ 5461
+        for (node, count) in counts.iter().enumerate() {
             assert!(
-                *count >= 80 && *count <= 90,
-                "Node {} has {} shards, expected ~85",
+                *count >= 5000 && *count <= 5600,
+                "Node {} has {} slots, expected ~5461",
                 node,
                 count
             );
         }
 
-        // Each shard with replication_factor=2 should have 1 replica
-        for shard_id in 0..NUM_SHARDS as u16 {
-            let nodes = topo.nodes_for_shard(shard_id);
-            assert_eq!(
-                nodes.len(),
-                2,
-                "Shard {} has {} nodes, expected 2",
-                shard_id,
-                nodes.len()
-            );
-            // Primary and replica should be different
-            assert_ne!(nodes[0], nodes[1], "Shard {} has same primary and replica", shard_id);
+        // With RF=2, each slot has 1 replica
+        for slot_id in 0..NUM_SLOTS as u16 {
+            let nodes = topo.nodes_for_shard(slot_id);
+            assert_eq!(nodes.len(), 2);
+            assert_ne!(nodes[0], nodes[1]);
         }
     }
 
     #[test]
-    fn test_shard_for_key() {
-        // Deterministic: same hash -> same shard
-        let shard1 = ClusterTopology::shard_for_key(0xFF00000000000000);
-        let shard2 = ClusterTopology::shard_for_key(0xFF00000000000000);
-        assert_eq!(shard1, shard2);
+    fn test_slot_ranges_for_node() {
+        let nodes = make_nodes(3);
+        let topo = ClusterTopology::new(0, nodes, 1);
 
-        // shard_id is always < 256
-        for hash in [0u64, 1, u64::MAX, 0xAB00000000000000] {
-            let shard = ClusterTopology::shard_for_key(hash);
-            assert!(shard < 256, "Shard {} >= 256 for hash {:#x}", shard, hash);
+        // Each node should have one contiguous range
+        for node_id in 0..3u32 {
+            let ranges = topo.slot_ranges_for_node(node_id);
+            assert!(!ranges.is_empty(), "Node {} has no ranges", node_id);
+
+            // Total slots across ranges should match shards_for_node count
+            let total: usize = ranges.iter().map(|(s, e)| (*e as usize - *s as usize + 1)).sum();
+            assert_eq!(total, topo.shards_for_node(node_id).len());
         }
     }
 
     #[test]
     fn test_rebalance_on_node_failure() {
-        let mut nodes = make_nodes(3);
-        let mut topo = ClusterTopology::new(0, nodes.clone(), 2);
+        let nodes = make_nodes(3);
+        let mut topo = ClusterTopology::new(0, nodes, 2);
 
-        // Mark node 1 as dead
         topo.nodes[1].status = NodeStatus::Dead;
-
         let moves = topo.rebalance();
+        assert!(!moves.is_empty());
 
-        // Some shards should have moved away from node 1
-        assert!(!moves.is_empty(), "Expected shard moves after node failure");
-
-        // No shard should be assigned to dead node 1
-        for shard_id in 0..NUM_SHARDS as u16 {
-            assert_ne!(
-                topo.primary_for_shard(shard_id),
-                1,
-                "Shard {} still assigned to dead node 1",
-                shard_id
-            );
+        for slot_id in 0..NUM_SLOTS as u16 {
+            assert_ne!(topo.primary_for_shard(slot_id), 1);
         }
     }
 
@@ -352,22 +466,53 @@ mod tests {
         let nodes = make_nodes(3);
         let topo = ClusterTopology::new(0, nodes, 2);
 
-        let local_shards = topo.shards_for_node(0);
-        for &shard_id in &local_shards {
-            assert!(topo.is_local_primary(shard_id));
-            assert!(topo.is_local_shard(shard_id));
+        let local_slots = topo.shards_for_node(0);
+        for &slot_id in &local_slots {
+            assert!(topo.is_local_primary(slot_id));
+            assert!(topo.is_local_shard(slot_id));
         }
     }
 
     #[test]
     fn test_topology_version() {
-        let mut nodes = make_nodes(3);
+        let nodes = make_nodes(3);
         let mut topo = ClusterTopology::new(0, nodes, 2);
         let v1 = topo.current_version();
 
         topo.nodes[1].status = NodeStatus::Dead;
         topo.rebalance();
         let v2 = topo.current_version();
-        assert!(v2 > v1, "Version should increase after rebalance");
+        assert!(v2 > v1);
+    }
+
+    #[test]
+    fn test_redis_addr_for_slot() {
+        let nodes = make_nodes(3);
+        let topo = ClusterTopology::new(0, nodes, 1);
+
+        let addr = topo.redis_addr_for_slot(0).unwrap();
+        assert_eq!(addr.port(), 7777); // Node 0
+
+        // Last slot should go to node 2
+        let last_slot = (NUM_SLOTS - 1) as u16;
+        let addr = topo.redis_addr_for_slot(last_slot).unwrap();
+        assert_eq!(addr.port(), 7779); // Node 2
+    }
+
+    #[test]
+    fn test_slot_distribution_well_spread() {
+        let mut slot_counts = vec![0u32; NUM_SLOTS];
+        for i in 0..100_000 {
+            let key = format!("distrib_key_{}", i);
+            let slot = key_hash_slot(key.as_bytes()) as usize;
+            slot_counts[slot] += 1;
+        }
+        let non_empty = slot_counts.iter().filter(|c| **c > 0).count();
+        assert!(
+            non_empty > 14000,
+            "Only {} of {} slots hit with 100k keys",
+            non_empty,
+            NUM_SLOTS,
+        );
     }
 }

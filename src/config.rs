@@ -94,6 +94,25 @@ pub struct Config {
     /// Number of missed heartbeats before marking a node as dead
     #[arg(long, default_value = "3")]
     pub health_check_threshold: u32,
+
+    // --- Eviction options ---
+
+    /// Maximum number of entries in the index (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    pub max_entries: u64,
+
+    /// Maximum data size in MB (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    pub max_data_mb: u64,
+
+    /// Eviction policy: "noeviction", "allkeys-lru", "volatile-lru",
+    /// "allkeys-random", "volatile-random", "volatile-ttl"
+    #[arg(long, default_value = "noeviction")]
+    pub eviction_policy: String,
+
+    /// Eviction check interval in seconds
+    #[arg(long, default_value = "1")]
+    pub eviction_interval: u64,
 }
 
 impl Config {
@@ -124,6 +143,18 @@ impl Config {
 
         if self.write_buffer_kb == 0 {
             return Err("Write buffer size must be positive".to_string());
+        }
+
+        match self.eviction_policy.as_str() {
+            "noeviction" | "allkeys-lru" | "volatile-lru" | "allkeys-random"
+            | "volatile-random" | "volatile-ttl" => {}
+            _ => {
+                return Err(format!(
+                    "Unknown eviction policy '{}'. Must be one of: noeviction, allkeys-lru, \
+                     volatile-lru, allkeys-random, volatile-random, volatile-ttl",
+                    self.eviction_policy
+                ));
+            }
         }
 
         if self.cluster_mode {
@@ -178,6 +209,10 @@ impl Default for Config {
             cluster_peers: None,
             health_check_interval_ms: 1000,
             health_check_threshold: 3,
+            max_entries: 0,
+            max_data_mb: 0,
+            eviction_policy: "noeviction".to_string(),
+            eviction_interval: 1,
         }
     }
 }

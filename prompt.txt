@@ -1,236 +1,126 @@
 dont ask any questions just implement this plan:
- Plan to implement                                                                                                                                        │
-│                                                                                                                                                          │
-│ Plan: SET TTL Options + Eviction System                                                                                                                  │
-│                                                                                                                                                          │
-│ Context                                                                                                                                                  │
-│                                                                                                                                                          │
-│ The SET command currently only supports EX (seconds) and PX (milliseconds) TTL options. Redis clients expect full SET option support including EXAT,     │
-│ PXAT, NX, XX, KEEPTTL, and GET. Additionally, the server has zero capacity management — writes succeed indefinitely until the OS runs out of             │
-│ disk/memory, with no eviction or expired-entry cleanup.                                                                                                  │
-│                                                                                                                                                          │
-│ ---                                                                                                                                                      │
-│ Step 1: Extend SET Command Options                                                                                                                       │
-│                                                                                                                                                          │
-│ File: src/server/redis.rs                                                                                                                                │
-│                                                                                                                                                          │
-│ Refactor parse_set_options → SetOptions struct                                                                                                           │
-│                                                                                                                                                          │
-│ Replace the current parse_set_options(&self, args) -> u32 with a richer struct:                                                                          │
-│                                                                                                                                                          │
-│ struct SetOptions {                                                                                                                                      │
-│     ttl_secs: u32,    // 0 = no TTL (computed from EX/PX/EXAT/PXAT)                                                                                      │
-│     nx: bool,         // Only set if NOT exists                                                                                                          │
-│     xx: bool,         // Only set if EXISTS                                                                                                              │
-│     keepttl: bool,    // Retain existing TTL                                                                                                             │
-│     get: bool,        // Return old value                                                                                                                │
-│ }                                                                                                                                                        │
-│                                                                                                                                                          │
-│ Parse all options from args slice in a single pass:                                                                                                      │
-│ - EX secs → ttl_secs = secs (already works)                                                                                                              │
-│ - PX ms → ttl_secs = ms / 1000 (already works)                                                                                                           │
-│ - EXAT timestamp → ttl_secs = timestamp - now_secs (new)                                                                                                 │
-│ - PXAT timestamp_ms → ttl_secs = (timestamp_ms - now_ms) / 1000 (new)                                                                                    │
-│ - NX → nx = true                                                                                                                                         │
-│ - XX → xx = true                                                                                                                                         │
-│ - KEEPTTL → keepttl = true                                                                                                                               │
-│ - GET → get = true                                                                                                                                       │
-│                                                                                                                                                          │
-│ Update cmd_set logic                                                                                                                                     │
-│                                                                                                                                                          │
-│ After parsing key, value, and options:                                                                                                                   │
-│                                                                                                                                                          │
-│ 1. If opts.nx: check handler.get_value(key) — if exists, return $-1\r\n (nil)                                                                            │
-│ 2. If opts.xx: check handler.get_value(key) — if NOT exists, return $-1\r\n (nil)                                                                        │
-│ 3. If opts.get: read old value via handler.get_value(key) before writing                                                                                 │
-│ 4. If opts.keepttl: read old TTL via handler.get_with_meta(key), use its ttl_secs                                                                        │
-│ 5. Call handler.put_sync(key, value, final_ttl)                                                                                                          │
-│ 6. If opts.get: return old value (or nil). Otherwise return +OK                                                                                          │
-│                                                                                                                                                          │
-│ ---                                                                                                                                                      │
-│ Step 2: Eviction Config                                                                                                                                  │
-│                                                                                                                                                          │
-│ File: src/config.rs                                                                                                                                      │
-│                                                                                                                                                          │
-│ Add new config fields:                                                                                                                                   │
-│                                                                                                                                                          │
-│ /// Maximum number of entries in the index (0 = unlimited)                                                                                               │
-│ #[arg(long, default_value = "0")]                                                                                                                        │
-│ pub max_entries: u64,                                                                                                                                    │
-│                                                                                                                                                          │
-│ /// Maximum data size in MB (0 = unlimited)                                                                                                              │
-│ #[arg(long, default_value = "0")]                                                                                                                        │
-│ pub max_data_mb: u64,                                                                                                                                    │
-│                                                                                                                                                          │
-│ /// Eviction policy: "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random", "volatile-random", "volatile-ttl"                                    │
-│ #[arg(long, default_value = "noeviction")]                                                                                                               │
-│ pub eviction_policy: String,                                                                                                                             │
-│                                                                                                                                                          │
-│ /// Eviction check interval in seconds                                                                                                                   │
-│ #[arg(long, default_value = "1")]                                                                                                                        │
-│ pub eviction_interval: u64,                                                                                                                              │
-│                                                                                                                                                          │
-│ Add validation: eviction_policy must be one of the known values.                                                                                         │
-│                                                                                                                                                          │
-│ ---                                                                                                                                                      │
-│ Step 3: Eviction Engine                                                                                                                                  │
-│                                                                                                                                                          │
-│ New file: src/storage/eviction.rs                                                                                                                        │
-│                                                                                                                                                          │
-│ EvictionPolicy enum                                                                                                                                      │
-│                                                                                                                                                          │
-│ pub enum EvictionPolicy {                                                                                                                                │
-│     NoEviction,       // Return error when full                                                                                                          │
-│     AllKeysLru,       // Evict least-recently-used across all keys                                                                                       │
-│     VolatileLru,      // Evict LRU among keys with TTL                                                                                                   │
-│     AllKeysRandom,    // Evict random keys                                                                                                               │
-│     VolatileRandom,   // Evict random keys with TTL                                                                                                      │
-│     VolatileTtl,      // Evict keys with shortest remaining TTL                                                                                          │
-│ }                                                                                                                                                        │
-│                                                                                                                                                          │
-│ EvictionConfig                                                                                                                                           │
-│                                                                                                                                                          │
-│ pub struct EvictionConfig {                                                                                                                              │
-│     pub policy: EvictionPolicy,                                                                                                                          │
-│     pub max_entries: u64,       // 0 = unlimited                                                                                                         │
-│     pub max_data_mb: u64,       // 0 = unlimited                                                                                                         │
-│     pub check_interval_secs: u64,                                                                                                                        │
-│     pub sample_size: usize,     // Keys to sample per eviction pass (default: 16)                                                                        │
-│ }                                                                                                                                                        │
-│                                                                                                                                                          │
-│ Evictor struct                                                                                                                                           │
-│                                                                                                                                                          │
-│ Follows the same pattern as Compactor:                                                                                                                   │
-│                                                                                                                                                          │
-│ pub struct Evictor {                                                                                                                                     │
-│     config: EvictionConfig,                                                                                                                              │
-│     handler: Arc<Handler>,                                                                                                                               │
-│     index: Arc<Index>,                                                                                                                                   │
-│     file_manager: Arc<FileManager>,                                                                                                                      │
-│     stats: Arc<EvictionStats>,                                                                                                                           │
-│ }                                                                                                                                                        │
-│                                                                                                                                                          │
-│ Core methods:                                                                                                                                            │
-│                                                                                                                                                          │
-│ - run(stop: Arc<AtomicBool>) — background loop, same pattern as compaction thread                                                                        │
-│ - should_evict() -> bool — checks if capacity thresholds are exceeded                                                                                    │
-│ - evict_batch() -> usize — evicts entries until below threshold, returns count evicted                                                                   │
-│ - evict_expired() -> usize — removes expired entries (runs every pass regardless of capacity)                                                            │
-│ - select_victim(shard: &IndexShard) -> Option<key> — policy-specific victim selection                                                                    │
-│                                                                                                                                                          │
-│ Expired entry cleanup                                                                                                                                    │
-│                                                                                                                                                          │
-│ Every cycle, scan a portion of shards (round-robin, e.g. 16 shards per cycle) and:                                                                       │
-│ 1. For each live entry, check if the on-disk record has expired using handler.get_with_meta(key)                                                         │
-│ 2. If expired: call index.remove(key) to free memory                                                                                                     │
-│                                                                                                                                                          │
-│ This is lightweight because get_with_meta checks write buffer first (hot path) and only goes to disk for cold entries.                                   │
-│                                                                                                                                                          │
-│ LRU approximation (for allkeys-lru / volatile-lru)                                                                                                       │
-│                                                                                                                                                          │
-│ Since IndexEntry has no access-time field, use random sampling (Redis-style approximation):                                                              │
-│ 1. Pick sample_size random entries from random shards                                                                                                    │
-│ 2. For LRU: pick the one with the lowest generation (generation is monotonically increasing, so lower = older write, approximation of LRU)               │
-│ 3. For volatile variants: filter to entries whose on-disk record has TTL > 0                                                                             │
-│ 4. Delete the victim via handler.delete_sync(key) + index.remove(key)                                                                                    │
-│                                                                                                                                                          │
-│ volatile-ttl                                                                                                                                             │
-│                                                                                                                                                          │
-│ Sample random entries with TTL, pick the one closest to expiry (lowest timestamp + ttl). Requires get_with_meta to read the TTL from disk/write-buffer.  │
-│                                                                                                                                                          │
-│ Capacity check in write path                                                                                                                             │
-│                                                                                                                                                          │
-│ File: src/server/handler.rs                                                                                                                              │
-│                                                                                                                                                          │
-│ Add to Handler:                                                                                                                                          │
-│ pub eviction_policy: EvictionPolicy,                                                                                                                     │
-│ pub max_entries: u64,                                                                                                                                    │
-│                                                                                                                                                          │
-│ In put_sync(), before writing:                                                                                                                           │
-│ - If max_entries > 0 && index.stats().live_entries >= max_entries and policy is NoEviction: return Err("OOM command not allowed when used memory >       │
-│ 'maxmemory'")                                                                                                                                            │
-│ - Otherwise the background evictor handles capacity                                                                                                      │
-│                                                                                                                                                          │
-│ Data size tracking                                                                                                                                       │
-│                                                                                                                                                          │
-│ Add total_data_bytes: AtomicU64 to Index. Increment by value_len on insert, decrement on remove. Check against max_data_mb * 1024 * 1024 in              │
-│ should_evict().                                                                                                                                          │
-│                                                                                                                                                          │
-│ ---                                                                                                                                                      │
-│ Step 4: Wire Up Eviction in main.rs                                                                                                                      │
-│                                                                                                                                                          │
-│ File: src/main.rs                                                                                                                                        │
-│                                                                                                                                                          │
-│ After creating Handler and starting compaction, start the eviction thread:                                                                               │
-│                                                                                                                                                          │
-│ let eviction_stop = if config.eviction_policy != "noeviction" || config.max_entries > 0 || config.max_data_mb > 0 {                                      │
-│     let evictor_config = EvictionConfig { ... };                                                                                                         │
-│     let (evictor, stop) = start_eviction_thread(evictor_config, handler, index, file_manager);                                                           │
-│     Some(stop)                                                                                                                                           │
-│ } else {                                                                                                                                                 │
-│     None                                                                                                                                                 │
-│ };                                                                                                                                                       │
-│                                                                                                                                                          │
-│ Stop on shutdown, same as compaction.                                                                                                                    │
-│                                                                                                                                                          │
-│ ---                                                                                                                                                      │
-│ Step 5: Register eviction module                                                                                                                         │
-│                                                                                                                                                          │
-│ File: src/storage/mod.rs                                                                                                                                 │
-│ - Add pub mod eviction;                                                                                                                                  │
-│                                                                                                                                                          │
-│ ---                                                                                                                                                      │
-│ Step 6: Tests                                                                                                                                            │
-│                                                                                                                                                          │
-│ Unit tests in src/server/redis.rs                                                                                                                        │
-│                                                                                                                                                          │
-│ - test_set_nx_new_key — NX on missing key succeeds                                                                                                       │
-│ - test_set_nx_existing_key — NX on existing key returns nil                                                                                              │
-│ - test_set_xx_existing_key — XX on existing key succeeds                                                                                                 │
-│ - test_set_xx_missing_key — XX on missing key returns nil                                                                                                │
-│ - test_set_get_returns_old_value — GET option returns previous value                                                                                     │
-│ - test_set_get_missing_returns_nil — GET on new key returns nil                                                                                          │
-│ - test_set_keepttl — KEEPTTL preserves existing TTL                                                                                                      │
-│ - test_set_exat — EXAT sets absolute TTL                                                                                                                 │
-│ - test_set_pxat — PXAT sets absolute TTL in ms                                                                                                           │
-│                                                                                                                                                          │
-│ Eviction tests in src/storage/eviction.rs                                                                                                                │
-│                                                                                                                                                          │
-│ - test_evict_expired_entries — expired entries are removed                                                                                               │
-│ - test_no_eviction_policy_rejects — NoEviction returns error when full                                                                                   │
-│ - test_allkeys_random_evicts — random eviction frees space                                                                                               │
-│ - test_volatile_ttl_evicts_soonest — shortest TTL evicted first                                                                                          │
-│ - test_max_entries_enforced — write fails/evicts when at limit                                                                                           │
-│                                                                                                                                                          │
-│ Integration tests in tests/cluster_integration.rs                                                                                                        │
-│                                                                                                                                                          │
-│ - test_set_with_nx_xx_options — full SET option round trip                                                                                               │
-│ - test_eviction_under_pressure — insert beyond max_entries, verify eviction happens                                                                      │
-│                                                                                                                                                          │
-│ ---                                                                                                                                                      │
-│ Files Modified                                                                                                                                           │
-│ ┌──────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────┐                                 │
-│ │             File             │                                        Changes                                        │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ src/server/redis.rs          │ Extend parse_set_options → SetOptions, update cmd_set for NX/XX/GET/KEEPTTL/EXAT/PXAT │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ src/config.rs                │ Add max_entries, max_data_mb, eviction_policy, eviction_interval                      │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ src/storage/eviction.rs      │ New: Evictor, EvictionPolicy, expired cleanup, LRU/random/TTL eviction                │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ src/storage/mod.rs           │ Add pub mod eviction                                                                  │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ src/server/handler.rs        │ Add capacity check in put_sync, store eviction policy/limits                          │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ src/engine/index.rs          │ Add total_data_bytes: AtomicU64 tracking                                              │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ src/main.rs                  │ Wire up eviction thread                                                               │                                 │
-│ ├──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤                                 │
-│ │ tests/cluster_integration.rs │ New integration tests                                                                 │                                 │
-│ └──────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────┘                                 │
-│ Verification                                                                                                                                             │
-│                                                                                                                                                          │
-│ 1. cargo build — compiles cleanly                                                                                                                        │
-│ 2. cargo test — all existing + new tests pass                                                                                                            │
-│ 3. Manual: SET with NX/XX/GET/KEEPTTL/EXAT/PXAT options work                                                                                             │
-│ 4. Manual: start with --max-entries 100 --eviction-policy allkeys-random, insert 200 keys, verify eviction kicks in and count stays ~100
+ Context
+
+ Currently all client reads are routed to the primary node for each slot via check_moved() in redis.rs. Replica nodes receive replicated data but never
+ serve client reads. This wastes replica capacity and increases read latency. Redis Cluster solves this with READONLY/READWRITE commands — a per-connection
+  flag that lets clients opt into reading from replicas (with eventual consistency).
+
+ Changes
+
+ Step 1: Per-connection readonly flag in RedisHandler
+
+ File: src/server/redis.rs
+
+ - Add readonly: bool field to RedisHandler (line 359)
+ - Add READONLY command → sets self.readonly = true, responds +OK
+ - Add READWRITE command → sets self.readonly = false, responds +OK
+ - Add both to the command dispatch table (line 402)
+
+ Since handle_command takes &mut self (it doesn't — it takes &self), we need to change readonly to a Cell<bool> or make handle_command take &mut self.
+ Looking at the code, handle_command takes &self. The simplest approach: use std::cell::Cell<bool> for interior mutability (single-threaded per-connection,
+  no need for atomic).
+
+ Step 2: Modify check_moved for readonly replica reads
+
+ File: src/server/redis.rs (line 441)
+
+ Create check_moved_read(&self, key, out) -> bool for read commands:
+ - If self.readonly is true AND this node is a replica for the key's slot → return false (allow local read)
+ - If self.readonly is true but this node is neither primary nor replica → still send MOVED
+ - If self.readonly is false → delegate to existing check_moved() (primary-only)
+
+ This requires access to topology from RedisHandler. The router already has topology. Add a helper:
+ fn is_local_replica_for_key(&self, key: &[u8]) -> bool {
+     if let Some(router) = &self.router {
+         let slot = ClusterTopology::slot_for_key(key);
+         let topo = router.topology().read();
+         topo.is_local_replica(slot)
+     } else {
+         false
+     }
+ }
+
+ Update read commands (cmd_get, cmd_mget, cmd_exists, cmd_ttl, cmd_pttl, cmd_dbsize) to use check_moved_read instead of check_moved.
+
+ Write commands (cmd_set, cmd_del, cmd_mset, cmd_expire, cmd_pexpire, cmd_persist, cmd_expireat, cmd_pexpireat) continue using check_moved (writes always
+ go to primary).
+
+ Step 3: Update CLUSTER NODES to show replica flags
+
+ File: src/server/redis.rs (line 919, cmd_cluster NODES subcommand)
+
+ Currently all nodes are shown as "master". Change to:
+ - For each node, check if it's a primary for any slot → "master"
+ - If it only appears in replicas lists → "slave" with <primary_id> as the master link
+ - Redis format: <id> <ip>:<port>@<cport> slave <master_id> 0 0 <version> connected
+
+ For simplicity (since all nodes are both primary for some slots and replica for others in our setup), output each node as "master" for the slots it owns
+ as primary. This matches Redis behavior where a node can be master for some slots.
+
+ Step 4: Add --replica-read CLI flag
+
+ File: src/config.rs
+
+ Add optional config flag:
+ /// Allow replica nodes to serve read requests (clients must still send READONLY)
+ #[arg(long)]
+ pub replica_read: bool,
+ Default: false. When false, READONLY command is accepted but check_moved_read still sends MOVED (server-side disable). This gives operators control.
+
+ Step 5: Operator CRD + controller changes
+
+ File: operator/crds/ssdkv-cluster.yaml
+
+ Add field to spec:
+ replicaRead:
+   type: boolean
+   default: false
+   description: Allow replica nodes to serve read requests (READONLY command).
+
+ File: operator/src/controller.rs
+
+ Add to SsdkvClusterSpec:
+ #[serde(default)]
+ pub replica_read: bool,
+
+ File: operator/src/resources.rs
+
+ In build_statefulset, append --replica-read to the command when cluster.spec.replica_read is true.
+
+ File: operator/src/resources.rs — build_client_service
+
+ Add a second read-only service {name}-readonly that clients can use for read-balanced traffic:
+ pub fn build_readonly_service(cluster: &SsdkvCluster) -> Service
+ Same as client service but with name {name}-readonly and an additional label ssdkv.io/role: replica (though all pods serve both roles, this service
+ provides a semantic signal).
+
+ File: operator/src/controller.rs — reconcile function
+
+ Add step to create/patch the readonly service when replica_read is true.
+
+ Step 6: Tests
+
+ Unit tests in src/server/redis.rs:
+ - Test READONLY/READWRITE command responses
+ - Test that readonly flag allows replica reads
+
+ Integration test in tests/cluster_integration.rs:
+ - Test READONLY + GET on a replica node returns data (not MOVED)
+ - Test that writes still get MOVED on replica even with READONLY
+
+ Files to modify
+
+ 1. src/server/redis.rs — READONLY/READWRITE commands, check_moved_read, replica flags in CLUSTER NODES
+ 2. src/config.rs — --replica-read flag
+ 3. src/main.rs — pass replica_read config to redis handler
+ 4. operator/src/controller.rs — replica_read field in spec
+ 5. operator/src/resources.rs — --replica-read flag in StatefulSet, readonly Service
+ 6. operator/crds/ssdkv-cluster.yaml — replicaRead field
+ 7. tests/cluster_integration.rs — integration tests
+
+ Verification
+
+ 1. cargo build — compiles cleanly
+ 2. cargo test — all existing + new tests pass
+ 3. Manual: start clustered instance, connect with redis-cli, send READONLY, verify GET works on replica slots
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌

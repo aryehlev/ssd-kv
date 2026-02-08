@@ -113,6 +113,10 @@ pub struct Config {
     /// Eviction check interval in seconds
     #[arg(long, default_value = "1")]
     pub eviction_interval: u64,
+
+    /// Allow replica nodes to serve read requests (clients must still send READONLY)
+    #[arg(long)]
+    pub replica_read: bool,
 }
 
 impl Config {
@@ -213,6 +217,7 @@ impl Default for Config {
             max_data_mb: 0,
             eviction_policy: "noeviction".to_string(),
             eviction_interval: 1,
+            replica_read: false,
         }
     }
 }

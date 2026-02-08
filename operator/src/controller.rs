@@ -52,6 +52,10 @@ pub struct SsdkvClusterSpec {
     /// Resource requests/limits.
     #[serde(default)]
     pub resources: Option<ResourceSpec>,
+
+    /// Allow replica nodes to serve read requests (READONLY command).
+    #[serde(default)]
+    pub replica_read: bool,
 }
 
 fn default_replicas() -> i32 { 3 }
@@ -127,6 +131,19 @@ pub async fn reconcile(
         )
         .await?;
     info!("Client service ensured for {}", name);
+
+    // 2b. Create or update readonly Service when replica_read is enabled
+    if cluster.spec.replica_read {
+        let readonly_service = resources::build_readonly_service(&cluster);
+        svc_api
+            .patch(
+                &format!("{}-readonly", name),
+                &PatchParams::apply("ssdkv-operator"),
+                &Patch::Apply(readonly_service),
+            )
+            .await?;
+        info!("Readonly service ensured for {}", name);
+    }
 
     // 3. Compute shard assignments
     let shard_map = shard_manager::compute_shard_map(

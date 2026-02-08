@@ -989,6 +989,145 @@ fn test_config_standalone_mode_valid() {
     assert!(config.validate().is_ok());
 }
 
+// =================== Readonly Replica Tests ===================
+
+#[test]
+fn test_readonly_replica_read_allows_local_get() {
+    use ssd_kv::server::redis::{RedisHandler, RespValue};
+
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    // 3-node cluster, this is node 1, RF=2
+    let nodes = make_nodes(3);
+    let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
+    let peers = Arc::new(PeerConnectionPool::new());
+    let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
+    let rh = RedisHandler::with_router(handler, router, true);
+
+    // Find a key where node 1 is a replica
+    let mut replica_key = None;
+    {
+        let topo = rh.router.as_ref().unwrap().topology().read();
+        for i in 0..10_000 {
+            let key = format!("readonly_integ_{}", i);
+            let slot = ClusterTopology::slot_for_key(key.as_bytes());
+            if topo.is_local_replica(slot) {
+                replica_key = Some(key);
+                break;
+            }
+        }
+    }
+    let key = replica_key.expect("Should find a replica key for node 1");
+
+    // Write data locally (simulate replication)
+    rh.handler.put_sync(key.as_bytes(), b"integ_val", 0).unwrap();
+
+    // Without READONLY: GET returns MOVED
+    let cmd = RespValue::Array(Some(vec![
+        RespValue::BulkString(Some(b"GET".to_vec())),
+        RespValue::BulkString(Some(key.as_bytes().to_vec())),
+    ]));
+    let mut out = Vec::new();
+    rh.handle_command(cmd.clone(), &mut out);
+    let resp = String::from_utf8_lossy(&out);
+    assert!(resp.starts_with("-MOVED"), "Expected MOVED without READONLY");
+
+    // Send READONLY
+    let mut readonly_out = Vec::new();
+    rh.handle_command(
+        RespValue::Array(Some(vec![RespValue::BulkString(Some(b"READONLY".to_vec()))])),
+        &mut readonly_out,
+    );
+    assert_eq!(readonly_out, b"+OK\r\n");
+
+    // With READONLY: GET returns data
+    let mut out2 = Vec::new();
+    rh.handle_command(cmd, &mut out2);
+    let resp2 = String::from_utf8_lossy(&out2);
+    assert!(!resp2.starts_with("-MOVED"), "Expected local read with READONLY, got: {}", resp2);
+    assert!(resp2.contains("integ_val"));
+
+    // READWRITE resets
+    let mut rw_out = Vec::new();
+    rh.handle_command(
+        RespValue::Array(Some(vec![RespValue::BulkString(Some(b"READWRITE".to_vec()))])),
+        &mut rw_out,
+    );
+    assert_eq!(rw_out, b"+OK\r\n");
+
+    // After READWRITE: GET returns MOVED again
+    let cmd2 = RespValue::Array(Some(vec![
+        RespValue::BulkString(Some(b"GET".to_vec())),
+        RespValue::BulkString(Some(key.as_bytes().to_vec())),
+    ]));
+    let mut out3 = Vec::new();
+    rh.handle_command(cmd2, &mut out3);
+    let resp3 = String::from_utf8_lossy(&out3);
+    assert!(resp3.starts_with("-MOVED"), "Expected MOVED after READWRITE");
+}
+
+#[test]
+fn test_readonly_writes_still_get_moved() {
+    use ssd_kv::server::redis::{RedisHandler, RespValue};
+
+    let dir = tempdir().unwrap();
+    let handler = make_handler(dir.path());
+
+    let nodes = make_nodes(3);
+    let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
+    let peers = Arc::new(PeerConnectionPool::new());
+    let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
+    let rh = RedisHandler::with_router(handler, router, true);
+
+    // Enable READONLY
+    let mut out = Vec::new();
+    rh.handle_command(
+        RespValue::Array(Some(vec![RespValue::BulkString(Some(b"READONLY".to_vec()))])),
+        &mut out,
+    );
+
+    // Find a replica key
+    let mut replica_key = None;
+    {
+        let topo = rh.router.as_ref().unwrap().topology().read();
+        for i in 0..10_000 {
+            let key = format!("wr_integ_{}", i);
+            let slot = ClusterTopology::slot_for_key(key.as_bytes());
+            if topo.is_local_replica(slot) {
+                replica_key = Some(key);
+                break;
+            }
+        }
+    }
+    let key = replica_key.expect("Should find replica key");
+
+    // SET should still MOVED (writes always go to primary)
+    let mut set_out = Vec::new();
+    rh.handle_command(
+        RespValue::Array(Some(vec![
+            RespValue::BulkString(Some(b"SET".to_vec())),
+            RespValue::BulkString(Some(key.as_bytes().to_vec())),
+            RespValue::BulkString(Some(b"val".to_vec())),
+        ])),
+        &mut set_out,
+    );
+    let resp = String::from_utf8_lossy(&set_out);
+    assert!(resp.starts_with("-MOVED"), "SET should still MOVED with READONLY");
+
+    // DEL should still MOVED
+    let mut del_out = Vec::new();
+    rh.handle_command(
+        RespValue::Array(Some(vec![
+            RespValue::BulkString(Some(b"DEL".to_vec())),
+            RespValue::BulkString(Some(key.as_bytes().to_vec())),
+        ])),
+        &mut del_out,
+    );
+    let del_resp = String::from_utf8_lossy(&del_out);
+    assert!(del_resp.starts_with("-MOVED"), "DEL should still MOVED with READONLY");
+}
+
 // =================== Connection Pool Tests ===================
 
 #[test]

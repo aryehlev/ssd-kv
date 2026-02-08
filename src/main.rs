@@ -271,6 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.bind,
             Arc::clone(&handler),
             router,
+            config.replica_read,
         );
         info!("Redis-compatible server (clustered) on {}", config.bind);
 

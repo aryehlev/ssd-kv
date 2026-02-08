@@ -56,6 +56,10 @@ spec:
                   type: integer
                   default: 7780
                   description: Port for inter-node cluster communication.
+                replicaRead:
+                  type: boolean
+                  default: false
+                  description: Allow replica nodes to serve read requests (READONLY command).
                 resources:
                   type: object
                   properties:

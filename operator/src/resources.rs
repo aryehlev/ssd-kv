@@ -84,6 +84,34 @@ pub fn build_client_service(cluster: &SsdkvCluster) -> Service {
     }
 }
 
+/// Builds a read-only client Service for replica read traffic.
+pub fn build_readonly_service(cluster: &SsdkvCluster) -> Service {
+    let name = format!("{}-readonly", cluster.name_any());
+    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
+    let selector = cluster_labels(cluster);
+    let mut labels = selector.clone();
+    labels.insert("ssdkv.io/role".to_string(), "replica".to_string());
+
+    Service {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace: Some(namespace),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(selector),
+            ports: Some(vec![ServicePort {
+                name: Some("redis".to_string()),
+                port: cluster.spec.redis_port,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Builds the topology ConfigMap containing shard-to-node mapping.
 pub fn build_topology_configmap(cluster: &SsdkvCluster, shard_map: &ShardMap) -> ConfigMap {
     let name = format!("{}-topology", cluster.name_any());
@@ -147,6 +175,12 @@ pub fn build_statefulset(cluster: &SsdkvCluster) -> StatefulSet {
         .collect();
     let peers_str = peers.join(",");
 
+    let replica_read_flag = if cluster.spec.replica_read {
+        " --replica-read"
+    } else {
+        ""
+    };
+
     let container = Container {
         name: "ssd-kv".to_string(),
         image: Some(cluster.spec.image.clone()),
@@ -189,13 +223,15 @@ pub fn build_statefulset(cluster: &SsdkvCluster) -> StatefulSet {
                     "--total-nodes {} ",
                     "--replication-factor {} ",
                     "--cluster-port {} ",
-                    "--cluster-peers {}"
+                    "--cluster-peers {}",
+                    "{}"
                 ),
                 cluster.spec.redis_port,
                 cluster.spec.replicas,
                 cluster.spec.replication_factor,
                 cluster.spec.cluster_port,
                 peers_str,
+                replica_read_flag,
             ),
         ]),
         volume_mounts: Some(vec![VolumeMount {

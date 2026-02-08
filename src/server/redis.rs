@@ -6,6 +6,7 @@
 //! - Inline response building
 //! - TCP_NODELAY for low latency
 
+use std::cell::Cell;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace};
 
 use crate::cluster::router::{ClusterRouter, RouteDecision};
-use crate::cluster::topology::{key_hash_slot, NUM_SLOTS};
+use crate::cluster::topology::{ClusterTopology, key_hash_slot, NUM_SLOTS};
 use crate::server::handler::Handler;
 
 /// Maximum pipeline depth before forcing flush
@@ -357,19 +358,25 @@ struct SetOptions {
 
 /// High-performance Redis command handler
 pub struct RedisHandler {
-    handler: Arc<Handler>,
-    router: Option<Arc<ClusterRouter>>,
+    pub handler: Arc<Handler>,
+    pub router: Option<Arc<ClusterRouter>>,
+    /// Per-connection flag: when true, read commands are served locally on replicas.
+    readonly: Cell<bool>,
+    /// Server-level flag: when false, READONLY is accepted but has no routing effect.
+    replica_read: bool,
 }
 
 impl RedisHandler {
     pub fn new(handler: Arc<Handler>) -> Self {
-        Self { handler, router: None }
+        Self { handler, router: None, readonly: Cell::new(false), replica_read: false }
     }
 
-    pub fn with_router(handler: Arc<Handler>, router: Arc<ClusterRouter>) -> Self {
+    pub fn with_router(handler: Arc<Handler>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
         Self {
             handler,
             router: Some(router),
+            readonly: Cell::new(false),
+            replica_read,
         }
     }
 
@@ -418,6 +425,8 @@ impl RedisHandler {
             b"PERSIST" | b"persist" => self.cmd_persist(&args, out),
             b"EXPIREAT" | b"expireat" => self.cmd_expireat(&args, out),
             b"PEXPIREAT" | b"pexpireat" => self.cmd_pexpireat(&args, out),
+            b"READONLY" | b"readonly" => self.cmd_readonly(out),
+            b"READWRITE" | b"readwrite" => self.cmd_readwrite(out),
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd);
                 RespValue::err(&format!("Unknown command: {}", cmd_str)).serialize_into(out);
@@ -452,6 +461,38 @@ impl RedisHandler {
         false
     }
 
+    /// Like `check_moved` but allows local reads on replicas when READONLY is set.
+    #[inline]
+    fn check_moved_read(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
+        if self.readonly.get() && self.replica_read && self.is_local_replica_for_key(key) {
+            return false;
+        }
+        self.check_moved(key, out)
+    }
+
+    /// Returns true if this node is a replica for the slot that `key` hashes to.
+    fn is_local_replica_for_key(&self, key: &[u8]) -> bool {
+        if let Some(router) = &self.router {
+            let slot = ClusterTopology::slot_for_key(key);
+            let topo = router.topology().read();
+            topo.is_local_replica(slot)
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    fn cmd_readonly(&self, out: &mut Vec<u8>) {
+        self.readonly.set(true);
+        RespValue::ok().serialize_into(out);
+    }
+
+    #[inline]
+    fn cmd_readwrite(&self, out: &mut Vec<u8>) {
+        self.readonly.set(false);
+        RespValue::ok().serialize_into(out);
+    }
+
     #[inline]
     fn cmd_get(&self, args: &[RespValue], out: &mut Vec<u8>) {
         if args.len() < 2 {
@@ -467,7 +508,7 @@ impl RedisHandler {
             }
         };
 
-        if self.check_moved(key, out) {
+        if self.check_moved_read(key, out) {
             return;
         }
 
@@ -728,7 +769,7 @@ impl RedisHandler {
                         }
                     }
                 }
-                if self.check_moved(first_key, out) {
+                if self.check_moved_read(first_key, out) {
                     return;
                 }
             }
@@ -825,7 +866,7 @@ impl RedisHandler {
         let mut count = 0i64;
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                if self.check_moved(key, out) {
+                if self.check_moved_read(key, out) {
                     return;
                 }
                 if self.handler.get_value(key).is_some() {
@@ -1039,7 +1080,7 @@ impl RedisHandler {
             }
         };
 
-        if self.check_moved(key, out) {
+        if self.check_moved_read(key, out) {
             return;
         }
 
@@ -1075,7 +1116,7 @@ impl RedisHandler {
             }
         };
 
-        if self.check_moved(key, out) {
+        if self.check_moved_read(key, out) {
             return;
         }
 
@@ -1333,15 +1374,16 @@ pub struct RedisServer {
     addr: SocketAddr,
     handler: Arc<Handler>,
     router: Option<Arc<ClusterRouter>>,
+    replica_read: bool,
 }
 
 impl RedisServer {
     pub fn new(addr: SocketAddr, handler: Arc<Handler>) -> Self {
-        Self { addr, handler, router: None }
+        Self { addr, handler, router: None, replica_read: false }
     }
 
-    pub fn with_router(addr: SocketAddr, handler: Arc<Handler>, router: Arc<ClusterRouter>) -> Self {
-        Self { addr, handler, router: Some(router) }
+    pub fn with_router(addr: SocketAddr, handler: Arc<Handler>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
+        Self { addr, handler, router: Some(router), replica_read }
     }
 
     pub fn run(&self) -> io::Result<()> {
@@ -1356,8 +1398,9 @@ impl RedisServer {
                 Ok(stream) => {
                     let handler = Arc::clone(&self.handler);
                     let router = self.router.clone();
+                    let replica_read = self.replica_read;
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_redis_client_fast(stream, handler, router) {
+                        if let Err(e) = handle_redis_client_fast(stream, handler, router, replica_read) {
                             debug!("Redis client error: {}", e);
                         }
                     });
@@ -1377,6 +1420,7 @@ fn handle_redis_client_fast(
     mut stream: TcpStream,
     handler: Arc<Handler>,
     router: Option<Arc<ClusterRouter>>,
+    replica_read: bool,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
@@ -1386,7 +1430,7 @@ fn handle_redis_client_fast(
 
     let mut parser = RespParser::new();
     let redis_handler = if let Some(router) = router {
-        RedisHandler::with_router(handler, router)
+        RedisHandler::with_router(handler, router, replica_read)
     } else {
         RedisHandler::new(handler)
     };
@@ -1457,11 +1501,178 @@ pub fn start_redis_server_clustered(
     addr: SocketAddr,
     handler: Arc<Handler>,
     router: Arc<ClusterRouter>,
+    replica_read: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let server = RedisServer::with_router(addr, handler, router);
+        let server = RedisServer::with_router(addr, handler, router, replica_read);
         if let Err(e) = server.run() {
             error!("Redis server error: {}", e);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::node::NodeInfo;
+    use crate::cluster::peer_pool::PeerConnectionPool;
+    use crate::cluster::topology::ClusterTopology;
+    use crate::engine::index::Index;
+    use crate::storage::file_manager::FileManager;
+    use crate::storage::write_buffer::WriteBuffer;
+    use parking_lot::RwLock;
+
+    fn make_handler(dir: &std::path::Path) -> Arc<Handler> {
+        let fm = Arc::new(FileManager::new(dir).unwrap());
+        fm.create_file().unwrap();
+        let index = Arc::new(Index::new());
+        let wb = Arc::new(WriteBuffer::new(0, 1023));
+        Arc::new(Handler::new(index, fm, wb))
+    }
+
+    fn make_cmd(parts: &[&[u8]]) -> RespValue {
+        RespValue::Array(Some(
+            parts.iter().map(|p| RespValue::BulkString(Some(p.to_vec()))).collect()
+        ))
+    }
+
+    #[test]
+    fn test_readonly_command_responds_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"READONLY"]), &mut out);
+        assert_eq!(out, b"+OK\r\n");
+        assert!(rh.readonly.get());
+    }
+
+    #[test]
+    fn test_readwrite_command_responds_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+        let rh = RedisHandler::new(handler);
+        let mut out = Vec::new();
+
+        // Set readonly first
+        rh.readonly.set(true);
+        rh.handle_command(make_cmd(&[b"READWRITE"]), &mut out);
+        assert_eq!(out, b"+OK\r\n");
+        assert!(!rh.readonly.get());
+    }
+
+    #[test]
+    fn test_readonly_flag_allows_replica_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+
+        // Set up a 3-node cluster where this node is node 1 (not primary for all slots)
+        let nodes = vec![
+            NodeInfo::new(0, "127.0.0.1:7777".parse().unwrap(), "127.0.0.1:7780".parse().unwrap()),
+            NodeInfo::new(1, "127.0.0.1:7778".parse().unwrap(), "127.0.0.1:7781".parse().unwrap()),
+            NodeInfo::new(2, "127.0.0.1:7779".parse().unwrap(), "127.0.0.1:7782".parse().unwrap()),
+        ];
+        // This node is node 1, replication factor 2 means it's replica for node 0's slots
+        let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
+        let peers = Arc::new(PeerConnectionPool::new());
+        let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
+        let rh = RedisHandler::with_router(handler, router, true);
+
+        // Write a key locally that hashes to a slot where node 1 is a replica (node 0 is primary)
+        let mut replica_key = None;
+        for i in 0..10_000 {
+            let key = format!("rr_key_{}", i);
+            if rh.is_local_replica_for_key(key.as_bytes()) {
+                replica_key = Some(key);
+                break;
+            }
+        }
+        let key = replica_key.expect("Should find a key where node 1 is replica");
+
+        // Write it directly to the local handler (simulating replication)
+        rh.handler.put_sync(key.as_bytes(), b"replica_val", 0).unwrap();
+
+        // Without READONLY, GET should return MOVED
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"GET", key.as_bytes()]), &mut out);
+        let response = String::from_utf8_lossy(&out);
+        assert!(response.starts_with("-MOVED"), "Expected MOVED, got: {}", response);
+
+        // With READONLY, GET should succeed locally
+        rh.readonly.set(true);
+        let mut out2 = Vec::new();
+        rh.handle_command(make_cmd(&[b"GET", key.as_bytes()]), &mut out2);
+        let response2 = String::from_utf8_lossy(&out2);
+        assert!(!response2.starts_with("-MOVED"), "Expected local read, got: {}", response2);
+        assert!(response2.contains("replica_val"));
+    }
+
+    #[test]
+    fn test_readonly_writes_still_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+
+        let nodes = vec![
+            NodeInfo::new(0, "127.0.0.1:7777".parse().unwrap(), "127.0.0.1:7780".parse().unwrap()),
+            NodeInfo::new(1, "127.0.0.1:7778".parse().unwrap(), "127.0.0.1:7781".parse().unwrap()),
+            NodeInfo::new(2, "127.0.0.1:7779".parse().unwrap(), "127.0.0.1:7782".parse().unwrap()),
+        ];
+        let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
+        let peers = Arc::new(PeerConnectionPool::new());
+        let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
+        let rh = RedisHandler::with_router(handler, router, true);
+        rh.readonly.set(true);
+
+        // Find a key where node 1 is replica (node 0 is primary)
+        let mut replica_key = None;
+        for i in 0..10_000 {
+            let key = format!("wr_key_{}", i);
+            if rh.is_local_replica_for_key(key.as_bytes()) {
+                replica_key = Some(key);
+                break;
+            }
+        }
+        let key = replica_key.expect("Should find replica key");
+
+        // SET should still return MOVED even with READONLY
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"SET", key.as_bytes(), b"val"]), &mut out);
+        let response = String::from_utf8_lossy(&out);
+        assert!(response.starts_with("-MOVED"), "Writes should MOVED even with READONLY: {}", response);
+    }
+
+    #[test]
+    fn test_readonly_without_replica_read_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = make_handler(dir.path());
+
+        let nodes = vec![
+            NodeInfo::new(0, "127.0.0.1:7777".parse().unwrap(), "127.0.0.1:7780".parse().unwrap()),
+            NodeInfo::new(1, "127.0.0.1:7778".parse().unwrap(), "127.0.0.1:7781".parse().unwrap()),
+        ];
+        let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
+        let peers = Arc::new(PeerConnectionPool::new());
+        let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
+        // replica_read = false (server disabled)
+        let rh = RedisHandler::with_router(handler, router, false);
+        rh.readonly.set(true);
+
+        // Find a key where we're replica
+        let mut replica_key = None;
+        for i in 0..10_000 {
+            let key = format!("nr_key_{}", i);
+            if rh.is_local_replica_for_key(key.as_bytes()) {
+                replica_key = Some(key);
+                break;
+            }
+        }
+        let key = replica_key.expect("Should find replica key");
+
+        // Even with READONLY set, should still MOVED because replica_read config is false
+        let mut out = Vec::new();
+        rh.handle_command(make_cmd(&[b"GET", key.as_bytes()]), &mut out);
+        let response = String::from_utf8_lossy(&out);
+        assert!(response.starts_with("-MOVED"), "Expected MOVED when replica_read=false: {}", response);
+    }
 }

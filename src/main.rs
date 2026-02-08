@@ -26,10 +26,11 @@ use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
 use engine::{recover_index, Index};
 use perf::{PerfTuning, pin_to_cpu};
-use server::{Handler, start_redis_server, start_redis_server_clustered};
+use server::{Handler, DatabaseManager, DbHandler, start_redis_server, start_redis_server_clustered};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
 use storage::file_manager::FileManager;
+use storage::memory_store::MemoryStore;
 use storage::write_buffer::WriteBuffer;
 
 /// Use mimalloc as the global allocator for better performance.
@@ -72,56 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create data directory
     std::fs::create_dir_all(&config.data_dir)?;
 
-    // Initialize file manager
-    let file_manager = Arc::new(FileManager::new(&config.data_dir)?);
-    info!("File manager initialized with {} existing files", file_manager.file_count());
-
-    // Initialize index
-    let index = Arc::new(Index::new());
-
-    // Initialize write buffer
-    let write_buffer = Arc::new(WriteBuffer::new(
-        file_manager.file_count() as u32,
-        config.wblocks_per_file,
-    ));
-
-    // Recover index from existing data files
-    info!("Recovering index from data files...");
-    let recovery_stats = recover_index(&index, &file_manager)?;
-    info!(
-        "Recovery complete: {} records indexed, {} expired, {} deleted",
-        recovery_stats.records_indexed,
-        recovery_stats.records_expired,
-        recovery_stats.records_deleted
-    );
-
-    // Create initial file if none exist
-    if file_manager.file_count() == 0 {
-        file_manager.create_file()?;
-        info!("Created initial data file");
-    }
-
-    // Start compaction thread if enabled
-    let compaction_stop = if !config.no_compaction {
-        let compaction_config = CompactionConfig {
-            utilization_threshold: config.compaction_threshold,
-            check_interval_secs: config.compaction_interval,
-            ..Default::default()
-        };
-
-        let (_compactor, stop) = start_compaction_thread(
-            compaction_config,
-            Arc::clone(&index),
-            Arc::clone(&file_manager),
-            Arc::clone(&write_buffer),
-        );
-        info!("Compaction thread started");
-        Some(stop)
-    } else {
-        info!("Compaction disabled");
-        None
-    };
-
     // Auto-tune performance settings
     let tuning = PerfTuning::auto_tune();
     info!("Performance tuning: {:?}", tuning);
@@ -129,38 +80,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pin main thread to CPU 0
     let _ = pin_to_cpu(0);
 
-    // Create request handler
     let eviction_policy = EvictionPolicy::from_str(&config.eviction_policy);
-    let mut handler_inner = Handler::new(
-        Arc::clone(&index),
-        Arc::clone(&file_manager),
-        Arc::clone(&write_buffer),
-    );
-    handler_inner.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
-    let handler = Arc::new(handler_inner);
 
-    // Start eviction thread if needed
-    let eviction_stop = if config.eviction_policy != "noeviction"
-        || config.max_entries > 0
-        || config.max_data_mb > 0
-    {
-        let eviction_config = EvictionConfig {
-            policy: eviction_policy,
-            max_entries: config.max_entries,
-            max_data_mb: config.max_data_mb,
-            check_interval_secs: config.eviction_interval,
-            sample_size: 16,
-        };
-        let (_evictor, stop) = start_eviction_thread(
-            eviction_config,
-            Arc::clone(&handler),
-            Arc::clone(&index),
-        );
-        info!("Eviction thread started (policy={})", config.eviction_policy);
-        Some(stop)
-    } else {
-        None
-    };
+    // Create all databases
+    info!("Initializing {} databases...", config.num_dbs);
+    let mut db_handlers = Vec::with_capacity(config.num_dbs as usize);
+    let mut compaction_stops: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut eviction_stops: Vec<Arc<AtomicBool>> = Vec::new();
+
+    for db_id in 0..config.num_dbs {
+        if config.is_memory_db(db_id) {
+            // Memory-only DB
+            let mut store = MemoryStore::new();
+            store.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
+            db_handlers.push(DbHandler::Memory(Arc::new(store)));
+            info!("DB {}: memory-only", db_id);
+        } else {
+            // SSD-backed DB
+            let db_data_dir = if config.num_dbs == 1 {
+                config.data_dir.clone() // backward compat: use data_dir directly
+            } else {
+                config.data_dir.join(format!("db{}", db_id))
+            };
+            std::fs::create_dir_all(&db_data_dir)?;
+
+            let fm = Arc::new(FileManager::new(&db_data_dir)?);
+            let idx = Arc::new(Index::new());
+            let wb = Arc::new(WriteBuffer::new(fm.file_count() as u32, config.wblocks_per_file));
+
+            // Recover index
+            let recovery_stats = recover_index(&idx, &fm)?;
+            info!(
+                "DB {}: SSD, recovered {} records ({} expired, {} deleted)",
+                db_id, recovery_stats.records_indexed, recovery_stats.records_expired, recovery_stats.records_deleted
+            );
+
+            if fm.file_count() == 0 {
+                fm.create_file()?;
+            }
+
+            // Start compaction thread for this DB
+            if !config.no_compaction {
+                let compaction_config = CompactionConfig {
+                    utilization_threshold: config.compaction_threshold,
+                    check_interval_secs: config.compaction_interval,
+                    ..Default::default()
+                };
+                let (_compactor, stop) = start_compaction_thread(
+                    compaction_config,
+                    Arc::clone(&idx),
+                    Arc::clone(&fm),
+                    Arc::clone(&wb),
+                );
+                compaction_stops.push(stop);
+            }
+
+            let mut handler_inner = Handler::new(
+                Arc::clone(&idx),
+                Arc::clone(&fm),
+                Arc::clone(&wb),
+            );
+            handler_inner.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
+            let handler = Arc::new(handler_inner);
+
+            // Start eviction thread for this SSD DB
+            if config.eviction_policy != "noeviction"
+                || config.max_entries > 0
+                || config.max_data_mb > 0
+            {
+                let eviction_config = EvictionConfig {
+                    policy: eviction_policy,
+                    max_entries: config.max_entries,
+                    max_data_mb: config.max_data_mb,
+                    check_interval_secs: config.eviction_interval,
+                    sample_size: 16,
+                };
+                let (_evictor, stop) = start_eviction_thread(
+                    eviction_config,
+                    Arc::clone(&handler),
+                    Arc::clone(&idx),
+                );
+                eviction_stops.push(stop);
+            }
+
+            db_handlers.push(DbHandler::Ssd(handler));
+        }
+    }
+
+    let db_manager = Arc::new(DatabaseManager::new(db_handlers));
+    info!("All databases initialized");
+
+    // Get DB 0 handler for cluster components that need Arc<Handler>
+    let primary_handler = db_manager.db(0).unwrap().as_ssd().cloned();
 
     // Initialize cluster components or standalone
     let _health_stop = if config.cluster_mode {
@@ -220,24 +231,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // In cluster mode, DB 0 must be SSD-backed
+        let cluster_handler = primary_handler.clone()
+            .expect("DB 0 must be SSD-backed in cluster mode");
+
         // Create router
         let router = Arc::new(ClusterRouter::new(
             Arc::clone(&topology),
-            Arc::clone(&handler),
+            Arc::clone(&cluster_handler),
             Arc::clone(&peers),
         ));
 
         // Create replication manager
         let replication = Arc::new(ReplicationManager::new(
             Arc::clone(&topology),
-            Arc::clone(&handler),
+            Arc::clone(&cluster_handler),
             Arc::clone(&peers),
         ));
 
         // Start peer server
         let peer_addr = format!("0.0.0.0:{}", config.cluster_port).parse().unwrap();
         let peer_server = Arc::new(PeerServer::new(
-            Arc::clone(&handler),
+            Arc::clone(&cluster_handler),
             Arc::clone(&replication),
             Arc::clone(&topology),
         ));
@@ -269,7 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Start Redis server with cluster routing
         let _redis_handle = start_redis_server_clustered(
             config.bind,
-            Arc::clone(&handler),
+            Arc::clone(&db_manager),
             router,
             config.replica_read,
         );
@@ -288,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(health_stop)
     } else {
         // Standalone mode
-        let _redis_handle = start_redis_server(config.bind, Arc::clone(&handler));
+        let _redis_handle = start_redis_server(config.bind, Arc::clone(&db_manager));
         info!("Redis-compatible server on {}", config.bind);
         None
     };
@@ -296,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_signal = Arc::new(AtomicBool::new(false));
 
     // Handle shutdown signals
-    let handler_clone = Arc::clone(&handler);
+    let db_manager_clone = Arc::clone(&db_manager);
     let shutdown_clone = Arc::clone(&shutdown_signal);
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
@@ -305,7 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Shutdown signal received");
 
         // Flush pending writes
-        if let Err(e) = handler_clone.flush().await {
+        if let Err(e) = db_manager_clone.flush_all().await {
             error!("Error flushing on shutdown: {}", e);
         }
 
@@ -322,21 +337,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stop.store(true, Ordering::SeqCst);
     }
 
-    // Stop eviction thread
-    if let Some(stop) = eviction_stop {
+    // Stop eviction threads
+    for stop in &eviction_stops {
         stop.store(true, Ordering::SeqCst);
     }
 
-    // Stop compaction thread
-    if let Some(stop) = compaction_stop {
+    // Stop compaction threads
+    for stop in &compaction_stops {
         stop.store(true, Ordering::SeqCst);
-        info!("Waiting for compaction thread to stop...");
+    }
+    if !compaction_stops.is_empty() {
+        info!("Waiting for compaction threads to stop...");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     // Final flush
     info!("Flushing pending writes...");
-    handler.flush().await?;
+    db_manager.flush_all().await?;
 
     info!("SSD-KV shutdown complete");
     Ok(())

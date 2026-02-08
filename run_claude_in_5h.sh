@@ -1,7 +1,7 @@
 #!/bin/bash
 
 PROMPT_FILE="prompt.txt"
-DELAY=$((5 * 60 * 60))   # 5 hours in seconds
+DELAY=$((2 * 60 * 60))   # 5 hours in seconds
 
 if [ ! -f "$PROMPT_FILE" ]; then
   echo "Missing prompt.txt"

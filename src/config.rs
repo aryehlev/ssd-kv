@@ -117,6 +117,16 @@ pub struct Config {
     /// Allow replica nodes to serve read requests (clients must still send READONLY)
     #[arg(long)]
     pub replica_read: bool,
+
+    // --- Multi-database options ---
+
+    /// Number of databases (1-16, like Redis)
+    #[arg(long, default_value = "16")]
+    pub num_dbs: u8,
+
+    /// Comma-separated list of DB indices that are memory-only (e.g. "1,2,5")
+    #[arg(long)]
+    pub memory_dbs: Option<String>,
 }
 
 impl Config {
@@ -161,6 +171,31 @@ impl Config {
             }
         }
 
+        if self.num_dbs == 0 || self.num_dbs > 16 {
+            return Err("--num-dbs must be between 1 and 16".to_string());
+        }
+
+        if let Some(ref mem_list) = self.memory_dbs {
+            for s in mem_list.split(',') {
+                let s = s.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                match s.parse::<u8>() {
+                    Ok(id) if id < self.num_dbs => {}
+                    Ok(id) => {
+                        return Err(format!(
+                            "memory-dbs index {} is out of range (num-dbs={})",
+                            id, self.num_dbs
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(format!("invalid memory-dbs value: '{}'", s));
+                    }
+                }
+            }
+        }
+
         if self.cluster_mode {
             if self.node_id.is_none() {
                 return Err("--node-id is required in cluster mode".to_string());
@@ -187,6 +222,14 @@ impl Config {
     /// Returns the write buffer size in bytes.
     pub fn write_buffer_size(&self) -> usize {
         self.write_buffer_kb * 1024
+    }
+
+    /// Returns true if the given DB index is configured as memory-only.
+    pub fn is_memory_db(&self, db_id: u8) -> bool {
+        self.memory_dbs.as_ref().map_or(false, |list| {
+            list.split(',')
+                .any(|s| s.trim().parse::<u8>().ok() == Some(db_id))
+        })
     }
 }
 
@@ -218,6 +261,8 @@ impl Default for Config {
             eviction_policy: "noeviction".to_string(),
             eviction_interval: 1,
             replica_read: false,
+            num_dbs: 16,
+            memory_dbs: None,
         }
     }
 }

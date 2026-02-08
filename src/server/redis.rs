@@ -17,6 +17,7 @@ use tracing::{debug, error, info, trace};
 
 use crate::cluster::router::{ClusterRouter, RouteDecision};
 use crate::cluster::topology::{ClusterTopology, key_hash_slot, NUM_SLOTS};
+use crate::server::db_manager::{DatabaseManager, DbHandler};
 use crate::server::handler::Handler;
 
 /// Maximum pipeline depth before forcing flush
@@ -451,12 +452,14 @@ impl PubSubManager {
 
 /// High-performance Redis command handler
 pub struct RedisHandler {
-    pub handler: Arc<Handler>,
+    pub db_manager: Arc<DatabaseManager>,
     pub router: Option<Arc<ClusterRouter>>,
     /// Per-connection flag: when true, read commands are served locally on replicas.
     readonly: Cell<bool>,
     /// Server-level flag: when false, READONLY is accepted but has no routing effect.
     replica_read: bool,
+    /// Current database index (SELECT changes this).
+    current_db: Cell<u8>,
     /// Shared pub/sub manager.
     pub pubsub: Arc<PubSubManager>,
     /// Transaction state: None = not in transaction, Some = queued commands.
@@ -466,36 +469,39 @@ pub struct RedisHandler {
 }
 
 impl RedisHandler {
-    pub fn new(handler: Arc<Handler>) -> Self {
+    pub fn new(db_manager: Arc<DatabaseManager>) -> Self {
         Self {
-            handler,
+            db_manager,
             router: None,
             readonly: Cell::new(false),
             replica_read: false,
+            current_db: Cell::new(0),
             pubsub: Arc::new(PubSubManager::new()),
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
-    pub fn new_with_pubsub(handler: Arc<Handler>, pubsub: Arc<PubSubManager>) -> Self {
+    pub fn new_with_pubsub(db_manager: Arc<DatabaseManager>, pubsub: Arc<PubSubManager>) -> Self {
         Self {
-            handler,
+            db_manager,
             router: None,
             readonly: Cell::new(false),
             replica_read: false,
+            current_db: Cell::new(0),
             pubsub,
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
-    pub fn with_router(handler: Arc<Handler>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
+    pub fn with_router(db_manager: Arc<DatabaseManager>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
         Self {
-            handler,
+            db_manager,
             router: Some(router),
             readonly: Cell::new(false),
             replica_read,
+            current_db: Cell::new(0),
             pubsub: Arc::new(PubSubManager::new()),
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
@@ -503,20 +509,27 @@ impl RedisHandler {
     }
 
     pub fn with_router_and_pubsub(
-        handler: Arc<Handler>,
+        db_manager: Arc<DatabaseManager>,
         router: Arc<ClusterRouter>,
         replica_read: bool,
         pubsub: Arc<PubSubManager>,
     ) -> Self {
         Self {
-            handler,
+            db_manager,
             router: Some(router),
             readonly: Cell::new(false),
             replica_read,
+            current_db: Cell::new(0),
             pubsub,
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Returns the current database handler.
+    #[inline]
+    fn current_handler(&self) -> &DbHandler {
+        self.db_manager.db(self.current_db.get()).unwrap()
     }
 
     /// Handles a Redis command and writes response to buffer
@@ -711,7 +724,7 @@ impl RedisHandler {
             return;
         }
 
-        match self.handler.get_value(key) {
+        match self.current_handler().get_value(key) {
             Some(value) => RespValue::bulk(value).serialize_into(out),
             None => RespValue::null().serialize_into(out),
         }
@@ -755,7 +768,7 @@ impl RedisHandler {
 
         // NX: only set if key does NOT exist
         if opts.nx {
-            if self.handler.get_value(key).is_some() {
+            if self.current_handler().get_value(key).is_some() {
                 RespValue::null().serialize_into(out);
                 return;
             }
@@ -763,7 +776,7 @@ impl RedisHandler {
 
         // XX: only set if key EXISTS
         if opts.xx {
-            if self.handler.get_value(key).is_none() {
+            if self.current_handler().get_value(key).is_none() {
                 RespValue::null().serialize_into(out);
                 return;
             }
@@ -771,7 +784,7 @@ impl RedisHandler {
 
         // GET: capture old value before writing
         let old_value = if opts.get {
-            self.handler.get_value(key)
+            self.current_handler().get_value(key)
         } else {
             None
         };
@@ -779,7 +792,7 @@ impl RedisHandler {
         // Determine final TTL
         let final_ttl = if opts.keepttl {
             // Preserve existing TTL
-            self.handler
+            self.current_handler()
                 .get_with_meta(key)
                 .map(|m| m.ttl_secs)
                 .unwrap_or(0)
@@ -787,7 +800,7 @@ impl RedisHandler {
             opts.ttl_secs
         };
 
-        match self.handler.put_sync(key, value, final_ttl) {
+        match self.current_handler().put_sync(key, value, final_ttl) {
             Ok(_) => {
                 if opts.get {
                     match old_value {
@@ -937,7 +950,7 @@ impl RedisHandler {
                 if self.check_moved(key, out) {
                     return;
                 }
-                if let Ok(true) = self.handler.delete_sync(key) {
+                if let Ok(true) = self.current_handler().delete_sync(key) {
                     deleted += 1;
                 }
             }
@@ -981,7 +994,7 @@ impl RedisHandler {
 
         for arg in &args[1..] {
             if let RespValue::BulkString(Some(key)) = arg {
-                match self.handler.get_value(key) {
+                match self.current_handler().get_value(key) {
                     Some(value) => {
                         out.push(b'$');
                         out.extend_from_slice(itoa::Buffer::new().format(value.len()).as_bytes());
@@ -1045,7 +1058,7 @@ impl RedisHandler {
                 }
             };
 
-            if let Err(e) = self.handler.put_sync(key, value, 0) {
+            if let Err(e) = self.current_handler().put_sync(key, value, 0) {
                 RespValue::err(&e.to_string()).serialize_into(out);
                 return;
             }
@@ -1068,7 +1081,7 @@ impl RedisHandler {
                 if self.check_moved_read(key, out) {
                     return;
                 }
-                if self.handler.get_value(key).is_some() {
+                if self.current_handler().get_value(key).is_some() {
                     count += 1;
                 }
             }
@@ -1099,8 +1112,7 @@ impl RedisHandler {
 
     #[inline]
     fn cmd_dbsize(&self, out: &mut Vec<u8>) {
-        let stats = self.handler.index().stats();
-        RespValue::Integer(stats.live_entries as i64).serialize_into(out);
+        RespValue::Integer(self.current_handler().live_entries() as i64).serialize_into(out);
     }
 
     #[inline]
@@ -1332,7 +1344,7 @@ impl RedisHandler {
         if self.check_moved_read(key, out) {
             return;
         }
-        if self.handler.get_value(key).is_some() {
+        if self.current_handler().get_value(key).is_some() {
             RespValue::SimpleString("string".to_string()).serialize_into(out);
         } else {
             RespValue::SimpleString("none".to_string()).serialize_into(out);
@@ -1341,7 +1353,7 @@ impl RedisHandler {
 
     // ── FLUSHDB / FLUSHALL ────────────────────────────────────────────
     fn cmd_flushdb(&self, out: &mut Vec<u8>) {
-        self.handler.index().clear();
+        self.current_handler().clear();
         RespValue::ok().serialize_into(out);
     }
 
@@ -1352,7 +1364,10 @@ impl RedisHandler {
             return;
         }
         match Self::parse_int_arg(&args[1]) {
-            Ok(0) => RespValue::ok().serialize_into(out),
+            Ok(db_num) if db_num >= 0 && (db_num as u8) < self.db_manager.num_dbs() => {
+                self.current_db.set(db_num as u8);
+                RespValue::ok().serialize_into(out);
+            }
             Ok(_) => RespValue::err("ERR DB index is out of range").serialize_into(out),
             Err(e) => RespValue::err(&e).serialize_into(out),
         }
@@ -1430,7 +1445,7 @@ impl RedisHandler {
 
     /// Shared implementation for INCR/DECR/INCRBY/DECRBY
     fn incr_by_int(&self, key: &[u8], delta: i64, out: &mut Vec<u8>) {
-        let current = match self.handler.get_value(key) {
+        let current = match self.current_handler().get_value(key) {
             Some(v) => {
                 match std::str::from_utf8(&v).ok().and_then(|s| s.parse::<i64>().ok()) {
                     Some(n) => n,
@@ -1451,8 +1466,8 @@ impl RedisHandler {
         };
         let new_bytes = new_val.to_string().into_bytes();
         // Preserve existing TTL
-        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.handler.put_sync(key, &new_bytes, ttl) {
+        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.current_handler().put_sync(key, &new_bytes, ttl) {
             Ok(_) => RespValue::Integer(new_val).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1481,7 +1496,7 @@ impl RedisHandler {
             }
             None => { RespValue::err("ERR value is not a valid float").serialize_into(out); return; }
         };
-        let current = match self.handler.get_value(key) {
+        let current = match self.current_handler().get_value(key) {
             Some(v) => {
                 match std::str::from_utf8(&v).ok().and_then(|s| s.parse::<f64>().ok()) {
                     Some(f) => f,
@@ -1500,8 +1515,8 @@ impl RedisHandler {
         }
         let new_str = format_float(new_val);
         let new_bytes = new_str.as_bytes().to_vec();
-        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.handler.put_sync(key, &new_bytes, ttl) {
+        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.current_handler().put_sync(key, &new_bytes, ttl) {
             Ok(_) => RespValue::bulk(new_bytes).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1522,11 +1537,11 @@ impl RedisHandler {
             Some(v) => v,
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
-        let mut new_val = self.handler.get_value(key).unwrap_or_default();
+        let mut new_val = self.current_handler().get_value(key).unwrap_or_default();
         new_val.extend_from_slice(suffix);
         let new_len = new_val.len() as i64;
-        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.handler.put_sync(key, &new_val, ttl) {
+        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.current_handler().put_sync(key, &new_val, ttl) {
             Ok(_) => RespValue::Integer(new_len).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1543,7 +1558,7 @@ impl RedisHandler {
             None => { RespValue::err("Invalid key").serialize_into(out); return; }
         };
         if self.check_moved_read(key, out) { return; }
-        let len = self.handler.get_value(key).map(|v| v.len() as i64).unwrap_or(0);
+        let len = self.current_handler().get_value(key).map(|v| v.len() as i64).unwrap_or(0);
         RespValue::Integer(len).serialize_into(out);
     }
 
@@ -1566,7 +1581,7 @@ impl RedisHandler {
             Ok(v) => v,
             Err(e) => { RespValue::err(&e).serialize_into(out); return; }
         };
-        let value = self.handler.get_value(key).unwrap_or_default();
+        let value = self.current_handler().get_value(key).unwrap_or_default();
         let len = value.len() as i64;
         if len == 0 {
             RespValue::bulk(Vec::new()).serialize_into(out);
@@ -1604,15 +1619,15 @@ impl RedisHandler {
             Some(v) => v,
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
-        let mut value = self.handler.get_value(key).unwrap_or_default();
+        let mut value = self.current_handler().get_value(key).unwrap_or_default();
         let needed = offset + replacement.len();
         if needed > value.len() {
             value.resize(needed, 0);
         }
         value[offset..offset + replacement.len()].copy_from_slice(replacement);
         let new_len = value.len() as i64;
-        let ttl = self.handler.get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.handler.put_sync(key, &value, ttl) {
+        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        match self.current_handler().put_sync(key, &value, ttl) {
             Ok(_) => RespValue::Integer(new_len).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1629,7 +1644,7 @@ impl RedisHandler {
             None => { RespValue::err("Invalid key").serialize_into(out); return; }
         };
         if self.check_moved(key, out) { return; }
-        if self.handler.get_value(key).is_some() {
+        if self.current_handler().get_value(key).is_some() {
             RespValue::Integer(0).serialize_into(out);
             return;
         }
@@ -1637,7 +1652,7 @@ impl RedisHandler {
             Some(v) => v,
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
-        match self.handler.put_sync(key, value, 0) {
+        match self.current_handler().put_sync(key, value, 0) {
             Ok(_) => RespValue::Integer(1).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1665,7 +1680,7 @@ impl RedisHandler {
             Some(v) => v,
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
-        match self.handler.put_sync(key, value, secs) {
+        match self.current_handler().put_sync(key, value, secs) {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1694,7 +1709,7 @@ impl RedisHandler {
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
         let secs = (ms / 1000).max(1) as u32;
-        match self.handler.put_sync(key, value, secs) {
+        match self.current_handler().put_sync(key, value, secs) {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1711,9 +1726,9 @@ impl RedisHandler {
             None => { RespValue::err("Invalid key").serialize_into(out); return; }
         };
         if self.check_moved(key, out) { return; }
-        match self.handler.get_value(key) {
+        match self.current_handler().get_value(key) {
             Some(value) => {
-                let _ = self.handler.delete_sync(key);
+                let _ = self.current_handler().delete_sync(key);
                 RespValue::bulk(value).serialize_into(out);
             }
             None => RespValue::null().serialize_into(out),
@@ -1731,7 +1746,7 @@ impl RedisHandler {
             None => { RespValue::err("Invalid key").serialize_into(out); return; }
         };
         if self.check_moved(key, out) { return; }
-        let value = match self.handler.get_value(key) {
+        let value = match self.current_handler().get_value(key) {
             Some(v) => v,
             None => { RespValue::null().serialize_into(out); return; }
         };
@@ -1745,7 +1760,7 @@ impl RedisHandler {
                             RespValue::err("syntax error").serialize_into(out); return;
                         }
                         match Self::parse_int_arg(&args[3]) {
-                            Ok(s) if s > 0 => { let _ = self.handler.update_ttl(key, s as u32); }
+                            Ok(s) if s > 0 => { let _ = self.current_handler().update_ttl(key, s as u32); }
                             _ => { RespValue::err("ERR invalid expire time").serialize_into(out); return; }
                         }
                     }
@@ -1754,7 +1769,7 @@ impl RedisHandler {
                             RespValue::err("syntax error").serialize_into(out); return;
                         }
                         match Self::parse_int_arg(&args[3]) {
-                            Ok(ms) if ms > 0 => { let _ = self.handler.update_ttl(key, (ms as u64 / 1000).max(1) as u32); }
+                            Ok(ms) if ms > 0 => { let _ = self.current_handler().update_ttl(key, (ms as u64 / 1000).max(1) as u32); }
                             _ => { RespValue::err("ERR invalid expire time").serialize_into(out); return; }
                         }
                     }
@@ -1766,7 +1781,7 @@ impl RedisHandler {
                             Ok(ts) => {
                                 let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                                 if ts > now {
-                                    let _ = self.handler.update_ttl(key, (ts - now) as u32);
+                                    let _ = self.current_handler().update_ttl(key, (ts - now) as u32);
                                 }
                             }
                             Err(e) => { RespValue::err(&e).serialize_into(out); return; }
@@ -1780,14 +1795,14 @@ impl RedisHandler {
                             Ok(ts_ms) => {
                                 let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                                 if ts_ms > now_ms {
-                                    let _ = self.handler.update_ttl(key, ((ts_ms - now_ms) / 1000).max(1) as u32);
+                                    let _ = self.current_handler().update_ttl(key, ((ts_ms - now_ms) / 1000).max(1) as u32);
                                 }
                             }
                             Err(e) => { RespValue::err(&e).serialize_into(out); return; }
                         }
                     }
                     b"PERSIST" | b"persist" => {
-                        let _ = self.handler.update_ttl(key, 0);
+                        let _ = self.current_handler().update_ttl(key, 0);
                     }
                     _ => {
                         RespValue::err("ERR unsupported option").serialize_into(out); return;
@@ -1810,16 +1825,11 @@ impl RedisHandler {
         };
 
         let mut matching_keys: Vec<Vec<u8>> = Vec::new();
-        let index = self.handler.index();
-        for shard_idx in 0..crate::engine::index::NUM_SHARDS {
-            let shard = index.shards[shard_idx].read();
-            for entry in shard.iter_live() {
-                let key_bytes = entry.key.as_bytes();
-                if glob_match(pattern, key_bytes) {
-                    matching_keys.push(key_bytes.to_vec());
-                }
+        self.current_handler().iter_keys(|key_bytes| {
+            if glob_match(pattern, key_bytes) {
+                matching_keys.push(key_bytes.to_vec());
             }
-        }
+        });
 
         let items: Vec<RespValue> = matching_keys.into_iter()
             .map(|k| RespValue::BulkString(Some(k)))
@@ -1871,42 +1881,15 @@ impl RedisHandler {
         let start_shard = ((cursor >> 56) & 0xFF) as usize;
         let start_pos = (cursor & 0x00FFFFFFFFFFFFFF) as usize;
 
-        let index = self.handler.index();
         let mut results: Vec<Vec<u8>> = Vec::new();
-        let mut next_shard = start_shard;
-        let mut next_pos = start_pos;
-        let mut done = false;
-
-        'outer: for shard_idx in start_shard..crate::engine::index::NUM_SHARDS {
-            let shard = index.shards[shard_idx].read();
-            let mut pos = if shard_idx == start_shard { start_pos } else { 0 };
-
-            for entry in shard.iter_live().skip(pos) {
-                let key_bytes = entry.key.as_bytes();
-                pos += 1;
-
-                if let Some(pat) = pattern {
-                    if !glob_match(pat, key_bytes) {
-                        continue;
-                    }
-                }
-
-                results.push(key_bytes.to_vec());
-                if results.len() >= count {
-                    next_shard = shard_idx;
-                    next_pos = pos;
-                    break 'outer;
-                }
-            }
-
-            // Finished this shard
-            if shard_idx + 1 < crate::engine::index::NUM_SHARDS {
-                next_shard = shard_idx + 1;
-                next_pos = 0;
-            } else {
-                done = true;
-            }
-        }
+        let (next_shard, next_pos, done) = self.current_handler().scan_keys(
+            start_shard,
+            start_pos,
+            count,
+            pattern,
+            &mut results,
+            glob_match,
+        );
 
         let next_cursor = if done {
             0u64
@@ -1939,7 +1922,7 @@ impl RedisHandler {
         };
         if self.check_moved(src, out) { return; }
 
-        let meta = match self.handler.get_with_meta(src) {
+        let meta = match self.current_handler().get_with_meta(src) {
             Some(m) => m,
             None => {
                 RespValue::err("ERR no such key").serialize_into(out);
@@ -1947,8 +1930,8 @@ impl RedisHandler {
             }
         };
         // Delete old key, set new key preserving TTL
-        let _ = self.handler.delete_sync(src);
-        match self.handler.put_sync(dst, &meta.value, meta.ttl_secs) {
+        let _ = self.current_handler().delete_sync(src);
+        match self.current_handler().put_sync(dst, &meta.value, meta.ttl_secs) {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1970,19 +1953,19 @@ impl RedisHandler {
         };
         if self.check_moved(src, out) { return; }
 
-        let meta = match self.handler.get_with_meta(src) {
+        let meta = match self.current_handler().get_with_meta(src) {
             Some(m) => m,
             None => {
                 RespValue::err("ERR no such key").serialize_into(out);
                 return;
             }
         };
-        if self.handler.get_value(dst).is_some() {
+        if self.current_handler().get_value(dst).is_some() {
             RespValue::Integer(0).serialize_into(out);
             return;
         }
-        let _ = self.handler.delete_sync(src);
-        match self.handler.put_sync(dst, &meta.value, meta.ttl_secs) {
+        let _ = self.current_handler().delete_sync(src);
+        match self.current_handler().put_sync(dst, &meta.value, meta.ttl_secs) {
             Ok(_) => RespValue::Integer(1).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1990,18 +1973,10 @@ impl RedisHandler {
 
     // ── RANDOMKEY ─────────────────────────────────────────────────────
     fn cmd_randomkey(&self, out: &mut Vec<u8>) {
-        let index = self.handler.index();
-        // Simple approach: scan shards until we find a live key
-        for shard_idx in 0..crate::engine::index::NUM_SHARDS {
-            let shard = index.shards[shard_idx].read();
-            let key_data = shard.iter_live().next().map(|e| e.key.as_bytes().to_vec());
-            drop(shard);
-            if let Some(key) = key_data {
-                RespValue::bulk(key).serialize_into(out);
-                return;
-            }
+        match self.current_handler().random_key() {
+            Some(key) => RespValue::bulk(key).serialize_into(out),
+            None => RespValue::null().serialize_into(out),
         }
-        RespValue::null().serialize_into(out);
     }
 
     // ── OBJECT ────────────────────────────────────────────────────────
@@ -2028,7 +2003,7 @@ impl RedisHandler {
                     Some(k) => k,
                     None => { RespValue::err("Invalid key").serialize_into(out); return; }
                 };
-                if self.handler.get_value(key).is_some() {
+                if self.current_handler().get_value(key).is_some() {
                     RespValue::bulk(b"raw".to_vec()).serialize_into(out);
                 } else {
                     RespValue::err("ERR no such key").serialize_into(out);
@@ -2061,18 +2036,18 @@ impl RedisHandler {
             Self::extract_bulk_arg(a).map(|v| v.eq_ignore_ascii_case(b"REPLACE")).unwrap_or(false)
         });
 
-        let meta = match self.handler.get_with_meta(src) {
+        let meta = match self.current_handler().get_with_meta(src) {
             Some(m) => m,
             None => {
                 RespValue::Integer(0).serialize_into(out);
                 return;
             }
         };
-        if !replace && self.handler.get_value(dst).is_some() {
+        if !replace && self.current_handler().get_value(dst).is_some() {
             RespValue::Integer(0).serialize_into(out);
             return;
         }
-        match self.handler.put_sync(dst, &meta.value, meta.ttl_secs) {
+        match self.current_handler().put_sync(dst, &meta.value, meta.ttl_secs) {
             Ok(_) => RespValue::Integer(1).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -2200,8 +2175,8 @@ impl RedisHandler {
         {
             let watched = self.watched_keys.borrow();
             for (key, gen_at_watch) in watched.iter() {
-                let current_gen = self.handler.index().get(key).map(|e| e.generation);
-                if current_gen.map(|g| Some(g)) != Some(*gen_at_watch) {
+                let current_gen = self.current_handler().get_generation(key);
+                if current_gen != *gen_at_watch {
                     // Watched key changed - abort transaction
                     self.watched_keys.borrow_mut().clear();
                     RespValue::Array(None).serialize_into(out);
@@ -2247,7 +2222,7 @@ impl RedisHandler {
         let mut watched = self.watched_keys.borrow_mut();
         for arg in &args[1..] {
             if let Some(key) = Self::extract_bulk_arg(arg) {
-                let gen = self.handler.index().get(key).map(|e| e.generation);
+                let gen = self.current_handler().get_generation(key);
                 watched.insert(key.to_vec(), gen);
             }
         }
@@ -2284,7 +2259,7 @@ impl RedisHandler {
             return;
         }
 
-        match self.handler.get_with_meta(key) {
+        match self.current_handler().get_with_meta(key) {
             None => RespValue::Integer(-2).serialize_into(out),
             Some(meta) => {
                 if meta.ttl_secs == 0 {
@@ -2320,7 +2295,7 @@ impl RedisHandler {
             return;
         }
 
-        match self.handler.get_with_meta(key) {
+        match self.current_handler().get_with_meta(key) {
             None => RespValue::Integer(-2).serialize_into(out),
             Some(meta) => {
                 if meta.ttl_secs == 0 {
@@ -2377,7 +2352,7 @@ impl RedisHandler {
             }
         };
 
-        match self.handler.update_ttl(key, secs) {
+        match self.current_handler().update_ttl(key, secs) {
             Ok(true) => RespValue::Integer(1).serialize_into(out),
             Ok(false) => RespValue::Integer(0).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
@@ -2420,7 +2395,7 @@ impl RedisHandler {
         };
 
         let secs = (ms / 1000) as u32;
-        match self.handler.update_ttl(key, secs) {
+        match self.current_handler().update_ttl(key, secs) {
             Ok(true) => RespValue::Integer(1).serialize_into(out),
             Ok(false) => RespValue::Integer(0).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
@@ -2442,14 +2417,14 @@ impl RedisHandler {
         }
 
         // Check if key has a TTL first
-        match self.handler.get_with_meta(key) {
+        match self.current_handler().get_with_meta(key) {
             None => RespValue::Integer(0).serialize_into(out),
             Some(meta) => {
                 if meta.ttl_secs == 0 {
                     // No TTL to remove
                     RespValue::Integer(0).serialize_into(out);
                 } else {
-                    match self.handler.update_ttl(key, 0) {
+                    match self.current_handler().update_ttl(key, 0) {
                         Ok(true) => RespValue::Integer(1).serialize_into(out),
                         Ok(false) => RespValue::Integer(0).serialize_into(out),
                         Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
@@ -2501,13 +2476,13 @@ impl RedisHandler {
 
         if timestamp <= now_secs {
             // Already expired - delete
-            let _ = self.handler.delete_sync(key);
+            let _ = self.current_handler().delete_sync(key);
             RespValue::Integer(1).serialize_into(out);
             return;
         }
 
         let remaining = (timestamp - now_secs) as u32;
-        match self.handler.update_ttl(key, remaining) {
+        match self.current_handler().update_ttl(key, remaining) {
             Ok(true) => RespValue::Integer(1).serialize_into(out),
             Ok(false) => RespValue::Integer(0).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
@@ -2555,13 +2530,13 @@ impl RedisHandler {
             .unwrap_or(0);
 
         if timestamp_ms <= now_ms {
-            let _ = self.handler.delete_sync(key);
+            let _ = self.current_handler().delete_sync(key);
             RespValue::Integer(1).serialize_into(out);
             return;
         }
 
         let remaining_secs = ((timestamp_ms - now_ms) / 1000) as u32;
-        match self.handler.update_ttl(key, remaining_secs) {
+        match self.current_handler().update_ttl(key, remaining_secs) {
             Ok(true) => RespValue::Integer(1).serialize_into(out),
             Ok(false) => RespValue::Integer(0).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
@@ -2649,19 +2624,19 @@ fn format_float(f: f64) -> String {
 /// High-performance Redis server with pipelining
 pub struct RedisServer {
     addr: SocketAddr,
-    handler: Arc<Handler>,
+    db_manager: Arc<DatabaseManager>,
     router: Option<Arc<ClusterRouter>>,
     replica_read: bool,
     pubsub: Arc<PubSubManager>,
 }
 
 impl RedisServer {
-    pub fn new(addr: SocketAddr, handler: Arc<Handler>) -> Self {
-        Self { addr, handler, router: None, replica_read: false, pubsub: Arc::new(PubSubManager::new()) }
+    pub fn new(addr: SocketAddr, db_manager: Arc<DatabaseManager>) -> Self {
+        Self { addr, db_manager, router: None, replica_read: false, pubsub: Arc::new(PubSubManager::new()) }
     }
 
-    pub fn with_router(addr: SocketAddr, handler: Arc<Handler>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
-        Self { addr, handler, router: Some(router), replica_read, pubsub: Arc::new(PubSubManager::new()) }
+    pub fn with_router(addr: SocketAddr, db_manager: Arc<DatabaseManager>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
+        Self { addr, db_manager, router: Some(router), replica_read, pubsub: Arc::new(PubSubManager::new()) }
     }
 
     pub fn run(&self) -> io::Result<()> {
@@ -2674,12 +2649,12 @@ impl RedisServer {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let handler = Arc::clone(&self.handler);
+                    let db_manager = Arc::clone(&self.db_manager);
                     let router = self.router.clone();
                     let replica_read = self.replica_read;
                     let pubsub = Arc::clone(&self.pubsub);
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_redis_client_fast(stream, handler, router, replica_read, pubsub) {
+                        if let Err(e) = handle_redis_client_fast(stream, db_manager, router, replica_read, pubsub) {
                             debug!("Redis client error: {}", e);
                         }
                     });
@@ -2697,7 +2672,7 @@ impl RedisServer {
 /// High-performance client handler with pipelining
 fn handle_redis_client_fast(
     mut stream: TcpStream,
-    handler: Arc<Handler>,
+    db_manager: Arc<DatabaseManager>,
     router: Option<Arc<ClusterRouter>>,
     replica_read: bool,
     pubsub: Arc<PubSubManager>,
@@ -2710,9 +2685,9 @@ fn handle_redis_client_fast(
 
     let mut parser = RespParser::new();
     let redis_handler = if let Some(router) = router {
-        RedisHandler::with_router_and_pubsub(handler, router, replica_read, pubsub)
+        RedisHandler::with_router_and_pubsub(db_manager, router, replica_read, pubsub)
     } else {
-        RedisHandler::new_with_pubsub(handler, pubsub)
+        RedisHandler::new_with_pubsub(db_manager, pubsub)
     };
     let mut write_buf = Vec::with_capacity(WRITE_BUFFER_SIZE);
     let mut commands_in_batch = 0;
@@ -2767,9 +2742,9 @@ fn handle_redis_client_fast(
 }
 
 /// Starts the Redis server on a separate thread
-pub fn start_redis_server(addr: SocketAddr, handler: Arc<Handler>) -> std::thread::JoinHandle<()> {
+pub fn start_redis_server(addr: SocketAddr, db_manager: Arc<DatabaseManager>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let server = RedisServer::new(addr, handler);
+        let server = RedisServer::new(addr, db_manager);
         if let Err(e) = server.run() {
             error!("Redis server error: {}", e);
         }
@@ -2779,12 +2754,12 @@ pub fn start_redis_server(addr: SocketAddr, handler: Arc<Handler>) -> std::threa
 /// Starts the Redis server with cluster routing on a separate thread
 pub fn start_redis_server_clustered(
     addr: SocketAddr,
-    handler: Arc<Handler>,
+    db_manager: Arc<DatabaseManager>,
     router: Arc<ClusterRouter>,
     replica_read: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let server = RedisServer::with_router(addr, handler, router, replica_read);
+        let server = RedisServer::with_router(addr, db_manager, router, replica_read);
         if let Err(e) = server.run() {
             error!("Redis server error: {}", e);
         }
@@ -2810,6 +2785,15 @@ mod tests {
         Arc::new(Handler::new(index, fm, wb))
     }
 
+    fn make_db_manager(dir: &std::path::Path) -> Arc<DatabaseManager> {
+        let handler = make_handler(dir);
+        Arc::new(DatabaseManager::new(vec![DbHandler::Ssd(handler)]))
+    }
+
+    fn make_db_manager_from_handler(handler: Arc<Handler>) -> Arc<DatabaseManager> {
+        Arc::new(DatabaseManager::new(vec![DbHandler::Ssd(handler)]))
+    }
+
     fn make_cmd(parts: &[&[u8]]) -> RespValue {
         RespValue::Array(Some(
             parts.iter().map(|p| RespValue::BulkString(Some(p.to_vec()))).collect()
@@ -2819,8 +2803,8 @@ mod tests {
     #[test]
     fn test_readonly_command_responds_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
 
         rh.handle_command(make_cmd(&[b"READONLY"]), &mut out);
@@ -2831,8 +2815,8 @@ mod tests {
     #[test]
     fn test_readwrite_command_responds_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
 
         // Set readonly first
@@ -2857,7 +2841,8 @@ mod tests {
         let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
         let peers = Arc::new(PeerConnectionPool::new());
         let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
-        let rh = RedisHandler::with_router(handler, router, true);
+        let db_manager = make_db_manager_from_handler(Arc::clone(&handler));
+        let rh = RedisHandler::with_router(db_manager, router, true);
 
         // Write a key locally that hashes to a slot where node 1 is a replica (node 0 is primary)
         let mut replica_key = None;
@@ -2871,7 +2856,7 @@ mod tests {
         let key = replica_key.expect("Should find a key where node 1 is replica");
 
         // Write it directly to the local handler (simulating replication)
-        rh.handler.put_sync(key.as_bytes(), b"replica_val", 0).unwrap();
+        handler.put_sync(key.as_bytes(), b"replica_val", 0).unwrap();
 
         // Without READONLY, GET should return MOVED
         let mut out = Vec::new();
@@ -2901,7 +2886,8 @@ mod tests {
         let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
         let peers = Arc::new(PeerConnectionPool::new());
         let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
-        let rh = RedisHandler::with_router(handler, router, true);
+        let db_manager = make_db_manager_from_handler(handler);
+        let rh = RedisHandler::with_router(db_manager, router, true);
         rh.readonly.set(true);
 
         // Find a key where node 1 is replica (node 0 is primary)
@@ -2934,8 +2920,9 @@ mod tests {
         let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
         let peers = Arc::new(PeerConnectionPool::new());
         let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
+        let db_manager = make_db_manager_from_handler(handler);
         // replica_read = false (server disabled)
-        let rh = RedisHandler::with_router(handler, router, false);
+        let rh = RedisHandler::with_router(db_manager, router, false);
         rh.readonly.set(true);
 
         // Find a key where we're replica
@@ -2961,8 +2948,8 @@ mod tests {
     #[test]
     fn test_echo() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"ECHO", b"hello world"]), &mut out);
         let resp = String::from_utf8_lossy(&out);
@@ -2972,8 +2959,8 @@ mod tests {
     #[test]
     fn test_time() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"TIME"]), &mut out);
         let resp = String::from_utf8_lossy(&out);
@@ -2983,8 +2970,8 @@ mod tests {
     #[test]
     fn test_type_existing_key() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"val"]), &mut out);
         out.clear();
@@ -2995,8 +2982,8 @@ mod tests {
     #[test]
     fn test_type_missing_key() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"TYPE", b"nokey"]), &mut out);
         assert_eq!(&out, b"+none\r\n");
@@ -3005,8 +2992,8 @@ mod tests {
     #[test]
     fn test_dbsize() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"k1", b"v1"]), &mut out);
         out.clear();
@@ -3019,8 +3006,8 @@ mod tests {
     #[test]
     fn test_flushdb() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"k1", b"v1"]), &mut out);
         out.clear();
@@ -3034,8 +3021,8 @@ mod tests {
     #[test]
     fn test_incr_new_key() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"INCR", b"counter"]), &mut out);
         assert_eq!(&out, b":1\r\n");
@@ -3044,8 +3031,8 @@ mod tests {
     #[test]
     fn test_incr_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
         out.clear();
@@ -3056,8 +3043,8 @@ mod tests {
     #[test]
     fn test_decr() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
         out.clear();
@@ -3068,8 +3055,8 @@ mod tests {
     #[test]
     fn test_incrby() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
         out.clear();
@@ -3080,8 +3067,8 @@ mod tests {
     #[test]
     fn test_decrby() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"counter", b"10"]), &mut out);
         out.clear();
@@ -3092,8 +3079,8 @@ mod tests {
     #[test]
     fn test_incr_non_integer() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"str", b"not_a_number"]), &mut out);
         out.clear();
@@ -3105,8 +3092,8 @@ mod tests {
     #[test]
     fn test_incrbyfloat() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"flt", b"10.5"]), &mut out);
         out.clear();
@@ -3118,8 +3105,8 @@ mod tests {
     #[test]
     fn test_append() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
         out.clear();
@@ -3134,8 +3121,8 @@ mod tests {
     #[test]
     fn test_strlen() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
         out.clear();
@@ -3146,8 +3133,8 @@ mod tests {
     #[test]
     fn test_strlen_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"STRLEN", b"nokey"]), &mut out);
         assert_eq!(&out, b":0\r\n");
@@ -3156,8 +3143,8 @@ mod tests {
     #[test]
     fn test_getrange() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello World"]), &mut out);
         out.clear();
@@ -3169,8 +3156,8 @@ mod tests {
     #[test]
     fn test_getrange_negative() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello World"]), &mut out);
         out.clear();
@@ -3182,8 +3169,8 @@ mod tests {
     #[test]
     fn test_setrange() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello World"]), &mut out);
         out.clear();
@@ -3198,8 +3185,8 @@ mod tests {
     #[test]
     fn test_setnx_new() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SETNX", b"mykey", b"Hello"]), &mut out);
         assert_eq!(&out, b":1\r\n");
@@ -3208,8 +3195,8 @@ mod tests {
     #[test]
     fn test_setnx_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
         out.clear();
@@ -3220,8 +3207,8 @@ mod tests {
     #[test]
     fn test_setex() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SETEX", b"mykey", b"10", b"Hello"]), &mut out);
         assert_eq!(&out, b"+OK\r\n");
@@ -3237,8 +3224,8 @@ mod tests {
     #[test]
     fn test_getdel() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
         out.clear();
@@ -3253,8 +3240,8 @@ mod tests {
     #[test]
     fn test_getex_with_persist() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"mykey", b"Hello"]), &mut out);
         out.clear();
@@ -3271,8 +3258,8 @@ mod tests {
     #[test]
     fn test_keys_all() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"key1", b"v1"]), &mut out);
         out.clear();
@@ -3290,8 +3277,8 @@ mod tests {
     #[test]
     fn test_scan_basic() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         for i in 0..5 {
             rh.handle_command(make_cmd(&[b"SET", format!("k{}", i).as_bytes(), b"v"]), &mut out);
@@ -3306,8 +3293,8 @@ mod tests {
     #[test]
     fn test_rename() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"old", b"value"]), &mut out);
         out.clear();
@@ -3325,8 +3312,8 @@ mod tests {
     #[test]
     fn test_rename_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"RENAME", b"nokey", b"new"]), &mut out);
         let resp = String::from_utf8_lossy(&out);
@@ -3336,8 +3323,8 @@ mod tests {
     #[test]
     fn test_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"src", b"value"]), &mut out);
         out.clear();
@@ -3356,8 +3343,8 @@ mod tests {
     #[test]
     fn test_select_db0() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SELECT", b"0"]), &mut out);
         assert_eq!(&out, b"+OK\r\n");
@@ -3366,8 +3353,8 @@ mod tests {
     #[test]
     fn test_select_invalid() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SELECT", b"1"]), &mut out);
         let resp = String::from_utf8_lossy(&out);
@@ -3377,8 +3364,8 @@ mod tests {
     #[test]
     fn test_multi_exec() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
 
         // MULTI
@@ -3408,8 +3395,8 @@ mod tests {
     #[test]
     fn test_discard() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
 
         rh.handle_command(make_cmd(&[b"MULTI"]), &mut out);
@@ -3428,8 +3415,8 @@ mod tests {
     #[test]
     fn test_watch_exec_no_change() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
 
         rh.handle_command(make_cmd(&[b"SET", b"wk", b"v1"]), &mut out);
@@ -3451,8 +3438,8 @@ mod tests {
     #[test]
     fn test_publish_returns_zero_no_subscribers() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"PUBLISH", b"chan", b"msg"]), &mut out);
         assert_eq!(&out, b":0\r\n");
@@ -3461,8 +3448,8 @@ mod tests {
     #[test]
     fn test_unlink_is_del_alias() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"k", b"v"]), &mut out);
         out.clear();
@@ -3476,8 +3463,8 @@ mod tests {
     #[test]
     fn test_object_encoding() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
         rh.handle_command(make_cmd(&[b"SET", b"k", b"v"]), &mut out);
         out.clear();
@@ -3505,8 +3492,8 @@ mod tests {
     #[test]
     fn test_randomkey() {
         let dir = tempfile::tempdir().unwrap();
-        let handler = make_handler(dir.path());
-        let rh = RedisHandler::new(handler);
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
         let mut out = Vec::new();
 
         // Empty db

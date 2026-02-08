@@ -27,6 +27,7 @@ use ssd_kv::cluster::topology::{ClusterTopology, ShardState, NUM_SLOTS};
 use ssd_kv::engine::index::Index;
 use ssd_kv::engine::index_entry::hash_key;
 use ssd_kv::server::handler::Handler;
+use ssd_kv::server::{DatabaseManager, DbHandler};
 use ssd_kv::storage::file_manager::FileManager;
 use ssd_kv::storage::write_buffer::WriteBuffer;
 
@@ -50,6 +51,10 @@ fn make_handler(dir: &std::path::Path) -> Arc<Handler> {
     let index = Arc::new(Index::new());
     let wb = Arc::new(WriteBuffer::new(0, 1023));
     Arc::new(Handler::new(index, fm, wb))
+}
+
+fn make_db_manager(handler: &Arc<Handler>) -> Arc<DatabaseManager> {
+    Arc::new(DatabaseManager::new(vec![DbHandler::Ssd(Arc::clone(handler))]))
 }
 
 fn make_handler_with_index(dir: &std::path::Path) -> (Arc<Handler>, Arc<Index>) {
@@ -1003,7 +1008,8 @@ fn test_readonly_replica_read_allows_local_get() {
     let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
     let peers = Arc::new(PeerConnectionPool::new());
     let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
-    let rh = RedisHandler::with_router(handler, router, true);
+    let db_manager = make_db_manager(&handler);
+    let rh = RedisHandler::with_router(db_manager, router, true);
 
     // Find a key where node 1 is a replica
     let mut replica_key = None;
@@ -1021,7 +1027,7 @@ fn test_readonly_replica_read_allows_local_get() {
     let key = replica_key.expect("Should find a replica key for node 1");
 
     // Write data locally (simulate replication)
-    rh.handler.put_sync(key.as_bytes(), b"integ_val", 0).unwrap();
+    handler.put_sync(key.as_bytes(), b"integ_val", 0).unwrap();
 
     // Without READONLY: GET returns MOVED
     let cmd = RespValue::Array(Some(vec![
@@ -1078,7 +1084,8 @@ fn test_readonly_writes_still_get_moved() {
     let topo = Arc::new(RwLock::new(ClusterTopology::new(1, nodes, 2)));
     let peers = Arc::new(PeerConnectionPool::new());
     let router = Arc::new(ClusterRouter::new(topo, Arc::clone(&handler), peers));
-    let rh = RedisHandler::with_router(handler, router, true);
+    let db_manager = make_db_manager(&handler);
+    let rh = RedisHandler::with_router(db_manager, router, true);
 
     // Enable READONLY
     let mut out = Vec::new();

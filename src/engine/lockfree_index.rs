@@ -283,10 +283,13 @@ impl LockFreeIndex {
         unsafe { &*self.buckets.add(index) }
     }
 
-    /// Get mutable bucket at index.
+    /// Get raw pointer to bucket at index.
+    /// Returns `*mut Bucket` instead of `&mut Bucket` to avoid creating a
+    /// mutable reference that would violate aliasing rules when an `&Bucket`
+    /// from `bucket()` is still in scope.
     #[inline]
-    fn bucket_mut(&self, index: usize) -> &mut Bucket {
-        unsafe { &mut *self.buckets.add(index) }
+    fn bucket_ptr(&self, index: usize) -> *mut Bucket {
+        unsafe { self.buckets.add(index) }
     }
 
     /// Find bucket for key (linear probing).
@@ -394,9 +397,8 @@ impl LockFreeIndex {
                 return self.put(key, location, generation);
             }
 
-            // Update existing entry
-            let bucket_mut = self.bucket_mut(index);
-            bucket_mut.set(key, key_hash, location, generation);
+            // Update existing entry via raw pointer to avoid aliasing UB
+            unsafe { &mut *self.bucket_ptr(index) }.set(key, key_hash, location, generation);
             bucket.unlock_occupied();
 
             return Ok(());
@@ -418,9 +420,8 @@ impl LockFreeIndex {
                 return self.put(key, location, generation);
             }
 
-            // Insert new entry (we hold the lock, so the bucket is ours)
-            let bucket_mut = self.bucket_mut(index);
-            bucket_mut.set(key, key_hash, location, generation);
+            // Insert new entry via raw pointer to avoid aliasing UB
+            unsafe { &mut *self.bucket_ptr(index) }.set(key, key_hash, location, generation);
             bucket.unlock_occupied();
 
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -502,41 +503,44 @@ pub fn compare_keys_simd(a: &[u8], b: &[u8]) -> bool {
         return a == b;
     }
 
-    // Use AVX2 for 32-byte chunks
-    #[cfg(target_feature = "avx2")]
-    {
-        use std::arch::x86_64::*;
-
-        let chunks = len / 32;
-        let remainder = len % 32;
-
-        for i in 0..chunks {
-            let offset = i * 32;
-            unsafe {
-                let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
-                let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
-                let cmp = _mm256_cmpeq_epi8(va, vb);
-                let mask = _mm256_movemask_epi8(cmp);
-                if mask != -1 {
-                    return false;
-                }
-            }
-        }
-
-        // Compare remainder
-        if remainder > 0 {
-            let offset = chunks * 32;
-            return &a[offset..] == &b[offset..];
-        }
-
-        return true;
+    // Runtime AVX2 detection to avoid SIGILL on CPUs without AVX2
+    if is_x86_feature_detected!("avx2") {
+        // Safety: we just confirmed AVX2 is available at runtime.
+        return unsafe { compare_keys_avx2(a, b) };
     }
 
-    // Fallback
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        a == b
+    // Fallback for non-AVX2 CPUs
+    a == b
+}
+
+/// AVX2 key comparison helper. Must only be called after runtime AVX2 check.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compare_keys_avx2(a: &[u8], b: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 32;
+    let remainder = len % 32;
+
+    for i in 0..chunks {
+        let offset = i * 32;
+        let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
+        let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
+        let cmp = _mm256_cmpeq_epi8(va, vb);
+        let mask = _mm256_movemask_epi8(cmp);
+        if mask != -1 {
+            return false;
+        }
     }
+
+    // Compare remainder
+    if remainder > 0 {
+        let offset = chunks * 32;
+        return &a[offset..] == &b[offset..];
+    }
+
+    true
 }
 
 #[cfg(not(target_arch = "x86_64"))]

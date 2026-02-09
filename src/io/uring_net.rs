@@ -534,6 +534,8 @@ pub struct UringServer {
     connections: HashMap<RawFd, TrackedConnection>,
     buffer_pool: NetBufferPool,
     recv_buffer_size: usize,
+    /// Whether an accept operation is currently pending in the submission queue.
+    accept_pending: bool,
 }
 
 impl UringServer {
@@ -555,12 +557,14 @@ impl UringServer {
             connections: HashMap::new(),
             buffer_pool: NetBufferPool::new(256, recv_buffer_size),
             recv_buffer_size,
+            accept_pending: false,
         })
     }
 
     /// Start accepting connections.
     pub fn start_accept(&mut self) -> io::Result<()> {
         self.net.submit_accept(self.listener_fd)?;
+        self.accept_pending = true;
         Ok(())
     }
 
@@ -605,6 +609,13 @@ impl UringServer {
     where
         F: FnMut(NetEvent) -> Option<Vec<u8>>,
     {
+        // Retry arming accept if a previous attempt failed
+        if !self.accept_pending {
+            if self.net.submit_accept(self.listener_fd).is_ok() {
+                self.accept_pending = true;
+            }
+        }
+
         let completions = self.net.collect_completions();
         let count = completions.len();
 
@@ -645,8 +656,8 @@ impl UringServer {
                         }
                     }
 
-                    // Re-arm accept
-                    let _ = self.net.submit_accept(self.listener_fd);
+                    // Re-arm accept, tracking whether it succeeded
+                    self.accept_pending = self.net.submit_accept(self.listener_fd).is_ok();
                 }
 
                 NetOperation::Recv => {

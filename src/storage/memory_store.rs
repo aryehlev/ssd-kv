@@ -71,13 +71,10 @@ impl MemoryStore {
         if self.max_entries > 0 || self.max_data_bytes > 0 {
             if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
                 let mut existing_size = None;
+                // Try to remove expired entry atomically (no TOCTOU race)
+                self.remove_if_expired(key);
                 if let Some(entry) = self.data.get(key) {
-                    if entry.ttl_secs != 0 && entry.is_expired() {
-                        drop(entry);
-                        self.remove_entry(key);
-                    } else {
-                        existing_size = Some((key.len() + entry.value.len()) as u64);
-                    }
+                    existing_size = Some((key.len() + entry.value.len()) as u64);
                 }
 
                 let current_entries = self.total_entries.load(Ordering::Relaxed);
@@ -141,7 +138,7 @@ impl MemoryStore {
         let entry = self.data.get(key)?;
         if entry.ttl_secs != 0 && entry.is_expired() {
             drop(entry);
-            self.remove_entry(key);
+            self.remove_if_expired(key);
             return None;
         }
         Some(entry.value.clone())
@@ -154,7 +151,7 @@ impl MemoryStore {
         if let Some(entry) = self.data.get(key) {
             if entry.ttl_secs != 0 && entry.is_expired() {
                 drop(entry);
-                self.remove_entry(key);
+                self.remove_if_expired(key);
                 return false;
             }
             let value = &entry.value;
@@ -176,7 +173,7 @@ impl MemoryStore {
         let entry = self.data.get(key)?;
         if entry.is_expired() {
             drop(entry);
-            self.remove_entry(key);
+            self.remove_if_expired(key);
             return None;
         }
         Some(RecordMeta {
@@ -190,7 +187,7 @@ impl MemoryStore {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
-                self.remove_entry(key);
+                self.remove_if_expired(key);
                 return Ok(false);
             }
             entry.ttl_secs = new_ttl;
@@ -217,9 +214,16 @@ impl MemoryStore {
     }
 
     pub fn clear(&self) {
-        self.data.clear();
-        self.total_entries.store(0, Ordering::Relaxed);
-        self.total_data_bytes.store(0, Ordering::Relaxed);
+        // Use retain(|_,_| false) to atomically remove all entries per-shard,
+        // decrementing counters for each removed entry. This is safe with
+        // concurrent writers: each shard is locked individually, so puts to
+        // other shards proceed normally, and counters stay consistent.
+        self.data.retain(|k, v| {
+            let data_size = (k.len() + v.value.len()) as u64;
+            self.total_entries.fetch_sub(1, Ordering::Relaxed);
+            self.total_data_bytes.fetch_sub(data_size, Ordering::Relaxed);
+            false // remove all entries
+        });
     }
 
     /// Iterate all keys (for KEYS/SCAN commands). Returns (key, generation) pairs.
@@ -254,6 +258,18 @@ impl MemoryStore {
         }
     }
 
+    /// Atomically remove an entry only if it is expired, avoiding TOCTOU races.
+    fn remove_if_expired(&self, key: &[u8]) -> bool {
+        if let Some((k, v)) = self.data.remove_if(key, |_, v| v.is_expired()) {
+            let data_size = (k.len() + v.value.len()) as u64;
+            self.total_entries.fetch_sub(1, Ordering::Relaxed);
+            self.total_data_bytes.fetch_sub(data_size, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Evict expired entries. Returns count removed.
     pub fn evict_expired(&self) -> usize {
         let mut expired_keys = Vec::new();
@@ -262,9 +278,13 @@ impl MemoryStore {
                 expired_keys.push(entry.key().clone());
             }
         }
-        let count = expired_keys.len();
+        let mut count = 0;
         for key in expired_keys {
-            self.remove_entry(&key);
+            // Use remove_if_expired to avoid deleting a fresh entry that was
+            // inserted between collecting the key and removing it (TOCTOU).
+            if self.remove_if_expired(&key) {
+                count += 1;
+            }
         }
         count
     }

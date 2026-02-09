@@ -142,6 +142,20 @@ impl Bucket {
         self.state.store(BUCKET_DELETED, Ordering::Release);
     }
 
+    /// Try to lock the bucket only if it is currently OCCUPIED.
+    /// Used by update/delete paths to avoid locking tombstones or empty buckets.
+    #[inline]
+    pub fn try_lock_occupied(&self) -> bool {
+        self.state
+            .compare_exchange(
+                BUCKET_OCCUPIED,
+                BUCKET_LOCKED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// Check if key matches (fast path: compare hash first).
     #[inline]
     pub fn key_matches(&self, key: &[u8], key_hash: u64) -> bool {
@@ -321,25 +335,29 @@ impl LockFreeIndex {
     pub fn get(&self, key: &[u8]) -> Option<DiskLocation> {
         let key_hash = hash_key(key);
 
-        if let Some(index) = self.find_bucket(key, key_hash) {
+        loop {
+            let index = self.find_bucket(key, key_hash)?;
             let bucket = self.bucket(index);
 
-            loop {
-                // Read generation before and after to detect concurrent modification
-                let gen1 = bucket.generation.load(Ordering::Acquire);
-                let location = bucket.get_disk_location();
-                let gen2 = bucket.generation.load(Ordering::Acquire);
+            let gen1 = bucket.generation.load(Ordering::Acquire);
+            let location = bucket.get_disk_location();
+            let gen2 = bucket.generation.load(Ordering::Acquire);
 
-                // If generation is stable, return the location
-                if gen1 == gen2 {
-                    return Some(location);
-                }
-                // Otherwise retry (concurrent write in progress)
+            if gen1 != gen2 {
+                // Concurrent write in progress, retry the whole lookup
                 std::hint::spin_loop();
+                continue;
             }
-        }
 
-        None
+            // Re-validate: bucket may have been deleted or repurposed between
+            // find_bucket and reading the generation-stable location.
+            if bucket.is_occupied() && bucket.key_matches(key, key_hash) {
+                return Some(location);
+            }
+
+            // Bucket changed or deleted between find_bucket and here; retry lookup
+            return None;
+        }
     }
 
     /// PUT - Uses fine-grained per-bucket locking. Values always on disk.
@@ -361,8 +379,12 @@ impl LockFreeIndex {
         if let Some(index) = self.find_bucket(key, key_hash) {
             let bucket = self.bucket(index);
 
-            // Spin until we can lock
-            while !bucket.try_lock() {
+            // Spin until we can lock — only lock OCCUPIED buckets
+            while !bucket.try_lock_occupied() {
+                if !bucket.is_occupied() {
+                    // Bucket was deleted/emptied while we waited; restart insertion
+                    return self.put(key, location, generation);
+                }
                 std::hint::spin_loop();
             }
 
@@ -416,8 +438,12 @@ impl LockFreeIndex {
         if let Some(index) = self.find_bucket(key, key_hash) {
             let bucket = self.bucket(index);
 
-            // Spin until we can lock
-            while !bucket.try_lock() {
+            // Spin until we can lock — only lock OCCUPIED buckets
+            while !bucket.try_lock_occupied() {
+                if !bucket.is_occupied() {
+                    // Bucket was already deleted by another thread
+                    return false;
+                }
                 std::hint::spin_loop();
             }
 

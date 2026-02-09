@@ -213,7 +213,6 @@ impl Bucket {
     ) {
         self.key_hash = key_hash;
         self.key_len = key.len() as u8;
-        self.generation.store(generation, Ordering::Release);
         self.flags = 0;
 
         // Store key
@@ -228,6 +227,9 @@ impl Bucket {
         self.disk_location[4..6].copy_from_slice(&location.wblock_id.to_le_bytes());
         self.disk_location[6..10].copy_from_slice(&location.offset.to_le_bytes());
         self.disk_location[10..14].copy_from_slice(&location.record_size.to_le_bytes());
+        // Release store AFTER all field writes so that a reader's Acquire load
+        // of generation guarantees visibility of the complete bucket update.
+        self.generation.store(generation, Ordering::Release);
     }
 }
 

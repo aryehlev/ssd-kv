@@ -138,27 +138,31 @@ impl RespParser {
     /// Read more data from the stream, growing the buffer if needed
     #[inline]
     fn fill_buffer(&mut self, stream: &mut impl Read) -> io::Result<bool> {
-        // Compact buffer if needed
-        if self.pos > 0 {
-            if self.pos < self.len {
-                self.buf.copy_within(self.pos..self.len, 0);
-                self.len -= self.pos;
-            } else {
-                self.len = 0;
-            }
-            self.pos = 0;
-        }
+        let remaining_space = self.buf.len() - self.len;
 
-        // Grow buffer if full after compaction
-        if self.len == self.buf.len() {
-            let new_size = (self.buf.len() * 2).min(MAX_BUFFER_SIZE);
-            if new_size <= self.buf.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "RESP message exceeds maximum buffer size",
-                ));
+        // Only compact when less than 25% of buffer is free, to reduce memcpy frequency
+        if remaining_space < self.buf.len() / 4 {
+            if self.pos > 0 {
+                if self.pos < self.len {
+                    self.buf.copy_within(self.pos..self.len, 0);
+                    self.len -= self.pos;
+                } else {
+                    self.len = 0;
+                }
+                self.pos = 0;
             }
-            self.buf.resize(new_size, 0);
+
+            // Grow buffer if still full after compaction
+            if self.len == self.buf.len() {
+                let new_size = (self.buf.len() * 2).min(MAX_BUFFER_SIZE);
+                if new_size <= self.buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "RESP message exceeds maximum buffer size",
+                    ));
+                }
+                self.buf.resize(new_size, 0);
+            }
         }
 
         // Read more data
@@ -191,7 +195,10 @@ impl RespParser {
     pub fn try_parse(&mut self, stream: &mut impl Read) -> io::Result<Option<RespValue>> {
         loop {
             if let Some(value) = self.parse_value()? {
-                self.maybe_shrink();
+                // Only shrink occasionally — checking buffer size is cheaper than shrink logic
+                if self.buf.len() > INITIAL_READ_BUFFER_SIZE {
+                    self.maybe_shrink();
+                }
                 return Ok(Some(value));
             }
 
@@ -200,6 +207,132 @@ impl RespParser {
                 return Ok(None); // EOF
             }
         }
+    }
+
+    /// Try to parse a simple GET or SET command directly from the buffer
+    /// without allocating any Vec<u8>. Returns true if a fast command was handled.
+    /// This avoids all heap allocations for the most common commands.
+    #[inline]
+    fn try_fast_command(
+        &mut self,
+        handler: &DbHandler,
+        out: &mut Vec<u8>,
+    ) -> io::Result<Option<bool>> {
+        if self.pos >= self.len {
+            return Ok(None);
+        }
+        let start = self.pos;
+        let buf = &self.buf[..self.len];
+
+        // Must start with *2 or *3 (GET has 2 args, SET has 3)
+        if buf[start] != b'*' {
+            return Ok(Some(false)); // not an array, fall through
+        }
+
+        // Parse array count
+        let (argc, mut cursor) = match Self::parse_inline_int(buf, start + 1) {
+            Some(v) => v,
+            None => return Ok(None), // need more data
+        };
+
+        if argc != 2 && argc != 3 {
+            return Ok(Some(false)); // not GET/SET, fall through
+        }
+
+        // Parse command name bulk string
+        let (cmd_start, cmd_len, next) = match Self::parse_inline_bulk(buf, cursor) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        cursor = next;
+
+        if cmd_len != 3 {
+            return Ok(Some(false)); // not GET/SET
+        }
+
+        let cmd = &buf[cmd_start..cmd_start + 3];
+
+        if argc == 2 && (cmd == b"GET" || cmd == b"get") {
+            // Parse key
+            let (key_start, key_len, next) = match Self::parse_inline_bulk(buf, cursor) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            let key = &buf[key_start..key_start + key_len];
+            self.pos = next;
+
+            // Zero-copy GET: write directly from DashMap guard
+            if !handler.get_value_into(key, out) {
+                out.extend_from_slice(b"$-1\r\n");
+            }
+            return Ok(Some(true));
+        }
+
+        if argc == 3 && (cmd == b"SET" || cmd == b"set") {
+            // Parse key
+            let (key_start, key_len, next) = match Self::parse_inline_bulk(buf, cursor) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            cursor = next;
+
+            // Parse value
+            let (val_start, val_len, next) = match Self::parse_inline_bulk(buf, cursor) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            let key = &buf[key_start..key_start + key_len];
+            let value = &buf[val_start..val_start + val_len];
+            self.pos = next;
+
+            match handler.put_sync(key, value, 0) {
+                Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+            }
+            return Ok(Some(true));
+        }
+
+        Ok(Some(false)) // not GET/SET
+    }
+
+    /// Parse a \r\n-terminated integer from buffer. Returns (value, pos_after_crlf).
+    #[inline]
+    fn parse_inline_int(buf: &[u8], start: usize) -> Option<(usize, usize)> {
+        let mut i = start;
+        while i < buf.len() {
+            if buf[i] == b'\r' {
+                if i + 1 >= buf.len() {
+                    return None;
+                }
+                // Parse the number from start..i
+                let mut val = 0usize;
+                for &b in &buf[start..i] {
+                    if b < b'0' || b > b'9' {
+                        return None; // not a simple positive integer
+                    }
+                    val = val * 10 + (b - b'0') as usize;
+                }
+                return Some((val, i + 2)); // skip \r\n
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Parse a RESP bulk string: $len\r\n<data>\r\n
+    /// Returns (data_start, data_len, pos_after_final_crlf).
+    #[inline]
+    fn parse_inline_bulk(buf: &[u8], start: usize) -> Option<(usize, usize, usize)> {
+        if start >= buf.len() || buf[start] != b'$' {
+            return None;
+        }
+        let (len, data_start) = Self::parse_inline_int(buf, start + 1)?;
+        let data_end = data_start + len;
+        if data_end + 2 > buf.len() {
+            return None; // need more data
+        }
+        Some((data_start, len, data_end + 2)) // skip trailing \r\n
     }
 
     /// Parse a RESP value from the buffer
@@ -548,35 +681,40 @@ impl RedisHandler {
             return;
         }
 
-        // Extract command name (clone to avoid borrow issues with transaction queuing)
-        let cmd = match &args[0] {
-            RespValue::BulkString(Some(data)) => data.clone(),
-            _ => {
-                RespValue::err("Invalid command format").serialize_into(out);
-                return;
-            }
-        };
+        // Validate command format before transaction check
+        if !matches!(&args[0], RespValue::BulkString(Some(_))) {
+            RespValue::err("Invalid command format").serialize_into(out);
+            return;
+        }
 
         // If in MULTI transaction mode, queue commands (except EXEC, DISCARD, MULTI)
         {
             let tx = self.tx_queue.borrow();
             if tx.is_some() {
-                match cmd.as_slice() {
-                    b"EXEC" | b"exec" | b"DISCARD" | b"discard" | b"MULTI" | b"multi" => {
-                        // Fall through to normal handling
-                    }
-                    _ => {
-                        drop(tx);
-                        self.tx_queue.borrow_mut().as_mut().unwrap().push(args);
-                        RespValue::SimpleString("QUEUED".to_string()).serialize_into(out);
-                        return;
-                    }
+                let is_tx_cmd = if let RespValue::BulkString(Some(data)) = &args[0] {
+                    matches!(data.as_slice(),
+                        b"EXEC" | b"exec" | b"DISCARD" | b"discard" | b"MULTI" | b"multi"
+                    )
+                } else {
+                    false
+                };
+                if !is_tx_cmd {
+                    drop(tx);
+                    self.tx_queue.borrow_mut().as_mut().unwrap().push(args);
+                    out.extend_from_slice(b"+QUEUED\r\n");
+                    return;
                 }
             }
         }
 
+        // Borrow command name without cloning (borrow is safe since args isn't moved below)
+        let cmd = match &args[0] {
+            RespValue::BulkString(Some(data)) => data.as_slice(),
+            _ => unreachable!(), // validated above
+        };
+
         // Fast path for common commands
-        match cmd.as_slice() {
+        match cmd {
             b"GET" | b"get" => self.cmd_get(&args, out),
             b"SET" | b"set" => self.cmd_set(&args, out),
             b"PING" | b"ping" => self.cmd_ping(&args, out),
@@ -650,11 +788,15 @@ impl RedisHandler {
     fn cmd_ping(&self, args: &[RespValue], out: &mut Vec<u8>) {
         if args.len() > 1 {
             if let RespValue::BulkString(Some(data)) = &args[1] {
-                RespValue::BulkString(Some(data.clone())).serialize_into(out);
+                out.push(b'$');
+                out.extend_from_slice(itoa::Buffer::new().format(data.len()).as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(data);
+                out.extend_from_slice(b"\r\n");
                 return;
             }
         }
-        RespValue::pong().serialize_into(out);
+        out.extend_from_slice(b"+PONG\r\n");
     }
 
     /// Checks if a key should be redirected via MOVED. Returns true if MOVED was written.
@@ -724,9 +866,9 @@ impl RedisHandler {
             return;
         }
 
-        match self.current_handler().get_value(key) {
-            Some(value) => RespValue::bulk(value).serialize_into(out),
-            None => RespValue::null().serialize_into(out),
+        // Zero-copy path: write RESP directly from DashMap guard
+        if !self.current_handler().get_value_into(key, out) {
+            out.extend_from_slice(b"$-1\r\n");
         }
     }
 
@@ -757,6 +899,15 @@ impl RedisHandler {
             }
         };
 
+        // Fast path: simple SET key value (no options) — most common case
+        if args.len() == 3 {
+            match self.current_handler().put_sync(key, value, 0) {
+                Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+            }
+            return;
+        }
+
         // Parse all SET options
         let opts = match self.parse_set_options(&args[3..]) {
             Ok(o) => o,
@@ -769,7 +920,7 @@ impl RedisHandler {
         // NX: only set if key does NOT exist
         if opts.nx {
             if self.current_handler().get_value(key).is_some() {
-                RespValue::null().serialize_into(out);
+                out.extend_from_slice(b"$-1\r\n");
                 return;
             }
         }
@@ -777,7 +928,7 @@ impl RedisHandler {
         // XX: only set if key EXISTS
         if opts.xx {
             if self.current_handler().get_value(key).is_none() {
-                RespValue::null().serialize_into(out);
+                out.extend_from_slice(b"$-1\r\n");
                 return;
             }
         }
@@ -805,10 +956,10 @@ impl RedisHandler {
                 if opts.get {
                     match old_value {
                         Some(v) => RespValue::bulk(v).serialize_into(out),
-                        None => RespValue::null().serialize_into(out),
+                        None => out.extend_from_slice(b"$-1\r\n"),
                     }
                 } else {
-                    RespValue::ok().serialize_into(out);
+                    out.extend_from_slice(b"+OK\r\n");
                 }
             }
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
@@ -2684,15 +2835,67 @@ fn handle_redis_client_fast(
     debug!("Redis client connected: {}", peer);
 
     let mut parser = RespParser::new();
-    let redis_handler = if let Some(router) = router {
-        RedisHandler::with_router_and_pubsub(db_manager, router, replica_read, pubsub)
+    let redis_handler = if let Some(router) = router.clone() {
+        RedisHandler::with_router_and_pubsub(db_manager.clone(), router, replica_read, pubsub)
     } else {
-        RedisHandler::new_with_pubsub(db_manager, pubsub)
+        RedisHandler::new_with_pubsub(db_manager.clone(), pubsub)
     };
     let mut write_buf = Vec::with_capacity(WRITE_BUFFER_SIZE);
     let mut commands_in_batch = 0;
 
+    // Pre-resolve current handler for fast path (no cluster, db 0)
+    let fast_handler = if router.is_none() {
+        db_manager.db(0)
+    } else {
+        None
+    };
+
     loop {
+        // Try zero-allocation fast path for simple GET/SET (non-cluster, no transaction)
+        if let Some(handler) = fast_handler {
+            match parser.try_fast_command(handler, &mut write_buf) {
+                Ok(Some(true)) => {
+                    // Fast path handled the command
+                    commands_in_batch += 1;
+                    if write_buf.len() >= WRITE_BUFFER_SIZE / 2 || commands_in_batch >= MAX_PIPELINE_DEPTH {
+                        stream.write_all(&write_buf)?;
+                        write_buf.clear();
+                        commands_in_batch = 0;
+                    }
+                    // Check for end of pipeline
+                    if parser.len == parser.pos && !write_buf.is_empty() {
+                        stream.write_all(&write_buf)?;
+                        write_buf.clear();
+                        commands_in_batch = 0;
+                    }
+                    continue;
+                }
+                Ok(Some(false)) => {
+                    // Not a fast command, fall through to full parse
+                }
+                Ok(None) => {
+                    // Need more data — fill buffer and retry
+                    if !parser.fill_buffer(&mut stream)? {
+                        if !write_buf.is_empty() {
+                            stream.write_all(&write_buf)?;
+                        }
+                        break;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof ||
+                       e.kind() == io::ErrorKind::TimedOut ||
+                       e.kind() == io::ErrorKind::ConnectionReset {
+                        if !write_buf.is_empty() {
+                            let _ = stream.write_all(&write_buf);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
         match parser.try_parse(&mut stream) {
             Ok(Some(value)) => {
                 // Handle command and buffer response

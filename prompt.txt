@@ -1,1 +1,3 @@
-keep building the plan and execute it without asking me.
+try running this benchmark and somehow get our in memory servers to perform as well as valkey:
+/Users/aryehlev/Documents/ssd-kv/benchmark/ssdkv_vs_valkey.sh.
+

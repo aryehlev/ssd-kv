@@ -48,7 +48,8 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
-            data: DashMap::new(),
+            // Use at least 64 shards for good concurrency regardless of CPU count
+            data: DashMap::with_shard_amount(64),
             next_generation: AtomicU32::new(1),
             total_entries: AtomicU64::new(0),
             total_data_bytes: AtomicU64::new(0),
@@ -65,32 +66,38 @@ impl MemoryStore {
     }
 
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
-        // Capacity check
-        if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
-            if self.max_entries > 0 && self.total_entries.load(Ordering::Relaxed) >= self.max_entries {
-                // Check if we're replacing an existing key (doesn't increase count)
-                if !self.data.contains_key(key) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "OOM command not allowed when used memory > 'maxmemory'",
-                    ));
+        // Capacity check (only when limits are configured)
+        if self.max_entries > 0 || self.max_data_bytes > 0 {
+            if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
+                if self.max_entries > 0 && self.total_entries.load(Ordering::Relaxed) >= self.max_entries {
+                    if !self.data.contains_key(key) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "OOM command not allowed when used memory > 'maxmemory'",
+                        ));
+                    }
                 }
-            }
-            if self.max_data_bytes > 0 && self.total_data_bytes.load(Ordering::Relaxed) >= self.max_data_bytes {
-                if !self.data.contains_key(key) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "OOM command not allowed when used memory > 'maxmemory'",
-                    ));
+                if self.max_data_bytes > 0 && self.total_data_bytes.load(Ordering::Relaxed) >= self.max_data_bytes {
+                    if !self.data.contains_key(key) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "OOM command not allowed when used memory > 'maxmemory'",
+                        ));
+                    }
                 }
             }
         }
 
-        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
-        let now_micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        // Skip syscall when no TTL — timestamp only matters for expiry
+        let now_micros = if ttl != 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let data_size = (key.len() + value.len()) as u64;
         let entry = MemoryEntry {
@@ -101,11 +108,15 @@ impl MemoryStore {
         };
 
         if let Some(old) = self.data.insert(key.to_vec(), entry) {
-            // Replacing existing entry
+            // Replacing existing entry — adjust data bytes atomically
             let old_size = (key.len() + old.value.len()) as u64;
-            // Adjust data bytes (add new, remove old)
-            self.total_data_bytes.fetch_add(data_size, Ordering::Relaxed);
-            self.total_data_bytes.fetch_sub(old_size, Ordering::Relaxed);
+            if data_size != old_size {
+                if data_size > old_size {
+                    self.total_data_bytes.fetch_add(data_size - old_size, Ordering::Relaxed);
+                } else {
+                    self.total_data_bytes.fetch_sub(old_size - data_size, Ordering::Relaxed);
+                }
+            }
         } else {
             // New entry
             self.total_entries.fetch_add(1, Ordering::Relaxed);
@@ -117,12 +128,33 @@ impl MemoryStore {
 
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
         let entry = self.data.get(key)?;
-        if entry.is_expired() {
+        if entry.ttl_secs != 0 && entry.is_expired() {
             drop(entry);
             self.remove_entry(key);
             return None;
         }
         Some(entry.value.clone())
+    }
+
+    /// Zero-copy GET: writes RESP bulk string directly into output buffer
+    /// while holding the DashMap read guard, avoiding a Vec clone.
+    #[inline]
+    pub fn get_value_into(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
+        if let Some(entry) = self.data.get(key) {
+            if entry.ttl_secs != 0 && entry.is_expired() {
+                drop(entry);
+                self.remove_entry(key);
+                return false;
+            }
+            let value = &entry.value;
+            out.push(b'$');
+            out.extend_from_slice(itoa::Buffer::new().format(value.len()).as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(value);
+            out.extend_from_slice(b"\r\n");
+            return true;
+        }
+        false
     }
 
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {

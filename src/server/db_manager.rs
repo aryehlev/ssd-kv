@@ -29,6 +29,29 @@ impl DbHandler {
         }
     }
 
+    /// Zero-copy GET: writes RESP bulk string directly into output buffer.
+    /// Returns true if key was found and written.
+    #[inline]
+    pub fn get_value_into(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
+        match self {
+            DbHandler::Memory(m) => m.get_value_into(key, out),
+            DbHandler::Ssd(h) => {
+                // Fallback to allocating path for SSD handler
+                match h.get_value(key) {
+                    Some(value) => {
+                        out.push(b'$');
+                        out.extend_from_slice(itoa::Buffer::new().format(value.len()).as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(&value);
+                        out.extend_from_slice(b"\r\n");
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
         match self {
             DbHandler::Ssd(h) => h.delete_sync(key),

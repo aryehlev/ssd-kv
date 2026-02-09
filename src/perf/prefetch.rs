@@ -214,6 +214,88 @@ impl BloomFilter {
     }
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Lock-free bloom filter using atomic operations.
+/// This eliminates write contention on the bloom filter.
+pub struct LockFreeBloomFilter {
+    bits: Box<[AtomicU64]>,
+    num_bits: usize,
+    num_hashes: u32,
+}
+
+impl LockFreeBloomFilter {
+    /// Creates a new lock-free bloom filter with approximately `expected_items` capacity
+    /// and `false_positive_rate` error rate.
+    pub fn new(expected_items: usize, false_positive_rate: f64) -> Self {
+        // Calculate optimal size
+        let ln2 = std::f64::consts::LN_2;
+        let bits_needed = -(expected_items as f64 * false_positive_rate.ln()) / (ln2 * ln2);
+        let num_bits = (bits_needed as usize).max(64).next_power_of_two();
+        let num_hashes = ((num_bits as f64 / expected_items as f64) * ln2).ceil() as u32;
+        let num_words = num_bits / 64;
+
+        // Allocate zeroed atomic array
+        let mut bits_vec = Vec::with_capacity(num_words);
+        for _ in 0..num_words {
+            bits_vec.push(AtomicU64::new(0));
+        }
+
+        Self {
+            bits: bits_vec.into_boxed_slice(),
+            num_bits,
+            num_hashes: num_hashes.max(1).min(16),
+        }
+    }
+
+    /// Adds a key to the filter using lock-free atomic fetch_or.
+    #[inline]
+    pub fn add(&self, key_hash: u64) {
+        for i in 0..self.num_hashes {
+            let h = self.hash(key_hash, i);
+            let bit_idx = (h as usize) % self.num_bits;
+            let word_idx = bit_idx / 64;
+            let bit_pos = bit_idx % 64;
+            // Lock-free set using fetch_or
+            self.bits[word_idx].fetch_or(1u64 << bit_pos, Ordering::Relaxed);
+        }
+    }
+
+    /// Checks if a key might be in the filter using lock-free atomic load.
+    /// Returns false if definitely not present, true if maybe present.
+    #[inline]
+    pub fn may_contain(&self, key_hash: u64) -> bool {
+        for i in 0..self.num_hashes {
+            let h = self.hash(key_hash, i);
+            let bit_idx = (h as usize) % self.num_bits;
+            let word_idx = bit_idx / 64;
+            let bit_pos = bit_idx % 64;
+            // Lock-free check using load
+            if (self.bits[word_idx].load(Ordering::Relaxed) & (1u64 << bit_pos)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    fn hash(&self, key_hash: u64, i: u32) -> u64 {
+        // Double hashing technique
+        let h1 = key_hash;
+        let h2 = key_hash.rotate_left(32);
+        h1.wrapping_add((i as u64).wrapping_mul(h2))
+    }
+
+    /// Returns the approximate fill ratio.
+    pub fn fill_ratio(&self) -> f64 {
+        let set_bits: u64 = self.bits
+            .iter()
+            .map(|w| w.load(Ordering::Relaxed).count_ones() as u64)
+            .sum();
+        set_bits as f64 / self.num_bits as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +339,61 @@ mod tests {
 
         // Should have low false positive rate
         assert!(false_positives < 50); // <5%
+    }
+
+    #[test]
+    fn test_lock_free_bloom_filter() {
+        let bf = LockFreeBloomFilter::new(10000, 0.01);
+
+        // Add some keys
+        for i in 0..1000u64 {
+            bf.add(i);
+        }
+
+        // Check present keys
+        for i in 0..1000u64 {
+            assert!(bf.may_contain(i));
+        }
+
+        // Check absent keys (some false positives expected)
+        let mut false_positives = 0;
+        for i in 1000..2000u64 {
+            if bf.may_contain(i) {
+                false_positives += 1;
+            }
+        }
+
+        // Should have low false positive rate
+        assert!(false_positives < 50); // <5%
+    }
+
+    #[test]
+    fn test_lock_free_bloom_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let bf = Arc::new(LockFreeBloomFilter::new(100000, 0.01));
+
+        // Spawn multiple writers
+        let mut handles = vec![];
+        for t in 0..4 {
+            let bf = Arc::clone(&bf);
+            handles.push(thread::spawn(move || {
+                for i in 0..10000u64 {
+                    bf.add(t * 10000 + i);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify all keys are present
+        for t in 0..4 {
+            for i in 0..10000u64 {
+                assert!(bf.may_contain(t * 10000 + i));
+            }
+        }
     }
 }

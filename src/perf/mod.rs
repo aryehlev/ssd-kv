@@ -3,25 +3,38 @@
 //! This module provides advanced optimizations for achieving Aerospike-level
 //! performance:
 //!
-//! - **Hot Cache**: Lock-free L1 cache for frequently accessed small keys
 //! - **Batch Writer**: Write coalescing for maximum SSD throughput
 //! - **Prefetch**: CPU cache prefetching and read-ahead
 //! - **NUMA**: NUMA-aware memory allocation and thread pinning
 //! - **XDP**: eBPF/XDP packet acceleration (Linux only)
+//! - **AF_XDP**: Zero-copy networking (Linux only)
+//! - **Huge Pages**: Reduce TLB misses for large allocations
+//! - **SIMD**: Vectorized batch operations (AVX2/NEON) for 2-4x throughput
 
-pub mod hot_cache;
 pub mod batch_writer;
 pub mod prefetch;
 pub mod numa;
 pub mod xdp;
+pub mod af_xdp;
+pub mod huge_pages;
+pub mod busy_poll;
 pub mod object_pool;
+pub mod simd;
 
-pub use hot_cache::{HotCache, CacheStats};
 pub use batch_writer::{BatchWriter, BatchWriterStats, WriteRequest};
-pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, ReadAhead};
+pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, LockFreeBloomFilter, ReadAhead};
 pub use numa::{CpuTopology, NumaThreadPool, pin_to_cpu, pin_to_numa_node, numa_alloc, numa_free};
 pub use xdp::{XdpAccelerator, XdpConfig, XdpStats};
+pub use af_xdp::{AfXdpConfig, AfXdpSocket, AfXdpStats, XdpDesc, is_af_xdp_available};
+pub use huge_pages::{HugePageAlloc, HugePageConfig, huge_page_alloc, huge_page_free, is_huge_pages_available};
+pub use busy_poll::{BusyPollConfig, BusyPoller, BusyPollStats, CpuIsolation, AdaptiveSpinner, enable_socket_busy_poll, set_system_busy_poll};
 pub use object_pool::{BufferPool, PooledBuffer, READ_BUFFER_POOL, WRITE_BUFFER_POOL};
+pub use simd::{
+    simd_key_eq, simd_memcpy, simd_memset, crc32c,
+    batch_bloom_check, batch_hash_keys_4, batch_hash_keys_8,
+    batch_index_lookup, batch_index_lookup_4, group_by_shard,
+    BloomBatchResult, BatchGetResult, prefetch_batch,
+};
 
 /// Performance tuning recommendations based on hardware.
 #[derive(Debug)]
@@ -30,8 +43,6 @@ pub struct PerfTuning {
     pub network_threads: usize,
     /// Recommended number of write threads.
     pub write_threads: usize,
-    /// Recommended hot cache size.
-    pub hot_cache_entries: usize,
     /// Recommended batch size.
     pub batch_size: usize,
     /// Whether to use XDP.
@@ -53,10 +64,6 @@ impl PerfTuning {
         // Write threads: 1 per NUMA node
         let write_threads = num_nodes.max(1);
 
-        // Hot cache: scale with available memory (assume 1GB available)
-        // Each entry is ~200 bytes, so 64K entries = ~12MB
-        let hot_cache_entries = 64 * 1024;
-
         // Batch size: balance latency vs throughput
         let batch_size = 1000;
 
@@ -75,7 +82,6 @@ impl PerfTuning {
         Self {
             network_threads,
             write_threads,
-            hot_cache_entries,
             batch_size,
             use_xdp,
             use_huge_pages,
@@ -115,7 +121,6 @@ mod tests {
         let tuning = PerfTuning::auto_tune();
         assert!(tuning.network_threads > 0);
         assert!(tuning.write_threads > 0);
-        assert!(tuning.hot_cache_entries > 0);
         assert!(tuning.batch_size > 0);
     }
 }

@@ -277,6 +277,44 @@ impl DataFile {
         Ok(buffer)
     }
 
+    /// Reads a partial WBlock - only the portion needed for the record.
+    /// This avoids reading the full 1MB WBlock for small records.
+    /// `record_size` should be the expected total record size (header + key + value).
+    pub fn read_partial_wblock(
+        &self,
+        wblock_id: u32,
+        offset_in_block: u32,
+        record_size: u32,
+    ) -> io::Result<AlignedBuffer> {
+        if wblock_id >= WBLOCKS_PER_FILE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WBlock ID exceeds file capacity",
+            ));
+        }
+
+        // Calculate absolute offset
+        let wblock_offset = FILE_HEADER_SIZE as u64 + (wblock_id as u64 * WBLOCK_SIZE as u64);
+        let absolute_offset = wblock_offset + offset_in_block as u64;
+
+        // Calculate read size: align to 4KB for O_DIRECT, minimum 4KB
+        // Add some extra for record header parsing
+        let read_size = ((record_size as usize + 128).max(ALIGNMENT))
+            .next_power_of_two()
+            .min(WBLOCK_SIZE); // Cap at WBlock size
+
+        // Align the read
+        let aligned_offset = absolute_offset & !(ALIGNMENT as u64 - 1);
+        let offset_adjustment = (absolute_offset - aligned_offset) as usize;
+        let aligned_len = ((offset_adjustment + read_size + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+        let aligned_len = aligned_len.min(WBLOCK_SIZE);
+
+        let mut buffer = AlignedBuffer::new(aligned_len);
+        self.file.read_at(&mut buffer, aligned_offset, aligned_len)?;
+
+        Ok(buffer)
+    }
+
     /// Syncs the file to disk.
     pub fn sync(&self) -> io::Result<()> {
         self.file.sync_data()
@@ -455,6 +493,84 @@ impl FileManager {
     }
 }
 
+/// Parallel file manager that distributes keys across multiple files.
+/// Each partition has its own FileManager for reduced contention.
+pub struct ParallelFileManager {
+    managers: Vec<Arc<FileManager>>,
+    num_partitions: usize,
+}
+
+impl ParallelFileManager {
+    /// Creates a new parallel file manager with the specified number of partitions.
+    /// Each partition gets its own subdirectory.
+    pub fn new<P: AsRef<Path>>(data_dir: P, num_partitions: usize) -> io::Result<Self> {
+        let data_dir = data_dir.as_ref();
+        let num_partitions = num_partitions.max(1);
+
+        let mut managers = Vec::with_capacity(num_partitions);
+
+        for i in 0..num_partitions {
+            let partition_dir = data_dir.join(format!("partition_{:02}", i));
+            let manager = FileManager::new(&partition_dir)?;
+            managers.push(Arc::new(manager));
+        }
+
+        Ok(Self {
+            managers,
+            num_partitions,
+        })
+    }
+
+    /// Returns the partition index for a given key hash.
+    #[inline]
+    pub fn partition_for(&self, key_hash: u64) -> usize {
+        ((key_hash >> 48) as usize) % self.num_partitions
+    }
+
+    /// Gets the FileManager for a given key hash.
+    #[inline]
+    pub fn get_manager(&self, key_hash: u64) -> &Arc<FileManager> {
+        let partition = self.partition_for(key_hash);
+        &self.managers[partition]
+    }
+
+    /// Gets the FileManager for a specific partition.
+    #[inline]
+    pub fn get_partition(&self, partition: usize) -> &Arc<FileManager> {
+        &self.managers[partition % self.num_partitions]
+    }
+
+    /// Gets a file by partition and file_id.
+    pub fn get_file(&self, partition: usize, file_id: u32) -> Option<Arc<Mutex<DataFile>>> {
+        self.managers[partition % self.num_partitions].get_file(file_id)
+    }
+
+    /// Creates a new file in the specified partition.
+    pub fn create_file(&self, partition: usize) -> io::Result<Arc<Mutex<DataFile>>> {
+        self.managers[partition % self.num_partitions].create_file()
+    }
+
+    /// Gets or creates a file by partition and file_id.
+    pub fn get_or_create_file(&self, partition: usize, file_id: u32) -> io::Result<Arc<Mutex<DataFile>>> {
+        self.managers[partition % self.num_partitions].get_or_create_file(file_id)
+    }
+
+    /// Returns the number of partitions.
+    pub fn num_partitions(&self) -> usize {
+        self.num_partitions
+    }
+
+    /// Returns total file count across all partitions.
+    pub fn total_file_count(&self) -> usize {
+        self.managers.iter().map(|m| m.file_count()).sum()
+    }
+
+    /// Returns all managers.
+    pub fn managers(&self) -> &[Arc<FileManager>] {
+        &self.managers
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +607,32 @@ mod tests {
         assert_eq!(file1_id, 0);
         assert_eq!(file2_id, 1);
         assert_eq!(manager.file_count(), 2);
+    }
+
+    #[test]
+    fn test_parallel_file_manager() {
+        let dir = tempdir().unwrap();
+        let pfm = ParallelFileManager::new(dir.path(), 4).unwrap();
+
+        assert_eq!(pfm.num_partitions(), 4);
+
+        // Test partition distribution
+        // partition = (key_hash >> 48) % 4
+        // We need high 16 bits to give us different partitions after mod 4
+        let hash1: u64 = 0x0000_0000_0000_0000; // >> 48 = 0, % 4 = 0
+        let hash2: u64 = 0x0001_0000_0000_0000; // >> 48 = 1, % 4 = 1
+        let hash3: u64 = 0x0002_0000_0000_0000; // >> 48 = 2, % 4 = 2
+        let hash4: u64 = 0x0003_0000_0000_0000; // >> 48 = 3, % 4 = 3
+
+        assert_eq!(pfm.partition_for(hash1), 0);
+        assert_eq!(pfm.partition_for(hash2), 1);
+        assert_eq!(pfm.partition_for(hash3), 2);
+        assert_eq!(pfm.partition_for(hash4), 3);
+
+        // Create files in different partitions
+        let file1 = pfm.create_file(0).unwrap();
+        let file2 = pfm.create_file(1).unwrap();
+
+        assert_eq!(pfm.total_file_count(), 2);
     }
 }

@@ -74,6 +74,18 @@ impl Bucket {
         }
     }
 
+    /// Check if bucket is empty (never written or fully cleared).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.state.load(Ordering::Acquire) == BUCKET_EMPTY
+    }
+
+    /// Check if bucket is deleted (tombstone — must not stop probing here).
+    #[inline]
+    pub fn is_deleted(&self) -> bool {
+        self.state.load(Ordering::Acquire) == BUCKET_DELETED
+    }
+
     /// Check if bucket is empty or deleted.
     #[inline]
     pub fn is_available(&self) -> bool {
@@ -264,6 +276,8 @@ impl LockFreeIndex {
     }
 
     /// Find bucket for key (linear probing).
+    /// Only stops at truly empty buckets — deleted (tombstone) buckets are skipped
+    /// to preserve linear probing chains.
     #[inline]
     fn find_bucket(&self, key: &[u8], key_hash: u64) -> Option<usize> {
         let start = (key_hash as usize) & self.mask;
@@ -272,13 +286,14 @@ impl LockFreeIndex {
             let index = (start + i) & self.mask;
             let bucket = self.bucket(index);
 
-            if bucket.is_available() {
-                return None; // Key not found
+            if bucket.is_empty() {
+                return None; // Key not found — end of probing chain
             }
 
             if bucket.is_occupied() && bucket.key_matches(key, key_hash) {
                 return Some(index);
             }
+            // Deleted buckets: continue probing
         }
 
         None
@@ -334,6 +349,12 @@ impl LockFreeIndex {
         location: &DiskLocation,
         generation: u32,
     ) -> io::Result<()> {
+        if key.len() > MAX_INLINE_KEY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("key length {} exceeds max inline key size {}", key.len(), MAX_INLINE_KEY),
+            ));
+        }
         let key_hash = hash_key(key);
 
         // First, check if key already exists

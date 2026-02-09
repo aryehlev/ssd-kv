@@ -331,21 +331,25 @@ pub use fallback::{huge_page_alloc, huge_page_free, is_huge_pages_available};
 /// RAII wrapper for huge page allocations.
 pub struct HugePageAlloc {
     ptr: *mut u8,
-    size: usize,
+    /// Actual mmap'd size (rounded up to page boundary).
+    allocated_size: usize,
+    /// User-requested size.
+    requested_size: usize,
 }
 
 impl HugePageAlloc {
     /// Allocate a huge page region.
     pub fn new(size: usize) -> io::Result<Self> {
         let config = HugePageConfig::default();
-        let ptr = huge_page_alloc(size, &config)?;
-        Ok(Self { ptr, size })
+        Self::with_config(size, &config)
     }
 
     /// Allocate with custom config.
     pub fn with_config(size: usize, config: &HugePageConfig) -> io::Result<Self> {
+        let page_size = config.size.bytes();
+        let allocated_size = (size + page_size - 1) & !(page_size - 1);
         let ptr = huge_page_alloc(size, config)?;
-        Ok(Self { ptr, size })
+        Ok(Self { ptr, allocated_size, requested_size: size })
     }
 
     /// Get the pointer.
@@ -358,25 +362,25 @@ impl HugePageAlloc {
         self.ptr
     }
 
-    /// Get the size.
+    /// Get the requested size.
     pub fn size(&self) -> usize {
-        self.size
+        self.requested_size
     }
 
     /// Convert to a slice.
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.requested_size) }
     }
 
     /// Convert to a mutable slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.requested_size) }
     }
 }
 
 impl Drop for HugePageAlloc {
     fn drop(&mut self) {
-        huge_page_free(self.ptr, self.size);
+        huge_page_free(self.ptr, self.allocated_size);
     }
 }
 

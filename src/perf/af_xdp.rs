@@ -432,9 +432,13 @@ mod linux {
                 return Err(io::Error::last_os_error());
             }
 
-            // Setup rings (simplified - in production would mmap each ring)
-            // For now, we note this needs kernel mapping
-            tracing::debug!("AF_XDP rings configured");
+            // TODO: Complete ring setup by mmapping each ring:
+            // 1. mmap fill ring at XDP_UMEM_PGOFF_FILL_RING
+            // 2. mmap completion ring at XDP_UMEM_PGOFF_COMPLETION_RING
+            // 3. mmap RX ring at XDP_PGOFF_RX_RING
+            // 4. mmap TX ring at XDP_PGOFF_TX_RING
+            // 5. Populate self.fill_ring, self.comp_ring, self.rx_ring, self.tx_ring
+            tracing::warn!("AF_XDP ring setup not fully implemented - socket will not transfer data");
 
             Ok(())
         }

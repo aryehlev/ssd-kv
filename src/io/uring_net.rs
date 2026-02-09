@@ -70,6 +70,8 @@ mod linux {
         next_id: AtomicU64,
         registered_buffers: bool,
         multishot_supported: bool,
+        /// Pinned buffers registered with the kernel — must outlive the registration.
+        _pinned_buffers: Option<Vec<Vec<u8>>>,
     }
 
     impl UringNet {
@@ -96,6 +98,7 @@ mod linux {
                 next_id: AtomicU64::new(1),
                 registered_buffers: false,
                 multishot_supported,
+                _pinned_buffers: None,
             })
         }
 
@@ -109,6 +112,7 @@ mod linux {
                 next_id: AtomicU64::new(1),
                 registered_buffers: false,
                 multishot_supported: false,
+                _pinned_buffers: None,
             })
         }
 
@@ -117,7 +121,9 @@ mod linux {
         }
 
         /// Register fixed buffers for zero-copy I/O.
-        pub fn register_buffers(&mut self, buffers: &[Vec<u8>]) -> io::Result<()> {
+        /// Takes ownership of buffers to ensure they remain valid for the
+        /// lifetime of the kernel registration.
+        pub fn register_buffers(&mut self, buffers: Vec<Vec<u8>>) -> io::Result<()> {
             let iovecs: Vec<libc::iovec> = buffers
                 .iter()
                 .map(|b| libc::iovec {
@@ -130,6 +136,8 @@ mod linux {
                 self.ring.submitter().register_buffers(&iovecs)?;
             }
             self.registered_buffers = true;
+            // Keep buffers alive for the lifetime of this struct
+            self._pinned_buffers = Some(buffers);
             Ok(())
         }
 

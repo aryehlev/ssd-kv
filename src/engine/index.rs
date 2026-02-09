@@ -194,13 +194,17 @@ impl Index {
 
         let old = shard.insert(entry);
         if let Some(ref old_entry) = old {
-            // Replacing existing: adjust data bytes (subtract old, add new)
-            let old_size = old_entry.value_len as u64 + old_entry.key.len() as u64;
-            let new_size = value_len as u64 + key.len() as u64;
-            if new_size > old_size {
-                self.total_data_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
-            } else {
-                self.total_data_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
+            // shard.insert returns Some(old) on replacement (old gen < new gen)
+            // or Some(entry) on rejection (old gen >= new gen).
+            // Only adjust accounting on actual replacement.
+            if old_entry.generation < generation {
+                let old_size = old_entry.value_len as u64 + old_entry.key.len() as u64;
+                let new_size = value_len as u64 + key.len() as u64;
+                if new_size > old_size {
+                    self.total_data_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
+                } else {
+                    self.total_data_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
+                }
             }
         } else {
             self.total_entries.fetch_add(1, Ordering::Relaxed);

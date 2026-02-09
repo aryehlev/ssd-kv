@@ -494,7 +494,7 @@ pub fn group_by_shard(hashes: &[u64], num_shards: usize) -> Vec<(usize, Vec<usiz
 // ============================================================================
 
 /// Hardware-accelerated CRC32C computation (if available).
-/// Falls back to crc32fast if hardware support is not available.
+/// Falls back to software CRC-32C if hardware support is not available.
 #[inline]
 pub fn crc32c(data: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
@@ -504,8 +504,37 @@ pub fn crc32c(data: &[u8]) -> u32 {
         }
     }
 
-    // Fallback to crc32fast (which may use hardware acceleration internally)
-    crc32fast::hash(data)
+    // Software CRC-32C (Castagnoli) fallback — same algorithm as the hardware path.
+    // crc32fast uses CRC-32 IEEE which is a DIFFERENT polynomial and would produce
+    // incompatible checksums.
+    crc32c_sw(data)
+}
+
+/// Software CRC-32C (Castagnoli) using a lookup table.
+/// Polynomial: 0x1EDC6F41 (bit-reversed: 0x82F63B78).
+fn crc32c_sw(data: &[u8]) -> u32 {
+    static TABLE: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::new(|| {
+        let mut table = [0u32; 256];
+        for i in 0..256u32 {
+            let mut crc = i;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0x82F63B78;
+                } else {
+                    crc >>= 1;
+                }
+            }
+            table[i as usize] = crc;
+        }
+        table
+    });
+
+    let mut crc = 0xFFFFFFFFu32;
+    for &byte in data {
+        let index = ((crc ^ byte as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ TABLE[index];
+    }
+    !crc
 }
 
 #[cfg(target_arch = "x86_64")]

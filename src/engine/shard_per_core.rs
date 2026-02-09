@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
-use crate::engine::index_entry::{hash_key, IndexEntry};
+use crate::engine::index_entry::hash_key;
 use crate::storage::write_buffer::{DiskLocation, WriteBuffer};
 
 /// Message types for cross-core communication.
@@ -63,8 +63,8 @@ pub struct ShardStats {
 pub struct Shard {
     /// Shard ID (0..num_cores)
     id: usize,
-    /// Local index - NO LOCKS because single-threaded access
-    index: HashMap<u64, ShardEntry>,
+    /// Local index keyed by full key bytes to avoid hash collisions
+    index: HashMap<Vec<u8>, ShardEntry>,
     /// Local write buffer
     write_buffer: Vec<u8>,
     /// Generation counter
@@ -78,7 +78,6 @@ pub struct Shard {
 /// Entry in the shard's local index.
 #[derive(Clone)]
 struct ShardEntry {
-    key: Vec<u8>,
     /// Inline value (if small enough) OR disk location
     data: ShardData,
     generation: u32,
@@ -110,19 +109,15 @@ impl Shard {
     pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         self.stats.gets.fetch_add(1, Ordering::Relaxed);
 
-        let key_hash = hash_key(key);
-
-        if let Some(entry) = self.index.get(&key_hash) {
-            if entry.key == key {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                return match &entry.data {
-                    ShardData::Inline(value) => Some(value.clone()),
-                    ShardData::OnDisk { .. } => {
-                        // TODO: Read from disk
-                        None
-                    }
-                };
-            }
+        if let Some(entry) = self.index.get(key) {
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return match &entry.data {
+                ShardData::Inline(value) => Some(value.clone()),
+                ShardData::OnDisk { .. } => {
+                    // TODO: Read from disk
+                    None
+                }
+            };
         }
 
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
@@ -134,7 +129,6 @@ impl Shard {
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>, _ttl: u32) -> io::Result<()> {
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
 
-        let key_hash = hash_key(&key);
         self.generation += 1;
 
         let data = if value.len() <= self.inline_threshold {
@@ -145,12 +139,11 @@ impl Shard {
         };
 
         let entry = ShardEntry {
-            key,
             data,
             generation: self.generation,
         };
 
-        if self.index.insert(key_hash, entry).is_none() {
+        if self.index.insert(key, entry).is_none() {
             self.stats.entries.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -162,9 +155,7 @@ impl Shard {
     pub fn delete(&mut self, key: &[u8]) -> bool {
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
 
-        let key_hash = hash_key(key);
-
-        if self.index.remove(&key_hash).is_some() {
+        if self.index.remove(key).is_some() {
             self.stats.entries.fetch_sub(1, Ordering::Relaxed);
             true
         } else {
@@ -387,15 +378,18 @@ impl<T: Clone> SwmrCell<T> {
 
     /// Write the value (single writer only!).
     pub fn write(&self, value: T) {
-        // Mark write in progress (odd version)
-        self.version.fetch_add(1, Ordering::Release);
+        // Mark write in progress (odd version).
+        // AcqRel ensures the value write below cannot be reordered before
+        // this version increment (Acquire), and prior writes are visible (Release).
+        self.version.fetch_add(1, Ordering::AcqRel);
 
         // Write value
         unsafe {
             *self.value.get() = value;
         }
 
-        // Mark write complete (even version)
+        // Mark write complete (even version).
+        // Release ensures the value write above is visible before version becomes even.
         self.version.fetch_add(1, Ordering::Release);
     }
 }

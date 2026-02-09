@@ -12,7 +12,7 @@
 //! - Registered buffers (zero-copy I/O)
 //! - Better cache locality
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -363,7 +363,7 @@ mod fallback {
             self.next_id.fetch_add(1, Ordering::Relaxed)
         }
 
-        pub fn register_buffers(&mut self, _buffers: &[Vec<u8>]) -> io::Result<()> {
+        pub fn register_buffers(&mut self, _buffers: Vec<Vec<u8>>) -> io::Result<()> {
             Ok(())
         }
 
@@ -524,7 +524,7 @@ pub struct TrackedConnection {
     pub fd: RawFd,
     pub recv_pending: bool,
     pub send_pending: bool,
-    pub send_queue: Vec<Vec<u8>>,
+    pub send_queue: VecDeque<Vec<u8>>,
 }
 
 /// High-performance TCP server using io_uring.
@@ -581,7 +581,7 @@ impl UringServer {
         if let Some(conn) = self.connections.get_mut(&fd) {
             if conn.send_pending {
                 // Already sending, queue for later
-                conn.send_queue.push(data);
+                conn.send_queue.push_back(data);
             } else {
                 self.net.submit_send(fd, data)?;
                 conn.send_pending = true;
@@ -632,7 +632,7 @@ impl UringServer {
                             fd: new_fd,
                             recv_pending: false,
                             send_pending: false,
-                            send_queue: Vec::new(),
+                            send_queue: VecDeque::new(),
                         });
 
                         handler(NetEvent::Accept(new_fd));
@@ -690,7 +690,7 @@ impl UringServer {
                         }
 
                         // Send next queued data if any
-                        if let Some(next_data) = conn.send_queue.pop() {
+                        if let Some(next_data) = conn.send_queue.pop_front() {
                             let _ = self.net.submit_send(fd, next_data);
                             conn.send_pending = true;
                         }
@@ -709,6 +709,19 @@ impl UringServer {
     /// Get number of active connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+}
+
+impl Drop for UringServer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.listener_fd);
+        }
+        for &fd in self.connections.keys() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
     }
 }
 

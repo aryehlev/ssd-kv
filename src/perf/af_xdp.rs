@@ -160,17 +160,18 @@ mod linux {
     impl UmemRing {
         /// Reserve space in the ring.
         pub fn reserve(&self, count: u32) -> u32 {
-            let prod = unsafe { (*self.producer).wrapping_add(0) };
-            let cons = unsafe { (*self.consumer).wrapping_add(0) };
-            let free = self.size - (prod - cons);
+            let prod = unsafe { ptr::read_volatile(self.producer) };
+            let cons = unsafe { ptr::read_volatile(self.consumer) };
+            let free = self.size - (prod.wrapping_sub(cons));
             count.min(free)
         }
 
         /// Submit entries to the ring.
         pub fn submit(&self, count: u32) {
+            std::sync::atomic::fence(Ordering::Release);
             unsafe {
-                std::sync::atomic::fence(Ordering::Release);
-                *self.producer = (*self.producer).wrapping_add(count);
+                let val = ptr::read_volatile(self.producer).wrapping_add(count);
+                ptr::write_volatile(self.producer, val);
             }
         }
 
@@ -204,15 +205,15 @@ mod linux {
         /// Get number of available entries to consume.
         pub fn available(&self) -> u32 {
             std::sync::atomic::fence(Ordering::Acquire);
-            let prod = unsafe { *self.producer };
-            let cons = unsafe { *self.consumer };
+            let prod = unsafe { ptr::read_volatile(self.producer) };
+            let cons = unsafe { ptr::read_volatile(self.consumer) };
             prod.wrapping_sub(cons)
         }
 
         /// Get number of free entries for production.
         pub fn free(&self) -> u32 {
-            let prod = unsafe { *self.producer };
-            let cons = unsafe { *self.consumer };
+            let prod = unsafe { ptr::read_volatile(self.producer) };
+            let cons = unsafe { ptr::read_volatile(self.consumer) };
             self.size - prod.wrapping_sub(cons)
         }
 
@@ -232,7 +233,8 @@ mod linux {
         pub fn release(&self, count: u32) {
             std::sync::atomic::fence(Ordering::Release);
             unsafe {
-                *self.consumer = (*self.consumer).wrapping_add(count);
+                let val = ptr::read_volatile(self.consumer).wrapping_add(count);
+                ptr::write_volatile(self.consumer, val);
             }
         }
 
@@ -240,13 +242,14 @@ mod linux {
         pub fn submit(&self, count: u32) {
             std::sync::atomic::fence(Ordering::Release);
             unsafe {
-                *self.producer = (*self.producer).wrapping_add(count);
+                let val = ptr::read_volatile(self.producer).wrapping_add(count);
+                ptr::write_volatile(self.producer, val);
             }
         }
 
         /// Check if wakeup is needed.
         pub fn needs_wakeup(&self) -> bool {
-            unsafe { (*self.flags & XDP_RING_NEED_WAKEUP) != 0 }
+            unsafe { (ptr::read_volatile(self.flags) & XDP_RING_NEED_WAKEUP) != 0 }
         }
     }
 
@@ -276,7 +279,12 @@ mod linux {
                 return Err(io::Error::last_os_error());
             }
 
-            let umem_size = (config.frame_count * config.frame_size) as usize;
+            let umem_size = (config.frame_count as usize)
+                .checked_mul(config.frame_size as usize)
+                .ok_or_else(|| io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UMEM size overflow: frame_count * frame_size exceeds maximum",
+                ))?;
 
             // Allocate UMEM (huge pages if available)
             let umem = unsafe {
@@ -467,7 +475,7 @@ mod linux {
                 return 0;
             }
 
-            let cons = unsafe { *rx.consumer };
+            let cons = unsafe { ptr::read_volatile(rx.consumer) };
             for i in 0..available {
                 descs[i as usize] = rx.get(cons.wrapping_add(i));
             }
@@ -489,7 +497,7 @@ mod linux {
                 return 0;
             }
 
-            let prod = unsafe { *tx.producer };
+            let prod = unsafe { ptr::read_volatile(tx.producer) };
             for i in 0..free {
                 tx.set(prod.wrapping_add(i), descs[i as usize]);
             }
@@ -500,8 +508,13 @@ mod linux {
         }
 
         /// Get frame data pointer.
-        pub fn frame_data(&self, addr: u64) -> *mut u8 {
-            unsafe { self.umem.add(addr as usize) }
+        pub fn frame_data(&self, addr: u64) -> Option<*mut u8> {
+            let offset = addr as usize;
+            if offset < self.umem_size {
+                Some(unsafe { self.umem.add(offset) })
+            } else {
+                None
+            }
         }
 
         /// Poll for events.
@@ -606,8 +619,8 @@ mod fallback {
             0
         }
 
-        pub fn frame_data(&self, _addr: u64) -> *mut u8 {
-            std::ptr::null_mut()
+        pub fn frame_data(&self, _addr: u64) -> Option<*mut u8> {
+            None
         }
 
         pub fn poll(&self, _timeout_ms: i32) -> io::Result<u32> {

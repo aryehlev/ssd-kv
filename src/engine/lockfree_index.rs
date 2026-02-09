@@ -366,6 +366,12 @@ impl LockFreeIndex {
                 std::hint::spin_loop();
             }
 
+            // Re-verify key still matches after acquiring lock (could have been deleted/modified)
+            if !bucket.key_matches(key, key_hash) {
+                bucket.unlock_occupied();
+                return self.put(key, location, generation);
+            }
+
             // Update existing entry
             let bucket_mut = self.bucket_mut(index);
             bucket_mut.set(key, key_hash, location, generation);
@@ -381,6 +387,13 @@ impl LockFreeIndex {
             // Spin until we can lock
             while !bucket.try_lock() {
                 std::hint::spin_loop();
+            }
+
+            // After acquiring lock, re-check that this key doesn't already exist
+            // (another thread may have inserted it while we were waiting)
+            if self.find_bucket(key, key_hash).is_some() {
+                bucket.unlock_deleted();
+                return self.put(key, location, generation);
             }
 
             // Insert new entry (we hold the lock, so the bucket is ours)
@@ -406,6 +419,12 @@ impl LockFreeIndex {
             // Spin until we can lock
             while !bucket.try_lock() {
                 std::hint::spin_loop();
+            }
+
+            // Re-verify key matches after acquiring lock
+            if !bucket.key_matches(key, key_hash) {
+                bucket.unlock_occupied();
+                return false;
             }
 
             // Mark as deleted

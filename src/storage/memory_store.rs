@@ -66,24 +66,36 @@ impl MemoryStore {
     }
 
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
+        let data_size = (key.len() + value.len()) as u64;
         // Capacity check (only when limits are configured)
         if self.max_entries > 0 || self.max_data_bytes > 0 {
             if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
-                if self.max_entries > 0 && self.total_entries.load(Ordering::Relaxed) >= self.max_entries {
-                    if !self.data.contains_key(key) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "OOM command not allowed when used memory > 'maxmemory'",
-                        ));
+                let mut existing_size = None;
+                if let Some(entry) = self.data.get(key) {
+                    if entry.ttl_secs != 0 && entry.is_expired() {
+                        drop(entry);
+                        self.remove_entry(key);
+                    } else {
+                        existing_size = Some((key.len() + entry.value.len()) as u64);
                     }
                 }
-                if self.max_data_bytes > 0 && self.total_data_bytes.load(Ordering::Relaxed) >= self.max_data_bytes {
-                    if !self.data.contains_key(key) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "OOM command not allowed when used memory > 'maxmemory'",
-                        ));
-                    }
+
+                let current_entries = self.total_entries.load(Ordering::Relaxed);
+                let current_bytes = self.total_data_bytes.load(Ordering::Relaxed);
+                let projected_entries = current_entries + if existing_size.is_none() { 1 } else { 0 };
+                let projected_bytes = current_bytes + data_size - existing_size.unwrap_or(0);
+
+                if self.max_entries > 0 && projected_entries > self.max_entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "OOM command not allowed when used memory > 'maxmemory'",
+                    ));
+                }
+                if self.max_data_bytes > 0 && projected_bytes > self.max_data_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "OOM command not allowed when used memory > 'maxmemory'",
+                    ));
                 }
             }
         }
@@ -99,7 +111,6 @@ impl MemoryStore {
             0
         };
 
-        let data_size = (key.len() + value.len()) as u64;
         let entry = MemoryEntry {
             value: value.to_vec(),
             generation,

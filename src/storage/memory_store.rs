@@ -18,6 +18,7 @@ struct MemoryEntry {
     generation: u32,
     timestamp_micros: u64,
     ttl_secs: u32,
+    value_type: u8,
 }
 
 impl MemoryEntry {
@@ -113,6 +114,7 @@ impl MemoryStore {
             generation,
             timestamp_micros: now_micros,
             ttl_secs: ttl,
+            value_type: 0,
         };
 
         if let Some(old) = self.data.insert(key.to_vec(), entry) {
@@ -180,6 +182,7 @@ impl MemoryStore {
             value: entry.value.clone(),
             timestamp_micros: entry.timestamp_micros,
             ttl_secs: entry.ttl_secs,
+            value_type: entry.value_type,
         })
     }
 
@@ -199,6 +202,69 @@ impl MemoryStore {
         } else {
             Ok(false)
         }
+    }
+
+    pub fn put_sync_typed(&self, key: &[u8], value: &[u8], ttl: u32, value_type: u8) -> io::Result<()> {
+        let data_size = (key.len() + value.len()) as u64;
+        if self.max_entries > 0 || self.max_data_bytes > 0 {
+            if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
+                self.remove_if_expired(key);
+                let existing_size = self.data.get(key).map(|e| (key.len() + e.value.len()) as u64);
+
+                let current_entries = self.total_entries.load(Ordering::Relaxed);
+                let current_bytes = self.total_data_bytes.load(Ordering::Relaxed);
+                let projected_entries = current_entries + if existing_size.is_none() { 1 } else { 0 };
+                let projected_bytes = current_bytes + data_size - existing_size.unwrap_or(0);
+
+                if self.max_entries > 0 && projected_entries > self.max_entries {
+                    return Err(io::Error::new(io::ErrorKind::Other, "OOM command not allowed when used memory > 'maxmemory'"));
+                }
+                if self.max_data_bytes > 0 && projected_bytes > self.max_data_bytes {
+                    return Err(io::Error::new(io::ErrorKind::Other, "OOM command not allowed when used memory > 'maxmemory'"));
+                }
+            }
+        }
+
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let now_micros = if ttl != 0 {
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let entry = MemoryEntry {
+            value: value.to_vec(),
+            generation,
+            timestamp_micros: now_micros,
+            ttl_secs: ttl,
+            value_type,
+        };
+
+        if let Some(old) = self.data.insert(key.to_vec(), entry) {
+            let old_size = (key.len() + old.value.len()) as u64;
+            if data_size != old_size {
+                if data_size > old_size {
+                    self.total_data_bytes.fetch_add(data_size - old_size, Ordering::Relaxed);
+                } else {
+                    self.total_data_bytes.fetch_sub(old_size - data_size, Ordering::Relaxed);
+                }
+            }
+        } else {
+            self.total_entries.fetch_add(1, Ordering::Relaxed);
+            self.total_data_bytes.fetch_add(data_size, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    pub fn get_value_with_type(&self, key: &[u8]) -> Option<(Vec<u8>, u8)> {
+        let entry = self.data.get(key)?;
+        if entry.ttl_secs != 0 && entry.is_expired() {
+            drop(entry);
+            self.remove_if_expired(key);
+            return None;
+        }
+        Some((entry.value.clone(), entry.value_type))
     }
 
     pub fn flush(&self) -> io::Result<()> {

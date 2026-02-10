@@ -20,6 +20,7 @@ pub struct RecordMeta {
     pub value: Vec<u8>,
     pub timestamp_micros: u64,
     pub ttl_secs: u32,
+    pub value_type: u8,
 }
 
 /// Statistics for the handler.
@@ -222,7 +223,71 @@ impl Handler {
             value: record.value,
             timestamp_micros: record.header.timestamp,
             ttl_secs: record.header.ttl,
+            value_type: record.header.reserved[0],
         })
+    }
+
+    /// Synchronous PUT that also sets the value type byte in reserved[0].
+    pub fn put_sync_typed(&self, key: &[u8], value: &[u8], ttl: u32, value_type: u8) -> io::Result<()> {
+        // Capacity check (same as put_sync)
+        if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
+            if self.max_entries > 0 {
+                let stats = self.index.stats();
+                if stats.live_entries >= self.max_entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "OOM command not allowed when used memory > 'maxmemory'",
+                    ));
+                }
+            }
+            if self.max_data_bytes > 0 {
+                if self.index.total_data_bytes() >= self.max_data_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "OOM command not allowed when used memory > 'maxmemory'",
+                    ));
+                }
+            }
+        }
+
+        let key_hash = hash_key(key);
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+
+        let mut record = Record::new(key.to_vec(), value.to_vec(), generation, ttl)?;
+        record.header.reserved[0] = value_type;
+
+        let location = self.write_buffer.append(&mut record)?;
+        self.index.insert(key, location, generation, record.header.value_len);
+        self.bloom_filter.write().add(key_hash);
+        self.stats.puts.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Returns (value, value_type) for a key.
+    pub fn get_value_with_type(&self, key: &[u8]) -> Option<(Vec<u8>, u8)> {
+        let entry = self.index.get(key)?;
+
+        // Check write buffer first
+        if let Some(meta) = self.write_buffer.read_unflushed_meta(&entry.location, key) {
+            return Some((meta.value, meta.value_type));
+        }
+
+        // Disk read
+        let file = self.file_manager.get_file(entry.location.file_id)?;
+        let file_guard = file.lock();
+        let wblock_data = file_guard.read_wblock(entry.location.wblock_id as u32).ok()?;
+
+        let offset = entry.location.offset as usize;
+        if offset >= wblock_data.len() {
+            return None;
+        }
+
+        let record = Record::from_bytes(&wblock_data[offset..]).ok()?;
+        if record.header.is_deleted() || record.header.is_expired() {
+            return None;
+        }
+
+        Some((record.value, record.header.reserved[0]))
     }
 
     /// Updates the TTL for an existing key. Returns false if key doesn't exist.

@@ -235,6 +235,7 @@ impl Compactor {
                             record.header.generation,
                             record.header.ttl,
                         )?;
+                        new_record.header.reserved = record.header.reserved;
 
                         let new_location = self.write_buffer.append(&mut new_record)?;
 

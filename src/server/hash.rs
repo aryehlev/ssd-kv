@@ -155,6 +155,15 @@ impl HashValue {
         self.fields.remove(field).is_some()
     }
 
+    /// Get the value of a field and delete it. Returns None if the field doesn't exist or is expired.
+    pub fn get_and_del(&mut self, field: &[u8]) -> Option<Vec<u8>> {
+        let now_ms = now_millis();
+        match self.fields.remove(field) {
+            Some(f) if f.expiry_ms == 0 || f.expiry_ms > now_ms => Some(f.value),
+            _ => None,
+        }
+    }
+
     /// Check if a field exists and is not expired.
     pub fn exists(&self, field: &[u8]) -> bool {
         self.get(field).is_some()
@@ -298,6 +307,177 @@ impl HashValue {
             }
         }).collect()
     }
+}
+
+// ── Direct blob manipulation (no HashMap allocation) ─────────────
+
+const FIELD_HEADER_SIZE: usize = 2 + 4 + 8; // name_len + value_len + expiry_ms
+
+/// Build a blob for a single field without allocating a HashMap.
+#[inline]
+pub fn encode_single_field(name: &[u8], value: &[u8]) -> Vec<u8> {
+    let len = 5 + FIELD_HEADER_SIZE + name.len() + value.len();
+    let mut buf = Vec::with_capacity(len);
+    buf.push(HASH_BLOB_VERSION);
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&0i64.to_le_bytes()); // no expiry
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(value);
+    buf
+}
+
+/// Result of a direct blob HSET operation.
+pub struct BlobSetResult {
+    pub blob: Vec<u8>,
+    pub new_fields: i64,
+}
+
+/// Set multiple field-value pairs directly in a blob without deserializing to HashMap.
+/// Scans the existing blob, replaces matching fields in-place, appends new ones.
+/// Skips expired fields during the copy. Returns the new blob and count of newly added fields.
+pub fn blob_set_fields(existing: &[u8], fields: &[(&[u8], &[u8])]) -> BlobSetResult {
+    // Handle empty/invalid existing blob
+    if existing.len() < 5 || existing[0] != HASH_BLOB_VERSION {
+        // Build new blob from scratch
+        let total_payload: usize = fields.iter()
+            .map(|(n, v)| FIELD_HEADER_SIZE + n.len() + v.len())
+            .sum();
+        let mut buf = Vec::with_capacity(5 + total_payload);
+        buf.push(HASH_BLOB_VERSION);
+        buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        for (name, value) in fields {
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&0i64.to_le_bytes());
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(value);
+        }
+        return BlobSetResult { blob: buf, new_fields: fields.len() as i64 };
+    }
+
+    let now_ms = now_millis();
+    let field_count = u32::from_le_bytes([existing[1], existing[2], existing[3], existing[4]]) as usize;
+
+    // Track which input fields have been matched (replaced) vs need appending
+    let mut matched = vec![false; fields.len()];
+
+    // First pass: calculate output size and find matches
+    // We'll scan existing fields and decide keep/replace/skip
+    struct ExistingField {
+        offset: usize, // start of this field's header in the blob
+        end: usize,    // end of this field (after value bytes)
+        replace_idx: Option<usize>, // index into `fields` if being replaced
+        expired: bool,
+    }
+
+    let mut existing_fields = Vec::with_capacity(field_count);
+    let mut offset = 5;
+    for _ in 0..field_count {
+        if offset + FIELD_HEADER_SIZE > existing.len() {
+            break;
+        }
+        let name_len = u16::from_le_bytes([existing[offset], existing[offset + 1]]) as usize;
+        let value_len = u32::from_le_bytes([
+            existing[offset + 2], existing[offset + 3],
+            existing[offset + 4], existing[offset + 5],
+        ]) as usize;
+        let expiry_ms = i64::from_le_bytes([
+            existing[offset + 6], existing[offset + 7], existing[offset + 8], existing[offset + 9],
+            existing[offset + 10], existing[offset + 11], existing[offset + 12], existing[offset + 13],
+        ]);
+        let field_start = offset;
+        offset += FIELD_HEADER_SIZE;
+
+        if offset + name_len + value_len > existing.len() {
+            break;
+        }
+
+        let name = &existing[offset..offset + name_len];
+        let expired = expiry_ms != 0 && expiry_ms <= now_ms;
+
+        // Check if this existing field is being replaced by one of our input fields
+        let mut replace_idx = None;
+        if !expired {
+            for (i, (fn_name, _)) in fields.iter().enumerate() {
+                if !matched[i] && name == *fn_name {
+                    replace_idx = Some(i);
+                    matched[i] = true;
+                    break;
+                }
+            }
+        }
+
+        offset += name_len + value_len;
+        existing_fields.push(ExistingField {
+            offset: field_start,
+            end: offset,
+            replace_idx,
+            expired,
+        });
+    }
+
+    // Count output fields and estimate size
+    let kept_fields = existing_fields.iter().filter(|f| !f.expired).count();
+    let new_fields_count = matched.iter().filter(|m| !**m).count();
+    let total_fields = kept_fields + new_fields_count;
+
+    // Estimate output size (rough upper bound)
+    let mut est_size = 5;
+    for ef in &existing_fields {
+        if ef.expired { continue; }
+        match ef.replace_idx {
+            Some(i) => {
+                est_size += FIELD_HEADER_SIZE + fields[i].0.len() + fields[i].1.len();
+            }
+            None => {
+                est_size += ef.end - ef.offset;
+            }
+        }
+    }
+    for (i, (name, value)) in fields.iter().enumerate() {
+        if !matched[i] {
+            est_size += FIELD_HEADER_SIZE + name.len() + value.len();
+        }
+    }
+
+    // Second pass: build output
+    let mut buf = Vec::with_capacity(est_size);
+    buf.push(HASH_BLOB_VERSION);
+    buf.extend_from_slice(&(total_fields as u32).to_le_bytes());
+
+    for ef in &existing_fields {
+        if ef.expired { continue; }
+        match ef.replace_idx {
+            Some(i) => {
+                // Write replacement field
+                let (name, value) = fields[i];
+                buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&0i64.to_le_bytes()); // reset expiry on overwrite
+                buf.extend_from_slice(name);
+                buf.extend_from_slice(value);
+            }
+            None => {
+                // Copy existing field as-is
+                buf.extend_from_slice(&existing[ef.offset..ef.end]);
+            }
+        }
+    }
+
+    // Append new fields that didn't match existing ones
+    for (i, (name, value)) in fields.iter().enumerate() {
+        if !matched[i] {
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&0i64.to_le_bytes());
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(value);
+        }
+    }
+
+    BlobSetResult { blob: buf, new_fields: new_fields_count as i64 }
 }
 
 #[inline]

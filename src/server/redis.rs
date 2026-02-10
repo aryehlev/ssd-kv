@@ -809,6 +809,9 @@ impl RedisHandler {
             b"HPTTL" | b"hpttl" => self.cmd_hpttl(&args, out),
             b"HEXPIRETIME" | b"hexpiretime" => self.cmd_hexpiretime(&args, out),
             b"HPEXPIRETIME" | b"hpexpiretime" => self.cmd_hpexpiretime(&args, out),
+            b"HGETDEL" | b"hgetdel" => self.cmd_hgetdel(&args, out),
+            b"HGETEX" | b"hgetex" => self.cmd_hgetex(&args, out),
+            b"HSETEX" | b"hsetex" => self.cmd_hsetex(&args, out),
             b"DUMP" | b"dump" | b"DEBUG" | b"debug" | b"RESTORE" | b"restore" => {
                 RespValue::err("not supported").serialize_into(out);
             }
@@ -2822,16 +2825,10 @@ impl RedisHandler {
             None => { RespValue::err("Invalid key").serialize_into(out); return; }
         };
         if self.check_moved(key, out) { return; }
-        if self.check_wrongtype_hash(key, out) { return; }
 
-        let mut hv = match self.load_hash(key, out) {
-            Ok(Some(h)) => h,
-            Ok(None) => HashValue::new(),
-            Err(()) => return,
-        };
-
-        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        let mut new_fields = 0i64;
+        // Extract field-value pairs first
+        let pair_count = (args.len() - 2) / 2;
+        let mut fv_pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(pair_count);
         let mut i = 2;
         while i + 1 < args.len() {
             let field = match Self::extract_bulk_arg(&args[i]) {
@@ -2842,14 +2839,42 @@ impl RedisHandler {
                 Some(v) => v,
                 None => { RespValue::err("Invalid value").serialize_into(out); return; }
             };
-            if hv.set(field.to_vec(), value.to_vec()) {
-                new_fields += 1;
-            }
+            fv_pairs.push((field, value));
             i += 2;
         }
 
-        if self.save_hash(key, &hv, ttl, out) {
-            RespValue::Integer(new_fields).serialize_into(out);
+        // Single lookup: get existing blob + ttl + type in one call
+        let handler = self.current_handler();
+        let meta = handler.get_with_meta(key);
+
+        // Check wrongtype
+        if let Some(ref m) = meta {
+            if m.value_type != ValueType::Hash as u8 {
+                RespValue::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()).serialize_into(out);
+                return;
+            }
+        }
+
+        let ttl = meta.as_ref().map(|m| m.ttl_secs).unwrap_or(0);
+
+        // Fast path: single field on new key — construct blob directly, zero HashMap overhead
+        if meta.is_none() && fv_pairs.len() == 1 {
+            let (fname, fval) = fv_pairs[0];
+            let blob = super::hash::encode_single_field(fname, fval);
+            match handler.put_sync_typed(key, &blob, ttl, ValueType::Hash as u8) {
+                Ok(_) => RespValue::Integer(1).serialize_into(out),
+                Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+            }
+            return;
+        }
+
+        // Fast path: direct blob manipulation — no HashMap allocation
+        let existing_blob = meta.as_ref().map(|m| m.value.as_slice()).unwrap_or(&[]);
+        let result = super::hash::blob_set_fields(existing_blob, &fv_pairs);
+
+        match handler.put_sync_typed(key, &result.blob, ttl, ValueType::Hash as u8) {
+            Ok(_) => RespValue::Integer(result.new_fields).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
     }
 
@@ -2864,15 +2889,9 @@ impl RedisHandler {
             None => { RespValue::err("Invalid key").serialize_into(out); return; }
         };
         if self.check_moved(key, out) { return; }
-        if self.check_wrongtype_hash(key, out) { return; }
 
-        let mut hv = match self.load_hash(key, out) {
-            Ok(Some(h)) => h,
-            Ok(None) => HashValue::new(),
-            Err(()) => return,
-        };
-
-        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        let pair_count = (args.len() - 2) / 2;
+        let mut fv_pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(pair_count);
         let mut i = 2;
         while i + 1 < args.len() {
             let field = match Self::extract_bulk_arg(&args[i]) {
@@ -2883,12 +2902,27 @@ impl RedisHandler {
                 Some(v) => v,
                 None => { RespValue::err("Invalid value").serialize_into(out); return; }
             };
-            hv.set(field.to_vec(), value.to_vec());
+            fv_pairs.push((field, value));
             i += 2;
         }
 
-        if self.save_hash(key, &hv, ttl, out) {
-            RespValue::ok().serialize_into(out);
+        let handler = self.current_handler();
+        let meta = handler.get_with_meta(key);
+
+        if let Some(ref m) = meta {
+            if m.value_type != ValueType::Hash as u8 {
+                RespValue::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()).serialize_into(out);
+                return;
+            }
+        }
+
+        let ttl = meta.as_ref().map(|m| m.ttl_secs).unwrap_or(0);
+        let existing_blob = meta.as_ref().map(|m| m.value.as_slice()).unwrap_or(&[]);
+        let result = super::hash::blob_set_fields(existing_blob, &fv_pairs);
+
+        match handler.put_sync_typed(key, &result.blob, ttl, ValueType::Hash as u8) {
+            Ok(_) => RespValue::ok().serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
     }
 
@@ -3696,6 +3730,472 @@ impl RedisHandler {
 
     fn cmd_hpexpiretime(&self, args: &[RespValue], out: &mut Vec<u8>) {
         self.hash_expiretime_cmd(args, out, true);
+    }
+
+    // ── HGETDEL ─────────────────────────────────────────────────────
+    // HGETDEL key FIELDS numfields field [field ...]
+    fn cmd_hgetdel(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 5 {
+            RespValue::err("ERR wrong number of arguments for 'hgetdel' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        if self.check_wrongtype_hash(key, out) { return; }
+
+        // Parse FIELDS numfields field [field ...]
+        let mut idx = 2;
+        if let Some(opt) = Self::extract_bulk_arg(&args[idx]) {
+            if opt.eq_ignore_ascii_case(b"FIELDS") {
+                idx += 1;
+            }
+        }
+        if idx >= args.len() {
+            RespValue::err("ERR syntax error").serialize_into(out);
+            return;
+        }
+        let numfields = match Self::parse_int_arg(&args[idx]) {
+            Ok(v) if v > 0 => v as usize,
+            _ => { RespValue::err("ERR syntax error").serialize_into(out); return; }
+        };
+        idx += 1;
+
+        let field_refs: Vec<&[u8]> = (idx..args.len())
+            .filter_map(|i| Self::extract_bulk_arg(&args[i]))
+            .take(numfields)
+            .collect();
+
+        if field_refs.is_empty() {
+            RespValue::err("ERR syntax error").serialize_into(out);
+            return;
+        }
+
+        let mut hv = match self.load_hash(key, out) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                let items: Vec<RespValue> = field_refs.iter().map(|_| RespValue::null()).collect();
+                RespValue::Array(Some(items)).serialize_into(out);
+                return;
+            }
+            Err(()) => return,
+        };
+
+        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        let mut items = Vec::with_capacity(field_refs.len());
+        let mut any_deleted = false;
+        for field in &field_refs {
+            match hv.get_and_del(field) {
+                Some(v) => { items.push(RespValue::bulk(v)); any_deleted = true; }
+                None => items.push(RespValue::null()),
+            }
+        }
+
+        if any_deleted {
+            self.save_hash(key, &hv, ttl, out);
+        }
+        RespValue::Array(Some(items)).serialize_into(out);
+    }
+
+    // ── HGETEX ──────────────────────────────────────────────────────
+    // HGETEX key [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | PERSIST] FIELDS numfields field [field ...]
+    fn cmd_hgetex(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 5 {
+            RespValue::err("ERR wrong number of arguments for 'hgetex' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        if self.check_wrongtype_hash(key, out) { return; }
+
+        // Parse optional expiry flags before FIELDS
+        #[derive(PartialEq)]
+        enum ExpiryMode { None, Ex, Px, Exat, Pxat, Persist }
+        let mut mode = ExpiryMode::None;
+        let mut time_arg: i64 = 0;
+        let mut idx = 2;
+
+        while idx < args.len() {
+            if let Some(opt) = Self::extract_bulk_arg(&args[idx]) {
+                match opt {
+                    b"EX" | b"ex" => {
+                        mode = ExpiryMode::Ex;
+                        idx += 1;
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"PX" | b"px" => {
+                        mode = ExpiryMode::Px;
+                        idx += 1;
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"EXAT" | b"exat" => {
+                        mode = ExpiryMode::Exat;
+                        idx += 1;
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"PXAT" | b"pxat" => {
+                        mode = ExpiryMode::Pxat;
+                        idx += 1;
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"PERSIST" | b"persist" => {
+                        mode = ExpiryMode::Persist;
+                        idx += 1;
+                    }
+                    b"FIELDS" | b"fields" => {
+                        idx += 1;
+                        break;
+                    }
+                    _ => { idx += 1; break; }
+                }
+            } else {
+                idx += 1;
+            }
+        }
+
+        // Parse numfields
+        if idx >= args.len() {
+            RespValue::err("ERR syntax error").serialize_into(out);
+            return;
+        }
+        let numfields = match Self::parse_int_arg(&args[idx]) {
+            Ok(v) if v > 0 => v as usize,
+            _ => { RespValue::err("ERR syntax error").serialize_into(out); return; }
+        };
+        idx += 1;
+
+        let field_refs: Vec<&[u8]> = (idx..args.len())
+            .filter_map(|i| Self::extract_bulk_arg(&args[i]))
+            .take(numfields)
+            .collect();
+
+        if field_refs.is_empty() {
+            RespValue::err("ERR syntax error").serialize_into(out);
+            return;
+        }
+
+        // If no expiry mode, this is read-only (like HMGET)
+        if mode == ExpiryMode::None {
+            let hv = match self.load_hash(key, out) {
+                Ok(h) => h,
+                Err(()) => return,
+            };
+            let mut items = Vec::with_capacity(field_refs.len());
+            for field in &field_refs {
+                match hv.as_ref().and_then(|h| h.get(field)) {
+                    Some(v) => items.push(RespValue::bulk(v.to_vec())),
+                    None => items.push(RespValue::null()),
+                }
+            }
+            RespValue::Array(Some(items)).serialize_into(out);
+            return;
+        }
+
+        let mut hv = match self.load_hash(key, out) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                let items: Vec<RespValue> = field_refs.iter().map(|_| RespValue::null()).collect();
+                RespValue::Array(Some(items)).serialize_into(out);
+                return;
+            }
+            Err(()) => return,
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // Compute absolute expiry
+        let expiry_ms = match mode {
+            ExpiryMode::Ex => {
+                if time_arg <= 0 { 0 } else { now_ms + time_arg * 1000 }
+            }
+            ExpiryMode::Px => {
+                if time_arg <= 0 { 0 } else { now_ms + time_arg }
+            }
+            ExpiryMode::Exat => {
+                if time_arg * 1000 <= now_ms { 0 } else { time_arg * 1000 }
+            }
+            ExpiryMode::Pxat => {
+                if time_arg <= now_ms { 0 } else { time_arg }
+            }
+            ExpiryMode::Persist | ExpiryMode::None => 0,
+        };
+
+        // Get values first, then apply expiry
+        let mut items = Vec::with_capacity(field_refs.len());
+        let mut needs_save = false;
+        for field in &field_refs {
+            match hv.get(field) {
+                Some(v) => {
+                    items.push(RespValue::bulk(v.to_vec()));
+                    // Apply expiry to this field
+                    if let Some(f) = hv.fields.get_mut(*field) {
+                        if expiry_ms == 0 && mode != ExpiryMode::Persist {
+                            // EX/PX 0 or past EXAT/PXAT: delete the field
+                            needs_save = true;
+                        } else if mode == ExpiryMode::Persist {
+                            if f.expiry_ms != 0 {
+                                f.expiry_ms = 0;
+                                needs_save = true;
+                            }
+                        } else {
+                            f.expiry_ms = expiry_ms;
+                            needs_save = true;
+                        }
+                    }
+                }
+                None => items.push(RespValue::null()),
+            }
+        }
+
+        // Delete fields with zero expiry (immediate expiration)
+        if mode != ExpiryMode::Persist && expiry_ms == 0 {
+            for field in &field_refs {
+                hv.fields.remove(*field);
+            }
+        }
+
+        if needs_save {
+            let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+            self.save_hash(key, &hv, ttl, out);
+        }
+        RespValue::Array(Some(items)).serialize_into(out);
+    }
+
+    // ── HSETEX ──────────────────────────────────────────────────────
+    // HSETEX key [NX|XX] [FNX|FXX] [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | KEEPTTL] FIELDS numfields field value [field value ...]
+    fn cmd_hsetex(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 5 {
+            RespValue::err("ERR wrong number of arguments for 'hsetex' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+        if self.check_wrongtype_hash(key, out) { return; }
+
+        // Parse optional flags before FIELDS
+        let mut key_nx = false;
+        let mut key_xx = false;
+        let mut field_nx = false;
+        let mut field_xx = false;
+        let mut keep_ttl = false;
+
+        #[derive(PartialEq)]
+        enum SetexExpiry { None, Ex, Px, Exat, Pxat }
+        let mut expiry_mode = SetexExpiry::None;
+        let mut time_arg: i64 = 0;
+        let mut idx = 2;
+
+        while idx < args.len() {
+            if let Some(opt) = Self::extract_bulk_arg(&args[idx]) {
+                match opt {
+                    b"NX" | b"nx" => { key_nx = true; idx += 1; }
+                    b"XX" | b"xx" => { key_xx = true; idx += 1; }
+                    b"FNX" | b"fnx" => { field_nx = true; idx += 1; }
+                    b"FXX" | b"fxx" => { field_xx = true; idx += 1; }
+                    b"KEEPTTL" | b"keepttl" => { keep_ttl = true; idx += 1; }
+                    b"EX" | b"ex" => {
+                        expiry_mode = SetexExpiry::Ex;
+                        idx += 1;
+                        if idx >= args.len() { RespValue::err("ERR syntax error").serialize_into(out); return; }
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"PX" | b"px" => {
+                        expiry_mode = SetexExpiry::Px;
+                        idx += 1;
+                        if idx >= args.len() { RespValue::err("ERR syntax error").serialize_into(out); return; }
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"EXAT" | b"exat" => {
+                        expiry_mode = SetexExpiry::Exat;
+                        idx += 1;
+                        if idx >= args.len() { RespValue::err("ERR syntax error").serialize_into(out); return; }
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"PXAT" | b"pxat" => {
+                        expiry_mode = SetexExpiry::Pxat;
+                        idx += 1;
+                        if idx >= args.len() { RespValue::err("ERR syntax error").serialize_into(out); return; }
+                        time_arg = match Self::parse_int_arg(&args[idx]) {
+                            Ok(v) => v,
+                            Err(e) => { RespValue::err(&e).serialize_into(out); return; }
+                        };
+                        idx += 1;
+                    }
+                    b"FIELDS" | b"fields" => {
+                        idx += 1;
+                        break;
+                    }
+                    _ => { idx += 1; break; }
+                }
+            } else {
+                idx += 1;
+            }
+        }
+
+        // Parse numfields
+        if idx >= args.len() {
+            RespValue::err("ERR syntax error").serialize_into(out);
+            return;
+        }
+        let numfields = match Self::parse_int_arg(&args[idx]) {
+            Ok(v) if v > 0 => v as usize,
+            _ => { RespValue::err("ERR syntax error").serialize_into(out); return; }
+        };
+        idx += 1;
+
+        // Parse field-value pairs
+        let mut fv_pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(numfields);
+        for _ in 0..numfields {
+            if idx + 1 >= args.len() {
+                RespValue::err("ERR wrong number of arguments for 'hsetex' command").serialize_into(out);
+                return;
+            }
+            let field = match Self::extract_bulk_arg(&args[idx]) {
+                Some(f) => f,
+                None => { RespValue::err("Invalid field").serialize_into(out); return; }
+            };
+            let value = match Self::extract_bulk_arg(&args[idx + 1]) {
+                Some(v) => v,
+                None => { RespValue::err("Invalid value").serialize_into(out); return; }
+            };
+            fv_pairs.push((field, value));
+            idx += 2;
+        }
+
+        if fv_pairs.is_empty() {
+            RespValue::err("ERR syntax error").serialize_into(out);
+            return;
+        }
+
+        let existing = self.load_hash(key, out);
+        let (mut hv, key_exists) = match existing {
+            Ok(Some(h)) => (h, true),
+            Ok(None) => (HashValue::new(), false),
+            Err(()) => return,
+        };
+
+        // Check key-level NX/XX conditions
+        if key_nx && key_exists {
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+        if key_xx && !key_exists {
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+
+        // Check field-level FNX/FXX conditions
+        if field_nx {
+            // All fields must NOT exist
+            for (field, _) in &fv_pairs {
+                if hv.exists(field) {
+                    RespValue::Integer(0).serialize_into(out);
+                    return;
+                }
+            }
+        }
+        if field_xx {
+            // All fields must already exist
+            for (field, _) in &fv_pairs {
+                if !hv.exists(field) {
+                    RespValue::Integer(0).serialize_into(out);
+                    return;
+                }
+            }
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // Compute field expiry
+        let field_expiry_ms = match expiry_mode {
+            SetexExpiry::None => 0,
+            SetexExpiry::Ex => {
+                if time_arg <= 0 { -1 } else { now_ms + time_arg * 1000 }
+            }
+            SetexExpiry::Px => {
+                if time_arg <= 0 { -1 } else { now_ms + time_arg }
+            }
+            SetexExpiry::Exat => {
+                if time_arg * 1000 <= now_ms { -1 } else { time_arg * 1000 }
+            }
+            SetexExpiry::Pxat => {
+                if time_arg <= now_ms { -1 } else { time_arg }
+            }
+        };
+
+        // If expiry is in the past, effectively delete right away — don't insert
+        if field_expiry_ms == -1 {
+            // Zero/past expiry means immediate deletion
+            for (field, _) in &fv_pairs {
+                hv.del(field);
+            }
+            let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+            self.save_hash(key, &hv, ttl, out);
+            RespValue::Integer(1).serialize_into(out);
+            return;
+        }
+
+        // Set the fields
+        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        for (field, value) in &fv_pairs {
+            let old_expiry = if keep_ttl {
+                hv.fields.get(*field).map(|f| f.expiry_ms).unwrap_or(0)
+            } else {
+                0
+            };
+            hv.fields.insert(
+                field.to_vec(),
+                super::hash::HashField {
+                    value: value.to_vec(),
+                    expiry_ms: if keep_ttl { old_expiry } else { field_expiry_ms },
+                },
+            );
+        }
+
+        self.save_hash(key, &hv, ttl, out);
+        RespValue::Integer(1).serialize_into(out);
     }
 }
 

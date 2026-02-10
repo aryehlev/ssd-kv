@@ -2,6 +2,7 @@
 
 pub mod db_manager;
 pub mod handler;
+pub mod hash;
 pub mod redis;
 
 pub use db_manager::{DatabaseManager, DbHandler};

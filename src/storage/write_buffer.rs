@@ -365,6 +365,7 @@ impl WriteBuffer {
                                 value: record.value,
                                 timestamp_micros: record.header.timestamp,
                                 ttl_secs: record.header.ttl,
+                                value_type: record.header.reserved[0],
                             });
                         }
                     }
@@ -386,6 +387,7 @@ impl WriteBuffer {
                                     value: record.value,
                                     timestamp_micros: record.header.timestamp,
                                     ttl_secs: record.header.ttl,
+                                    value_type: record.header.reserved[0],
                                 });
                             }
                         }

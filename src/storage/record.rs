@@ -34,6 +34,23 @@ pub const MAX_KEY_SIZE: usize = 65535;
 /// Maximum value size (16MB).
 pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 
+/// Value type stored in reserved[0] of the record header.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueType {
+    String = 0,
+    Hash = 1,
+}
+
+impl From<u8> for ValueType {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => ValueType::Hash,
+            _ => ValueType::String,
+        }
+    }
+}
+
 /// Record flags.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +127,16 @@ impl RecordHeader {
             .unwrap_or(0);
         let expiry = self.timestamp + (self.ttl as u64 * 1_000_000);
         now > expiry
+    }
+
+    /// Returns the value type stored in reserved[0].
+    pub fn value_type(&self) -> ValueType {
+        ValueType::from(self.reserved[0])
+    }
+
+    /// Sets the value type in reserved[0].
+    pub fn set_value_type(&mut self, vt: ValueType) {
+        self.reserved[0] = vt as u8;
     }
 
     /// Returns the total record size including padding.

@@ -66,6 +66,20 @@ impl DbHandler {
         }
     }
 
+    pub fn put_sync_typed(&self, key: &[u8], value: &[u8], ttl: u32, value_type: u8) -> io::Result<()> {
+        match self {
+            DbHandler::Ssd(h) => h.put_sync_typed(key, value, ttl, value_type),
+            DbHandler::Memory(m) => m.put_sync_typed(key, value, ttl, value_type),
+        }
+    }
+
+    pub fn get_value_with_type(&self, key: &[u8]) -> Option<(Vec<u8>, u8)> {
+        match self {
+            DbHandler::Ssd(h) => h.get_value_with_type(key),
+            DbHandler::Memory(m) => m.get_value_with_type(key),
+        }
+    }
+
     pub fn update_ttl(&self, key: &[u8], new_ttl: u32) -> io::Result<bool> {
         match self {
             DbHandler::Ssd(h) => h.update_ttl(key, new_ttl),

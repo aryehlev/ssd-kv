@@ -40,12 +40,14 @@ pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 pub enum ValueType {
     String = 0,
     Hash = 1,
+    Set = 2,
 }
 
 impl From<u8> for ValueType {
     fn from(v: u8) -> Self {
         match v {
             1 => ValueType::Hash,
+            2 => ValueType::Set,
             _ => ValueType::String,
         }
     }

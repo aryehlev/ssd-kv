@@ -20,6 +20,7 @@ use crate::cluster::topology::{ClusterTopology, key_hash_slot, NUM_SLOTS};
 use crate::server::db_manager::{DatabaseManager, DbHandler};
 use crate::server::handler::Handler;
 use crate::server::hash::HashValue;
+use crate::server::set::SetValue;
 use crate::storage::record::ValueType;
 
 /// Maximum pipeline depth before forcing flush
@@ -812,6 +813,23 @@ impl RedisHandler {
             b"HGETDEL" | b"hgetdel" => self.cmd_hgetdel(&args, out),
             b"HGETEX" | b"hgetex" => self.cmd_hgetex(&args, out),
             b"HSETEX" | b"hsetex" => self.cmd_hsetex(&args, out),
+            b"SADD" | b"sadd" => self.cmd_sadd(&args, out),
+            b"SREM" | b"srem" => self.cmd_srem(&args, out),
+            b"SISMEMBER" | b"sismember" => self.cmd_sismember(&args, out),
+            b"SMISMEMBER" | b"smismember" => self.cmd_smismember(&args, out),
+            b"SMEMBERS" | b"smembers" => self.cmd_smembers(&args, out),
+            b"SCARD" | b"scard" => self.cmd_scard(&args, out),
+            b"SPOP" | b"spop" => self.cmd_spop(&args, out),
+            b"SRANDMEMBER" | b"srandmember" => self.cmd_srandmember(&args, out),
+            b"SINTER" | b"sinter" => self.cmd_sinter(&args, out),
+            b"SINTERCARD" | b"sintercard" => self.cmd_sintercard(&args, out),
+            b"SINTERSTORE" | b"sinterstore" => self.cmd_sinterstore(&args, out),
+            b"SUNION" | b"sunion" => self.cmd_sunion(&args, out),
+            b"SUNIONSTORE" | b"sunionstore" => self.cmd_sunionstore(&args, out),
+            b"SDIFF" | b"sdiff" => self.cmd_sdiff(&args, out),
+            b"SDIFFSTORE" | b"sdiffstore" => self.cmd_sdiffstore(&args, out),
+            b"SMOVE" | b"smove" => self.cmd_smove(&args, out),
+            b"SSCAN" | b"sscan" => self.cmd_sscan(&args, out),
             b"DUMP" | b"dump" | b"DEBUG" | b"debug" | b"RESTORE" | b"restore" => {
                 RespValue::err("not supported").serialize_into(out);
             }
@@ -912,6 +930,51 @@ impl RedisHandler {
         }
         let blob = hv.to_bytes();
         match self.current_handler().put_sync_typed(key, &blob, ttl, ValueType::Hash as u8) {
+            Ok(_) => true,
+            Err(e) => {
+                RespValue::err(&e.to_string()).serialize_into(out);
+                false
+            }
+        }
+    }
+
+    /// Returns true (and writes WRONGTYPE error) if the key exists with a non-set type.
+    #[inline]
+    fn check_wrongtype_set(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
+        if let Some(meta) = self.current_handler().get_with_meta(key) {
+            if meta.value_type != ValueType::Set as u8 {
+                RespValue::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()).serialize_into(out);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Load a set value from storage, returning None if key doesn't exist.
+    fn load_set(&self, key: &[u8], out: &mut Vec<u8>) -> Result<Option<SetValue>, ()> {
+        match self.current_handler().get_value_with_type(key) {
+            Some((data, vt)) => {
+                if vt != ValueType::Set as u8 {
+                    RespValue::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()).serialize_into(out);
+                    return Err(());
+                }
+                match SetValue::from_bytes(&data) {
+                    Some(sv) => Ok(Some(sv)),
+                    None => Ok(Some(SetValue::new())),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Save a set value to storage. Deletes the key if the set is empty.
+    fn save_set(&self, key: &[u8], sv: &SetValue, ttl: u32, out: &mut Vec<u8>) -> bool {
+        if sv.is_empty() {
+            let _ = self.current_handler().delete_sync(key);
+            return true;
+        }
+        let blob = sv.to_bytes();
+        match self.current_handler().put_sync_typed(key, &blob, ttl, ValueType::Set as u8) {
             Ok(_) => true,
             Err(e) => {
                 RespValue::err(&e.to_string()).serialize_into(out);
@@ -1599,6 +1662,7 @@ impl RedisHandler {
             Some((_, vt)) => {
                 let type_str = match ValueType::from(vt) {
                     ValueType::Hash => "hash",
+                    ValueType::Set => "set",
                     ValueType::String => "string",
                 };
                 RespValue::SimpleString(type_str.to_string()).serialize_into(out);
@@ -4197,6 +4261,703 @@ impl RedisHandler {
         self.save_hash(key, &hv, ttl, out);
         RespValue::Integer(1).serialize_into(out);
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  SET COMMANDS
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── SADD ─────────────────────────────────────────────────────────
+    fn cmd_sadd(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'sadd' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+
+        let mut members: Vec<&[u8]> = Vec::with_capacity(args.len() - 2);
+        for i in 2..args.len() {
+            let m = match Self::extract_bulk_arg(&args[i]) {
+                Some(m) => m,
+                None => { RespValue::err("Invalid member").serialize_into(out); return; }
+            };
+            members.push(m);
+        }
+
+        let handler = self.current_handler();
+        let meta = handler.get_with_meta(key);
+
+        // Check wrongtype
+        if let Some(ref m) = meta {
+            if m.value_type != ValueType::Set as u8 {
+                RespValue::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()).serialize_into(out);
+                return;
+            }
+        }
+
+        let ttl = meta.as_ref().map(|m| m.ttl_secs).unwrap_or(0);
+
+        // Fast path: single member on new key
+        if meta.is_none() && members.len() == 1 {
+            let blob = super::set::encode_single_member(members[0]);
+            match handler.put_sync_typed(key, &blob, ttl, ValueType::Set as u8) {
+                Ok(_) => RespValue::Integer(1).serialize_into(out),
+                Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+            }
+            return;
+        }
+
+        // Fast path: direct blob manipulation
+        let existing_blob = meta.as_ref().map(|m| m.value.as_slice()).unwrap_or(&[]);
+        let result = super::set::blob_add_members(existing_blob, &members);
+
+        match handler.put_sync_typed(key, &result.blob, ttl, ValueType::Set as u8) {
+            Ok(_) => RespValue::Integer(result.new_members).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    // ── SREM ─────────────────────────────────────────────────────────
+    fn cmd_srem(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'srem' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+
+        let handler = self.current_handler();
+        let meta = handler.get_with_meta(key);
+
+        match meta {
+            None => {
+                RespValue::Integer(0).serialize_into(out);
+            }
+            Some(m) => {
+                if m.value_type != ValueType::Set as u8 {
+                    RespValue::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()).serialize_into(out);
+                    return;
+                }
+                let mut members: Vec<&[u8]> = Vec::with_capacity(args.len() - 2);
+                for i in 2..args.len() {
+                    if let Some(mb) = Self::extract_bulk_arg(&args[i]) {
+                        members.push(mb);
+                    }
+                }
+
+                let (new_blob, removed) = super::set::blob_remove_members(&m.value, &members);
+                // Check if set is now empty
+                if new_blob.len() >= 5 {
+                    let count = u32::from_le_bytes([new_blob[1], new_blob[2], new_blob[3], new_blob[4]]);
+                    if count == 0 {
+                        let _ = handler.delete_sync(key);
+                    } else {
+                        let _ = handler.put_sync_typed(key, &new_blob, m.ttl_secs, ValueType::Set as u8);
+                    }
+                }
+                RespValue::Integer(removed).serialize_into(out);
+            }
+        }
+    }
+
+    // ── SISMEMBER ────────────────────────────────────────────────────
+    fn cmd_sismember(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'sismember' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+
+        let member = match Self::extract_bulk_arg(&args[2]) {
+            Some(m) => m,
+            None => { RespValue::err("Invalid member").serialize_into(out); return; }
+        };
+
+        match self.load_set(key, out) {
+            Ok(Some(sv)) => {
+                RespValue::Integer(if sv.is_member(member) { 1 } else { 0 }).serialize_into(out);
+            }
+            Ok(None) => {
+                RespValue::Integer(0).serialize_into(out);
+            }
+            Err(()) => {}
+        }
+    }
+
+    // ── SMISMEMBER ───────────────────────────────────────────────────
+    fn cmd_smismember(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'smismember' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+
+        let sv = match self.load_set(key, out) {
+            Ok(Some(s)) => s,
+            Ok(None) => SetValue::new(),
+            Err(()) => return,
+        };
+
+        let mut results = Vec::with_capacity(args.len() - 2);
+        for i in 2..args.len() {
+            if let Some(member) = Self::extract_bulk_arg(&args[i]) {
+                results.push(RespValue::Integer(if sv.is_member(member) { 1 } else { 0 }));
+            } else {
+                results.push(RespValue::Integer(0));
+            }
+        }
+        RespValue::Array(Some(results)).serialize_into(out);
+    }
+
+    // ── SMEMBERS ─────────────────────────────────────────────────────
+    fn cmd_smembers(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'smembers' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+
+        match self.load_set(key, out) {
+            Ok(Some(sv)) => {
+                let items: Vec<RespValue> = sv.members.iter()
+                    .map(|m| RespValue::bulk(m.clone()))
+                    .collect();
+                RespValue::Array(Some(items)).serialize_into(out);
+            }
+            Ok(None) => {
+                RespValue::Array(Some(Vec::new())).serialize_into(out);
+            }
+            Err(()) => {}
+        }
+    }
+
+    // ── SCARD ────────────────────────────────────────────────────────
+    fn cmd_scard(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'scard' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+
+        match self.load_set(key, out) {
+            Ok(Some(sv)) => {
+                RespValue::Integer(sv.len() as i64).serialize_into(out);
+            }
+            Ok(None) => {
+                RespValue::Integer(0).serialize_into(out);
+            }
+            Err(()) => {}
+        }
+    }
+
+    // ── SPOP ─────────────────────────────────────────────────────────
+    fn cmd_spop(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'spop' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(key, out) { return; }
+
+        let count = if args.len() >= 3 {
+            match Self::parse_int_arg(&args[2]) {
+                Ok(c) if c >= 0 => c as usize,
+                _ => { RespValue::err("ERR value is not an integer or out of range").serialize_into(out); return; }
+            }
+        } else {
+            0 // sentinel: no count arg means return single bulk string
+        };
+
+        let has_count_arg = args.len() >= 3;
+
+        let mut sv = match self.load_set(key, out) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                if has_count_arg {
+                    RespValue::Array(Some(Vec::new())).serialize_into(out);
+                } else {
+                    RespValue::BulkString(None).serialize_into(out);
+                }
+                return;
+            }
+            Err(()) => return,
+        };
+
+        let actual_count = if has_count_arg { count } else { 1 };
+        let popped = sv.pop(actual_count);
+
+        let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
+        self.save_set(key, &sv, ttl, out);
+
+        if has_count_arg {
+            let items: Vec<RespValue> = popped.iter()
+                .map(|m| RespValue::bulk(m.clone()))
+                .collect();
+            RespValue::Array(Some(items)).serialize_into(out);
+        } else if let Some(first) = popped.into_iter().next() {
+            RespValue::bulk(first).serialize_into(out);
+        } else {
+            RespValue::BulkString(None).serialize_into(out);
+        }
+    }
+
+    // ── SRANDMEMBER ──────────────────────────────────────────────────
+    fn cmd_srandmember(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'srandmember' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+
+        let has_count_arg = args.len() >= 3;
+        let (count, allow_dups) = if has_count_arg {
+            match Self::parse_int_arg(&args[2]) {
+                Ok(c) => {
+                    if c < 0 {
+                        ((-c) as usize, true)
+                    } else {
+                        (c as usize, false)
+                    }
+                }
+                Err(_) => { RespValue::err("ERR value is not an integer or out of range").serialize_into(out); return; }
+            }
+        } else {
+            (1, false)
+        };
+
+        let sv = match self.load_set(key, out) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                if has_count_arg {
+                    RespValue::Array(Some(Vec::new())).serialize_into(out);
+                } else {
+                    RespValue::BulkString(None).serialize_into(out);
+                }
+                return;
+            }
+            Err(()) => return,
+        };
+
+        let result = sv.random_members(count, allow_dups);
+
+        if has_count_arg {
+            let items: Vec<RespValue> = result.iter()
+                .map(|m| RespValue::bulk(m.to_vec()))
+                .collect();
+            RespValue::Array(Some(items)).serialize_into(out);
+        } else if let Some(&first) = result.first() {
+            RespValue::bulk(first.to_vec()).serialize_into(out);
+        } else {
+            RespValue::BulkString(None).serialize_into(out);
+        }
+    }
+
+    // ── SINTER ───────────────────────────────────────────────────────
+    fn cmd_sinter(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'sinter' command").serialize_into(out);
+            return;
+        }
+
+        // CROSSSLOT check
+        if self.router.is_some() && args.len() > 2 {
+            if self.check_crossslot(&args[1..], out) { return; }
+        }
+
+        let sets = match self.load_multi_sets(&args[1..], out) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let refs: Vec<&SetValue> = sets.iter().collect();
+        let result = SetValue::intersection(&refs);
+        let items: Vec<RespValue> = result.members.iter()
+            .map(|m| RespValue::bulk(m.clone()))
+            .collect();
+        RespValue::Array(Some(items)).serialize_into(out);
+    }
+
+    // ── SINTERCARD ───────────────────────────────────────────────────
+    fn cmd_sintercard(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'sintercard' command").serialize_into(out);
+            return;
+        }
+        let numkeys = match Self::parse_int_arg(&args[1]) {
+            Ok(n) if n > 0 => n as usize,
+            _ => { RespValue::err("ERR numkeys should be positive").serialize_into(out); return; }
+        };
+        if args.len() < 2 + numkeys {
+            RespValue::err("ERR wrong number of arguments for 'sintercard' command").serialize_into(out);
+            return;
+        }
+
+        // Parse optional LIMIT
+        let mut limit = 0usize;
+        let after_keys = 2 + numkeys;
+        if after_keys + 1 < args.len() {
+            if let Some(opt) = Self::extract_bulk_arg(&args[after_keys]) {
+                if opt.eq_ignore_ascii_case(b"LIMIT") {
+                    limit = match Self::parse_int_arg(&args[after_keys + 1]) {
+                        Ok(l) if l >= 0 => l as usize,
+                        _ => { RespValue::err("ERR LIMIT can't be negative").serialize_into(out); return; }
+                    };
+                }
+            }
+        }
+
+        let key_args = &args[2..2 + numkeys];
+        if self.router.is_some() && numkeys > 1 {
+            if self.check_crossslot(key_args, out) { return; }
+        }
+
+        let sets = match self.load_multi_sets(key_args, out) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let refs: Vec<&SetValue> = sets.iter().collect();
+        let result = SetValue::intersection(&refs);
+        let count = if limit > 0 { result.len().min(limit) } else { result.len() };
+        RespValue::Integer(count as i64).serialize_into(out);
+    }
+
+    // ── SINTERSTORE ──────────────────────────────────────────────────
+    fn cmd_sinterstore(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'sinterstore' command").serialize_into(out);
+            return;
+        }
+        let dest = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(dest, out) { return; }
+
+        if self.router.is_some() && args.len() > 3 {
+            if self.check_crossslot(&args[1..], out) { return; }
+        }
+
+        let sets = match self.load_multi_sets(&args[2..], out) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let refs: Vec<&SetValue> = sets.iter().collect();
+        let result = SetValue::intersection(&refs);
+        let count = result.len() as i64;
+        self.save_set(dest, &result, 0, out);
+        RespValue::Integer(count).serialize_into(out);
+    }
+
+    // ── SUNION ───────────────────────────────────────────────────────
+    fn cmd_sunion(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'sunion' command").serialize_into(out);
+            return;
+        }
+        if self.router.is_some() && args.len() > 2 {
+            if self.check_crossslot(&args[1..], out) { return; }
+        }
+
+        let sets = match self.load_multi_sets(&args[1..], out) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let refs: Vec<&SetValue> = sets.iter().collect();
+        let result = SetValue::union(&refs);
+        let items: Vec<RespValue> = result.members.iter()
+            .map(|m| RespValue::bulk(m.clone()))
+            .collect();
+        RespValue::Array(Some(items)).serialize_into(out);
+    }
+
+    // ── SUNIONSTORE ──────────────────────────────────────────────────
+    fn cmd_sunionstore(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'sunionstore' command").serialize_into(out);
+            return;
+        }
+        let dest = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(dest, out) { return; }
+
+        if self.router.is_some() && args.len() > 3 {
+            if self.check_crossslot(&args[1..], out) { return; }
+        }
+
+        let sets = match self.load_multi_sets(&args[2..], out) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let refs: Vec<&SetValue> = sets.iter().collect();
+        let result = SetValue::union(&refs);
+        let count = result.len() as i64;
+        self.save_set(dest, &result, 0, out);
+        RespValue::Integer(count).serialize_into(out);
+    }
+
+    // ── SDIFF ────────────────────────────────────────────────────────
+    fn cmd_sdiff(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("ERR wrong number of arguments for 'sdiff' command").serialize_into(out);
+            return;
+        }
+        if self.router.is_some() && args.len() > 2 {
+            if self.check_crossslot(&args[1..], out) { return; }
+        }
+
+        let sets = match self.load_multi_sets(&args[1..], out) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if sets.is_empty() {
+            RespValue::Array(Some(Vec::new())).serialize_into(out);
+            return;
+        }
+
+        let others: Vec<&SetValue> = sets[1..].iter().collect();
+        let result = sets[0].difference(&others);
+        let items: Vec<RespValue> = result.members.iter()
+            .map(|m| RespValue::bulk(m.clone()))
+            .collect();
+        RespValue::Array(Some(items)).serialize_into(out);
+    }
+
+    // ── SDIFFSTORE ───────────────────────────────────────────────────
+    fn cmd_sdiffstore(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'sdiffstore' command").serialize_into(out);
+            return;
+        }
+        let dest = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved(dest, out) { return; }
+
+        if self.router.is_some() && args.len() > 3 {
+            if self.check_crossslot(&args[1..], out) { return; }
+        }
+
+        let sets = match self.load_multi_sets(&args[2..], out) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if sets.is_empty() {
+            let _ = self.current_handler().delete_sync(dest);
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+
+        let others: Vec<&SetValue> = sets[1..].iter().collect();
+        let result = sets[0].difference(&others);
+        let count = result.len() as i64;
+        self.save_set(dest, &result, 0, out);
+        RespValue::Integer(count).serialize_into(out);
+    }
+
+    // ── SMOVE ────────────────────────────────────────────────────────
+    fn cmd_smove(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 4 {
+            RespValue::err("ERR wrong number of arguments for 'smove' command").serialize_into(out);
+            return;
+        }
+        let source = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        let dest = match Self::extract_bulk_arg(&args[2]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        let member = match Self::extract_bulk_arg(&args[3]) {
+            Some(m) => m,
+            None => { RespValue::err("Invalid member").serialize_into(out); return; }
+        };
+        if self.check_moved(source, out) { return; }
+
+        if self.router.is_some() {
+            if self.check_crossslot(&args[1..3], out) { return; }
+        }
+
+        // Load source set
+        let mut src_sv = match self.load_set(source, out) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                RespValue::Integer(0).serialize_into(out);
+                return;
+            }
+            Err(()) => return,
+        };
+
+        // Check if member exists in source
+        if !src_sv.remove(member) {
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+
+        // Load destination set (check wrongtype)
+        let mut dst_sv = match self.load_set(dest, out) {
+            Ok(Some(s)) => s,
+            Ok(None) => SetValue::new(),
+            Err(()) => return,
+        };
+
+        dst_sv.add(member.to_vec());
+
+        // Save both
+        let src_ttl = self.current_handler().get_with_meta(source).map(|m| m.ttl_secs).unwrap_or(0);
+        let dst_ttl = self.current_handler().get_with_meta(dest).map(|m| m.ttl_secs).unwrap_or(0);
+        self.save_set(source, &src_sv, src_ttl, out);
+        self.save_set(dest, &dst_sv, dst_ttl, out);
+
+        RespValue::Integer(1).serialize_into(out);
+    }
+
+    // ── SSCAN ────────────────────────────────────────────────────────
+    fn cmd_sscan(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 3 {
+            RespValue::err("ERR wrong number of arguments for 'sscan' command").serialize_into(out);
+            return;
+        }
+        let key = match Self::extract_bulk_arg(&args[1]) {
+            Some(k) => k,
+            None => { RespValue::err("Invalid key").serialize_into(out); return; }
+        };
+        if self.check_moved_read(key, out) { return; }
+
+        let _cursor = match Self::extract_bulk_arg(&args[2]) {
+            Some(c) => std::str::from_utf8(c).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0),
+            None => 0,
+        };
+
+        let mut count = 10usize;
+        let mut pattern: Option<&[u8]> = None;
+        let mut i = 3;
+        while i + 1 < args.len() {
+            if let Some(opt) = Self::extract_bulk_arg(&args[i]) {
+                match opt {
+                    b"COUNT" | b"count" => {
+                        if let Some(v) = Self::extract_bulk_arg(&args[i + 1]) {
+                            count = std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+                        }
+                        i += 2;
+                    }
+                    b"MATCH" | b"match" => {
+                        pattern = Self::extract_bulk_arg(&args[i + 1]);
+                        i += 2;
+                    }
+                    _ => { i += 1; }
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        let sv = match self.load_set(key, out) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                RespValue::Array(Some(vec![
+                    RespValue::bulk(b"0".to_vec()),
+                    RespValue::Array(Some(Vec::new())),
+                ])).serialize_into(out);
+                return;
+            }
+            Err(()) => return,
+        };
+
+        let mut items = Vec::new();
+        for member in &sv.members {
+            if let Some(pat) = pattern {
+                if !glob_match(pat, member) {
+                    continue;
+                }
+            }
+            items.push(RespValue::bulk(member.clone()));
+            if items.len() >= count {
+                break;
+            }
+        }
+
+        RespValue::Array(Some(vec![
+            RespValue::bulk(b"0".to_vec()),
+            RespValue::Array(Some(items)),
+        ])).serialize_into(out);
+    }
+
+    // ── Set helper: load multiple sets from key args ─────────────────
+    fn load_multi_sets(&self, key_args: &[RespValue], out: &mut Vec<u8>) -> Option<Vec<SetValue>> {
+        let mut sets = Vec::with_capacity(key_args.len());
+        for arg in key_args {
+            let key = match Self::extract_bulk_arg(arg) {
+                Some(k) => k,
+                None => { RespValue::err("Invalid key").serialize_into(out); return None; }
+            };
+            if self.check_moved_read(key, out) { return None; }
+
+            match self.load_set(key, out) {
+                Ok(Some(s)) => sets.push(s),
+                Ok(None) => sets.push(SetValue::new()),
+                Err(()) => return None,
+            }
+        }
+        Some(sets)
+    }
+
+    // ── Set helper: check CROSSSLOT for multi-key commands ───────────
+    fn check_crossslot(&self, key_args: &[RespValue], out: &mut Vec<u8>) -> bool {
+        let mut first_slot = None;
+        for arg in key_args {
+            if let Some(key) = Self::extract_bulk_arg(arg) {
+                let slot = key_hash_slot(key);
+                match first_slot {
+                    None => first_slot = Some(slot),
+                    Some(s) if s != slot => {
+                        RespValue::Error("CROSSSLOT Keys in request don't hash to the same slot".to_string()).serialize_into(out);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Glob-style pattern matching (supports *, ?, [abc], [a-z], [^a]).
@@ -5214,5 +5975,405 @@ mod tests {
         rh.handle_command(make_cmd(&[b"RANDOMKEY"]), &mut out);
         let resp = String::from_utf8_lossy(&out);
         assert!(resp.contains("somekey"), "Should return somekey: {}", resp);
+    }
+
+    // ── Set command tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_sadd_and_smembers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        // SADD 3 members
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b", b"c"]), &mut out);
+        assert_eq!(&out, b":3\r\n");
+
+        // SMEMBERS
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SMEMBERS", b"myset"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("a"), "Should contain 'a': {}", resp);
+        assert!(resp.contains("b"), "Should contain 'b': {}", resp);
+        assert!(resp.contains("c"), "Should contain 'c': {}", resp);
+    }
+
+    #[test]
+    fn test_sadd_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+    }
+
+    #[test]
+    fn test_srem() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SREM", b"myset", b"b", b"x"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SCARD", b"myset"]), &mut out);
+        assert_eq!(&out, b":2\r\n");
+    }
+
+    #[test]
+    fn test_sismember() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"hello"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SISMEMBER", b"myset", b"hello"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SISMEMBER", b"myset", b"nope"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+    }
+
+    #[test]
+    fn test_smismember() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SMISMEMBER", b"myset", b"a", b"c", b"b"]), &mut out);
+        // Should return array of [1, 0, 1]
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("*3\r\n"), "Should be array of 3: {}", resp);
+    }
+
+    #[test]
+    fn test_scard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        // Empty
+        rh.handle_command(make_cmd(&[b"SCARD", b"myset"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SCARD", b"myset"]), &mut out);
+        assert_eq!(&out, b":2\r\n");
+    }
+
+    #[test]
+    fn test_spop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+
+        // SPOP without count returns bulk string
+        rh.handle_command(make_cmd(&[b"SPOP", b"myset"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("$1\r\n"), "Should return bulk string: {}", resp);
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SCARD", b"myset"]), &mut out);
+        assert_eq!(&out, b":2\r\n");
+    }
+
+    #[test]
+    fn test_srandmember() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+
+        // Without count: returns bulk string, set unchanged
+        rh.handle_command(make_cmd(&[b"SRANDMEMBER", b"myset"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("$1\r\n"), "Should return bulk string: {}", resp);
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SCARD", b"myset"]), &mut out);
+        assert_eq!(&out, b":3\r\n"); // unchanged
+    }
+
+    #[test]
+    fn test_srandmember_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a"]), &mut out);
+        out.clear();
+
+        // Negative count: allows duplicates, returns array
+        rh.handle_command(make_cmd(&[b"SRANDMEMBER", b"myset", b"-3"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("*3\r\n"), "Should return array of 3: {}", resp);
+    }
+
+    #[test]
+    fn test_sinter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"s1", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"s2", b"b", b"c", b"d"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SINTER", b"s1", b"s2"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("*2\r\n"), "Should return 2 items: {}", resp);
+        assert!(resp.contains("b"));
+        assert!(resp.contains("c"));
+    }
+
+    #[test]
+    fn test_sunion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"s1", b"a", b"b"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"s2", b"b", b"c"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SUNION", b"s1", b"s2"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("*3\r\n"), "Should return 3 items: {}", resp);
+    }
+
+    #[test]
+    fn test_sdiff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"s1", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"s2", b"b", b"d"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SDIFF", b"s1", b"s2"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.starts_with("*2\r\n"), "Should return 2 items: {}", resp);
+        assert!(resp.contains("a"));
+        assert!(resp.contains("c"));
+    }
+
+    #[test]
+    fn test_sinterstore() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"s1", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"s2", b"b", b"c", b"d"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SINTERSTORE", b"dest", b"s1", b"s2"]), &mut out);
+        assert_eq!(&out, b":2\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SCARD", b"dest"]), &mut out);
+        assert_eq!(&out, b":2\r\n");
+    }
+
+    #[test]
+    fn test_sunionstore() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"s1", b"a", b"b"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"s2", b"b", b"c"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SUNIONSTORE", b"dest", b"s1", b"s2"]), &mut out);
+        assert_eq!(&out, b":3\r\n");
+    }
+
+    #[test]
+    fn test_sdiffstore() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"s1", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"s2", b"b"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SDIFFSTORE", b"dest", b"s1", b"s2"]), &mut out);
+        assert_eq!(&out, b":2\r\n");
+    }
+
+    #[test]
+    fn test_smove() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"src", b"a", b"b"]), &mut out);
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SADD", b"dst", b"c"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SMOVE", b"src", b"dst", b"a"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SISMEMBER", b"dst", b"a"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SISMEMBER", b"src", b"a"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+
+        // SMOVE non-existing member
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SMOVE", b"src", b"dst", b"z"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+    }
+
+    #[test]
+    fn test_sscan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b", b"c"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SSCAN", b"myset", b"0"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        // Should start with array of 2 elements (cursor + items)
+        assert!(resp.starts_with("*2\r\n"), "Should return scan result: {}", resp);
+    }
+
+    #[test]
+    fn test_set_wrongtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        // Create a string key
+        rh.handle_command(make_cmd(&[b"SET", b"mykey", b"value"]), &mut out);
+        out.clear();
+
+        // SADD on string key should return WRONGTYPE
+        rh.handle_command(make_cmd(&[b"SADD", b"mykey", b"member"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("WRONGTYPE"), "Should return WRONGTYPE: {}", resp);
+    }
+
+    #[test]
+    fn test_get_on_set_wrongtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        // Create a set key
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"member"]), &mut out);
+        out.clear();
+
+        // GET on set key should return WRONGTYPE
+        rh.handle_command(make_cmd(&[b"GET", b"myset"]), &mut out);
+        let resp = String::from_utf8_lossy(&out);
+        assert!(resp.contains("WRONGTYPE"), "Should return WRONGTYPE: {}", resp);
+    }
+
+    #[test]
+    fn test_type_returns_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"TYPE", b"myset"]), &mut out);
+        assert_eq!(&out, b"+set\r\n");
+    }
+
+    #[test]
+    fn test_del_removes_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a", b"b"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"DEL", b"myset"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        out.clear();
+        rh.handle_command(make_cmd(&[b"SCARD", b"myset"]), &mut out);
+        assert_eq!(&out, b":0\r\n");
+    }
+
+    #[test]
+    fn test_set_empty_after_srem() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_manager = make_db_manager(dir.path());
+        let rh = RedisHandler::new(db_manager);
+        let mut out = Vec::new();
+
+        rh.handle_command(make_cmd(&[b"SADD", b"myset", b"a"]), &mut out);
+        out.clear();
+
+        rh.handle_command(make_cmd(&[b"SREM", b"myset", b"a"]), &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        // Key should be gone (TYPE returns none)
+        out.clear();
+        rh.handle_command(make_cmd(&[b"TYPE", b"myset"]), &mut out);
+        assert_eq!(&out, b"+none\r\n");
     }
 }

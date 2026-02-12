@@ -1,4 +1,7 @@
 target/
+operator/target/
 .git/
 *.md
 .idea/
+data/
+benchmark-results/

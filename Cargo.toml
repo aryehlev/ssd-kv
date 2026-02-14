@@ -45,7 +45,3 @@ criterion = "0.5"
 #[[bench]]
 #name = "throughput"
 #harness = false
-#
-#[[bin]]
-#name = "redis_vs_aerospike"
-#path = "benchmark/redis_vs_aerospike.rs"

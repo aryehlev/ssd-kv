@@ -1,7 +1,6 @@
 //! Performance optimization layer.
 //!
-//! This module provides advanced optimizations for achieving Aerospike-level
-//! performance:
+//! This module provides advanced performance optimizations:
 //!
 //! - **Batch Writer**: Write coalescing for maximum SSD throughput
 //! - **Prefetch**: CPU cache prefetching and read-ahead

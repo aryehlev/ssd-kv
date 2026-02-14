@@ -1,4 +1,4 @@
-//! Lock-Free Index with Open Addressing (Aerospike SPRIGS-inspired)
+//! Lock-Free Index with Open Addressing
 //!
 //! Features:
 //! - Open addressing with linear probing (better cache locality than chaining)

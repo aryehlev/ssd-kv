@@ -12,7 +12,7 @@
 //! 3. Return success to client
 //! 4. Background: flush WAL to main storage
 //!
-//! This is similar to Aerospike's streaming write buffer approach.
+//! This uses a streaming write buffer approach for optimal SSD performance.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};

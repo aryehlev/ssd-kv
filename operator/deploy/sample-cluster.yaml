@@ -1,0 +1,20 @@
+apiVersion: ssdkv.io/v1alpha1
+kind: SsdkvCluster
+metadata:
+  name: ssdkv
+  namespace: default
+spec:
+  replicas: 3
+  replicationFactor: 2
+  image: ssd-kv:latest
+  redisPort: 7777
+  clusterPort: 7780
+  storage:
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi

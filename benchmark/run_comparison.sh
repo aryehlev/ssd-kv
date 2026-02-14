@@ -1,10 +1,10 @@
 #!/bin/bash
-# Run comparison benchmark between SSD-KV and Aerospike
+# Run comparison benchmark between SSD-KV and Redis
 
 set -e
 
 echo "================================================"
-echo "SSD-KV vs Aerospike Performance Comparison"
+echo "SSD-KV vs Redis Performance Comparison"
 echo "================================================"
 echo ""
 
@@ -39,19 +39,12 @@ echo "Benchmarking SSD-KV (port 7777)"
 echo "================================================"
 ./target/release/bench_client 127.0.0.1:7777 $NUM_KEYS $NUM_THREADS $VALUE_SIZE
 
-# For Aerospike comparison, we'd need a separate client that speaks Aerospike protocol
-# Here we just show how the benchmark would be structured
-
+# Run Redis benchmark for comparison
 echo ""
 echo "================================================"
-echo "Notes on Aerospike Comparison"
+echo "Benchmarking Redis (port 6379)"
 echo "================================================"
-echo ""
-echo "To compare with Aerospike, install the Aerospike tools and run:"
-echo "  asbench -h 127.0.0.1:3000 -n test -s testset -k $NUM_KEYS -o I1 -w RU,50"
-echo ""
-echo "Or use the YCSB benchmark framework for a fair comparison."
-echo ""
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n $NUM_KEYS -c $NUM_THREADS -d $VALUE_SIZE -q
 
 # Optional: Stop containers
 # docker-compose down

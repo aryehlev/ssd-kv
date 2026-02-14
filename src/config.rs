@@ -10,7 +10,7 @@ use clap::Parser;
 #[command(name = "ssd-kv")]
 #[command(author = "SSD-KV Team")]
 #[command(version = "0.1.0")]
-#[command(about = "Aerospike-inspired KV store: index in RAM, data on SSD")]
+#[command(about = "High-performance KV store: index in RAM, data on SSD")]
 pub struct Config {
     /// Data directory for storage files
     #[arg(short, long, default_value = "./data")]
@@ -205,6 +205,13 @@ impl Config {
             }
             if self.total_nodes.unwrap() == 0 {
                 return Err("--total-nodes must be at least 1".to_string());
+            }
+            if self.node_id.unwrap() >= self.total_nodes.unwrap() {
+                return Err(format!(
+                    "--node-id {} is out of range (total-nodes={})",
+                    self.node_id.unwrap(),
+                    self.total_nodes.unwrap()
+                ));
             }
             if self.replication_factor as u32 > self.total_nodes.unwrap() {
                 return Err("Replication factor cannot exceed total nodes".to_string());

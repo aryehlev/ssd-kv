@@ -206,6 +206,13 @@ impl Config {
             if self.total_nodes.unwrap() == 0 {
                 return Err("--total-nodes must be at least 1".to_string());
             }
+            if self.node_id.unwrap() >= self.total_nodes.unwrap() {
+                return Err(format!(
+                    "--node-id {} is out of range (total-nodes={})",
+                    self.node_id.unwrap(),
+                    self.total_nodes.unwrap()
+                ));
+            }
             if self.replication_factor as u32 > self.total_nodes.unwrap() {
                 return Err("Replication factor cannot exceed total nodes".to_string());
             }

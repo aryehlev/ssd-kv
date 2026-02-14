@@ -1,12 +1,13 @@
 //! SSD-KV: High-Performance Key-Value Store
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use parking_lot::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod cluster;
@@ -36,6 +37,36 @@ use storage::write_buffer::WriteBuffer;
 /// Use mimalloc as the global allocator for better performance.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Resolve a peer address string to a SocketAddr.
+/// Handles both "IP:port" (parsed directly) and "hostname:port" (DNS lookup with retries).
+async fn resolve_peer_addr(addr: &str) -> Result<SocketAddr, String> {
+    // Try direct parse first (handles IP:port)
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+
+    // Must be hostname:port — resolve via DNS with retries
+    let max_retries = 30;
+    for attempt in 1..=max_retries {
+        match tokio::net::lookup_host(addr).await {
+            Ok(mut addrs) => {
+                if let Some(sa) = addrs.next() {
+                    info!("Resolved {} -> {} (attempt {})", addr, sa, attempt);
+                    return Ok(sa);
+                }
+            }
+            Err(e) => {
+                if attempt == max_retries {
+                    return Err(format!("Failed to resolve '{}' after {} attempts: {}", addr, max_retries, e));
+                }
+                warn!("DNS lookup for '{}' failed (attempt {}/{}): {}", addr, attempt, max_retries, e);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(format!("Failed to resolve '{}'", addr))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -190,27 +221,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.to_string())
             .collect();
 
-        for i in 0..total_nodes {
-            let redis_port = config.bind.port();
-            let cluster_port = config.cluster_port;
+        let redis_port = config.bind.port();
+        let cluster_port = config.cluster_port;
 
-            let (redis_addr, cluster_addr) = if i as usize >= peer_addrs.len() {
-                // No peer address provided, use localhost with offset
-                let addr = format!("{}:{}", bind_ip, redis_port);
-                let caddr = format!("{}:{}", bind_ip, cluster_port);
-                (addr.parse().unwrap(), caddr.parse().unwrap())
-            } else {
-                // Parse peer address (host:cluster_port)
+        for i in 0..total_nodes {
+            let (redis_addr, cluster_addr) = if (i as usize) < peer_addrs.len() {
+                // Resolve peer address (supports both IP:port and hostname:port)
                 let peer = &peer_addrs[i as usize];
-                let cluster_addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|_| {
-                    format!("{}:{}", bind_ip, cluster_port + i as u16)
-                        .parse()
-                        .unwrap()
-                });
-                let redis_addr = format!("{}:{}", cluster_addr.ip(), redis_port)
+                match resolve_peer_addr(peer).await {
+                    Ok(caddr) => {
+                        let raddr: SocketAddr = format!("{}:{}", caddr.ip(), redis_port)
+                            .parse()
+                            .unwrap();
+                        (raddr, caddr)
+                    }
+                    Err(e) => {
+                        error!("Could not resolve peer {}: {}", peer, e);
+                        // Fall back to bind_ip with port offsets
+                        let raddr: SocketAddr = format!("{}:{}", bind_ip, redis_port + i as u16)
+                            .parse()
+                            .unwrap();
+                        let caddr: SocketAddr = format!("{}:{}", bind_ip, cluster_port + i as u16)
+                            .parse()
+                            .unwrap();
+                        (raddr, caddr)
+                    }
+                }
+            } else {
+                // No peer address provided, use bind_ip with port offsets
+                let raddr: SocketAddr = format!("{}:{}", bind_ip, redis_port + i as u16)
                     .parse()
                     .unwrap();
-                (redis_addr, cluster_addr)
+                let caddr: SocketAddr = format!("{}:{}", bind_ip, cluster_port + i as u16)
+                    .parse()
+                    .unwrap();
+                (raddr, caddr)
             };
 
             nodes.push(NodeInfo::new(i, redis_addr, cluster_addr));

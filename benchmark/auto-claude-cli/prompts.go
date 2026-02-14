@@ -7,15 +7,13 @@ func (r *runner) buildTaskPrompt() string {
 
 Additional required deliverables (do all of these before finishing):
 1. Run benchmark comparisons for:
-   - Aerospike vs SSD-KV
    - Valkey vs SSD-KV in-memory/Redis-compatible mode
-2. Use benchmark results to improve SSD-KV performance and keep iterating until it is as close as possible to Valkey/Aerospike under the measured workloads.
+2. Use benchmark results to improve SSD-KV performance and keep iterating until it is as close as possible to Valkey under the measured workloads.
 3. If you add new command types, data types, or workloads in code, update benchmark tooling and scripts so they benchmark those additions too.
    Relevant files to update as needed include:
    - benchmark/run_comparison.sh
    - benchmark/run_redis_benchmark.sh
    - benchmark/run_redis_benchmark.go
-   - benchmark/redis_vs_aerospike.rs
 4. Include a concise summary of benchmark commands run, key throughput/latency results, and what performance fixes were made.
 
 Do not ask questions. Make decisions and execute end-to-end.

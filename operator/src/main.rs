@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use kube::runtime::controller::Action;
 use kube::runtime::Controller;
 use kube::{Api, Client};
 use tracing::{error, info};

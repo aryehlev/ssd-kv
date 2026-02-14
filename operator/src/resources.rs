@@ -88,19 +88,18 @@ pub fn build_client_service(cluster: &SsdkvCluster) -> Service {
 pub fn build_readonly_service(cluster: &SsdkvCluster) -> Service {
     let name = format!("{}-readonly", cluster.name_any());
     let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
-    let selector = cluster_labels(cluster);
-    let mut labels = selector.clone();
+    let mut labels = cluster_labels(cluster);
     labels.insert("ssdkv.io/role".to_string(), "replica".to_string());
 
     Service {
         metadata: ObjectMeta {
             name: Some(name),
             namespace: Some(namespace),
-            labels: Some(labels),
+            labels: Some(labels.clone()),
             ..Default::default()
         },
         spec: Some(ServiceSpec {
-            selector: Some(selector),
+            selector: Some(labels),
             ports: Some(vec![ServicePort {
                 name: Some("redis".to_string()),
                 port: cluster.spec.redis_port,
@@ -134,7 +133,7 @@ pub fn build_topology_configmap(cluster: &SsdkvCluster, shard_map: &ShardMap) ->
     let peers: Vec<String> = (0..cluster.spec.replicas)
         .map(|i| {
             format!(
-                "{}-{}:{}.{}.svc.cluster.local:{}",
+                "{}-{}.{}.{}.svc.cluster.local:{}",
                 cluster.name_any(),
                 i,
                 headless_svc,
@@ -181,9 +180,56 @@ pub fn build_statefulset(cluster: &SsdkvCluster) -> StatefulSet {
         ""
     };
 
+    // Build resource requirements if specified
+    let container_resources = cluster.spec.resources.as_ref().map(|res| {
+        let mut reqs = BTreeMap::new();
+        let mut lims = BTreeMap::new();
+        if let Some(ref r) = res.requests {
+            if let Some(ref cpu) = r.cpu {
+                reqs.insert("cpu".to_string(), Quantity(cpu.clone()));
+            }
+            if let Some(ref mem) = r.memory {
+                reqs.insert("memory".to_string(), Quantity(mem.clone()));
+            }
+        }
+        if let Some(ref l) = res.limits {
+            if let Some(ref cpu) = l.cpu {
+                lims.insert("cpu".to_string(), Quantity(cpu.clone()));
+            }
+            if let Some(ref mem) = l.memory {
+                lims.insert("memory".to_string(), Quantity(mem.clone()));
+            }
+        }
+        k8s_openapi::api::core::v1::ResourceRequirements {
+            requests: if reqs.is_empty() { None } else { Some(reqs) },
+            limits: if lims.is_empty() { None } else { Some(lims) },
+            ..Default::default()
+        }
+    });
+
     let container = Container {
         name: "ssd-kv".to_string(),
         image: Some(cluster.spec.image.clone()),
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        resources: container_resources,
+        readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
+            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
+                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(cluster.spec.redis_port),
+                ..Default::default()
+            }),
+            initial_delay_seconds: Some(5),
+            period_seconds: Some(10),
+            ..Default::default()
+        }),
+        liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
+            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
+                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(cluster.spec.redis_port),
+                ..Default::default()
+            }),
+            initial_delay_seconds: Some(15),
+            period_seconds: Some(20),
+            ..Default::default()
+        }),
         ports: Some(vec![
             ContainerPort {
                 name: Some("redis".to_string()),

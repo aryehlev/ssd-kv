@@ -77,9 +77,8 @@ func (r *runner) runBenchmarksAndGeminiFixes() error {
 		}
 
 		r.log(fmt.Sprintf("Benchmarks failed. Asking Gemini to fix issues (attempt %d / %d)", attempt+1, r.cfg.maxBenchFixes))
-		prompt := "Fix benchmark failures for SSD-KV comparisons. Ensure both flows work: " +
-			"(1) benchmark/run_redis_benchmark.sh for Valkey/Redis-compatible comparison and " +
-			"(2) cargo run --release --bin redis_vs_aerospike for Aerospike comparison. " +
+		prompt := "Fix benchmark failures for SSD-KV comparisons. Ensure this flow works: " +
+			"benchmark/run_redis_benchmark.sh for Valkey/Redis-compatible comparison. " +
 			"Update benchmark scripts if new command/data types need coverage."
 		if gemErr := r.runGeminiPrompt(prompt); gemErr != nil {
 			return fmt.Errorf("gemini failed while fixing benchmark issues: %w", gemErr)
@@ -91,9 +90,6 @@ func (r *runner) runBenchmarksAndGeminiFixes() error {
 func (r *runner) runRequiredBenchmarks() error {
 	if err := runCmdStream("bash", "benchmark/run_redis_benchmark.sh"); err != nil {
 		return fmt.Errorf("valkey/redis benchmark failed: %w", err)
-	}
-	if err := runCmdStream("cargo", "run", "--release", "--bin", "redis_vs_aerospike"); err != nil {
-		return fmt.Errorf("aerospike benchmark failed: %w", err)
 	}
 	return nil
 }

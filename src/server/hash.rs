@@ -189,39 +189,41 @@ impl HashValue {
 
     /// Increment an integer field by delta. Returns new value or error string.
     pub fn incr_by(&mut self, field: &[u8], delta: i64) -> Result<i64, String> {
-        let current = match self.get(field) {
-            Some(v) => {
-                std::str::from_utf8(v)
+        let (current, existing_expiry) = match self.fields.get(field) {
+            Some(f) => {
+                let val = std::str::from_utf8(&f.value)
                     .map_err(|_| "ERR hash value is not an integer".to_string())?
                     .parse::<i64>()
-                    .map_err(|_| "ERR hash value is not an integer".to_string())?
+                    .map_err(|_| "ERR hash value is not an integer".to_string())?;
+                (val, f.expiry_ms)
             }
-            None => 0,
+            None => (0, 0),
         };
         let new_val = current.checked_add(delta)
             .ok_or_else(|| "ERR increment or decrement would overflow".to_string())?;
         let new_bytes = new_val.to_string().into_bytes();
-        self.fields.insert(field.to_vec(), HashField { value: new_bytes, expiry_ms: 0 });
+        self.fields.insert(field.to_vec(), HashField { value: new_bytes, expiry_ms: existing_expiry });
         Ok(new_val)
     }
 
     /// Increment a float field by delta. Returns new value or error string.
     pub fn incr_by_float(&mut self, field: &[u8], delta: f64) -> Result<f64, String> {
-        let current = match self.get(field) {
-            Some(v) => {
-                std::str::from_utf8(v)
+        let (current, existing_expiry) = match self.fields.get(field) {
+            Some(f) => {
+                let val = std::str::from_utf8(&f.value)
                     .map_err(|_| "ERR hash value is not a valid float".to_string())?
                     .parse::<f64>()
-                    .map_err(|_| "ERR hash value is not a valid float".to_string())?
+                    .map_err(|_| "ERR hash value is not a valid float".to_string())?;
+                (val, f.expiry_ms)
             }
-            None => 0.0,
+            None => (0.0, 0),
         };
         let new_val = current + delta;
         if !new_val.is_finite() {
             return Err("ERR increment would produce NaN or Infinity".to_string());
         }
         let new_bytes = format_float(new_val).into_bytes();
-        self.fields.insert(field.to_vec(), HashField { value: new_bytes, expiry_ms: 0 });
+        self.fields.insert(field.to_vec(), HashField { value: new_bytes, expiry_ms: existing_expiry });
         Ok(new_val)
     }
 

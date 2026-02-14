@@ -2,7 +2,7 @@
 //!
 //! This module provides multiple index implementations:
 //! - **Index**: Original sharded RwLock-based index
-//! - **LockFreeIndex**: Lock-free hash table with open addressing (Aerospike SPRIGS-inspired)
+//! - **LockFreeIndex**: Lock-free hash table with open addressing
 //! - **ShardPerCoreEngine**: Shard-per-core architecture (ScyllaDB-inspired)
 
 pub mod index;

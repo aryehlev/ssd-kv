@@ -10,7 +10,7 @@ use clap::Parser;
 #[command(name = "ssd-kv")]
 #[command(author = "SSD-KV Team")]
 #[command(version = "0.1.0")]
-#[command(about = "Aerospike-inspired KV store: index in RAM, data on SSD")]
+#[command(about = "High-performance KV store: index in RAM, data on SSD")]
 pub struct Config {
     /// Data directory for storage files
     #[arg(short, long, default_value = "./data")]

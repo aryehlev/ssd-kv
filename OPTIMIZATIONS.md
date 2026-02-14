@@ -1,6 +1,6 @@
 # SSD-KV Performance Optimizations
 
-This document tracks all performance optimizations implemented and planned for SSD-KV, based on research from ScyllaDB, Aerospike, and other high-performance databases.
+This document tracks all performance optimizations implemented and planned for SSD-KV, based on research from ScyllaDB and other high-performance databases.
 
 ## Table of Contents
 1. [Architecture Overview](#architecture-overview)
@@ -291,7 +291,7 @@ pub struct Shard {
 
 **Status**: ✅ Implemented
 
-**What it does** (Aerospike SPRIGS-inspired):
+**What it does**:
 - Open addressing with linear probing (better cache locality)
 - Lock-free reads using atomic operations
 - Per-bucket locks only for writes
@@ -354,7 +354,7 @@ pub fn get(&self, key: &[u8]) -> Option<GetResult> {
 
 **Status**: ✅ Implemented
 
-**What it does** (Aerospike streaming write buffer inspired):
+**What it does**:
 - Fast sequential writes (no random I/O)
 - Durability guarantees via fsync
 - Crash recovery via replay
@@ -510,8 +510,8 @@ pub mod uring_server;
               │              │              │
               ▼              │              ▼
     ┌─────────────────┐      │    ┌─────────────────┐
-    │  SSD-KV         │      │    │  Aerospike      │
-    │  10.x.x.x:7777  │      │    │  10.x.x.x:3000  │
+    │  SSD-KV         │      │    │  Redis           │
+    │  10.x.x.x:7777  │      │    │  10.x.x.x:6379  │
     └─────────────────┘      │    └─────────────────┘
 ```
 
@@ -534,7 +534,7 @@ pub mod uring_server;
 
 Automated benchmarking on every commit:
 - Runs on ubuntu-latest
-- Compares against Aerospike in Docker
+- Compares against Redis in Docker
 - Configurable: keys, threads, value_size
 
 ### Current Benchmark Results (macOS, same machine)
@@ -544,7 +544,7 @@ SSD-KV Performance:
   PUT: 156,000 ops/sec
   GET: 312,000 ops/sec
 
-Aerospike Performance (Docker):
+Redis Performance (Docker):
   PUT: 45,000 ops/sec
   GET: 89,000 ops/sec
 ```
@@ -603,13 +603,13 @@ Aerospike Performance (Docker):
 
 ## Performance Targets
 
-| Metric | Current | Target | Aerospike |
-|--------|---------|--------|-----------|
-| GET latency p50 | ~50μs | <10μs | ~50μs |
-| GET latency p99 | ~500μs | <100μs | ~500μs |
-| PUT latency p50 | ~100μs | <20μs | ~100μs |
-| PUT throughput | 156K/s | >500K/s | ~300K/s |
-| GET throughput | 312K/s | >1M/s | ~500K/s |
+| Metric | Current | Target |
+|--------|---------|--------|
+| GET latency p50 | ~50μs | <10μs |
+| GET latency p99 | ~500μs | <100μs |
+| PUT latency p50 | ~100μs | <20μs |
+| PUT throughput | 156K/s | >500K/s |
+| GET throughput | 312K/s | >1M/s |
 
 ---
 
@@ -619,11 +619,7 @@ Aerospike Performance (Docker):
    - Shard-per-core design: https://www.scylladb.com/product/technology/shard-per-core-architecture/
    - No locks, message passing between cores
 
-2. **Aerospike Architecture**
-   - SPRIGS index: https://aerospike.com/docs/architecture/primary-index
-   - Defragmentation: https://aerospike.com/docs/operations/manage/storage/defragmentation
-
-3. **io_uring**
+2. **io_uring**
    - Efficient I/O: https://kernel.dk/io_uring.pdf
    - SQPOLL mode for zero-syscall submission
 

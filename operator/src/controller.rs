@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
-use kube::api::{Api, Patch, PatchParams, PostParams};
+use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Client, CustomResource, ResourceExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::resources;
 use crate::shard_manager;
@@ -24,6 +24,7 @@ use crate::shard_manager;
     namespaced,
     status = "SsdkvClusterStatus"
 )]
+#[serde(rename_all = "camelCase")]
 pub struct SsdkvClusterSpec {
     /// Number of nodes in the cluster.
     #[serde(default = "default_replicas")]
@@ -65,6 +66,7 @@ fn default_redis_port() -> i32 { 7777 }
 fn default_cluster_port() -> i32 { 7780 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageSpec {
     #[serde(default = "default_storage_size")]
     pub size: String,
@@ -87,6 +89,7 @@ pub struct ResourceValues {
 
 /// Status subresource for SsdkvCluster.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SsdkvClusterStatus {
     pub phase: Option<String>,
     pub ready_replicas: Option<i32>,
@@ -175,10 +178,24 @@ pub async fn reconcile(
         .await?;
     info!("StatefulSet ensured for {}", name);
 
-    // 6. Update status
+    // 6. Update status based on actual StatefulSet state
+    let ss_status = ss_api.get(&name).await?;
+    let actual_ready = ss_status
+        .status
+        .as_ref()
+        .and_then(|s| s.ready_replicas)
+        .unwrap_or(0);
+    let desired = cluster.spec.replicas;
+    let phase = if actual_ready == desired {
+        "Running"
+    } else if actual_ready > 0 {
+        "Degraded"
+    } else {
+        "Pending"
+    };
     let status = SsdkvClusterStatus {
-        phase: Some("Running".to_string()),
-        ready_replicas: Some(cluster.spec.replicas),
+        phase: Some(phase.to_string()),
+        ready_replicas: Some(actual_ready),
         topology_version: Some(1),
     };
 

@@ -1,18 +1,15 @@
 //! SSD-KV: High-Performance Key-Value Store
-//!
-//! An Aerospike-inspired KV store with:
-//! - Index in RAM for fast lookups
-//! - Data on SSD with O_DIRECT for consistent latency
-//! - io_uring for async I/O
-//! - Sharded hashmap index with 256 shards
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
+use parking_lot::RwLock;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod cluster;
 mod config;
 mod engine;
 mod io;
@@ -20,12 +17,25 @@ mod perf;
 mod server;
 mod storage;
 
+use cluster::node::NodeInfo;
+use cluster::peer_pool::PeerConnectionPool;
+use cluster::replication::{PeerServer, ReplicationManager};
+use cluster::router::ClusterRouter;
+use io::AsyncReader;
+use cluster::topology::ClusterTopology;
+use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
-use engine::{recover_index, Index};
-use perf::{HotCache, PerfTuning, pin_to_cpu};
-use server::{Handler, Server, ServerConfig, start_udp_server, start_redis_server};
+use engine::{recover_index, recover_with_wal, Index};
+use perf::PerfTuning;
+use server::{
+    Handler, DatabaseManager, DbHandler, start_reactor_multi, ServerTuning,
+};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
+use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
 use storage::file_manager::FileManager;
+use storage::memory_store::MemoryStore;
+use storage::wal::{WalConfig, WriteAheadLog};
+use storage::wblock_cache::WblockCache;
 use storage::write_buffer::WriteBuffer;
 
 /// Use mimalloc as the global allocator for better performance.
@@ -56,110 +66,414 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("SSD-KV starting...");
     info!("Data directory: {:?}", config.data_dir);
     info!("Bind address: {}", config.bind);
+    if config.cluster_mode {
+        info!(
+            "Cluster mode: node_id={}, total_nodes={}, replication_factor={}",
+            config.node_id.unwrap(),
+            config.total_nodes.unwrap(),
+            config.replication_factor
+        );
+    }
 
     // Create data directory
     std::fs::create_dir_all(&config.data_dir)?;
-
-    // Initialize file manager
-    let file_manager = Arc::new(FileManager::new(&config.data_dir)?);
-    info!("File manager initialized with {} existing files", file_manager.file_count());
-
-    // Initialize index
-    let index = Arc::new(Index::new());
-
-    // Initialize write buffer
-    let write_buffer = Arc::new(WriteBuffer::new(
-        file_manager.file_count() as u32,
-        config.wblocks_per_file,
-    ));
-
-    // Recover index from existing data files
-    info!("Recovering index from data files...");
-    let recovery_stats = recover_index(&index, &file_manager)?;
-    info!(
-        "Recovery complete: {} records indexed, {} expired, {} deleted",
-        recovery_stats.records_indexed,
-        recovery_stats.records_expired,
-        recovery_stats.records_deleted
-    );
-
-    // Create initial file if none exist
-    if file_manager.file_count() == 0 {
-        file_manager.create_file()?;
-        info!("Created initial data file");
-    }
-
-    // Start compaction thread if enabled
-    let compaction_stop = if !config.no_compaction {
-        let compaction_config = CompactionConfig {
-            utilization_threshold: config.compaction_threshold,
-            check_interval_secs: config.compaction_interval,
-            ..Default::default()
-        };
-
-        let (compactor, stop) = start_compaction_thread(
-            compaction_config,
-            Arc::clone(&index),
-            Arc::clone(&file_manager),
-            Arc::clone(&write_buffer),
-        );
-        info!("Compaction thread started");
-        Some(stop)
-    } else {
-        info!("Compaction disabled");
-        None
-    };
 
     // Auto-tune performance settings
     let tuning = PerfTuning::auto_tune();
     info!("Performance tuning: {:?}", tuning);
 
-    // Pin main thread to CPU 0
-    let _ = pin_to_cpu(0);
+    // CPU pinning is delegated to the kubelet's static CPU manager when
+    // running under the operator (Guaranteed QoS + integer CPU). For non-K8s
+    // deployments use taskset(1) or cgroups; pinning only the main thread
+    // here had no real effect since it spends its life parked on a signal.
 
-    // Create hot cache
-    let hot_cache = Arc::new(HotCache::new());
+    let eviction_policy = EvictionPolicy::from_str(&config.eviction_policy);
 
-    // Create request handler with hot cache
-    let handler = Arc::new(Handler::with_hot_cache(
-        Arc::clone(&index),
-        Arc::clone(&file_manager),
-        Arc::clone(&write_buffer),
-        hot_cache,
-    ));
-
-    // Configure server
-    let server_config = ServerConfig {
-        bind_addr: config.bind,
-        max_connections: config.max_connections,
-        read_buffer_size: config.read_buffer_size(),
-        write_buffer_size: config.write_buffer_size(),
+    // Optional wblock read cache, shared across SSD-backed DBs. 0 disables it;
+    // without the cache every GET does a 1 MiB SSD pread.
+    let wblock_cache = if config.wblock_cache_mb > 0 {
+        let c = WblockCache::new(config.wblock_cache_mb);
+        info!("Wblock cache enabled: {} MiB", config.wblock_cache_mb);
+        Some(c)
+    } else {
+        None
     };
 
-    // Create and start TCP server
-    let server = Arc::new(Server::new(server_config, Arc::clone(&handler)));
+    // Shared io_uring reader for cache-miss reads. One pool shared across
+    // all SSD-backed DBs keeps the total number of kernel polling threads
+    // bounded. Best-effort: if io_uring isn't available the GETs fall back
+    // to the blocking pread path. Set --io-workers 0 to force the pread
+    // path (useful for benchmarking and for environments where io_uring
+    // submissions silently fail).
+    let async_reader: Option<Arc<AsyncReader>> = if config.io_workers == 0 {
+        info!("io_uring disabled (--io-workers 0); using blocking pread");
+        None
+    } else {
+        match AsyncReader::new(config.io_workers, 256) {
+            Ok(r) => {
+                info!(
+                    "io_uring async reader enabled: {} worker(s)",
+                    r.num_workers()
+                );
+                Some(r)
+            }
+            Err(e) => {
+                info!(
+                    "io_uring unavailable ({}); falling back to blocking pread",
+                    e
+                );
+                None
+            }
+        }
+    };
 
-    // Start UDP server on port + 1 for fast reads
-    let udp_addr: std::net::SocketAddr = format!(
-        "{}:{}",
-        config.bind.ip(),
-        config.bind.port() + 1
-    ).parse().unwrap();
-    let _udp_handle = start_udp_server(udp_addr, Arc::clone(&handler));
-    info!("UDP server (fast reads) on {}", udp_addr);
+    // Create all databases
+    info!("Initializing {} databases...", config.num_dbs);
+    let mut db_handlers = Vec::with_capacity(config.num_dbs as usize);
+    let mut compaction_stops: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut eviction_stops: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut wal_trim_stops: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut wals: Vec<Arc<WriteAheadLog>> = Vec::new();
 
-    // Start Redis-compatible server on port + 2
-    let redis_addr: std::net::SocketAddr = format!(
-        "{}:{}",
-        config.bind.ip(),
-        config.bind.port() + 2
-    ).parse().unwrap();
-    let _redis_handle = start_redis_server(redis_addr, Arc::clone(&handler));
-    info!("Redis-compatible server on {}", redis_addr);
+    for db_id in 0..config.num_dbs {
+        if config.is_memory_db(db_id) {
+            // Memory-only DB
+            let mut store = MemoryStore::new();
+            store.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
+            db_handlers.push(DbHandler::Memory(Arc::new(store)));
+            info!("DB {}: memory-only", db_id);
+        } else {
+            // SSD-backed DB
+            let db_data_dir = if config.num_dbs == 1 {
+                config.data_dir.clone() // backward compat: use data_dir directly
+            } else {
+                config.data_dir.join(format!("db{}", db_id))
+            };
+            std::fs::create_dir_all(&db_data_dir)?;
+
+            let fm = Arc::new(FileManager::new(&db_data_dir)?);
+            let idx = Arc::new(Index::new());
+            let wb = Arc::new(WriteBuffer::new(fm.file_count() as u32, config.wblocks_per_file));
+
+            // Group-commit WAL for this DB. Every durable write goes here
+            // before we ack to the client; recovery replays it on startup.
+            let wal_dir = db_data_dir.join("wal");
+            let wal = Arc::new(WriteAheadLog::new(WalConfig {
+                dir: wal_dir,
+                fsync_interval: std::time::Duration::from_micros(config.fsync_interval_us),
+                fsync_batch: config.fsync_batch,
+                ..Default::default()
+            })?);
+
+            if fm.file_count() == 0 {
+                fm.create_file()?;
+            }
+
+            // Start compaction thread for this DB
+            if !config.no_compaction {
+                let compaction_config = CompactionConfig {
+                    utilization_threshold: config.compaction_threshold,
+                    check_interval_secs: config.compaction_interval,
+                    ..Default::default()
+                };
+                let (_compactor, stop) = start_compaction_thread(
+                    compaction_config,
+                    Arc::clone(&idx),
+                    Arc::clone(&fm),
+                    Arc::clone(&wb),
+                );
+                compaction_stops.push(stop);
+            }
+
+            let mut handler_inner = Handler::new(
+                Arc::clone(&idx),
+                Arc::clone(&fm),
+                Arc::clone(&wb),
+            );
+            handler_inner.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
+            if let Some(cache) = &wblock_cache {
+                handler_inner.set_wblock_cache(Arc::clone(cache));
+            }
+            if let Some(reader) = &async_reader {
+                handler_inner.set_async_reader(Arc::clone(reader));
+            }
+
+            // Recover: scan data files, then replay WAL for records that were
+            // ack'd but not yet flushed. Done BEFORE wiring the WAL into the
+            // handler so replayed records don't re-append to the log.
+            let recovery_stats = recover_with_wal(&handler_inner, &fm, &wal)?;
+            info!(
+                "DB {}: SSD, recovered {} records ({} expired, {} deleted, {} from WAL, max gen {})",
+                db_id,
+                recovery_stats.records_indexed,
+                recovery_stats.records_expired,
+                recovery_stats.records_deleted,
+                recovery_stats.wal_entries_replayed,
+                recovery_stats.max_generation,
+            );
+
+            // From here on, every put_sync/delete_sync is durable.
+            handler_inner.set_wal(Arc::clone(&wal));
+            wals.push(Arc::clone(&wal));
+
+            let handler = Arc::new(handler_inner);
+
+            // Start eviction thread for this SSD DB
+            if config.eviction_policy != "noeviction"
+                || config.max_entries > 0
+                || config.max_data_mb > 0
+            {
+                let eviction_config = EvictionConfig {
+                    policy: eviction_policy,
+                    max_entries: config.max_entries,
+                    max_data_mb: config.max_data_mb,
+                    check_interval_secs: config.eviction_interval,
+                    sample_size: 16,
+                };
+                let (_evictor, stop) = start_eviction_thread(
+                    eviction_config,
+                    Arc::clone(&handler),
+                    Arc::clone(&idx),
+                );
+                eviction_stops.push(stop);
+            }
+
+            // Periodic WAL-trim thread: every few seconds, force a
+            // handler.flush() so WBlocks land in data files, then delete
+            // WAL files whose contents are now fully redundant. Keeps the
+            // WAL bounded on long-running servers.
+            if config.wal_trim_interval_secs > 0 {
+                let handler_for_trim = Arc::clone(&handler);
+                let wal_for_trim = Arc::clone(&wal);
+                let interval = std::time::Duration::from_secs(config.wal_trim_interval_secs);
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_clone = Arc::clone(&stop);
+                let trim_runtime = tokio::runtime::Handle::try_current().ok();
+                std::thread::Builder::new()
+                    .name(format!("wal-trim-db{}", db_id))
+                    .spawn(move || {
+                        while !stop_clone.load(Ordering::Relaxed) {
+                            std::thread::sleep(interval);
+                            if stop_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            // Handler::flush is async; drive it from the
+                            // tokio runtime if we're inside one, else a
+                            // small ad-hoc current-thread runtime.
+                            let flush_res = if let Some(h) = &trim_runtime {
+                                h.block_on(handler_for_trim.flush())
+                            } else {
+                                match tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                {
+                                    Ok(rt) => rt.block_on(handler_for_trim.flush()),
+                                    Err(e) => {
+                                        error!("wal-trim: failed to build runtime: {}", e);
+                                        continue;
+                                    }
+                                }
+                            };
+                            if let Err(e) = flush_res {
+                                error!("wal-trim: flush failed: {}", e);
+                                continue;
+                            }
+                            let dg = handler_for_trim.durable_generation();
+                            if dg == 0 {
+                                continue;
+                            }
+                            match wal_for_trim.cleanup_up_to_gen(dg) {
+                                Ok(n) if n > 0 => {
+                                    info!("wal-trim: removed {} files (durable_gen={})", n, dg);
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("wal-trim: cleanup failed: {}", e);
+                                }
+                            }
+                        }
+                    })
+                    .expect("failed to spawn wal-trim thread");
+                wal_trim_stops.push(stop);
+            }
+
+            db_handlers.push(DbHandler::Ssd(handler));
+        }
+    }
+
+    let db_manager = Arc::new(DatabaseManager::new(db_handlers));
+    info!("All databases initialized");
+
+    let tuning = ServerTuning {
+        read_buf_bytes: config.read_buffer_size(),
+        write_buf_bytes: config.write_buffer_size(),
+        max_connections: config.max_connections,
+    };
+    info!(
+        "Server tuning: read_buf={}KB write_buf={}KB max_conns={}",
+        tuning.read_buf_bytes / 1024,
+        tuning.write_buf_bytes / 1024,
+        tuning.max_connections,
+    );
+
+    // Get DB 0 handler for cluster components that need Arc<Handler>
+    let primary_handler = db_manager.db(0).unwrap().as_ssd().cloned();
+
+    // Initialize cluster components or standalone
+    let _health_stop = if config.cluster_mode {
+        let node_id = config.node_id.unwrap();
+        let total_nodes = config.total_nodes.unwrap();
+        let bind_ip = config.bind.ip();
+
+        // Build node list
+        let mut nodes = Vec::new();
+        let peer_addrs: Vec<String> = config
+            .cluster_peers
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for i in 0..total_nodes {
+            let redis_port = config.bind.port();
+            let cluster_port = config.cluster_port;
+
+            let (redis_addr, cluster_addr) = if i as usize >= peer_addrs.len() {
+                // No peer address provided, use localhost with offset
+                let addr = format!("{}:{}", bind_ip, redis_port);
+                let caddr = format!("{}:{}", bind_ip, cluster_port);
+                (addr.parse().unwrap(), caddr.parse().unwrap())
+            } else {
+                // Parse peer address (host:cluster_port)
+                let peer = &peer_addrs[i as usize];
+                let cluster_addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|_| {
+                    format!("{}:{}", bind_ip, cluster_port + i as u16)
+                        .parse()
+                        .unwrap()
+                });
+                let redis_addr = format!("{}:{}", cluster_addr.ip(), redis_port)
+                    .parse()
+                    .unwrap();
+                (redis_addr, cluster_addr)
+            };
+
+            nodes.push(NodeInfo::new(i, redis_addr, cluster_addr));
+        }
+
+        // Create topology
+        let topology = Arc::new(RwLock::new(ClusterTopology::new(
+            node_id,
+            nodes.clone(),
+            config.replication_factor,
+        )));
+
+        // Create peer connection pool
+        let peers = Arc::new(PeerConnectionPool::new());
+        for node in &nodes {
+            if node.id != node_id {
+                peers.add_peer(node.id, node.cluster_addr);
+            }
+        }
+
+        // In cluster mode, DB 0 must be SSD-backed
+        let cluster_handler = primary_handler.clone()
+            .expect("DB 0 must be SSD-backed in cluster mode");
+
+        // Create router
+        let router = Arc::new(ClusterRouter::new(
+            Arc::clone(&topology),
+            Arc::clone(&cluster_handler),
+            Arc::clone(&peers),
+        ));
+
+        // Create replication manager
+        let replication = Arc::new(ReplicationManager::new(
+            Arc::clone(&topology),
+            Arc::clone(&cluster_handler),
+            Arc::clone(&peers),
+        ));
+
+        // Start peer server
+        let peer_addr = format!("0.0.0.0:{}", config.cluster_port).parse().unwrap();
+        let peer_server = Arc::new(PeerServer::new(
+            Arc::clone(&cluster_handler),
+            Arc::clone(&replication),
+            Arc::clone(&topology),
+        ));
+        tokio::spawn(async move {
+            if let Err(e) = peer_server.run(peer_addr).await {
+                error!("Peer server error: {}", e);
+            }
+        });
+        info!("Cluster peer server on 0.0.0.0:{}", config.cluster_port);
+
+        // Start health checker
+        let health_config = HealthConfig {
+            check_interval: Duration::from_millis(config.health_check_interval_ms),
+            suspect_threshold: config.health_check_threshold.saturating_sub(1).max(1),
+            dead_threshold: config.health_check_threshold,
+        };
+        let health_checker = Arc::new(HealthChecker::new(
+            Arc::clone(&topology),
+            Arc::clone(&peers),
+            health_config,
+        ));
+        let health_stop = health_checker.stop_handle();
+        let hc = Arc::clone(&health_checker);
+        tokio::spawn(async move {
+            hc.run().await;
+        });
+        info!("Health checker started");
+
+        // Start N reactor threads (io_uring). SO_REUSEPORT when N > 1.
+        let _redis_handles = start_reactor_multi(
+            config.bind,
+            Arc::clone(&db_manager),
+            Some(router),
+            config.replica_read,
+            tuning,
+            config.reactor_threads,
+        );
+        info!(
+            "Redis-compatible reactor (clustered) on {} [threads={}]",
+            config.bind, config.reactor_threads
+        );
+
+        // Log shard ownership
+        let topo = topology.read();
+        let local_shards = topo.shards_for_node(node_id);
+        info!(
+            "Node {} owns {} shards as primary (topology v{})",
+            node_id,
+            local_shards.len(),
+            topo.current_version()
+        );
+
+        Some(health_stop)
+    } else {
+        // Standalone mode
+        let _redis_handles = start_reactor_multi(
+            config.bind,
+            Arc::clone(&db_manager),
+            None,
+            false,
+            tuning,
+            config.reactor_threads,
+        );
+        info!(
+            "Redis-compatible reactor on {} [threads={}]",
+            config.bind, config.reactor_threads
+        );
+        None
+    };
+
+    let shutdown_signal = Arc::new(AtomicBool::new(false));
 
     // Handle shutdown signals
-    let server_clone = Arc::clone(&server);
-    let handler_clone = Arc::clone(&handler);
+    let db_manager_clone = Arc::clone(&db_manager);
+    let shutdown_clone = Arc::clone(&shutdown_signal);
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
             .await
@@ -167,29 +481,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Shutdown signal received");
 
         // Flush pending writes
-        if let Err(e) = handler_clone.flush().await {
+        if let Err(e) = db_manager_clone.flush_all().await {
             error!("Error flushing on shutdown: {}", e);
         }
 
-        server_clone.shutdown();
+        shutdown_clone.store(true, Ordering::SeqCst);
     });
 
-    // Run server
-    info!("Server starting on {}", config.bind);
-    if let Err(e) = server.run().await {
-        error!("Server error: {}", e);
+    // Wait for shutdown signal
+    while !shutdown_signal.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Stop compaction thread
-    if let Some(stop) = compaction_stop {
+    // Stop health checker
+    if let Some(stop) = _health_stop {
         stop.store(true, Ordering::SeqCst);
-        info!("Waiting for compaction thread to stop...");
+    }
+
+    // Stop eviction threads
+    for stop in &eviction_stops {
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    // Stop compaction threads
+    for stop in &compaction_stops {
+        stop.store(true, Ordering::SeqCst);
+    }
+    if !compaction_stops.is_empty() {
+        info!("Waiting for compaction threads to stop...");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Final flush
+    // Stop WAL-trim threads
+    for stop in &wal_trim_stops {
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    // Final flush: push pending WBlocks to data files and fsync them.
     info!("Flushing pending writes...");
-    handler.flush().await?;
+    db_manager.flush_all().await?;
+
+    // After a successful flush every record up to this point is durable in
+    // the data files. WAL entries that duplicate those records are
+    // redundant, so trim old WAL files down to the last 2 (current + one
+    // back) so the log doesn't accumulate unboundedly across restarts.
+    for wal in &wals {
+        if let Err(e) = wal.cleanup(2) {
+            error!("WAL cleanup failed: {}", e);
+        }
+    }
 
     info!("SSD-KV shutdown complete");
     Ok(())

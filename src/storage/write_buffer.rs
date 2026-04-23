@@ -7,6 +7,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::io::aligned_buf::{AlignedBuffer, ALIGNMENT};
+use crate::perf::simd::simd_key_eq;
 use crate::storage::record::{Record, RECORD_ALIGNMENT};
 
 /// Size of a write block (1MB).
@@ -29,6 +30,10 @@ pub struct WBlock {
     pub block_id: u32,
     /// Whether this block has been flushed to disk.
     pub flushed: bool,
+    /// Maximum record generation seen in this block. Used by the WAL
+    /// cleanup path to know "everything up to this gen is durable in a
+    /// data file once this block is fsynced".
+    pub max_generation: u32,
 }
 
 impl WBlock {
@@ -42,6 +47,7 @@ impl WBlock {
             file_id,
             block_id,
             flushed: false,
+            max_generation: 0,
         }
     }
 
@@ -62,6 +68,10 @@ impl WBlock {
         self.write_pos += record_size;
         self.live_records += 1;
         self.total_records += 1;
+
+        if record.header.generation > self.max_generation {
+            self.max_generation = record.header.generation;
+        }
 
         Ok(offset)
     }
@@ -152,6 +162,8 @@ pub struct DiskLocation {
     pub wblock_id: u16,
     /// Offset within the WBlock (up to 1MB = 20 bits, using u32 for safety).
     pub offset: u32,
+    /// Record size for partial reads (0 means unknown, read full WBlock).
+    pub record_size: u32,
 }
 
 impl DiskLocation {
@@ -160,12 +172,28 @@ impl DiskLocation {
             file_id,
             wblock_id,
             offset,
+            record_size: 0,
+        }
+    }
+
+    /// Creates a new DiskLocation with known record size for partial reads.
+    pub fn with_size(file_id: u32, wblock_id: u16, offset: u32, record_size: u32) -> Self {
+        Self {
+            file_id,
+            wblock_id,
+            offset,
+            record_size,
         }
     }
 
     /// Calculates the absolute file offset.
     pub fn file_offset(&self, file_header_size: u64) -> u64 {
         file_header_size + (self.wblock_id as u64 * WBLOCK_SIZE as u64) + self.offset as u64
+    }
+
+    /// Returns true if partial reads are possible (record size is known).
+    pub fn supports_partial_read(&self) -> bool {
+        self.record_size > 0
     }
 }
 
@@ -285,6 +313,7 @@ impl WriteBuffer {
 
     /// Reads data from unflushed buffers (current + pending).
     /// Returns None if the data has been flushed to disk.
+    /// Uses SIMD-accelerated key comparison.
     pub fn read_unflushed(&self, location: &DiskLocation, key: &[u8]) -> Option<Vec<u8>> {
         use crate::storage::record::Record;
 
@@ -296,8 +325,8 @@ impl WriteBuffer {
                 let buffer = current.buffer();
                 if offset < buffer.len() {
                     if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
-                        // Verify key matches before returning value
-                        if record.key == key && !record.header.is_deleted() && !record.header.is_expired() {
+                        // SIMD-accelerated key comparison
+                        if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
                             return Some(record.value);
                         }
                     }
@@ -314,9 +343,59 @@ impl WriteBuffer {
                     let buffer = block.buffer();
                     if offset < buffer.len() {
                         if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
-                            // Verify key matches before returning value
-                            if record.key == key && !record.header.is_deleted() && !record.header.is_expired() {
+                            // SIMD-accelerated key comparison
+                            if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
                                 return Some(record.value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Reads full record metadata from unflushed buffers.
+    /// Returns RecordMeta if the key is found in write buffers.
+    pub fn read_unflushed_meta(&self, location: &DiskLocation, key: &[u8]) -> Option<crate::server::handler::RecordMeta> {
+        use crate::storage::record::Record;
+
+        // Check current block first
+        {
+            let current = self.current.lock();
+            if current.file_id == location.file_id && current.block_id == location.wblock_id as u32 {
+                let offset = location.offset as usize;
+                let buffer = current.buffer();
+                if offset < buffer.len() {
+                    if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
+                        if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
+                            return Some(crate::server::handler::RecordMeta {
+                                value: record.value,
+                                timestamp_micros: record.header.timestamp,
+                                ttl_secs: record.header.ttl,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check pending blocks
+        {
+            let pending = self.pending.lock();
+            for block in pending.iter() {
+                if block.file_id == location.file_id && block.block_id == location.wblock_id as u32 {
+                    let offset = location.offset as usize;
+                    let buffer = block.buffer();
+                    if offset < buffer.len() {
+                        if let Ok(record) = Record::from_bytes(&buffer[offset..]) {
+                            if simd_key_eq(&record.key, key) && !record.header.is_deleted() && !record.header.is_expired() {
+                                return Some(crate::server::handler::RecordMeta {
+                                    value: record.value,
+                                    timestamp_micros: record.header.timestamp,
+                                    ttl_secs: record.header.ttl,
+                                });
                             }
                         }
                     }
@@ -374,6 +453,11 @@ mod tests {
         let offset = loc.file_offset(4096);
         // file_header(4096) + 5 * 1MB + 128
         assert_eq!(offset, 4096 + 5 * 1024 * 1024 + 128);
+        assert!(!loc.supports_partial_read());
+
+        let loc_with_size = DiskLocation::with_size(1, 5, 128, 256);
+        assert!(loc_with_size.supports_partial_read());
+        assert_eq!(loc_with_size.record_size, 256);
     }
 
     #[test]

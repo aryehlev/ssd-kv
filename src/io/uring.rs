@@ -514,6 +514,130 @@ fn io_thread(
     }
 }
 
+/// Batched I/O manager for submitting multiple operations at once.
+/// This reduces syscall overhead by batching up to 64 operations per submission.
+pub struct BatchedUring {
+    manager: UringManager,
+    pending_reads: Vec<BatchedReadRequest>,
+    pending_writes: Vec<BatchedWriteRequest>,
+    max_batch_size: usize,
+}
+
+struct BatchedReadRequest {
+    fd: RawFd,
+    offset: u64,
+    buffer: AlignedBuffer,
+    user_data: u64,
+}
+
+struct BatchedWriteRequest {
+    fd: RawFd,
+    offset: u64,
+    buffer: AlignedBuffer,
+    user_data: u64,
+}
+
+impl BatchedUring {
+    /// Creates a new batched I/O manager.
+    pub fn new(queue_depth: u32, max_batch_size: usize) -> io::Result<Self> {
+        let manager = UringManager::new(queue_depth)
+            .or_else(|_| UringManager::new_simple(queue_depth))?;
+
+        Ok(Self {
+            manager,
+            pending_reads: Vec::with_capacity(max_batch_size),
+            pending_writes: Vec::with_capacity(max_batch_size),
+            max_batch_size,
+        })
+    }
+
+    /// Queues a read operation for batched submission.
+    pub fn queue_read(
+        &mut self,
+        fd: RawFd,
+        buffer: AlignedBuffer,
+        offset: u64,
+        user_data: u64,
+    ) {
+        self.pending_reads.push(BatchedReadRequest {
+            fd,
+            offset,
+            buffer,
+            user_data,
+        });
+    }
+
+    /// Queues a write operation for batched submission.
+    pub fn queue_write(
+        &mut self,
+        fd: RawFd,
+        buffer: AlignedBuffer,
+        offset: u64,
+        user_data: u64,
+    ) {
+        self.pending_writes.push(BatchedWriteRequest {
+            fd,
+            offset,
+            buffer,
+            user_data,
+        });
+    }
+
+    /// Submits all queued operations as a batch.
+    /// Returns the number of operations submitted.
+    pub fn flush(&mut self) -> io::Result<usize> {
+        let mut submitted = 0;
+
+        // Submit all pending reads
+        for req in self.pending_reads.drain(..) {
+            let len = req.buffer.capacity() as u32;
+            self.manager.submit_read(req.fd, req.buffer, req.offset, len)?;
+            submitted += 1;
+        }
+
+        // Submit all pending writes
+        for req in self.pending_writes.drain(..) {
+            self.manager.submit_write(req.fd, req.buffer, req.offset)?;
+            submitted += 1;
+        }
+
+        if submitted > 0 {
+            self.manager.submit()?;
+        }
+
+        Ok(submitted)
+    }
+
+    /// Submits all queued operations and waits for at least `min_completions`.
+    pub fn flush_and_wait(&mut self, min_completions: usize) -> io::Result<usize> {
+        let submitted = self.flush()?;
+        if submitted > 0 {
+            self.manager.submit_and_wait(min_completions)?;
+        }
+        Ok(submitted)
+    }
+
+    /// Collects completed operations.
+    pub fn collect(&mut self) -> Vec<IoResult> {
+        self.manager.collect_completions()
+    }
+
+    /// Returns the number of pending operations (not yet submitted).
+    pub fn pending_count(&self) -> usize {
+        self.pending_reads.len() + self.pending_writes.len()
+    }
+
+    /// Returns true if there are pending operations.
+    pub fn has_pending(&self) -> bool {
+        !self.pending_reads.is_empty() || !self.pending_writes.is_empty()
+    }
+
+    /// Returns the maximum batch size.
+    pub fn max_batch_size(&self) -> usize {
+        self.max_batch_size
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +646,14 @@ mod tests {
     fn test_uring_manager_creation() {
         let manager = UringManager::new_simple(32);
         assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn test_batched_uring_creation() {
+        let batched = BatchedUring::new(64, 32);
+        assert!(batched.is_ok());
+        let batched = batched.unwrap();
+        assert_eq!(batched.max_batch_size(), 32);
+        assert_eq!(batched.pending_count(), 0);
     }
 }

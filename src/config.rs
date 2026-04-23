@@ -55,9 +55,137 @@ pub struct Config {
     /// Number of WBlocks per file (1 WBlock = 1MB)
     #[arg(long, default_value = "1023")]
     pub wblocks_per_file: u32,
+
+    /// Number of worker threads (0 = auto-detect based on CPU count)
+    #[arg(long, default_value = "0")]
+    pub workers: usize,
+
+    // --- Cluster mode options ---
+
+    /// Enable cluster mode
+    #[arg(long)]
+    pub cluster_mode: bool,
+
+    /// This node's ID (required in cluster mode, typically the StatefulSet ordinal)
+    #[arg(long)]
+    pub node_id: Option<u32>,
+
+    /// Total number of nodes in the cluster
+    #[arg(long)]
+    pub total_nodes: Option<u32>,
+
+    /// Replication factor (number of copies including primary)
+    #[arg(long, default_value = "2")]
+    pub replication_factor: u8,
+
+    /// Port for inter-node gRPC communication
+    #[arg(long, default_value = "7780")]
+    pub cluster_port: u16,
+
+    /// Comma-separated list of peer addresses (host:cluster_port)
+    /// e.g. "ssdkv-0:7780,ssdkv-1:7780,ssdkv-2:7780"
+    #[arg(long)]
+    pub cluster_peers: Option<String>,
+
+    /// Health check interval in milliseconds
+    #[arg(long, default_value = "1000")]
+    pub health_check_interval_ms: u64,
+
+    /// Number of missed heartbeats before marking a node as dead
+    #[arg(long, default_value = "3")]
+    pub health_check_threshold: u32,
+
+    // --- Eviction options ---
+
+    /// Maximum number of entries in the index (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    pub max_entries: u64,
+
+    /// Maximum data size in MB (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    pub max_data_mb: u64,
+
+    /// Eviction policy: "noeviction", "allkeys-lru", "volatile-lru",
+    /// "allkeys-random", "volatile-random", "volatile-ttl"
+    #[arg(long, default_value = "noeviction")]
+    pub eviction_policy: String,
+
+    /// Eviction check interval in seconds
+    #[arg(long, default_value = "1")]
+    pub eviction_interval: u64,
+
+    /// Allow replica nodes to serve read requests (clients must still send READONLY)
+    #[arg(long)]
+    pub replica_read: bool,
+
+    // --- Multi-database options ---
+
+    /// Number of databases (1-16, like Redis)
+    #[arg(long, default_value = "16")]
+    pub num_dbs: u8,
+
+    /// Comma-separated list of DB indices that are memory-only (e.g. "1,2,5")
+    #[arg(long)]
+    pub memory_dbs: Option<String>,
+
+    // --- Read cache ---
+
+    /// Size (MiB) of the wblock read cache. Shared across all SSD-backed DBs.
+    /// Every cached entry is one 1 MiB WBlock; 0 disables the cache (default).
+    /// Enable only if the working set fits (or partially fits) in the chosen
+    /// RAM budget; without it every GET = a 1 MiB SSD read.
+    #[arg(long, default_value = "0")]
+    pub wblock_cache_mb: usize,
+
+    // --- Durability (group-commit WAL) ---
+
+    /// Group-commit interval in microseconds. The WAL commit thread wakes at
+    /// least this often to fsync. Smaller = lower tail latency, higher
+    /// syscall rate.
+    #[arg(long, default_value = "500")]
+    pub fsync_interval_us: u64,
+
+    /// Number of writers that may stack up waiting for fsync before the
+    /// commit thread wakes early. Bounds worst-case queue depth at high QPS.
+    #[arg(long, default_value = "256")]
+    pub fsync_batch: usize,
+
+    // --- io_uring ---
+
+    /// Number of io_uring workers (one kernel polling thread each in SQPOLL
+    /// mode) that service cache-miss disk reads. Falls back to blocking
+    /// pread if io_uring is unavailable.
+    #[arg(long, default_value = "2")]
+    pub io_workers: usize,
+
+    /// Number of RESP reactor threads. Each reactor owns its own io_uring
+    /// ring; when >1 they share the listen port via SO_REUSEPORT so the
+    /// kernel load-balances connections across them. Default 1.
+    #[arg(long, default_value = "1")]
+    pub reactor_threads: usize,
+
+    // --- WAL trim ---
+
+    /// Periodic WAL-trim interval in seconds. Every tick, the server
+    /// flushes pending WBlocks to data files and deletes WAL files whose
+    /// records are now redundant. 0 disables runtime trimming; WAL still
+    /// gets trimmed at shutdown.
+    #[arg(long, default_value = "30")]
+    pub wal_trim_interval_secs: u64,
 }
 
 impl Config {
+    /// Returns the number of worker threads.
+    pub fn num_workers(&self) -> usize {
+        if self.workers == 0 {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+        } else {
+            self.workers
+        }
+    }
+
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.compaction_threshold < 0.0 || self.compaction_threshold > 1.0 {
@@ -76,6 +204,58 @@ impl Config {
             return Err("Write buffer size must be positive".to_string());
         }
 
+        match self.eviction_policy.as_str() {
+            "noeviction" | "allkeys-lru" | "volatile-lru" | "allkeys-random"
+            | "volatile-random" | "volatile-ttl" => {}
+            _ => {
+                return Err(format!(
+                    "Unknown eviction policy '{}'. Must be one of: noeviction, allkeys-lru, \
+                     volatile-lru, allkeys-random, volatile-random, volatile-ttl",
+                    self.eviction_policy
+                ));
+            }
+        }
+
+        if self.num_dbs == 0 || self.num_dbs > 16 {
+            return Err("--num-dbs must be between 1 and 16".to_string());
+        }
+
+        if let Some(ref mem_list) = self.memory_dbs {
+            for s in mem_list.split(',') {
+                let s = s.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                match s.parse::<u8>() {
+                    Ok(id) if id < self.num_dbs => {}
+                    Ok(id) => {
+                        return Err(format!(
+                            "memory-dbs index {} is out of range (num-dbs={})",
+                            id, self.num_dbs
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(format!("invalid memory-dbs value: '{}'", s));
+                    }
+                }
+            }
+        }
+
+        if self.cluster_mode {
+            if self.node_id.is_none() {
+                return Err("--node-id is required in cluster mode".to_string());
+            }
+            if self.total_nodes.is_none() {
+                return Err("--total-nodes is required in cluster mode".to_string());
+            }
+            if self.total_nodes.unwrap() == 0 {
+                return Err("--total-nodes must be at least 1".to_string());
+            }
+            if self.replication_factor as u32 > self.total_nodes.unwrap() {
+                return Err("Replication factor cannot exceed total nodes".to_string());
+            }
+        }
+
         Ok(())
     }
 
@@ -87,6 +267,14 @@ impl Config {
     /// Returns the write buffer size in bytes.
     pub fn write_buffer_size(&self) -> usize {
         self.write_buffer_kb * 1024
+    }
+
+    /// Returns true if the given DB index is configured as memory-only.
+    pub fn is_memory_db(&self, db_id: u8) -> bool {
+        self.memory_dbs.as_ref().map_or(false, |list| {
+            list.split(',')
+                .any(|s| s.trim().parse::<u8>().ok() == Some(db_id))
+        })
     }
 }
 
@@ -104,6 +292,28 @@ impl Default for Config {
             read_buffer_kb: 64,
             write_buffer_kb: 64,
             wblocks_per_file: 1023,
+            workers: 0,
+            cluster_mode: false,
+            node_id: None,
+            total_nodes: None,
+            replication_factor: 2,
+            cluster_port: 7780,
+            cluster_peers: None,
+            health_check_interval_ms: 1000,
+            health_check_threshold: 3,
+            max_entries: 0,
+            max_data_mb: 0,
+            eviction_policy: "noeviction".to_string(),
+            eviction_interval: 1,
+            replica_read: false,
+            num_dbs: 16,
+            memory_dbs: None,
+            wblock_cache_mb: 0,
+            fsync_interval_us: 500,
+            fsync_batch: 256,
+            io_workers: 2,
+            reactor_threads: 1,
+            wal_trim_interval_secs: 30,
         }
     }
 }

@@ -3,7 +3,17 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// CLI representation of the durability mode. The conversion to the
+/// runtime `DurabilityMode` lives in `main.rs` where we plumb the WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DurabilityArg {
+    /// Per-write fsync. Every ACK is durable. Matches Redis `appendfsync=always`.
+    Strong,
+    /// Background fsync (~1s window). Matches Redis `appendfsync=everysec`.
+    Everysec,
+}
 
 /// SSD-KV: High-Performance Key-Value Store
 #[derive(Parser, Debug, Clone)]
@@ -149,6 +159,20 @@ pub struct Config {
     /// commit thread wakes early. Bounds worst-case queue depth at high QPS.
     #[arg(long, default_value = "256")]
     pub fsync_batch: usize,
+
+    /// Durability model. Tradeoff is the same as Redis:
+    ///
+    /// - `strong` (default): every reply is acknowledged only after the
+    ///   WAL is fsynced. A kill -9 in the middle of a batch loses only
+    ///   the unacknowledged writes. Matches Redis `appendfsync=always`.
+    /// - `everysec`: the reactor replies as soon as the write is staged
+    ///   in the WAL buffer. The commit thread fsyncs once per second
+    ///   in the background. A crash can lose up to one second of
+    ///   acknowledged writes. Matches Redis `appendfsync=everysec`.
+    ///   Use this when your workload can tolerate the window in
+    ///   exchange for 5-10x lower p50.
+    #[arg(long, default_value = "strong")]
+    pub durability: DurabilityArg,
 
     // --- io_uring ---
 
@@ -311,6 +335,7 @@ impl Default for Config {
             wblock_cache_mb: 0,
             fsync_interval_us: 500,
             fsync_batch: 256,
+            durability: DurabilityArg::Strong,
             io_workers: 2,
             reactor_threads: 1,
             wal_trim_interval_secs: 30,

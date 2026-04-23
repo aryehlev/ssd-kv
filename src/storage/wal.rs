@@ -942,14 +942,26 @@ impl WriteAheadLog {
                     break; // Corrupted entry, stop replay
                 }
 
-                // Read key
+                // Read key. A short read here (UnexpectedEof) means the
+                // WAL was torn mid-entry — most commonly by a kill -9
+                // between the header write and the value write. Treat
+                // it as the end of valid entries; the prior iteration's
+                // records are still good.
                 let mut key = vec![0u8; header.key_len as usize];
-                file.read_exact(&mut key)?;
+                match file.read_exact(&mut key) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
 
-                // Read value (if PUT)
+                // Read value (if PUT). Same torn-write handling.
                 let value = if header.is_put() {
                     let mut value = vec![0u8; header.value_len as usize];
-                    file.read_exact(&mut value)?;
+                    match file.read_exact(&mut value) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(e),
+                    }
                     value
                 } else {
                     Vec::new()

@@ -59,6 +59,31 @@ impl HandlerStats {
     }
 }
 
+/// How a client write becomes durable.
+///
+/// - `Strong`: every ACK means the write has been fsynced. Matches
+///   Redis `appendfsync=always`. `put_nowait` returns the WAL
+///   position so the reactor blocks the reply until the commit thread
+///   publishes a durable_pos ≥ that.
+/// - `Everysec`: the ACK comes back as soon as the write is staged in
+///   the WAL buffer — the commit thread fsyncs on its own schedule
+///   (by default every ~1 second). Matches Redis
+///   `appendfsync=everysec`. On a kill -9 you may lose up to that
+///   window's worth of acknowledged writes, but p50 latency drops
+///   ~5-10× on disk-bound workloads. Good fit for caches and
+///   session stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityMode {
+    Strong,
+    Everysec,
+}
+
+impl Default for DurabilityMode {
+    fn default() -> Self {
+        Self::Strong
+    }
+}
+
 /// The request handler that processes KV operations.
 pub struct Handler {
     index: Arc<Index>,
@@ -74,6 +99,8 @@ pub struct Handler {
     /// set, writes live in RAM until a WBlock fills — used by tests that
     /// don't care about durability.
     wal: Option<Arc<WriteAheadLog>>,
+    /// Per-ack durability policy. See [`DurabilityMode`].
+    durability: DurabilityMode,
     /// Highest record generation that is durably in a data file. Bumped
     /// by `flush()` after a successful fsync. The periodic WAL-trim path
     /// uses this to decide when old WAL files are redundant.
@@ -103,6 +130,7 @@ impl Handler {
             wblock_cache: None,
             async_reader: None,
             wal: None,
+            durability: DurabilityMode::Strong,
             durable_gen: AtomicU32::new(0),
             bloom_filter: Arc::new(LockFreeBloomFilter::new(10_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
@@ -157,6 +185,15 @@ impl Handler {
 
     pub fn wal(&self) -> Option<&Arc<WriteAheadLog>> {
         self.wal.as_ref()
+    }
+
+    /// Sets the per-ack durability policy. See [`DurabilityMode`].
+    pub fn set_durability(&mut self, mode: DurabilityMode) {
+        self.durability = mode;
+    }
+
+    pub fn durability(&self) -> DurabilityMode {
+        self.durability
     }
 
     /// Sets the eviction policy and capacity limits.
@@ -242,6 +279,15 @@ impl Handler {
         self.bloom_filter.add(key_hash);
 
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
+        // In Everysec mode we hand back `None` even if the WAL returned
+        // a position: the reactor interprets `None` as "don't wait for
+        // durability, flush the reply now." Writes are still staged in
+        // the WAL buffer; the commit thread fsyncs them on its own
+        // schedule (configured by `fsync_interval`, default 1s for
+        // everysec).
+        if matches!(self.durability, DurabilityMode::Everysec) {
+            return Ok(None);
+        }
         Ok(wal_pos)
     }
 
@@ -320,6 +366,9 @@ impl Handler {
 
         let deleted = self.index.delete(key, generation);
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
+        if matches!(self.durability, DurabilityMode::Everysec) {
+            return Ok((deleted, None));
+        }
         Ok((deleted, wal_pos))
     }
 

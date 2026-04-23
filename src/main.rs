@@ -158,9 +158,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Group-commit WAL for this DB. Every durable write goes here
             // before we ack to the client; recovery replays it on startup.
             let wal_dir = db_data_dir.join("wal");
+            // In Everysec mode the fsync cadence is 1 second regardless
+            // of what the user passed on the CLI — we're trading
+            // strong-per-write durability for amortized throughput, and
+            // fsyncing more often than once a second would defeat that
+            // without actually narrowing the crash window meaningfully.
+            let fsync_interval = match config.durability {
+                crate::config::DurabilityArg::Strong => {
+                    std::time::Duration::from_micros(config.fsync_interval_us)
+                }
+                crate::config::DurabilityArg::Everysec => {
+                    std::time::Duration::from_secs(1)
+                }
+            };
+
             let wal = Arc::new(WriteAheadLog::new(WalConfig {
                 dir: wal_dir,
-                fsync_interval: std::time::Duration::from_micros(config.fsync_interval_us),
+                fsync_interval,
                 fsync_batch: config.fsync_batch,
                 ..Default::default()
             })?);
@@ -214,6 +228,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // From here on, every put_sync/delete_sync is durable.
             handler_inner.set_wal(Arc::clone(&wal));
+            handler_inner.set_durability(match config.durability {
+                crate::config::DurabilityArg::Strong => {
+                    crate::server::handler::DurabilityMode::Strong
+                }
+                crate::config::DurabilityArg::Everysec => {
+                    crate::server::handler::DurabilityMode::Everysec
+                }
+            });
             wals.push(Arc::clone(&wal));
 
             let handler = Arc::new(handler_inner);

@@ -1,57 +1,90 @@
-#!/bin/bash
-# Run comparison benchmark between SSD-KV and Aerospike
+#!/usr/bin/env bash
+# Run a battery of throughput / latency benchmarks against ssd-kv using
+# redis-benchmark (standard, apples-to-apples with Redis/Valkey). For an
+# Aerospike comparison, run the same workload shapes against Aerospike
+# using asbench or YCSB — see the notes at the end.
+#
+# Requirements:
+#   - redis-benchmark on PATH (ships with redis-tools / valkey-tools)
+#   - ssd-kv already running on $HOST:$PORT
+#
+# Usage:
+#   ./benchmark/run_comparison.sh                  # defaults below
+#   HOST=other PORT=7777 ./benchmark/run_comparison.sh
+#   WORKLOADS="get,set" ./benchmark/run_comparison.sh
 
-set -e
+set -euo pipefail
 
-echo "================================================"
-echo "SSD-KV vs Aerospike Performance Comparison"
-echo "================================================"
+HOST=${HOST:-127.0.0.1}
+PORT=${PORT:-7777}
+KEYSPACE=${KEYSPACE:-1000000}    # -r: random-key range
+REQUESTS=${REQUESTS:-2000000}    # -n: total requests per workload
+CLIENTS=${CLIENTS:-64}           # -c: concurrent clients
+PIPELINE=${PIPELINE:-16}         # -P: pipeline depth
+VALUE_SIZE=${VALUE_SIZE:-100}    # -d: SET value size in bytes
+
+# Comma-separated list; valid entries: set, get, incr, del, mset, ping_mbulk
+WORKLOADS=${WORKLOADS:-set,get,incr,del,mset}
+
+if ! command -v redis-benchmark >/dev/null 2>&1; then
+  echo "error: redis-benchmark not found on PATH" >&2
+  echo "       install redis-tools (debian/ubuntu) or valkey-tools" >&2
+  exit 1
+fi
+
+if ! redis-cli -h "$HOST" -p "$PORT" PING >/dev/null 2>&1; then
+  echo "error: no ssd-kv responding at $HOST:$PORT" >&2
+  echo "       start it first:  ./target/release/ssd-kv --bind 0.0.0.0:$PORT" >&2
+  exit 1
+fi
+
+echo "============================================================"
+echo "ssd-kv benchmark (target: $HOST:$PORT)"
+echo "  keyspace=$KEYSPACE  requests=$REQUESTS  clients=$CLIENTS"
+echo "  pipeline=$PIPELINE  value_size=$VALUE_SIZE B"
+echo "============================================================"
+
+# Warm up. Also pre-populates keys so GET workloads are realistic.
 echo ""
+echo "-- warmup (SET $KEYSPACE keys) --"
+redis-benchmark -h "$HOST" -p "$PORT" \
+  -t set -n "$KEYSPACE" -c "$CLIENTS" -P "$PIPELINE" \
+  -d "$VALUE_SIZE" -r "$KEYSPACE" -q
 
-# Configuration
-NUM_KEYS=${NUM_KEYS:-100000}
-NUM_THREADS=${NUM_THREADS:-4}
-VALUE_SIZE=${VALUE_SIZE:-100}
+# Run each workload with throughput (-q) and latency (--latency-history gets
+# noisy; use --csv for a single summary row).
+for w in ${WORKLOADS//,/ }; do
+  echo ""
+  echo "-- $w --"
+  redis-benchmark -h "$HOST" -p "$PORT" \
+    -t "$w" -n "$REQUESTS" -c "$CLIENTS" -P "$PIPELINE" \
+    -d "$VALUE_SIZE" -r "$KEYSPACE" -q
+done
 
-echo "Configuration:"
-echo "  Keys: $NUM_KEYS"
-echo "  Threads: $NUM_THREADS"
-echo "  Value size: $VALUE_SIZE bytes"
-echo ""
+cat <<'EOF'
 
-# Build the benchmark client
-echo "Building benchmark client..."
-cargo build --release --bin bench_client
+============================================================
+Running the same workload against Aerospike or Valkey
+============================================================
 
-# Start containers if not running
-echo ""
-echo "Starting containers..."
-docker-compose up -d
+Valkey / Redis (RESP, same redis-benchmark):
+  redis-benchmark -h <host> -p 6379 -t set,get,incr,del,mset \
+                  -n 2000000 -c 64 -P 16 -d 100 -r 1000000 -q
 
-# Wait for services to be ready
-echo "Waiting for services to start..."
-sleep 5
+Aerospike (native, asbench):
+  asbench -h <host>:3000 -n test -s testset \
+          -K 0 -k 1000000 -o B:100 \
+          -z 64 --throughput 0 \
+          -w RU,50      # mixed 50/50 reads/writes
 
-# Run SSD-KV benchmark
-echo ""
-echo "================================================"
-echo "Benchmarking SSD-KV (port 7777)"
-echo "================================================"
-./target/release/bench_client 127.0.0.1:7777 $NUM_KEYS $NUM_THREADS $VALUE_SIZE
+YCSB (cross-store, most honest apples-to-apples):
+  # Core workloads a-f cover everything from read-heavy to update-heavy.
+  bin/ycsb load aerospike -P workloads/workloada -threads 64
+  bin/ycsb run  aerospike -P workloads/workloada -threads 64
+  bin/ycsb load redis     -P workloads/workloada -threads 64 \
+                          -p redis.host=<host> -p redis.port=7777
+  bin/ycsb run  redis     -P workloads/workloada -threads 64 \
+                          -p redis.host=<host> -p redis.port=7777
 
-# For Aerospike comparison, we'd need a separate client that speaks Aerospike protocol
-# Here we just show how the benchmark would be structured
-
-echo ""
-echo "================================================"
-echo "Notes on Aerospike Comparison"
-echo "================================================"
-echo ""
-echo "To compare with Aerospike, install the Aerospike tools and run:"
-echo "  asbench -h 127.0.0.1:3000 -n test -s testset -k $NUM_KEYS -o I1 -w RU,50"
-echo ""
-echo "Or use the YCSB benchmark framework for a fair comparison."
-echo ""
-
-# Optional: Stop containers
-# docker-compose down
+Compare throughput + p50/p99/p99.9 latency.
+EOF

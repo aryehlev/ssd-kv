@@ -10,8 +10,10 @@ use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
 use crate::perf::prefetch::{BloomFilter, LockFreeBloomFilter};
 use crate::perf::simd::{batch_bloom_check, batch_hash_keys_4, group_by_shard};
+use crate::io::async_reader::AsyncReader;
+use crate::io::aligned_buf::AlignedBuffer;
 use crate::storage::eviction::EvictionPolicy;
-use crate::storage::file_manager::{FileManager, ParallelFileManager};
+use crate::storage::file_manager::{FileManager, ParallelFileManager, FILE_HEADER_SIZE};
 use crate::storage::record::Record;
 use crate::storage::wal::WriteAheadLog;
 use crate::storage::wblock_cache::WblockCache;
@@ -57,6 +59,10 @@ pub struct Handler {
     file_manager: Arc<FileManager>,
     write_buffer: Arc<WriteBuffer>,
     wblock_cache: Option<Arc<WblockCache>>,
+    /// Optional io_uring reader for cache-miss reads. When set, GETs that
+    /// fall through to disk go through io_uring (SQPOLL amortizes the
+    /// submission syscall) instead of a blocking pread.
+    async_reader: Option<Arc<AsyncReader>>,
     /// Optional write-ahead log. When set, put_sync/delete_sync return only
     /// after the record is durably in the WAL (via group commit). When not
     /// set, writes live in RAM until a WBlock fills — used by tests that
@@ -82,6 +88,7 @@ impl Handler {
             file_manager,
             write_buffer,
             wblock_cache: None,
+            async_reader: None,
             wal: None,
             bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
@@ -90,6 +97,11 @@ impl Handler {
             max_entries: 0,
             max_data_bytes: 0,
         }
+    }
+
+    /// Installs an io_uring async reader for cache-miss reads.
+    pub fn set_async_reader(&mut self, reader: Arc<AsyncReader>) {
+        self.async_reader = Some(reader);
     }
 
     /// Installs a shared wblock cache (shared across databases so total
@@ -284,11 +296,9 @@ impl Handler {
             }
         }
 
-        // Slow path: Read from disk (blocking pread)
-        let file = self.file_manager.get_file(file_id)?;
-        let file_guard = file.lock();
-        let wblock_data = file_guard.read_wblock(wblock_id).ok()?;
-        drop(file_guard);
+        // Slow path: read the wblock off disk (io_uring if wired,
+        // blocking pread otherwise).
+        let wblock_data = self.read_wblock_for_get(file_id, wblock_id).ok()?;
 
         if offset >= wblock_data.len() {
             return None;
@@ -308,6 +318,36 @@ impl Handler {
         }
 
         result
+    }
+
+    /// Read a wblock for the GET hot path. Prefers io_uring when an
+    /// AsyncReader is installed, falls back to the blocking pread path
+    /// otherwise. Used only for request-path reads — compaction / scans
+    /// deliberately go through FileManager directly so they don't pollute
+    /// this code path.
+    fn read_wblock_for_get(
+        &self,
+        file_id: u32,
+        wblock_id: u32,
+    ) -> io::Result<AlignedBuffer> {
+        if let Some(reader) = &self.async_reader {
+            let file = self.file_manager.get_file(file_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "file not found")
+            })?;
+            let file_guard = file.lock();
+            let fd = file_guard.raw_fd();
+            drop(file_guard); // release before we block waiting for io_uring
+
+            let offset = FILE_HEADER_SIZE as u64 + (wblock_id as u64 * WBLOCK_SIZE as u64);
+            return reader.pread_blocking(fd, offset, WBLOCK_SIZE);
+        }
+
+        let file = self
+            .file_manager
+            .get_file(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+        let file_guard = file.lock();
+        file_guard.read_wblock(wblock_id)
     }
 
     /// Returns the full record metadata for a key (value, timestamp, ttl).
@@ -342,11 +382,8 @@ impl Handler {
             }
         }
 
-        // Disk read
-        let file = self.file_manager.get_file(file_id)?;
-        let file_guard = file.lock();
-        let wblock_data = file_guard.read_wblock(wblock_id).ok()?;
-        drop(file_guard);
+        // Disk read (io_uring if wired, else pread)
+        let wblock_data = self.read_wblock_for_get(file_id, wblock_id).ok()?;
 
         if offset >= wblock_data.len() {
             return None;

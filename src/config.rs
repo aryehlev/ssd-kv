@@ -149,6 +149,14 @@ pub struct Config {
     /// commit thread wakes early. Bounds worst-case queue depth at high QPS.
     #[arg(long, default_value = "256")]
     pub fsync_batch: usize,
+
+    // --- io_uring ---
+
+    /// Number of io_uring workers (one kernel polling thread each in SQPOLL
+    /// mode) that service cache-miss disk reads. Falls back to blocking
+    /// pread if io_uring is unavailable.
+    #[arg(long, default_value = "2")]
+    pub io_workers: usize,
 }
 
 impl Config {
@@ -288,6 +296,7 @@ impl Default for Config {
             wblock_cache_mb: 0,
             fsync_interval_us: 500,
             fsync_batch: 256,
+            io_workers: 2,
         }
     }
 }

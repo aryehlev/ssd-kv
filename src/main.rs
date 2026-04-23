@@ -21,6 +21,7 @@ use cluster::node::NodeInfo;
 use cluster::peer_pool::PeerConnectionPool;
 use cluster::replication::{PeerServer, ReplicationManager};
 use cluster::router::ClusterRouter;
+use io::AsyncReader;
 use cluster::topology::ClusterTopology;
 use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
@@ -96,6 +97,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Shared io_uring reader for cache-miss reads. One pool shared across
+    // all SSD-backed DBs keeps the total number of kernel polling threads
+    // bounded. Best-effort: if io_uring isn't available the GETs fall back
+    // to the blocking pread path.
+    let async_reader: Option<Arc<AsyncReader>> = match AsyncReader::new(
+        config.io_workers.max(1),
+        256,
+    ) {
+        Ok(r) => {
+            info!(
+                "io_uring async reader enabled: {} worker(s)",
+                r.num_workers()
+            );
+            Some(r)
+        }
+        Err(e) => {
+            info!(
+                "io_uring unavailable ({}); falling back to blocking pread",
+                e
+            );
+            None
+        }
+    };
+
     // Create all databases
     info!("Initializing {} databases...", config.num_dbs);
     let mut db_handlers = Vec::with_capacity(config.num_dbs as usize);
@@ -161,6 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handler_inner.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
             if let Some(cache) = &wblock_cache {
                 handler_inner.set_wblock_cache(Arc::clone(cache));
+            }
+            if let Some(reader) = &async_reader {
+                handler_inner.set_async_reader(Arc::clone(reader));
             }
 
             // Recover: scan data files, then replay WAL for records that were

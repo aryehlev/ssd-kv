@@ -541,12 +541,28 @@ pub struct UringServer {
 impl UringServer {
     /// Create a new io_uring-based server.
     pub fn new(addr: SocketAddr, queue_depth: u32, recv_buffer_size: usize) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
-        let listener_fd = listener.as_raw_fd();
+        Self::new_with_options(addr, queue_depth, recv_buffer_size, false)
+    }
 
-        // Prevent listener from being dropped (we manage the fd)
-        std::mem::forget(listener);
+    /// Create a new io_uring-based server with optional SO_REUSEPORT so
+    /// multiple reactor threads can bind the same port and let the kernel
+    /// load-balance incoming connections across them.
+    pub fn new_with_options(
+        addr: SocketAddr,
+        queue_depth: u32,
+        recv_buffer_size: usize,
+        reuse_port: bool,
+    ) -> io::Result<Self> {
+        let listener_fd = if reuse_port {
+            Self::bind_with_reuseport(addr)?
+        } else {
+            let listener = TcpListener::bind(addr)?;
+            listener.set_nonblocking(true)?;
+            let fd = listener.as_raw_fd();
+            // Prevent listener from being dropped (we manage the fd)
+            std::mem::forget(listener);
+            fd
+        };
 
         let net = UringNet::new(queue_depth)
             .or_else(|_| UringNet::new_simple(queue_depth))?;
@@ -559,6 +575,94 @@ impl UringServer {
             recv_buffer_size,
             accept_pending: false,
         })
+    }
+
+    /// Create a listening socket with SO_REUSEPORT + SO_REUSEADDR set
+    /// BEFORE bind so multiple reactor threads can share the port.
+    #[cfg(target_os = "linux")]
+    fn bind_with_reuseport(addr: SocketAddr) -> io::Result<RawFd> {
+        use std::os::unix::io::FromRawFd;
+
+        // Create a raw TCP socket.
+        let domain = match addr {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        };
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Set SO_REUSEADDR + SO_REUSEPORT before bind.
+        let one: libc::c_int = 1;
+        let optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let r = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &one as *const _ as *const libc::c_void,
+                optlen,
+            )
+        };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let r = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &one as *const _ as *const libc::c_void,
+                optlen,
+            )
+        };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+
+        // Wrap in a std TcpListener to reuse its bind/listen logic, then
+        // extract the fd again. Using `into_raw_fd` would dispose the
+        // TcpListener and return its fd; instead we convert via the
+        // socket2-less `From<OwnedFd>` dance manually.
+        //
+        // Simpler: let std bind on this fd by going through a raw sockaddr.
+        let (sockaddr, addrlen) = sockaddr_from_socketaddr(&addr);
+        let r = unsafe { libc::bind(fd, &sockaddr as *const _ as *const libc::sockaddr, addrlen) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+
+        // Listen
+        let r = unsafe { libc::listen(fd, 1024) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+
+        // Sanity: wrap as TcpListener to confirm it's usable, then forget
+        // so we keep ownership of the fd.
+        let listener = unsafe { TcpListener::from_raw_fd(fd) };
+        listener.set_nonblocking(true)?;
+        let fd = listener.as_raw_fd();
+        std::mem::forget(listener);
+
+        Ok(fd)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn bind_with_reuseport(_addr: SocketAddr) -> io::Result<RawFd> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SO_REUSEPORT requires Linux",
+        ))
     }
 
     /// Start accepting connections.
@@ -742,6 +846,51 @@ pub enum NetEvent {
     Accept(RawFd),
     Data(RawFd, Vec<u8>),
     Close(RawFd),
+}
+
+/// Build a raw sockaddr from a SocketAddr. Used by the SO_REUSEPORT bind
+/// path that needs to call `libc::bind` directly instead of going through
+/// std's TcpListener::bind (which doesn't expose socket options).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+union SockAddr {
+    v4: libc::sockaddr_in,
+    v6: libc::sockaddr_in6,
+}
+
+#[cfg(target_os = "linux")]
+fn sockaddr_from_socketaddr(addr: &SocketAddr) -> (SockAddr, libc::socklen_t) {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sa = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            (
+                SockAddr { v4: sa },
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let sa = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            (
+                SockAddr { v6: sa },
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
 }
 
 #[cfg(test)]

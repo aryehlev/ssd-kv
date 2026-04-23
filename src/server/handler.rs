@@ -72,7 +72,10 @@ pub struct Handler {
     /// by `flush()` after a successful fsync. The periodic WAL-trim path
     /// uses this to decide when old WAL files are redundant.
     durable_gen: AtomicU32,
-    bloom_filter: parking_lot::RwLock<BloomFilter>,
+    /// Global bloom filter for membership hints. Lock-free — every
+    /// put_nowait CAS-adds without taking a mutex, so hot-key
+    /// workloads don't serialize here.
+    bloom_filter: Arc<LockFreeBloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
     eviction_policy: EvictionPolicy,
@@ -95,7 +98,7 @@ impl Handler {
             async_reader: None,
             wal: None,
             durable_gen: AtomicU32::new(0),
-            bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
+            bloom_filter: Arc::new(LockFreeBloomFilter::new(10_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
             eviction_policy: EvictionPolicy::NoEviction,
@@ -228,7 +231,7 @@ impl Handler {
         let location = self.write_buffer.append(&mut record)?;
         self.index
             .insert(key, location, generation, record.header.value_len);
-        self.bloom_filter.write().add(key_hash);
+        self.bloom_filter.add(key_hash);
 
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
         Ok(wal_pos)
@@ -249,7 +252,7 @@ impl Handler {
         let location = self.write_buffer.append(&mut record)?;
         self.index
             .insert(key, location, generation, record.header.value_len);
-        self.bloom_filter.write().add(key_hash);
+        self.bloom_filter.add(key_hash);
         Ok(())
     }
 

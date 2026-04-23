@@ -1,8 +1,13 @@
 # ssd-kv
 
-A Redis-compatible key-value store written in Rust. The hot index lives in RAM,
-values live on SSD. Speaks the standard RESP protocol, so any Redis client
-works. Ships with a Go-based Kubernetes operator for clustered deployments.
+A string key-value store written in Rust that speaks the Redis RESP protocol,
+so any Redis client can talk to it. The hot index lives in RAM, values live
+on SSD. Ships with a Go-based Kubernetes operator for clustered deployments.
+
+Only the string / generic / TTL / transactions / cluster subsets are real —
+pub/sub, `WAIT`, `INFO`, `COMMAND`, and `FLUSHALL` are stubs, and Redis
+collection types (hashes, lists, sets, streams, …) are not implemented.
+See [Supported commands](#supported-commands) for the full list.
 
 ```
 client ──RESP──▶ ssd-kv ──┬─▶ in-memory index (RAM)
@@ -61,19 +66,19 @@ spec:
 
 ## Server flags
 
+Only flags that are actually wired into the server are listed. Flags that
+`clap` parses but the rest of the code ignores have been omitted until
+they're hooked up.
+
 | Flag                          | Default           | Meaning                                                       |
 | ----------------------------- | ----------------- | ------------------------------------------------------------- |
 | `--data-dir <path>`           | `./data`          | Where log files live                                          |
 | `--bind <addr>`               | `127.0.0.1:7777`  | Listen address                                                |
-| `--workers <n>`               | `0` (auto)        | Worker threads (0 = `available_parallelism`)                  |
-| `--max-connections <n>`       | `10000`           | Max concurrent client connections                             |
 | `--num-dbs <1..16>`           | `16`              | Number of logical DBs (`SELECT 0..N-1`)                       |
 | `--memory-dbs <list>`         | —                 | DB indices that are memory-only (e.g. `--memory-dbs 1,2`)     |
 | `--no-compaction`             | off               | Disable background compaction                                 |
 | `--compaction-threshold <f>`  | `0.5`             | Compact files below this live-data ratio                      |
 | `--compaction-interval <s>`   | `60`              | Compaction check interval                                     |
-| `--read-buffer-kb <n>`        | `64`              | Per-connection read buffer                                    |
-| `--write-buffer-kb <n>`       | `64`              | Per-connection write buffer                                   |
 | `--wblocks-per-file <1..1023>`| `1023`            | 1 MB blocks per data file (1023 → ~1 GB files)                |
 | `--eviction-policy <p>`       | `noeviction`      | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-random`, `volatile-ttl` |
 | `--max-entries <n>`           | `0`               | Index size cap (0 = unlimited)                                |
@@ -91,39 +96,72 @@ spec:
 | `--log-level <lvl>`           | `info`            | `trace`, `debug`, `info`, `warn`, `error`                     |
 | `--verbose`                   | off               | Shortcut for `--log-level debug`                              |
 
+Accepted but currently ignored: `--max-connections`, `--workers`,
+`--read-buffer-kb`, `--write-buffer-kb`. The RESP server uses fixed
+64 KB per-connection buffers and spawns one OS thread per connection;
+these knobs will be hooked up before they're documented as supported.
+
 ---
 
 ## Supported commands
 
 All commands speak RESP-2; clients pipeline freely.
 
+Commands listed here have real implementations — verified by walking each
+`cmd_*` function in `src/server/redis.rs`. Anything not listed isn't
+implemented (the match arm either errors or is absent). The server is a
+string-only KV; there are no hashes, lists, sets, sorted sets, streams,
+geo, bitmap, HyperLogLog, or Lua scripting.
+
 **Strings / generic**
 `GET`, `SET` (`EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`, `KEEPTTL`, `GET`),
 `SETNX`, `SETEX`, `PSETEX`, `GETDEL`, `GETEX`, `GETRANGE`, `SETRANGE`,
 `APPEND`, `STRLEN`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`,
-`MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`, `TYPE`, `RENAME`, `RENAMENX`,
-`COPY`, `RANDOMKEY`, `OBJECT`, `KEYS`, `SCAN`.
+`MGET`, `MSET`, `DEL`, `UNLINK` (alias of `DEL`), `EXISTS`, `TYPE`,
+`RENAME`, `RENAMENX`, `COPY`, `RANDOMKEY`, `KEYS`, `SCAN`,
+`OBJECT ENCODING`.
 
 **TTL**
 `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`.
 
-**Server / connection**
-`PING`, `ECHO`, `TIME`, `INFO`, `COMMAND`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`,
-`SELECT`, `READONLY`, `READWRITE`, `WAIT`.
+**Connection / server**
+`PING`, `ECHO`, `TIME`, `DBSIZE`, `SELECT`, `READONLY`, `READWRITE`.
 
 **Transactions**
-`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`.
-
-**Pub/Sub**
-`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`.
+`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`. `WATCH` snapshots the
+per-key generation counter; `EXEC` aborts and returns nil if any watched
+key's generation changed.
 
 **Cluster**
 `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SLOTS`,
-`CLUSTER KEYSLOT`.
+`CLUSTER KEYSLOT`. All return live topology data.
 
-Not supported: `DUMP`, `RESTORE`, `DEBUG`, Lua scripting, streams, sorted
-sets, hashes, lists, geo, bitmap, HyperLogLog. The store is a string KV; it
-does not implement Redis's collection types.
+### Present but stubbed / partial
+
+Redis clients won't error on these, but the behaviour is not what you'd
+expect from Redis:
+
+- **`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`** —
+  ack envelopes are returned and `PUBLISH` reports a count, but
+  subscriptions are never registered and no messages are ever delivered.
+  Effectively a no-op: `PUBLISH` will always return `0`.
+- **`WAIT numreplicas timeout`** — always returns `0` immediately; does
+  not actually block or count acknowledged replicas.
+- **`FLUSHALL`** — only flushes the currently selected DB, not all
+  databases. Use it as a `FLUSHDB` alias.
+- **`COMMAND`** — returns an empty array (`*0\r\n`) regardless of
+  arguments.
+- **`INFO`** — returns a minimal fixed document with `redis_version`,
+  `redis_mode`, and an empty `Keyspace` section. No real stats.
+- **`OBJECT`** — only the `ENCODING` subcommand responds; it always
+  reports `raw` for live keys.
+
+### Not implemented
+
+`DUMP`, `RESTORE`, `DEBUG`, all collection types (hashes, lists, sets,
+sorted sets, streams, geo, bitmap, HyperLogLog), Lua / functions,
+`CLIENT`, `CONFIG`, `SLOWLOG`, `ACL`, `MEMORY`, `LATENCY`, `MONITOR`,
+`SCRIPT`, `XADD`/stream commands.
 
 ---
 

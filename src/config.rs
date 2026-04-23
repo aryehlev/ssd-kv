@@ -136,6 +136,19 @@ pub struct Config {
     /// RAM budget; without it every GET = a 1 MiB SSD read.
     #[arg(long, default_value = "0")]
     pub wblock_cache_mb: usize,
+
+    // --- Durability (group-commit WAL) ---
+
+    /// Group-commit interval in microseconds. The WAL commit thread wakes at
+    /// least this often to fsync. Smaller = lower tail latency, higher
+    /// syscall rate.
+    #[arg(long, default_value = "500")]
+    pub fsync_interval_us: u64,
+
+    /// Number of writers that may stack up waiting for fsync before the
+    /// commit thread wakes early. Bounds worst-case queue depth at high QPS.
+    #[arg(long, default_value = "256")]
+    pub fsync_batch: usize,
 }
 
 impl Config {
@@ -273,6 +286,8 @@ impl Default for Config {
             num_dbs: 16,
             memory_dbs: None,
             wblock_cache_mb: 0,
+            fsync_interval_us: 500,
+            fsync_batch: 256,
         }
     }
 }

@@ -13,6 +13,7 @@ use crate::perf::simd::{batch_bloom_check, batch_hash_keys_4, group_by_shard};
 use crate::storage::eviction::EvictionPolicy;
 use crate::storage::file_manager::{FileManager, ParallelFileManager};
 use crate::storage::record::Record;
+use crate::storage::wal::WriteAheadLog;
 use crate::storage::wblock_cache::WblockCache;
 use crate::storage::write_buffer::{WriteBuffer, WBLOCK_SIZE};
 
@@ -56,6 +57,11 @@ pub struct Handler {
     file_manager: Arc<FileManager>,
     write_buffer: Arc<WriteBuffer>,
     wblock_cache: Option<Arc<WblockCache>>,
+    /// Optional write-ahead log. When set, put_sync/delete_sync return only
+    /// after the record is durably in the WAL (via group commit). When not
+    /// set, writes live in RAM until a WBlock fills — used by tests that
+    /// don't care about durability.
+    wal: Option<Arc<WriteAheadLog>>,
     bloom_filter: parking_lot::RwLock<BloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
@@ -76,6 +82,7 @@ impl Handler {
             file_manager,
             write_buffer,
             wblock_cache: None,
+            wal: None,
             bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
@@ -93,6 +100,16 @@ impl Handler {
 
     pub fn wblock_cache(&self) -> Option<&Arc<WblockCache>> {
         self.wblock_cache.as_ref()
+    }
+
+    /// Installs a write-ahead log. When set, every put/delete returns only
+    /// after the record is durably in the WAL.
+    pub fn set_wal(&mut self, wal: Arc<WriteAheadLog>) {
+        self.wal = Some(wal);
+    }
+
+    pub fn wal(&self) -> Option<&Arc<WriteAheadLog>> {
+        self.wal.as_ref()
     }
 
     /// Sets the eviction policy and capacity limits.
@@ -143,6 +160,13 @@ impl Handler {
         let key_hash = hash_key(key);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
+        // Durability first: if a WAL is installed, append + wait for group
+        // commit before we acknowledge. On crash after this point, recovery
+        // will replay the entry.
+        if let Some(wal) = &self.wal {
+            wal.append_put(key, value, generation, ttl)?;
+        }
+
         // Create record
         let mut record = Record::new(key.to_vec(), value.to_vec(), generation, ttl)?;
 
@@ -159,9 +183,61 @@ impl Handler {
         Ok(())
     }
 
+    /// Write path used by recovery / WAL replay. Uses an explicit generation
+    /// from the WAL entry, skips the WAL append, and skips capacity checks
+    /// (crash recovery shouldn't be blocked by eviction).
+    pub(crate) fn put_from_wal(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        generation: u32,
+        ttl: u32,
+    ) -> io::Result<()> {
+        let key_hash = hash_key(key);
+        let mut record = Record::new(key.to_vec(), value.to_vec(), generation, ttl)?;
+        let location = self.write_buffer.append(&mut record)?;
+        self.index
+            .insert(key, location, generation, record.header.value_len);
+        self.bloom_filter.write().add(key_hash);
+        Ok(())
+    }
+
+    /// Delete path used by recovery / WAL replay.
+    pub(crate) fn delete_from_wal(&self, key: &[u8], generation: u32) -> io::Result<()> {
+        let mut record = Record::tombstone(key.to_vec(), generation)?;
+        self.write_buffer.append(&mut record)?;
+        self.index.delete(key, generation);
+        Ok(())
+    }
+
+    /// Advance the generation counter past a value observed during recovery
+    /// so subsequent writes don't conflict with replayed records.
+    pub(crate) fn bump_generation_past(&self, seen: u32) {
+        let next = seen.saturating_add(1);
+        // Load-max-store loop; only increases.
+        loop {
+            let cur = self.next_generation.load(Ordering::Acquire);
+            if next <= cur {
+                return;
+            }
+            if self
+                .next_generation
+                .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     /// Synchronous DELETE for Redis compatibility
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+
+        // Durability first — see put_sync for rationale.
+        if let Some(wal) = &self.wal {
+            wal.append_delete(key, generation)?;
+        }
 
         // Create tombstone record
         let mut record = Record::tombstone(key.to_vec(), generation)?;

@@ -1,15 +1,16 @@
 //! Index recovery: rebuilds the in-memory index from data files on startup.
 
-use std::io::{self, Cursor, Read};
-use std::path::Path;
+use std::io;
 
 use tracing::{debug, info, warn};
 
 use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
-use crate::storage::file_manager::{FileManager, WBLOCKS_PER_FILE, FILE_HEADER_SIZE};
-use crate::storage::record::{Record, RecordHeader, HEADER_SIZE, RECORD_ALIGNMENT, RECORD_MAGIC};
-use crate::storage::write_buffer::{DiskLocation, WBLOCK_SIZE};
+use crate::server::Handler;
+use crate::storage::file_manager::{FileManager, WBLOCKS_PER_FILE};
+use crate::storage::record::{Record, HEADER_SIZE, RECORD_ALIGNMENT, RECORD_MAGIC};
+use crate::storage::wal::WriteAheadLog;
+use crate::storage::write_buffer::DiskLocation;
 
 /// Recovery statistics.
 #[derive(Debug, Default)]
@@ -21,6 +22,10 @@ pub struct RecoveryStats {
     pub records_expired: u64,
     pub records_deleted: u64,
     pub errors: u64,
+    /// WAL entries replayed (if a WAL was passed to `recover_with_wal`).
+    pub wal_entries_replayed: u64,
+    /// Highest generation observed across data files + WAL.
+    pub max_generation: u32,
 }
 
 /// Recovers the index from data files.
@@ -53,6 +58,50 @@ pub fn recover_index(
         stats.records_deleted,
         stats.errors
     );
+
+    Ok(stats)
+}
+
+/// Full recovery: scan data files, then replay the WAL for records that
+/// were ack'd to clients but not yet flushed to data files. Finally,
+/// advance the handler's generation counter past anything we've seen so
+/// new writes don't collide.
+pub fn recover_with_wal(
+    handler: &Handler,
+    file_manager: &FileManager,
+    wal: &WriteAheadLog,
+) -> io::Result<RecoveryStats> {
+    // Step 1: scan data files
+    let mut stats = recover_index(handler.index(), file_manager)?;
+
+    // Step 2: replay WAL entries. Index::insert compares generations so
+    // anything already in the index at a higher gen stays; otherwise the
+    // WAL entry takes over (this covers the "acked but not flushed" window).
+    let max_gen_before = stats.max_generation;
+    let replayed = wal.replay(|header, key, value| -> io::Result<()> {
+        if header.generation > stats.max_generation {
+            stats.max_generation = header.generation;
+        }
+        if header.is_put() {
+            handler.put_from_wal(&key, &value, header.generation, header.ttl)?;
+        } else if header.is_delete() {
+            handler.delete_from_wal(&key, header.generation)?;
+        }
+        Ok(())
+    })?;
+    stats.wal_entries_replayed = replayed;
+
+    // Step 3: make sure future writes get fresh generations.
+    if stats.max_generation > 0 {
+        handler.bump_generation_past(stats.max_generation);
+    }
+
+    if replayed > 0 {
+        info!(
+            "Replayed {} WAL entries (max gen {} -> {})",
+            replayed, max_gen_before, stats.max_generation
+        );
+    }
 
     Ok(stats)
 }
@@ -118,12 +167,16 @@ fn recover_wblock(
                 stats.records_found += 1;
                 let record_size = record.serialized_size();
 
+                if record.header.generation > stats.max_generation {
+                    stats.max_generation = record.header.generation;
+                }
+
                 if record.header.is_expired() {
                     stats.records_expired += 1;
                 } else if record.header.is_deleted() {
                     stats.records_deleted += 1;
                     // Index the deletion
-                    let key_hash = hash_key(&record.key);
+                    let _key_hash = hash_key(&record.key);
                     index.delete(&record.key, record.header.generation);
                 } else {
                     // Index the record

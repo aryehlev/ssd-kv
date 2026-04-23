@@ -24,13 +24,14 @@ use cluster::router::ClusterRouter;
 use cluster::topology::ClusterTopology;
 use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
-use engine::{recover_index, Index};
+use engine::{recover_index, recover_with_wal, Index};
 use perf::PerfTuning;
 use server::{Handler, DatabaseManager, DbHandler, start_redis_server, start_redis_server_clustered, ServerTuning};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
 use storage::file_manager::FileManager;
 use storage::memory_store::MemoryStore;
+use storage::wal::{WalConfig, WriteAheadLog};
 use storage::wblock_cache::WblockCache;
 use storage::write_buffer::WriteBuffer;
 
@@ -121,12 +122,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let idx = Arc::new(Index::new());
             let wb = Arc::new(WriteBuffer::new(fm.file_count() as u32, config.wblocks_per_file));
 
-            // Recover index
-            let recovery_stats = recover_index(&idx, &fm)?;
-            info!(
-                "DB {}: SSD, recovered {} records ({} expired, {} deleted)",
-                db_id, recovery_stats.records_indexed, recovery_stats.records_expired, recovery_stats.records_deleted
-            );
+            // Group-commit WAL for this DB. Every durable write goes here
+            // before we ack to the client; recovery replays it on startup.
+            let wal_dir = db_data_dir.join("wal");
+            let wal = Arc::new(WriteAheadLog::new(WalConfig {
+                dir: wal_dir,
+                fsync_interval: std::time::Duration::from_micros(config.fsync_interval_us),
+                fsync_batch: config.fsync_batch,
+                ..Default::default()
+            })?);
 
             if fm.file_count() == 0 {
                 fm.create_file()?;
@@ -157,6 +161,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(cache) = &wblock_cache {
                 handler_inner.set_wblock_cache(Arc::clone(cache));
             }
+
+            // Recover: scan data files, then replay WAL for records that were
+            // ack'd but not yet flushed. Done BEFORE wiring the WAL into the
+            // handler so replayed records don't re-append to the log.
+            let recovery_stats = recover_with_wal(&handler_inner, &fm, &wal)?;
+            info!(
+                "DB {}: SSD, recovered {} records ({} expired, {} deleted, {} from WAL, max gen {})",
+                db_id,
+                recovery_stats.records_indexed,
+                recovery_stats.records_expired,
+                recovery_stats.records_deleted,
+                recovery_stats.wal_entries_replayed,
+                recovery_stats.max_generation,
+            );
+
+            // From here on, every put_sync/delete_sync is durable.
+            handler_inner.set_wal(Arc::clone(&wal));
+
             let handler = Arc::new(handler_inner);
 
             // Start eviction thread for this SSD DB

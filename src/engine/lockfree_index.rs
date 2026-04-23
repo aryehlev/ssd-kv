@@ -234,9 +234,17 @@ impl Bucket {
 }
 
 /// Lock-free hash table with open addressing.
+///
+/// Keys larger than `MAX_INLINE_KEY` (24 bytes) live in the `heap_keys`
+/// side table, keyed by bucket index. The `flags` byte in the bucket
+/// tells readers which place to look. This avoids breaking the 64-byte
+/// cache-line layout of Bucket while supporting arbitrary-length keys.
 pub struct LockFreeIndex {
     /// Buckets array
     buckets: *mut Bucket,
+    /// Side table for keys longer than `MAX_INLINE_KEY`. Keyed by the
+    /// bucket index the key occupies.
+    heap_keys: dashmap::DashMap<usize, std::sync::Arc<[u8]>>,
     /// Number of buckets (power of 2)
     capacity: usize,
     /// Mask for fast modulo (capacity - 1)
@@ -272,10 +280,34 @@ impl LockFreeIndex {
 
         Self {
             buckets,
+            heap_keys: dashmap::DashMap::new(),
             capacity,
             mask: capacity - 1,
             count: AtomicU64::new(0),
             layout,
+        }
+    }
+
+    /// Does the bucket at `index` hold this key? Works for both inline and
+    /// heap-stored keys; replaces the old `Bucket::key_matches` which
+    /// silently returned `false` for any key > 24 bytes.
+    #[inline]
+    fn bucket_matches(&self, index: usize, key: &[u8], key_hash: u64) -> bool {
+        let bucket = self.bucket(index);
+        if bucket.key_hash != key_hash {
+            return false;
+        }
+        if bucket.flags & FLAG_INLINE_KEY != 0 {
+            if bucket.key_len as usize != key.len() {
+                return false;
+            }
+            &bucket.inline_key[..bucket.key_len as usize] == key
+        } else {
+            // Heap-stored key: look up the side table.
+            match self.heap_keys.get(&index) {
+                Some(stored) => stored.as_ref() == key,
+                None => false,
+            }
         }
     }
 
@@ -309,7 +341,7 @@ impl LockFreeIndex {
                 return None; // Key not found — end of probing chain
             }
 
-            if bucket.is_occupied() && bucket.key_matches(key, key_hash) {
+            if bucket.is_occupied() && self.bucket_matches(index, key, key_hash) {
                 return Some(index);
             }
             // Deleted buckets: continue probing
@@ -356,7 +388,7 @@ impl LockFreeIndex {
 
             // Re-validate: bucket may have been deleted or repurposed between
             // find_bucket and reading the generation-stable location.
-            if bucket.is_occupied() && bucket.key_matches(key, key_hash) {
+            if bucket.is_occupied() && self.bucket_matches(index, key, key_hash) {
                 return Some(location);
             }
 
@@ -366,18 +398,14 @@ impl LockFreeIndex {
     }
 
     /// PUT - Uses fine-grained per-bucket locking. Values always on disk.
+    /// Supports any key length: keys <= MAX_INLINE_KEY live inline in the
+    /// bucket, longer keys are stored in the `heap_keys` side table.
     pub fn put(
         &self,
         key: &[u8],
         location: &DiskLocation,
         generation: u32,
     ) -> io::Result<()> {
-        if key.len() > MAX_INLINE_KEY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("key length {} exceeds max inline key size {}", key.len(), MAX_INLINE_KEY),
-            ));
-        }
         let key_hash = hash_key(key);
 
         // First, check if key already exists
@@ -394,12 +422,13 @@ impl LockFreeIndex {
             }
 
             // Re-verify key still matches after acquiring lock (could have been deleted/modified)
-            if !bucket.key_matches(key, key_hash) {
+            if !self.bucket_matches(index, key, key_hash) {
                 bucket.unlock_occupied();
                 return self.put(key, location, generation);
             }
 
-            // Update existing entry via raw pointer to avoid aliasing UB
+            // Update existing entry. Same key, so heap_keys stays put if it
+            // was there; otherwise it was inline and stays inline.
             unsafe { &mut *self.bucket_ptr(index) }.set(key, key_hash, location, generation);
             bucket.unlock_occupied();
 
@@ -422,7 +451,18 @@ impl LockFreeIndex {
                 return self.put(key, location, generation);
             }
 
-            // Insert new entry via raw pointer to avoid aliasing UB
+            // Drop any stale heap-key at this index (the bucket was
+            // tombstoned by another key previously). We do this before
+            // `set()` so a concurrent reader seeing the post-set bucket
+            // won't transiently find a wrong heap key.
+            self.heap_keys.remove(&index);
+
+            // For long keys, install the heap-side entry FIRST, while the
+            // bucket is still LOCKED — readers see state=LOCKED and skip.
+            if key.len() > MAX_INLINE_KEY {
+                self.heap_keys.insert(index, std::sync::Arc::from(key));
+            }
+
             unsafe { &mut *self.bucket_ptr(index) }.set(key, key_hash, location, generation);
             bucket.unlock_occupied();
 
@@ -451,12 +491,14 @@ impl LockFreeIndex {
             }
 
             // Re-verify key matches after acquiring lock
-            if !bucket.key_matches(key, key_hash) {
+            if !self.bucket_matches(index, key, key_hash) {
                 bucket.unlock_occupied();
                 return false;
             }
 
-            // Mark as deleted
+            // Mark as deleted. Drop the heap-side key first so no reader
+            // ever sees a tombstoned bucket still pointing at a heap key.
+            self.heap_keys.remove(&index);
             bucket.unlock_deleted();
             self.count.fetch_sub(1, Ordering::Relaxed);
 
@@ -603,5 +645,56 @@ mod tests {
 
         assert!(compare_keys_simd(a, b));
         assert!(!compare_keys_simd(a, c));
+    }
+
+    #[test]
+    fn long_keys_round_trip_through_heap_side_table() {
+        // Keys longer than MAX_INLINE_KEY (24 bytes) used to be rejected
+        // by put() and silently mishandled by key_matches. Verify they
+        // now store/retrieve correctly.
+        let index = LockFreeIndex::new(64);
+        let loc = DiskLocation::new(7, 1, 42);
+
+        let short = b"short";
+        let long = b"this-is-a-long-key-that-exceeds-the-24-byte-inline-limit";
+        let other_long = b"another-long-key-of-meaningfully-different-content-here";
+
+        index.put(short, &loc, 1).unwrap();
+        index.put(long, &loc, 2).unwrap();
+        index.put(other_long, &loc, 3).unwrap();
+
+        assert!(index.get(short).is_some(), "short key missing");
+        assert!(index.get(long).is_some(), "long key missing");
+        assert!(index.get(other_long).is_some(), "other long key missing");
+
+        // Update the long key and re-read.
+        let loc2 = DiskLocation::new(8, 2, 99);
+        index.put(long, &loc2, 4).unwrap();
+        assert!(index.get(long).is_some());
+
+        // Delete and verify gone.
+        assert!(index.delete(long));
+        assert!(index.get(long).is_none());
+        // The other long key must be unaffected.
+        assert!(index.get(other_long).is_some());
+    }
+
+    #[test]
+    fn long_key_collision_handled_correctly() {
+        // Two different long keys with similar-but-not-equal content
+        // shouldn't match each other.
+        let index = LockFreeIndex::new(64);
+        let loc = DiskLocation::new(0, 0, 0);
+
+        let k1 = b"prefix/common-path/object-id-0000000000000001";
+        let k2 = b"prefix/common-path/object-id-0000000000000002";
+
+        index.put(k1, &loc, 1).unwrap();
+        index.put(k2, &loc, 2).unwrap();
+
+        assert!(index.get(k1).is_some());
+        assert!(index.get(k2).is_some());
+        // Neither of these is in the index.
+        assert!(index.get(b"prefix/common-path/object-id-0000000000000003").is_none());
     }
 }

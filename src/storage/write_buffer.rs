@@ -30,6 +30,10 @@ pub struct WBlock {
     pub block_id: u32,
     /// Whether this block has been flushed to disk.
     pub flushed: bool,
+    /// Maximum record generation seen in this block. Used by the WAL
+    /// cleanup path to know "everything up to this gen is durable in a
+    /// data file once this block is fsynced".
+    pub max_generation: u32,
 }
 
 impl WBlock {
@@ -43,6 +47,7 @@ impl WBlock {
             file_id,
             block_id,
             flushed: false,
+            max_generation: 0,
         }
     }
 
@@ -63,6 +68,10 @@ impl WBlock {
         self.write_pos += record_size;
         self.live_records += 1;
         self.total_records += 1;
+
+        if record.header.generation > self.max_generation {
+            self.max_generation = record.header.generation;
+        }
 
         Ok(offset)
     }

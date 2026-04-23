@@ -17,7 +17,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -195,6 +195,17 @@ impl GroupCommit {
     }
 }
 
+/// Closed-file metadata used by the cleanup path.
+#[derive(Clone, Copy, Debug)]
+struct ClosedFile {
+    seq: u64,
+    /// Highest generation ever appended to this file while it was current.
+    /// Only meaningful for files we wrote during this process's lifetime;
+    /// files carried over from a previous run have `max_gen = u32::MAX`
+    /// so we never prematurely delete them.
+    max_gen: u32,
+}
+
 /// Write-Ahead Log for durability and fast writes.
 ///
 /// Writers stage their bytes into a BufWriter under a mutex, record their
@@ -210,6 +221,12 @@ pub struct WriteAheadLog {
     file_seq: AtomicU64,
     /// Current staged position in file (bytes appended, pre-fsync).
     position: AtomicU64,
+    /// Highest generation appended to the current WAL file. Bumped by every
+    /// append_put / append_delete; frozen into `closed_files` on rotate.
+    current_max_gen: AtomicU32,
+    /// Closed WAL files in seq order; used by `cleanup_up_to_gen` to
+    /// delete files whose entire contents are safely on disk.
+    closed_files: Mutex<Vec<ClosedFile>>,
     /// Statistics
     stats: Arc<WalStats>,
     /// Group-commit coordinator
@@ -241,11 +258,23 @@ impl WriteAheadLog {
             file,
         )));
 
+        // Any WAL files on disk older than this are from a prior run; we
+        // can't reason about their max_gen without scanning, so mark them
+        // with u32::MAX so cleanup treats them as "always newer than any
+        // watermark" and leaves them alone. Recovery-path cleanup (via
+        // the shutdown `cleanup(keep_files)` call) takes care of those.
+        let closed = Self::find_closed_file_seqs(&config.dir, file_seq)?
+            .into_iter()
+            .map(|seq| ClosedFile { seq, max_gen: u32::MAX })
+            .collect::<Vec<_>>();
+
         let mut wal = Self {
             config,
             writer,
             file_seq: AtomicU64::new(file_seq),
             position: AtomicU64::new(position),
+            current_max_gen: AtomicU32::new(0),
+            closed_files: Mutex::new(closed),
             stats: Arc::new(WalStats::default()),
             gc: Arc::new(GroupCommit::new(position)),
             sync_thread: None,
@@ -259,6 +288,27 @@ impl WriteAheadLog {
     }
 
     /// Find the latest WAL sequence number.
+    /// Return the sorted list of WAL file seqs on disk, excluding the one
+    /// we just opened as current.
+    fn find_closed_file_seqs(dir: &Path, current_seq: u64) -> io::Result<Vec<u64>> {
+        let mut seqs = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("wal_") && name.ends_with(".log") {
+                        if let Ok(seq) = name[4..name.len() - 4].parse::<u64>() {
+                            if seq != current_seq {
+                                seqs.push(seq);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seqs.sort();
+        Ok(seqs)
+    }
+
     fn find_latest_seq(dir: &Path) -> io::Result<u64> {
         let mut max_seq = 0u64;
 
@@ -393,6 +443,29 @@ impl WriteAheadLog {
             self.rotate()?;
         }
 
+        // Bump the per-file high-water generation so cleanup_up_to_gen
+        // knows when this file is safe to delete. Monotonic: only grows.
+        //
+        // SAFETY of the read-from-packed-struct pattern: WalEntryHeader is
+        // #[repr(C, packed)] with no unaligned references escaping; we
+        // copy the u32 out directly.
+        let header_gen = {
+            let g = header.generation;
+            g
+        };
+        let mut prev = self.current_max_gen.load(Ordering::Relaxed);
+        while header_gen > prev {
+            match self.current_max_gen.compare_exchange_weak(
+                prev,
+                header_gen,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+
         let new_pos = {
             let mut writer = self.writer.lock();
 
@@ -432,6 +505,7 @@ impl WriteAheadLog {
 
     /// Rotate to a new WAL file.
     fn rotate(&self) -> io::Result<()> {
+        let old_seq = self.file_seq.load(Ordering::Relaxed);
         let new_seq = self.file_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let new_path = Self::wal_file_path(&self.config.dir, new_seq);
 
@@ -446,6 +520,14 @@ impl WriteAheadLog {
         // across a rotation.
         writer.flush()?;
         writer.get_ref().sync_data()?;
+
+        // Freeze the old file's max_gen so cleanup_up_to_gen can decide
+        // when to delete it. Reset current_max_gen for the new file.
+        let old_max_gen = self.current_max_gen.swap(0, Ordering::AcqRel);
+        self.closed_files.lock().push(ClosedFile {
+            seq: old_seq,
+            max_gen: old_max_gen,
+        });
 
         // Switch to new file. The new file starts at offset 0 in its own
         // space; however the group-commit counters (written_pos/durable_pos)
@@ -477,6 +559,39 @@ impl WriteAheadLog {
     /// Get WAL statistics.
     pub fn stats(&self) -> &WalStats {
         &self.stats
+    }
+
+    /// Delete closed WAL files whose entire contents are durable (i.e.
+    /// max_gen <= `durable_gen`). Returns the number of files removed.
+    ///
+    /// Called by the periodic WAL-trim thread right after a successful
+    /// `handler.flush()` has fsynced the WBlocks that carried all records
+    /// up to `durable_gen` into data files.
+    pub fn cleanup_up_to_gen(&self, durable_gen: u32) -> io::Result<usize> {
+        let mut to_delete = Vec::new();
+        {
+            let mut closed = self.closed_files.lock();
+            closed.retain(|cf| {
+                if cf.max_gen <= durable_gen {
+                    to_delete.push(cf.seq);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        let mut removed = 0;
+        for seq in to_delete {
+            let path = Self::wal_file_path(&self.config.dir, seq);
+            match std::fs::remove_file(&path) {
+                Ok(_) => removed += 1,
+                Err(e) => {
+                    tracing::warn!("wal: failed to remove old file {}: {}", path.display(), e);
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Replay WAL entries for recovery.
@@ -710,4 +825,70 @@ mod tests {
         .unwrap();
         assert_eq!(count, 8 * 100);
     }
+
+    #[test]
+    fn cleanup_up_to_gen_deletes_only_fully_durable_files() {
+        // Force small max_file_size so we get multiple files after a few
+        // appends, letting us test the per-file max_gen logic.
+        let dir = tempdir().unwrap();
+        let config = WalConfig {
+            dir: dir.path().to_path_buf(),
+            max_file_size: 128, // tiny so writes rotate quickly
+            fsync_interval: Duration::from_micros(200),
+            fsync_batch: 4,
+            ..Default::default()
+        };
+        let wal = WriteAheadLog::new(config.clone()).unwrap();
+
+        // Write three "batches" with increasing generations. Each batch
+        // is large enough to force a rotation so we end up with multiple
+        // closed files.
+        for i in 1u32..=3 {
+            let val = vec![b'x'; 40];
+            wal.append_put(format!("k{}", i).as_bytes(), &val, i * 100, 0)
+                .unwrap();
+        }
+        // Count files before cleanup.
+        let files_before = count_wal_files(dir.path());
+        assert!(files_before >= 2, "expected rotations, got {} files", files_before);
+
+        // Trim everything with max_gen <= 100 (only the earliest file).
+        let removed = wal.cleanup_up_to_gen(100).unwrap();
+        assert!(removed >= 1, "expected at least one file removed");
+
+        // Files with max_gen > 100 stay.
+        let files_after = count_wal_files(dir.path());
+        assert!(files_after < files_before);
+
+        // And the WAL is still functional — replay picks up the surviving
+        // entries.
+        drop(wal);
+        let wal = WriteAheadLog::new(config).unwrap();
+        let mut count = 0;
+        wal.replay(|_h, _k, _v| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        // The earliest entry is gone (its file was deleted), but gen 200 and
+        // 300 must still be there.
+        assert!(count >= 2, "expected >= 2 entries to survive, got {}", count);
+    }
+}
+
+// Test helper (kept out of tests mod to avoid inherent-method name clash).
+#[cfg(test)]
+fn count_wal_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map_or(false, |n| n.starts_with("wal_") && n.ends_with(".log"))
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }

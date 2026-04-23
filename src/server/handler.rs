@@ -68,6 +68,10 @@ pub struct Handler {
     /// set, writes live in RAM until a WBlock fills — used by tests that
     /// don't care about durability.
     wal: Option<Arc<WriteAheadLog>>,
+    /// Highest record generation that is durably in a data file. Bumped
+    /// by `flush()` after a successful fsync. The periodic WAL-trim path
+    /// uses this to decide when old WAL files are redundant.
+    durable_gen: AtomicU32,
     bloom_filter: parking_lot::RwLock<BloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
@@ -90,12 +94,34 @@ impl Handler {
             wblock_cache: None,
             async_reader: None,
             wal: None,
+            durable_gen: AtomicU32::new(0),
             bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
             eviction_policy: EvictionPolicy::NoEviction,
             max_entries: 0,
             max_data_bytes: 0,
+        }
+    }
+
+    /// Highest generation that is durable in a data file (not just WAL).
+    /// The WAL trim path uses this to decide which log files are redundant.
+    pub fn durable_generation(&self) -> u32 {
+        self.durable_gen.load(Ordering::Acquire)
+    }
+
+    fn bump_durable_gen(&self, seen: u32) {
+        let mut prev = self.durable_gen.load(Ordering::Relaxed);
+        while seen > prev {
+            match self.durable_gen.compare_exchange_weak(
+                prev,
+                seen,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => prev = actual,
+            }
         }
     }
 
@@ -428,21 +454,30 @@ impl Handler {
         Ok(())
     }
 
-    /// Flushes pending writes to disk.
+    /// Flushes pending writes to disk. After each wblock is fsynced we
+    /// advance `durable_gen` so the periodic WAL-trim path knows which
+    /// WAL files are now redundant.
     pub async fn flush(&self) -> io::Result<()> {
         // Force flush current WBlock
         if let Some(mut wblock) = self.write_buffer.force_flush() {
+            let max_gen = wblock.max_generation;
             let file = self.file_manager.get_or_create_file(wblock.file_id)?;
             let file_guard = file.lock();
             file_guard.write_wblock(&mut wblock)?;
             file_guard.sync()?;
+            drop(file_guard);
+            self.bump_durable_gen(max_gen);
         }
 
         // Flush all pending WBlocks
         for mut wblock in self.write_buffer.take_pending() {
+            let max_gen = wblock.max_generation;
             let file = self.file_manager.get_or_create_file(wblock.file_id)?;
             let file_guard = file.lock();
             file_guard.write_wblock(&mut wblock)?;
+            file_guard.sync()?;
+            drop(file_guard);
+            self.bump_durable_gen(max_gen);
         }
 
         Ok(())

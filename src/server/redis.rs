@@ -207,6 +207,50 @@ impl RespParser {
         }
     }
 
+    /// Push-based entry point for the io_uring reactor. Appends `data` to
+    /// the parser's buffer, growing if needed, and never blocks. After
+    /// appending, call `next_value()` in a loop to drain complete RESP
+    /// values.
+    pub fn append_bytes(&mut self, data: &[u8]) -> io::Result<()> {
+        // Compact if the head of the buffer is all parsed/consumed.
+        if self.pos > 0 {
+            if self.pos < self.len {
+                self.buf.copy_within(self.pos..self.len, 0);
+                self.len -= self.pos;
+            } else {
+                self.len = 0;
+            }
+            self.pos = 0;
+        }
+
+        // Grow (doubling) until there's room, capped at MAX_BUFFER_SIZE.
+        while self.len + data.len() > self.buf.len() {
+            let new_size = (self.buf.len() * 2).min(MAX_BUFFER_SIZE);
+            if new_size <= self.buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "RESP message exceeds maximum buffer size",
+                ));
+            }
+            self.buf.resize(new_size, 0);
+        }
+
+        self.buf[self.len..self.len + data.len()].copy_from_slice(data);
+        self.len += data.len();
+        Ok(())
+    }
+
+    /// Pull the next complete RESP value out of the buffer, if any. Returns
+    /// `Ok(None)` when the buffer holds a partial message and needs more
+    /// bytes. Callers (reactor) should loop until this returns `Ok(None)`.
+    pub fn next_value(&mut self) -> io::Result<Option<RespValue>> {
+        let result = self.parse_value()?;
+        if result.is_some() && self.buf.len() > self.initial {
+            self.maybe_shrink();
+        }
+        Ok(result)
+    }
+
     /// Try to parse a complete RESP value
     pub fn try_parse(&mut self, stream: &mut impl Read) -> io::Result<Option<RespValue>> {
         loop {

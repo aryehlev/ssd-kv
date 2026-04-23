@@ -27,7 +27,10 @@ use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
 use engine::{recover_index, recover_with_wal, Index};
 use perf::PerfTuning;
-use server::{Handler, DatabaseManager, DbHandler, start_redis_server, start_redis_server_clustered, ServerTuning};
+use server::{
+    Handler, DatabaseManager, DbHandler, start_reactor_server,
+    start_reactor_server_clustered, ServerTuning,
+};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
 use storage::file_manager::FileManager;
@@ -361,15 +364,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         info!("Health checker started");
 
-        // Start Redis server with cluster routing
-        let _redis_handle = start_redis_server_clustered(
+        // Start Redis server with cluster routing (io_uring reactor)
+        let _redis_handle = start_reactor_server_clustered(
             config.bind,
             Arc::clone(&db_manager),
             router,
             config.replica_read,
             tuning,
         );
-        info!("Redis-compatible server (clustered) on {}", config.bind);
+        info!("Redis-compatible reactor (clustered) on {}", config.bind);
 
         // Log shard ownership
         let topo = topology.read();
@@ -384,8 +387,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(health_stop)
     } else {
         // Standalone mode
-        let _redis_handle = start_redis_server(config.bind, Arc::clone(&db_manager), tuning);
-        info!("Redis-compatible server on {}", config.bind);
+        let _redis_handle = start_reactor_server(config.bind, Arc::clone(&db_manager), tuning);
+        info!("Redis-compatible reactor on {}", config.bind);
         None
     };
 

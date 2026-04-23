@@ -26,7 +26,7 @@ use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
 use engine::{recover_index, Index};
 use perf::PerfTuning;
-use server::{Handler, DatabaseManager, DbHandler, start_redis_server, start_redis_server_clustered};
+use server::{Handler, DatabaseManager, DbHandler, start_redis_server, start_redis_server_clustered, ServerTuning};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
 use storage::file_manager::FileManager;
@@ -172,6 +172,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_manager = Arc::new(DatabaseManager::new(db_handlers));
     info!("All databases initialized");
 
+    let tuning = ServerTuning {
+        read_buf_bytes: config.read_buffer_size(),
+        write_buf_bytes: config.write_buffer_size(),
+        max_connections: config.max_connections,
+    };
+    info!(
+        "Server tuning: read_buf={}KB write_buf={}KB max_conns={}",
+        tuning.read_buf_bytes / 1024,
+        tuning.write_buf_bytes / 1024,
+        tuning.max_connections,
+    );
+
     // Get DB 0 handler for cluster components that need Arc<Handler>
     let primary_handler = db_manager.db(0).unwrap().as_ssd().cloned();
 
@@ -289,6 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&db_manager),
             router,
             config.replica_read,
+            tuning,
         );
         info!("Redis-compatible server (clustered) on {}", config.bind);
 
@@ -305,7 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(health_stop)
     } else {
         // Standalone mode
-        let _redis_handle = start_redis_server(config.bind, Arc::clone(&db_manager));
+        let _redis_handle = start_redis_server(config.bind, Arc::clone(&db_manager), tuning);
         info!("Redis-compatible server on {}", config.bind);
         None
     };

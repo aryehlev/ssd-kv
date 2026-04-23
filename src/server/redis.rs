@@ -23,14 +23,27 @@ use crate::server::handler::Handler;
 /// Maximum pipeline depth before forcing flush
 const MAX_PIPELINE_DEPTH: usize = 128;
 
-/// Initial read buffer size (64KB - efficient for small values)
-const INITIAL_READ_BUFFER_SIZE: usize = 64 * 1024;
-
 /// Maximum read buffer size (64MB - supports arbitrarily large values)
 const MAX_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
-/// Write buffer size
-const WRITE_BUFFER_SIZE: usize = 64 * 1024;
+/// Per-server tuning sizes derived from CLI flags.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerTuning {
+    pub read_buf_bytes: usize,
+    pub write_buf_bytes: usize,
+    pub max_connections: usize,
+}
+
+impl ServerTuning {
+    /// Defaults used by tests and anywhere a Config isn't handy.
+    pub const fn default_test() -> Self {
+        Self {
+            read_buf_bytes: 64 * 1024,
+            write_buf_bytes: 64 * 1024,
+            max_connections: 10_000,
+        }
+    }
+}
 
 /// RESP data types
 #[derive(Debug, Clone)]
@@ -124,14 +137,17 @@ pub struct RespParser {
     buf: Vec<u8>,
     pos: usize,
     len: usize,
+    /// Initial buffer size; the floor that `maybe_shrink` targets.
+    initial: usize,
 }
 
 impl RespParser {
-    pub fn new() -> Self {
+    pub fn new(initial: usize) -> Self {
         Self {
-            buf: vec![0u8; INITIAL_READ_BUFFER_SIZE],
+            buf: vec![0u8; initial],
             pos: 0,
             len: 0,
+            initial,
         }
     }
 
@@ -179,8 +195,8 @@ impl RespParser {
     fn maybe_shrink(&mut self) {
         let remaining = self.len - self.pos;
         // Only shrink if buffer is larger than initial and less than 1/4 used
-        if self.buf.len() > INITIAL_READ_BUFFER_SIZE && remaining < self.buf.len() / 4 {
-            let new_size = (self.buf.len() / 2).max(INITIAL_READ_BUFFER_SIZE);
+        if self.buf.len() > self.initial && remaining < self.buf.len() / 4 {
+            let new_size = (self.buf.len() / 2).max(self.initial);
             if remaining > 0 {
                 self.buf.copy_within(self.pos..self.len, 0);
             }
@@ -196,7 +212,7 @@ impl RespParser {
         loop {
             if let Some(value) = self.parse_value()? {
                 // Only shrink occasionally — checking buffer size is cheaper than shrink logic
-                if self.buf.len() > INITIAL_READ_BUFFER_SIZE {
+                if self.buf.len() > self.initial {
                     self.maybe_shrink();
                 }
                 return Ok(Some(value));
@@ -2779,15 +2795,16 @@ pub struct RedisServer {
     router: Option<Arc<ClusterRouter>>,
     replica_read: bool,
     pubsub: Arc<PubSubManager>,
+    tuning: ServerTuning,
 }
 
 impl RedisServer {
-    pub fn new(addr: SocketAddr, db_manager: Arc<DatabaseManager>) -> Self {
-        Self { addr, db_manager, router: None, replica_read: false, pubsub: Arc::new(PubSubManager::new()) }
+    pub fn new(addr: SocketAddr, db_manager: Arc<DatabaseManager>, tuning: ServerTuning) -> Self {
+        Self { addr, db_manager, router: None, replica_read: false, pubsub: Arc::new(PubSubManager::new()), tuning }
     }
 
-    pub fn with_router(addr: SocketAddr, db_manager: Arc<DatabaseManager>, router: Arc<ClusterRouter>, replica_read: bool) -> Self {
-        Self { addr, db_manager, router: Some(router), replica_read, pubsub: Arc::new(PubSubManager::new()) }
+    pub fn with_router(addr: SocketAddr, db_manager: Arc<DatabaseManager>, router: Arc<ClusterRouter>, replica_read: bool, tuning: ServerTuning) -> Self {
+        Self { addr, db_manager, router: Some(router), replica_read, pubsub: Arc::new(PubSubManager::new()), tuning }
     }
 
     pub fn run(&self) -> io::Result<()> {
@@ -2804,8 +2821,9 @@ impl RedisServer {
                     let router = self.router.clone();
                     let replica_read = self.replica_read;
                     let pubsub = Arc::clone(&self.pubsub);
+                    let tuning = self.tuning;
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_redis_client_fast(stream, db_manager, router, replica_read, pubsub) {
+                        if let Err(e) = handle_redis_client_fast(stream, db_manager, router, replica_read, pubsub, tuning) {
                             debug!("Redis client error: {}", e);
                         }
                     });
@@ -2827,6 +2845,7 @@ fn handle_redis_client_fast(
     router: Option<Arc<ClusterRouter>>,
     replica_read: bool,
     pubsub: Arc<PubSubManager>,
+    tuning: ServerTuning,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
@@ -2834,13 +2853,13 @@ fn handle_redis_client_fast(
     let peer = stream.peer_addr()?;
     debug!("Redis client connected: {}", peer);
 
-    let mut parser = RespParser::new();
+    let mut parser = RespParser::new(tuning.read_buf_bytes);
     let redis_handler = if let Some(router) = router.clone() {
         RedisHandler::with_router_and_pubsub(db_manager.clone(), router, replica_read, pubsub)
     } else {
         RedisHandler::new_with_pubsub(db_manager.clone(), pubsub)
     };
-    let mut write_buf = Vec::with_capacity(WRITE_BUFFER_SIZE);
+    let mut write_buf = Vec::with_capacity(tuning.write_buf_bytes);
     let mut commands_in_batch = 0;
 
     // Pre-resolve current handler for fast path (no cluster, db 0)
@@ -2857,7 +2876,7 @@ fn handle_redis_client_fast(
                 Ok(Some(true)) => {
                     // Fast path handled the command
                     commands_in_batch += 1;
-                    if write_buf.len() >= WRITE_BUFFER_SIZE / 2 || commands_in_batch >= MAX_PIPELINE_DEPTH {
+                    if write_buf.len() >= tuning.write_buf_bytes / 2 || commands_in_batch >= MAX_PIPELINE_DEPTH {
                         stream.write_all(&write_buf)?;
                         write_buf.clear();
                         commands_in_batch = 0;
@@ -2903,7 +2922,7 @@ fn handle_redis_client_fast(
                 commands_in_batch += 1;
 
                 // Flush if buffer is large or many commands processed
-                if write_buf.len() >= WRITE_BUFFER_SIZE / 2 || commands_in_batch >= MAX_PIPELINE_DEPTH {
+                if write_buf.len() >= tuning.write_buf_bytes / 2 || commands_in_batch >= MAX_PIPELINE_DEPTH {
                     stream.write_all(&write_buf)?;
                     write_buf.clear();
                     commands_in_batch = 0;
@@ -2945,9 +2964,13 @@ fn handle_redis_client_fast(
 }
 
 /// Starts the Redis server on a separate thread
-pub fn start_redis_server(addr: SocketAddr, db_manager: Arc<DatabaseManager>) -> std::thread::JoinHandle<()> {
+pub fn start_redis_server(
+    addr: SocketAddr,
+    db_manager: Arc<DatabaseManager>,
+    tuning: ServerTuning,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let server = RedisServer::new(addr, db_manager);
+        let server = RedisServer::new(addr, db_manager, tuning);
         if let Err(e) = server.run() {
             error!("Redis server error: {}", e);
         }
@@ -2960,9 +2983,10 @@ pub fn start_redis_server_clustered(
     db_manager: Arc<DatabaseManager>,
     router: Arc<ClusterRouter>,
     replica_read: bool,
+    tuning: ServerTuning,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let server = RedisServer::with_router(addr, db_manager, router, replica_read);
+        let server = RedisServer::with_router(addr, db_manager, router, replica_read, tuning);
         if let Err(e) = server.run() {
             error!("Redis server error: {}", e);
         }

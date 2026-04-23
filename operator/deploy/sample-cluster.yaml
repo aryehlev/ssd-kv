@@ -1,0 +1,19 @@
+apiVersion: ssdkv.io/v1alpha1
+kind: SsdkvCluster
+metadata:
+  name: ssdkv
+  namespace: default
+spec:
+  replicas: 3
+  replicationFactor: 2
+  image: ssd-kv:latest
+  redisPort: 7777
+  clusterPort: 7780
+  storage:
+    size: 1Gi
+  # Whole-core CPU + memory; the operator copies these into both requests and
+  # limits so the resulting pod is Guaranteed-QoS and the kubelet's static CPU
+  # manager (--cpu-manager-policy=static) can pin exclusive cores.
+  resources:
+    cpu: "2"
+    memory: 2Gi

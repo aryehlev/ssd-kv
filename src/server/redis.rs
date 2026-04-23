@@ -371,18 +371,26 @@ impl RespParser {
     }
 
     fn parse_line(&mut self) -> io::Result<Option<&[u8]>> {
-        // Find \r\n
+        // SIMD-accelerated CRLF scan. memchr::memchr uses AVX2/NEON to hunt
+        // for '\n' ~16× faster than a scalar byte loop, which matters when
+        // requests come in big pipelined batches.
         let start = self.pos;
-        while self.pos < self.len {
-            if self.pos > 0 && self.buf[self.pos - 1] == b'\r' && self.buf[self.pos] == b'\n' {
-                let line = &self.buf[start..self.pos - 1];
-                self.pos += 1;
-                return Ok(Some(line));
+        match memchr::memchr(b'\n', &self.buf[start..self.len]) {
+            Some(rel) => {
+                let lf = start + rel;
+                // Standard RESP requires CRLF; bare LF is malformed but we
+                // accept it defensively (no leading-\r check means the
+                // line slice is just up to LF, not LF-1).
+                let end = if lf > start && self.buf[lf - 1] == b'\r' {
+                    lf - 1
+                } else {
+                    lf
+                };
+                self.pos = lf + 1;
+                Ok(Some(&self.buf[start..end]))
             }
-            self.pos += 1;
+            None => Ok(None),
         }
-        self.pos = start;
-        Ok(None)
     }
 
     fn parse_simple_string(&mut self) -> io::Result<Option<RespValue>> {

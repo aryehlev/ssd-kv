@@ -1020,6 +1020,7 @@ dependencies = [
  "itoa",
  "libc",
  "lru",
+ "memchr",
  "memmap2",
  "mimalloc",
  "once_cell",

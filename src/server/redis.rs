@@ -667,6 +667,11 @@ pub struct RedisHandler {
     tx_queue: std::cell::RefCell<Option<Vec<Vec<RespValue>>>>,
     /// Watched keys for optimistic locking (key -> generation at watch time).
     watched_keys: std::cell::RefCell<HashMap<Vec<u8>, Option<u32>>>,
+    /// WAL position the most-recently-dispatched command needs durable
+    /// before its response can be sent to the client. 0 = no durability
+    /// requirement. The reactor reads + resets this after each
+    /// handle_command call.
+    pub last_wal_position: Cell<u64>,
 }
 
 impl RedisHandler {
@@ -680,6 +685,7 @@ impl RedisHandler {
             pubsub: Arc::new(PubSubManager::new()),
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
+            last_wal_position: Cell::new(0),
         }
     }
 
@@ -693,6 +699,7 @@ impl RedisHandler {
             pubsub,
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
+            last_wal_position: Cell::new(0),
         }
     }
 
@@ -706,6 +713,7 @@ impl RedisHandler {
             pubsub: Arc::new(PubSubManager::new()),
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
+            last_wal_position: Cell::new(0),
         }
     }
 
@@ -724,6 +732,7 @@ impl RedisHandler {
             pubsub,
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
+            last_wal_position: Cell::new(0),
         }
     }
 
@@ -731,6 +740,44 @@ impl RedisHandler {
     #[inline]
     fn current_handler(&self) -> &DbHandler {
         self.db_manager.db(self.current_db.get()).unwrap()
+    }
+
+    /// PUT via the non-blocking path, tracking the WAL position so the
+    /// reactor knows when the response is safe to send. A thin wrapper
+    /// callers use instead of `current_handler().put_sync(…)`.
+    #[inline]
+    fn put_and_track(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
+        let pos = self.current_handler().put_nowait(key, value, ttl)?;
+        if let Some(p) = pos {
+            let cur = self.last_wal_position.get();
+            if p > cur {
+                self.last_wal_position.set(p);
+            }
+        }
+        Ok(())
+    }
+
+    /// DELETE via the non-blocking path, tracking WAL position like
+    /// `put_and_track`.
+    #[inline]
+    fn delete_and_track(&self, key: &[u8]) -> io::Result<bool> {
+        let (deleted, pos) = self.current_handler().delete_nowait(key)?;
+        if let Some(p) = pos {
+            let cur = self.last_wal_position.get();
+            if p > cur {
+                self.last_wal_position.set(p);
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Take the last WAL position produced by this handler and reset it.
+    /// The reactor calls this after each handle_command; a non-zero
+    /// result means the response must wait until the WAL is durable up
+    /// to that offset.
+    #[inline]
+    pub fn take_wal_position(&self) -> u64 {
+        self.last_wal_position.replace(0)
     }
 
     /// Handles a Redis command and writes response to buffer
@@ -969,7 +1016,7 @@ impl RedisHandler {
 
         // Fast path: simple SET key value (no options) — most common case
         if args.len() == 3 {
-            match self.current_handler().put_sync(key, value, 0) {
+            match self.put_and_track(key, value, 0) {
                 Ok(_) => out.extend_from_slice(b"+OK\r\n"),
                 Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
             }
@@ -1019,7 +1066,7 @@ impl RedisHandler {
             opts.ttl_secs
         };
 
-        match self.current_handler().put_sync(key, value, final_ttl) {
+        match self.put_and_track(key, value, final_ttl) {
             Ok(_) => {
                 if opts.get {
                     match old_value {
@@ -1169,7 +1216,7 @@ impl RedisHandler {
                 if self.check_moved(key, out) {
                     return;
                 }
-                if let Ok(true) = self.current_handler().delete_sync(key) {
+                if let Ok(true) = self.delete_and_track(key) {
                     deleted += 1;
                 }
             }
@@ -1277,7 +1324,7 @@ impl RedisHandler {
                 }
             };
 
-            if let Err(e) = self.current_handler().put_sync(key, value, 0) {
+            if let Err(e) = self.put_and_track(key, value, 0) {
                 RespValue::err(&e.to_string()).serialize_into(out);
                 return;
             }
@@ -1686,7 +1733,7 @@ impl RedisHandler {
         let new_bytes = new_val.to_string().into_bytes();
         // Preserve existing TTL
         let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.current_handler().put_sync(key, &new_bytes, ttl) {
+        match self.put_and_track(key, &new_bytes, ttl) {
             Ok(_) => RespValue::Integer(new_val).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1735,7 +1782,7 @@ impl RedisHandler {
         let new_str = format_float(new_val);
         let new_bytes = new_str.as_bytes().to_vec();
         let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.current_handler().put_sync(key, &new_bytes, ttl) {
+        match self.put_and_track(key, &new_bytes, ttl) {
             Ok(_) => RespValue::bulk(new_bytes).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1760,7 +1807,7 @@ impl RedisHandler {
         new_val.extend_from_slice(suffix);
         let new_len = new_val.len() as i64;
         let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.current_handler().put_sync(key, &new_val, ttl) {
+        match self.put_and_track(key, &new_val, ttl) {
             Ok(_) => RespValue::Integer(new_len).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1846,7 +1893,7 @@ impl RedisHandler {
         value[offset..offset + replacement.len()].copy_from_slice(replacement);
         let new_len = value.len() as i64;
         let ttl = self.current_handler().get_with_meta(key).map(|m| m.ttl_secs).unwrap_or(0);
-        match self.current_handler().put_sync(key, &value, ttl) {
+        match self.put_and_track(key, &value, ttl) {
             Ok(_) => RespValue::Integer(new_len).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1871,7 +1918,7 @@ impl RedisHandler {
             Some(v) => v,
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
-        match self.current_handler().put_sync(key, value, 0) {
+        match self.put_and_track(key, value, 0) {
             Ok(_) => RespValue::Integer(1).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1899,7 +1946,7 @@ impl RedisHandler {
             Some(v) => v,
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
-        match self.current_handler().put_sync(key, value, secs) {
+        match self.put_and_track(key, value, secs) {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1928,7 +1975,7 @@ impl RedisHandler {
             None => { RespValue::err("Invalid value").serialize_into(out); return; }
         };
         let secs = (ms / 1000).max(1) as u32;
-        match self.current_handler().put_sync(key, value, secs) {
+        match self.put_and_track(key, value, secs) {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -1947,7 +1994,7 @@ impl RedisHandler {
         if self.check_moved(key, out) { return; }
         match self.current_handler().get_value(key) {
             Some(value) => {
-                let _ = self.current_handler().delete_sync(key);
+                let _ = self.delete_and_track(key);
                 RespValue::bulk(value).serialize_into(out);
             }
             None => RespValue::null().serialize_into(out),
@@ -2149,8 +2196,8 @@ impl RedisHandler {
             }
         };
         // Delete old key, set new key preserving TTL
-        let _ = self.current_handler().delete_sync(src);
-        match self.current_handler().put_sync(dst, &meta.value, meta.ttl_secs) {
+        let _ = self.delete_and_track(src);
+        match self.put_and_track(dst, &meta.value, meta.ttl_secs) {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -2183,8 +2230,8 @@ impl RedisHandler {
             RespValue::Integer(0).serialize_into(out);
             return;
         }
-        let _ = self.current_handler().delete_sync(src);
-        match self.current_handler().put_sync(dst, &meta.value, meta.ttl_secs) {
+        let _ = self.delete_and_track(src);
+        match self.put_and_track(dst, &meta.value, meta.ttl_secs) {
             Ok(_) => RespValue::Integer(1).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -2266,7 +2313,7 @@ impl RedisHandler {
             RespValue::Integer(0).serialize_into(out);
             return;
         }
-        match self.current_handler().put_sync(dst, &meta.value, meta.ttl_secs) {
+        match self.put_and_track(dst, &meta.value, meta.ttl_secs) {
             Ok(_) => RespValue::Integer(1).serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
         }
@@ -2695,7 +2742,7 @@ impl RedisHandler {
 
         if timestamp <= now_secs {
             // Already expired - delete
-            let _ = self.current_handler().delete_sync(key);
+            let _ = self.delete_and_track(key);
             RespValue::Integer(1).serialize_into(out);
             return;
         }
@@ -2749,7 +2796,7 @@ impl RedisHandler {
             .unwrap_or(0);
 
         if timestamp_ms <= now_ms {
-            let _ = self.current_handler().delete_sync(key);
+            let _ = self.delete_and_track(key);
             RespValue::Integer(1).serialize_into(out);
             return;
         }

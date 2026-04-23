@@ -172,8 +172,22 @@ impl Handler {
         Arc::clone(&self.stats)
     }
 
-    /// Synchronous PUT for Redis compatibility
+    /// Synchronous PUT for Redis compatibility. Blocks until the record
+    /// is durably in the WAL (if one is installed).
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
+        let wal_pos = self.put_nowait(key, value, ttl)?;
+        if let (Some(pos), Some(wal)) = (wal_pos, &self.wal) {
+            wal.wait_for_durable(pos);
+        }
+        Ok(())
+    }
+
+    /// Non-blocking PUT. Updates the WAL, write_buffer, and index, then
+    /// returns immediately. Returns the WAL position at which the record
+    /// ends if a WAL is installed (so the reactor can poll
+    /// `wal.durable_position()` and send the +OK once it's covered).
+    /// Returns `Ok(None)` if there's no WAL (memory-only, tests).
+    pub fn put_nowait(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<Option<u64>> {
         // Capacity check: reject writes if NoEviction and at capacity
         if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
             if self.max_entries > 0 {
@@ -198,27 +212,26 @@ impl Handler {
         let key_hash = hash_key(key);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
-        // Durability first: if a WAL is installed, append + wait for group
-        // commit before we acknowledge. On crash after this point, recovery
-        // will replay the entry.
-        if let Some(wal) = &self.wal {
-            wal.append_put(key, value, generation, ttl)?;
-        }
+        // Stage into the WAL (BufWriter memcpy, no fsync yet). The commit
+        // thread picks it up on the next tick.
+        let wal_pos = if let Some(wal) = &self.wal {
+            Some(wal.append_put_nowait(key, value, generation, ttl)?)
+        } else {
+            None
+        };
 
-        // Create record
+        // Create record + append to write buffer + index. Readers on the
+        // SAME reactor see the new value immediately via the write_buffer
+        // fast-path; clients on other connections see it once the reactor
+        // sends the +OK (after durability).
         let mut record = Record::new(key.to_vec(), value.to_vec(), generation, ttl)?;
-
-        // Append to write buffer
         let location = self.write_buffer.append(&mut record)?;
-
-        // Update index (values always on disk, only keys in memory)
-        self.index.insert(key, location, generation, record.header.value_len);
-
-        // Update bloom filter
+        self.index
+            .insert(key, location, generation, record.header.value_len);
         self.bloom_filter.write().add(key_hash);
 
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(wal_pos)
     }
 
     /// Write path used by recovery / WAL replay. Uses an explicit generation
@@ -268,26 +281,33 @@ impl Handler {
         }
     }
 
-    /// Synchronous DELETE for Redis compatibility
+    /// Synchronous DELETE for Redis compatibility. Blocks until durable.
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
+        let (deleted, wal_pos) = self.delete_nowait(key)?;
+        if let (Some(pos), Some(wal)) = (wal_pos, &self.wal) {
+            wal.wait_for_durable(pos);
+        }
+        Ok(deleted)
+    }
+
+    /// Non-blocking DELETE. Returns `(was_live, Option<wal_pos>)`. Reactor
+    /// path: stash the response, poll `wal.durable_position()` before
+    /// sending the `:N\r\n` reply.
+    pub fn delete_nowait(&self, key: &[u8]) -> io::Result<(bool, Option<u64>)> {
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
-        // Durability first — see put_sync for rationale.
-        if let Some(wal) = &self.wal {
-            wal.append_delete(key, generation)?;
-        }
+        let wal_pos = if let Some(wal) = &self.wal {
+            Some(wal.append_delete_nowait(key, generation)?)
+        } else {
+            None
+        };
 
-        // Create tombstone record
         let mut record = Record::tombstone(key.to_vec(), generation)?;
-
-        // Append tombstone to write buffer
         self.write_buffer.append(&mut record)?;
 
-        // Update index
         let deleted = self.index.delete(key, generation);
-
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
-        Ok(deleted)
+        Ok((deleted, wal_pos))
     }
 
     /// Fast synchronous GET for UDP/Redis - returns value if found.

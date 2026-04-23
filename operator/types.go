@@ -54,15 +54,20 @@ type StorageSpec struct {
 }
 
 // ResourceSpec defines compute resources for each node.
+//
+// To get Guaranteed QoS (requests == limits) and exclusive CPUs from the
+// kubelet's static CPU manager, CPU must be a positive integer (whole cores)
+// and Memory must be set. The operator copies these values into both requests
+// and limits so the resulting pod is always Guaranteed.
+//
+// The cluster's kubelet must be started with --cpu-manager-policy=static for
+// pinning to actually take effect.
 type ResourceSpec struct {
-	Requests ResourceList `json:"requests,omitempty"`
-	Limits   ResourceList `json:"limits,omitempty"`
-}
-
-// ResourceList holds CPU and memory quantities.
-type ResourceList struct {
-	CPU    string `json:"cpu,omitempty"`
-	Memory string `json:"memory,omitempty"`
+	// CPU is the integer number of cores per node, e.g. "2".
+	// Must be a whole number; fractional values (e.g. "500m") are rejected.
+	CPU string `json:"cpu"`
+	// Memory is the per-node memory quantity, e.g. "2Gi".
+	Memory string `json:"memory"`
 }
 
 // SsdkvClusterStatus defines the observed state.

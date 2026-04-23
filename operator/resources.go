@@ -56,7 +56,7 @@ func buildClientService(cluster *SsdkvCluster) *corev1.Service {
 	}
 }
 
-func buildStatefulSet(cluster *SsdkvCluster) *appsv1.StatefulSet {
+func buildStatefulSet(cluster *SsdkvCluster) (*appsv1.StatefulSet, error) {
 	replicas := cluster.Spec.GetReplicas()
 	redisPort := cluster.Spec.GetRedisPort()
 	clusterPort := cluster.Spec.GetClusterPort()
@@ -114,10 +114,16 @@ func buildStatefulSet(cluster *SsdkvCluster) *appsv1.StatefulSet {
 		},
 	}
 
-	// Resources
-	if cluster.Spec.Resources != nil {
-		container.Resources = buildResourceRequirements(cluster.Spec.Resources)
+	// Resources are required so every pod is Guaranteed-QoS and eligible for
+	// the kubelet's static CPU manager.
+	if cluster.Spec.Resources == nil {
+		return nil, fmt.Errorf("spec.resources is required (cpu and memory)")
 	}
+	rr, err := buildResourceRequirements(cluster.Spec.Resources)
+	if err != nil {
+		return nil, err
+	}
+	container.Resources = rr
 
 	// Volume mount
 	container.VolumeMounts = []corev1.VolumeMount{
@@ -165,30 +171,33 @@ func buildStatefulSet(cluster *SsdkvCluster) *appsv1.StatefulSet {
 		}
 	}
 
-	return ss
+	return ss, nil
 }
 
-func buildResourceRequirements(r *ResourceSpec) corev1.ResourceRequirements {
-	rr := corev1.ResourceRequirements{}
-	if r.Requests.CPU != "" || r.Requests.Memory != "" {
-		rr.Requests = corev1.ResourceList{}
-		if r.Requests.CPU != "" {
-			rr.Requests[corev1.ResourceCPU] = resource.MustParse(r.Requests.CPU)
-		}
-		if r.Requests.Memory != "" {
-			rr.Requests[corev1.ResourceMemory] = resource.MustParse(r.Requests.Memory)
-		}
+// buildResourceRequirements returns a Guaranteed-QoS ResourceRequirements:
+// requests == limits for both CPU and memory. CPU must be a positive integer
+// (whole cores) so the kubelet's static CPU manager can assign exclusive cores.
+func buildResourceRequirements(r *ResourceSpec) (corev1.ResourceRequirements, error) {
+	cpuQty, err := resource.ParseQuantity(r.CPU)
+	if err != nil {
+		return corev1.ResourceRequirements{}, fmt.Errorf("invalid cpu %q: %w", r.CPU, err)
 	}
-	if r.Limits.CPU != "" || r.Limits.Memory != "" {
-		rr.Limits = corev1.ResourceList{}
-		if r.Limits.CPU != "" {
-			rr.Limits[corev1.ResourceCPU] = resource.MustParse(r.Limits.CPU)
-		}
-		if r.Limits.Memory != "" {
-			rr.Limits[corev1.ResourceMemory] = resource.MustParse(r.Limits.Memory)
-		}
+	if cpuQty.MilliValue()%1000 != 0 || cpuQty.Sign() <= 0 {
+		return corev1.ResourceRequirements{}, fmt.Errorf(
+			"cpu must be a positive whole number of cores (got %q); fractional CPUs disable static CPU pinning",
+			r.CPU,
+		)
 	}
-	return rr
+	memQty, err := resource.ParseQuantity(r.Memory)
+	if err != nil {
+		return corev1.ResourceRequirements{}, fmt.Errorf("invalid memory %q: %w", r.Memory, err)
+	}
+
+	list := corev1.ResourceList{
+		corev1.ResourceCPU:    cpuQty,
+		corev1.ResourceMemory: memQty,
+	}
+	return corev1.ResourceRequirements{Requests: list, Limits: list}, nil
 }
 
 func labels(cluster *SsdkvCluster) map[string]string {

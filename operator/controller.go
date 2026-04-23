@@ -50,7 +50,12 @@ func (r *SsdkvClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// 3. StatefulSet
-	desiredSS := buildStatefulSet(&cluster)
+	desiredSS, err := buildStatefulSet(&cluster)
+	if err != nil {
+		cluster.Status.Phase = "Invalid"
+		_ = r.Status().Update(ctx, &cluster)
+		return ctrl.Result{}, fmt.Errorf("build statefulset: %w", err)
+	}
 	if err := r.reconcileStatefulSet(ctx, &cluster, desiredSS); err != nil {
 		return ctrl.Result{}, fmt.Errorf("statefulset: %w", err)
 	}

@@ -40,6 +40,23 @@ kubectl apply -f operator/deploy/operator.yaml
 kubectl apply -f operator/deploy/sample-cluster.yaml
 ```
 
+The operator forces every `SsdkvCluster` pod into the **Guaranteed** QoS class
+(requests == limits) and rejects fractional CPU. Combined with a kubelet
+started with `--cpu-manager-policy=static` and a non-zero `--reserved-cpus`,
+each pod gets exclusive whole cores from the static CPU manager, so worker
+threads aren't preempted by neighbours. Without static CPU manager the cluster
+still runs — it just doesn't get pinning.
+
+`spec.resources` therefore takes a single `cpu` (whole cores) and `memory`,
+not the usual `requests`/`limits` pair:
+
+```yaml
+spec:
+  resources:
+    cpu: "2"
+    memory: 2Gi
+```
+
 ---
 
 ## Server flags
@@ -161,8 +178,11 @@ versus ~120 GB of RAM for an all-in-memory store.
 - **Pipelining.** Up to 128 commands per connection are processed before the
   socket is flushed, amortizing syscalls.
 - **mimalloc.** Replaces the system allocator; cheaper small allocations.
-- **CPU pinning + worker auto-tune.** The main thread is pinned to CPU 0;
-  worker count defaults to `available_parallelism`.
+- **Worker auto-tune + cgroup-honest CPU pinning.** Worker count defaults to
+  `available_parallelism`. Pinning is delegated to the kubelet's static CPU
+  manager (Guaranteed QoS + integer cores, enforced by the operator), instead
+  of `sched_setaffinity` calls that would silently no-op inside a restricted
+  cpuset.
 - **Append-only log + background compaction.** Deletes and overwrites are
   free at write time; reclamation happens off the hot path.
 - **Tight RESP fast path.** Common commands (`GET`/`SET`/`PING`/`DEL`) match

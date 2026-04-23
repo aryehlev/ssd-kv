@@ -41,7 +41,8 @@ pub fn simd_key_eq(a: &[u8], b: &[u8]) -> bool {
     {
         if is_x86_feature_detected!("avx2") {
             return unsafe { simd_key_eq_avx2(a, b) };
-        } else if is_x86_feature_detected!("sse2") {
+        }
+        if is_x86_feature_detected!("sse2") {
             return unsafe { simd_key_eq_sse2(a, b) };
         }
     }
@@ -51,11 +52,7 @@ pub fn simd_key_eq(a: &[u8], b: &[u8]) -> bool {
         return unsafe { simd_key_eq_neon(a, b) };
     }
 
-    // Fallback
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        a == b
-    }
+    a == b
 }
 
 #[cfg(target_arch = "x86_64")]

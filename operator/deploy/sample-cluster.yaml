@@ -11,10 +11,9 @@ spec:
   clusterPort: 7780
   storage:
     size: 1Gi
+  # Whole-core CPU + memory; the operator copies these into both requests and
+  # limits so the resulting pod is Guaranteed-QoS and the kubelet's static CPU
+  # manager (--cpu-manager-policy=static) can pin exclusive cores.
   resources:
-    requests:
-      cpu: 500m
-      memory: 512Mi
-    limits:
-      cpu: "2"
-      memory: 2Gi
+    cpu: "2"
+    memory: 2Gi

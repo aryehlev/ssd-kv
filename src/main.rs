@@ -25,7 +25,7 @@ use cluster::topology::ClusterTopology;
 use cluster::health::{HealthChecker, HealthConfig};
 use config::Config;
 use engine::{recover_index, Index};
-use perf::{PerfTuning, pin_to_cpu};
+use perf::PerfTuning;
 use server::{Handler, DatabaseManager, DbHandler, start_redis_server, start_redis_server_clustered};
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
@@ -77,8 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tuning = PerfTuning::auto_tune();
     info!("Performance tuning: {:?}", tuning);
 
-    // Pin main thread to CPU 0
-    let _ = pin_to_cpu(0);
+    // CPU pinning is delegated to the kubelet's static CPU manager when
+    // running under the operator (Guaranteed QoS + integer CPU). For non-K8s
+    // deployments use taskset(1) or cgroups; pinning only the main thread
+    // here had no real effect since it spends its life parked on a signal.
 
     let eviction_policy = EvictionPolicy::from_str(&config.eviction_policy);
 

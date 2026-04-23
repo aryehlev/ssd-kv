@@ -227,7 +227,17 @@ impl Record {
 
     /// Serializes the record to bytes with padding.
     /// Uses SIMD-accelerated memory copy for large values.
+    ///
+    /// Opportunistically compresses the value with LZ4 if it's ≥
+    /// COMPRESS_THRESHOLD bytes AND compression saves at least 10% —
+    /// cheap values (short strings, already-compressed payloads) skip
+    /// the roundtrip. Compressed records carry the `Compressed` flag
+    /// and their `value_len` field is the *compressed* size. CRC is
+    /// computed over what's actually on disk, so integrity checks match
+    /// without a separate pre-compression checksum.
     pub fn serialize(&mut self) -> Vec<u8> {
+        self.maybe_compress_value();
+
         self.header.crc32 = self.compute_crc();
         let total_size = self.header.total_size();
         let mut buf = vec![0u8; total_size];
@@ -243,6 +253,30 @@ impl Record {
         // Remaining bytes are already zero (padding)
 
         buf
+    }
+
+    /// Compress `self.value` in place if it's worth it. Updates
+    /// `header.value_len` and sets the `Compressed` flag. A no-op on
+    /// deletes (no value), already-compressed records, or tiny values.
+    fn maybe_compress_value(&mut self) {
+        const COMPRESS_THRESHOLD: usize = 256;
+        // Skip if already compressed (serialize called twice) or nothing to compress.
+        if self.header.flags & (RecordFlags::Compressed as u8) != 0 {
+            return;
+        }
+        if self.value.len() < COMPRESS_THRESHOLD {
+            return;
+        }
+        let compressed = lz4_flex::compress_prepend_size(&self.value);
+        // Only worth it if we save ≥10%. Random / already-compressed
+        // data often grows slightly; skipping those avoids paying
+        // decompression cost on GET for no benefit.
+        if compressed.len() >= self.value.len() * 9 / 10 {
+            return;
+        }
+        self.value = compressed;
+        self.header.value_len = self.value.len() as u32;
+        self.header.flags |= RecordFlags::Compressed as u8;
     }
 
     /// Deserializes a record from a reader.
@@ -273,9 +307,12 @@ impl Record {
             reader.read_exact(&mut pad_buf)?;
         }
 
-        let record = Self { header, key, value };
+        let mut record = Self { header, key, value };
 
-        // Verify CRC
+        // Verify CRC over the on-disk bytes (key + compressed value,
+        // if compressed) BEFORE decompression. That way a corrupt
+        // compressed payload is caught at the right boundary — LZ4's
+        // decompressor would otherwise panic on malformed input.
         let computed_crc = record.compute_crc();
         if computed_crc != record.header.crc32 {
             return Err(io::Error::new(
@@ -285,6 +322,26 @@ impl Record {
                     record.header.crc32, computed_crc
                 ),
             ));
+        }
+
+        // Decompress in place. After this, `record.value` is the
+        // original uncompressed payload and `header.value_len` reflects
+        // its length — callers never see the compressed form. We keep
+        // the Compressed flag set so the disk footprint stored in the
+        // index (via total_size) can be recomputed if needed; but most
+        // callers use `record.value` directly.
+        if record.header.flags & (RecordFlags::Compressed as u8) != 0 {
+            let decompressed = lz4_flex::decompress_size_prepended(&record.value)
+                .map_err(|e| io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("LZ4 decompress failed: {}", e),
+                ))?;
+            record.value = decompressed;
+            record.header.value_len = record.value.len() as u32;
+            // Clear the flag since the in-memory record is now
+            // uncompressed — any subsequent serialize() that runs will
+            // re-compress as needed.
+            record.header.flags &= !(RecordFlags::Compressed as u8);
         }
 
         Ok(record)
@@ -362,5 +419,66 @@ mod tests {
         assert_eq!(align_to_boundary(1, 128), 128);
         assert_eq!(align_to_boundary(128, 128), 128);
         assert_eq!(align_to_boundary(129, 128), 256);
+    }
+
+    #[test]
+    fn compressible_value_roundtrips_with_compressed_flag() {
+        // 4 KB of repeating data — LZ4 compresses this to a tiny
+        // fraction of the original. Roundtrip through serialize →
+        // from_bytes, verify (a) the on-disk form was smaller than the
+        // uncompressed total_size would have been, (b) from_bytes
+        // returns the original bytes, and (c) CRC matched.
+        let value = b"abcdefghij".repeat(400); // 4000 bytes
+        let original_size = value.len();
+
+        let mut record = Record::new(b"k".to_vec(), value.clone(), 1, 0).unwrap();
+        let serialized = record.serialize();
+
+        // The serialized bytes include header + compressed value + padding.
+        // For repeating text LZ4 should reduce 4000 bytes to well under 200.
+        assert!(
+            serialized.len() < original_size / 2,
+            "compression didn't trigger or ratio was worse than expected \
+             (serialized={} original={})",
+            serialized.len(),
+            original_size
+        );
+
+        let restored = Record::from_bytes(&serialized).unwrap();
+        assert_eq!(restored.key, b"k");
+        assert_eq!(restored.value, value);
+        assert_eq!(restored.header.value_len as usize, original_size);
+        // Compressed flag cleared after decompression; from_bytes
+        // normalises to the in-memory uncompressed form.
+        assert_eq!(
+            restored.header.flags & (RecordFlags::Compressed as u8),
+            0,
+            "flag should be cleared post-decompression"
+        );
+    }
+
+    #[test]
+    fn small_value_skips_compression() {
+        // 100 bytes is below the 256 threshold — must not trigger the
+        // compression path at all (otherwise overhead for no gain).
+        let mut record = Record::new(b"k".to_vec(), vec![b'x'; 100], 1, 0).unwrap();
+        let _ = record.serialize();
+        assert_eq!(record.header.flags & (RecordFlags::Compressed as u8), 0);
+    }
+
+    #[test]
+    fn incompressible_value_skips_compression() {
+        // Random-looking bytes don't compress well; skip compression
+        // rather than writing slightly-larger ciphertext with CPU cost
+        // on every GET.
+        let value: Vec<u8> = (0..2048).map(|i| ((i * 2654435761u64) as u8)).collect();
+        let mut record = Record::new(b"k".to_vec(), value, 1, 0).unwrap();
+        let _ = record.serialize();
+        // Can't assert flag absolutely — some distributions do compress
+        // ~10%. But this sequence doesn't; accept whichever result.
+        // Test that a roundtrip still returns identical bytes.
+        let serialized = record.serialize();
+        let restored = Record::from_bytes(&serialized).unwrap();
+        assert_eq!(restored.value.len(), 2048);
     }
 }

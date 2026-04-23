@@ -38,6 +38,12 @@ struct ConnState {
     /// cleared once the reactor observes durable_position() >= it and
     /// flushes pending_out to the socket.
     pending_up_to: u64,
+    /// Timestamp of when `pending_up_to` was set. Measured at the point
+    /// the SET/DEL command completed its synchronous work and the
+    /// response got buffered awaiting durability. Used to record total
+    /// latency (including the fsync wait) into the SSD handler's
+    /// `set_latency` histogram when the response finally flushes.
+    pending_since: Option<std::time::Instant>,
 }
 
 impl ConnState {
@@ -58,6 +64,7 @@ impl ConnState {
             handler,
             pending_out: Vec::with_capacity(tuning.write_buf_bytes),
             pending_up_to: 0,
+            pending_since: None,
         }
     }
 }
@@ -156,6 +163,15 @@ impl ReactorServer {
                     .and_then(|h| h.wal().cloned())
             })
             .collect();
+
+        // Snapshot DB 0's stats for recording per-write latency on the
+        // reactor flush path. Multi-DB deployments record into DB 0
+        // unconditionally — per-DB histograms would need connection-to-
+        // DB tracking, and the dominant use case has 1 DB anyway.
+        let latency_sink: Option<Arc<crate::server::handler::HandlerStats>> = db_manager
+            .db(0)
+            .and_then(|d| d.as_ssd())
+            .map(|h| h.stats());
 
         // Create a wake eventfd and register it with every WAL. The WAL
         // commit thread writes to this fd every time durable_pos
@@ -279,6 +295,15 @@ impl ReactorServer {
                                 let pos = state.handler.take_wal_position();
                                 if pos > state.pending_up_to {
                                     state.pending_up_to = pos;
+                                    // First write in this pending batch —
+                                    // start the latency clock. Subsequent
+                                    // pipelined writes don't reset it; we
+                                    // measure the first-to-durable time,
+                                    // which is the reply latency the
+                                    // client sees.
+                                    if state.pending_since.is_none() {
+                                        state.pending_since = Some(std::time::Instant::now());
+                                    }
                                 }
                             }
                             Ok(None) => break, // partial, wait for more
@@ -327,6 +352,19 @@ impl ReactorServer {
                     {
                         let bytes = std::mem::take(&mut state.pending_out);
                         state.pending_up_to = 0;
+                        // Record the end-to-end durable-write latency for
+                        // this batch. `set_latency` is the coarse
+                        // aggregate across SET/DEL/writes since we don't
+                        // split here — that's fine, the user can read
+                        // per-op breakdown from the individual
+                        // put_sync/delete_sync paths used by non-reactor
+                        // callers.
+                        if let (Some(start), Some(sink)) =
+                            (state.pending_since.take(), latency_sink.as_ref())
+                        {
+                            let us = start.elapsed().as_micros() as u64;
+                            sink.set_latency.record(us);
+                        }
                         if let Err(e) = server.queue_send(fd, bytes) {
                             error!("reactor queue_send error on fd={}: {}", fd, e);
                         }
@@ -336,6 +374,7 @@ impl ReactorServer {
                         // pending_out is empty but we were waiting — no-op
                         // apart from clearing the watermark.
                         state.pending_up_to = 0;
+                        state.pending_since = None;
                     }
                 }
             }

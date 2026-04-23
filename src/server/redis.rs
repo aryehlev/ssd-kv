@@ -1364,9 +1364,35 @@ impl RedisHandler {
     #[inline]
     fn cmd_info(&self, out: &mut Vec<u8>) {
         let mode = if self.router.is_some() { "cluster" } else { "standalone" };
+        // Percentiles in µs (coarse — log-bucketed to factor-of-2).
+        // Matches Redis's `INFO latencystats` section so monitoring
+        // tooling that reads `latency_percentiles_usec_*` keys works
+        // transparently. Memory-only DBs have no histograms; skip the
+        // section for those.
+        let latency_section = if let Some(h) = self.current_handler().as_ssd() {
+            let stats = h.stats();
+            let set = &stats.set_latency;
+            let get = &stats.get_latency;
+            let del = &stats.del_latency;
+            format!(
+                "# Latencystats\r\n\
+                 latency_percentiles_usec_set:p50={},p99={},p999={},max={}\r\n\
+                 latency_percentiles_usec_get:p50={},p99={},p999={},max={}\r\n\
+                 latency_percentiles_usec_del:p50={},p99={},p999={},max={}\r\n\
+                 set_ops:{}\r\n\
+                 get_ops:{}\r\n\
+                 del_ops:{}\r\n",
+                set.percentile(0.50), set.percentile(0.99), set.percentile(0.999), set.max_us(),
+                get.percentile(0.50), get.percentile(0.99), get.percentile(0.999), get.max_us(),
+                del.percentile(0.50), del.percentile(0.99), del.percentile(0.999), del.max_us(),
+                set.count(), get.count(), del.count(),
+            )
+        } else {
+            String::new()
+        };
+
         let info = format!(
-            "# Server\r\nredis_version:7.0.0-ssd-kv\r\nredis_mode:{}\r\n# Keyspace\r\n",
-            mode
+            "# Server\r\nredis_version:7.0.0-ssd-kv\r\nredis_mode:{mode}\r\n{latency_section}# Keyspace\r\n",
         );
         let info_bytes = info.as_bytes();
         out.push(b'$');

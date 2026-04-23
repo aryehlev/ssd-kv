@@ -36,6 +36,12 @@ pub struct HandlerStats {
     pub get_misses: AtomicU64,
     pub cache_hits: AtomicU64,
     pub errors: AtomicU64,
+    /// Per-op latency histograms. Recording is a handful of relaxed
+    /// atomics in the hot path; percentiles are computed lazily when
+    /// `INFO latencystats` runs.
+    pub set_latency: crate::perf::latency_hist::LatencyHistogram,
+    pub get_latency: crate::perf::latency_hist::LatencyHistogram,
+    pub del_latency: crate::perf::latency_hist::LatencyHistogram,
 }
 
 impl HandlerStats {
@@ -178,10 +184,12 @@ impl Handler {
     /// Synchronous PUT for Redis compatibility. Blocks until the record
     /// is durably in the WAL (if one is installed).
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
+        let start = std::time::Instant::now();
         let wal_pos = self.put_nowait(key, value, ttl)?;
         if let (Some(pos), Some(wal)) = (wal_pos, &self.wal) {
             wal.wait_for_durable(pos);
         }
+        self.stats.set_latency.record(start.elapsed().as_micros() as u64);
         Ok(())
     }
 
@@ -286,10 +294,12 @@ impl Handler {
 
     /// Synchronous DELETE for Redis compatibility. Blocks until durable.
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
+        let start = std::time::Instant::now();
         let (deleted, wal_pos) = self.delete_nowait(key)?;
         if let (Some(pos), Some(wal)) = (wal_pos, &self.wal) {
             wal.wait_for_durable(pos);
         }
+        self.stats.del_latency.record(start.elapsed().as_micros() as u64);
         Ok(deleted)
     }
 
@@ -317,6 +327,14 @@ impl Handler {
     /// Priority: write buffer -> wblock cache -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let start = std::time::Instant::now();
+        let result = self.get_value_inner(key);
+        self.stats.get_latency.record(start.elapsed().as_micros() as u64);
+        result
+    }
+
+    #[inline]
+    fn get_value_inner(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Fast path 1: Check index
         let entry = self.index.get(key)?;
 

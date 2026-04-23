@@ -20,6 +20,7 @@ pub mod huge_pages;
 pub mod busy_poll;
 pub mod object_pool;
 pub mod simd;
+pub mod latency_hist;
 
 pub use batch_writer::{BatchWriter, BatchWriterStats, WriteRequest};
 pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, LockFreeBloomFilter, ReadAhead};

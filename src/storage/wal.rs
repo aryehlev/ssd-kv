@@ -17,7 +17,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -128,8 +128,11 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("./wal"),
-            max_file_size: 64 * 1024 * 1024, // 64MB
-            buffer_size: 1024 * 1024,        // 1MB
+            // Bigger WAL files mean rarer rotations — even with
+            // non-blocking rotate, fewer rotations = less pending_close
+            // traffic for the commit thread.
+            max_file_size: 256 * 1024 * 1024, // 256MB
+            buffer_size: 1024 * 1024,         // 1MB
             fsync_interval: Duration::from_micros(500),
             fsync_batch: 256,
         }
@@ -161,6 +164,20 @@ struct GroupCommit {
     waiters: AtomicU64,
     cond_lock: Mutex<()>,
     cond: Condvar,
+    /// Dedicated condvar/mutex for the commit thread's wait. Writers
+    /// notify this after staging bytes so the commit thread wakes in
+    /// microseconds instead of polling every `fsync_interval`.
+    wake_lock: Mutex<()>,
+    wake_cond: Condvar,
+    /// True while the commit thread is parked on `wake_cond`. Writers
+    /// check this Relaxed before taking `wake_lock` — if the commit
+    /// thread isn't sleeping, we skip the mutex entirely (fast path).
+    commit_sleeping: AtomicBool,
+    /// Optional eventfd written by the commit thread when durable_pos
+    /// advances. The reactor's io_uring watches this fd so it wakes
+    /// immediately on durable advance instead of waiting out its own
+    /// 200µs timeout.
+    wake_eventfd: AtomicI32,
 }
 
 impl GroupCommit {
@@ -171,6 +188,23 @@ impl GroupCommit {
             waiters: AtomicU64::new(0),
             cond_lock: Mutex::new(()),
             cond: Condvar::new(),
+            wake_lock: Mutex::new(()),
+            wake_cond: Condvar::new(),
+            commit_sleeping: AtomicBool::new(false),
+            wake_eventfd: AtomicI32::new(-1),
+        }
+    }
+
+    /// Notify the commit thread that new bytes were staged. Only takes
+    /// the wake lock if the commit thread might actually be sleeping
+    /// (indicated by `commit_sleeping`). Under high load the commit
+    /// thread is rarely asleep — it's already fsyncing — so the fast
+    /// path is a single Relaxed load and a branch.
+    #[inline]
+    fn notify_commit(&self) {
+        if self.commit_sleeping.load(Ordering::Relaxed) {
+            let _g = self.wake_lock.lock();
+            self.wake_cond.notify_one();
         }
     }
 
@@ -192,6 +226,22 @@ impl GroupCommit {
         self.durable_pos.store(pos, Ordering::Release);
         let _g = self.cond_lock.lock();
         self.cond.notify_all();
+
+        // Wake any reactor watching an eventfd for durable-pos advances.
+        // This short-circuits the reactor's 200µs wait_timeout — it gets
+        // the ready response out immediately.
+        let fd = self.wake_eventfd.load(Ordering::Relaxed);
+        if fd >= 0 {
+            // One 64-bit write is all eventfd needs.
+            let one: u64 = 1;
+            unsafe {
+                let _ = libc::write(
+                    fd,
+                    &one as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
     }
 }
 
@@ -215,8 +265,17 @@ struct ClosedFile {
 /// streaming-write-buffer shape.
 pub struct WriteAheadLog {
     config: WalConfig,
-    /// Current WAL file. Arc so the commit thread can share the same mutex.
-    writer: Arc<Mutex<BufWriter<File>>>,
+    /// Current WAL file. `ArcSwap` lets rotate() atomically replace it
+    /// without blocking writers — they load the Arc once per append,
+    /// take the inner Mutex for the memcpy, and move on. The old writer
+    /// goes onto `pending_close` for the commit thread to drain + sync
+    /// off the hot path.
+    writer: Arc<arc_swap::ArcSwap<Mutex<BufWriter<File>>>>,
+    /// Old writers retired by rotate() that still need their final
+    /// flush + sync_data + close. Drained by the commit thread.
+    pending_close: Arc<Mutex<Vec<Arc<Mutex<BufWriter<File>>>>>>,
+    /// Held during rotate() so two writers don't race to rotate.
+    rotate_lock: Mutex<()>,
     /// Current file sequence number
     file_seq: AtomicU64,
     /// Current staged position in file (bytes appended, pre-fsync).
@@ -253,10 +312,9 @@ impl WriteAheadLog {
 
         let position = file.metadata()?.len();
 
-        let writer = Arc::new(Mutex::new(BufWriter::with_capacity(
-            config.buffer_size.max(4096),
-            file,
-        )));
+        let writer = Arc::new(arc_swap::ArcSwap::from(Arc::new(Mutex::new(
+            BufWriter::with_capacity(config.buffer_size.max(4096), file),
+        ))));
 
         // Any WAL files on disk older than this are from a prior run; we
         // can't reason about their max_gen without scanning, so mark them
@@ -271,6 +329,8 @@ impl WriteAheadLog {
         let mut wal = Self {
             config,
             writer,
+            pending_close: Arc::new(Mutex::new(Vec::new())),
+            rotate_lock: Mutex::new(()),
             file_seq: AtomicU64::new(file_seq),
             position: AtomicU64::new(position),
             current_max_gen: AtomicU32::new(0),
@@ -342,6 +402,7 @@ impl WriteAheadLog {
         let shutdown = Arc::clone(&self.shutdown);
         let gc = Arc::clone(&self.gc);
         let writer_handle = Arc::clone(&self.writer);
+        let pending_close_handle = Arc::clone(&self.pending_close);
         let interval = self.config.fsync_interval;
         let batch = self.config.fsync_batch as u64;
 
@@ -352,23 +413,53 @@ impl WriteAheadLog {
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
                         // Final flush before exit so nothing dangles.
+                        Self::drain_pending_close(&pending_close_handle);
                         Self::commit_once(&writer_handle, &gc, &stats);
+                        // Also wake any stragglers blocked on durability.
+                        let _g = gc.cond_lock.lock();
+                        gc.cond.notify_all();
                         return;
                     }
 
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(last_tick);
+                    let written = gc.written_pos.load(Ordering::Acquire);
+                    let durable = gc.durable_pos.load(Ordering::Acquire);
                     let stacked = gc.waiters.load(Ordering::Relaxed);
+                    let elapsed = last_tick.elapsed();
+                    let new_work = written > durable;
+                    let over_batch = batch > 0 && stacked >= batch;
+                    let past_interval = elapsed >= interval;
 
-                    // Wake on timer OR batch threshold.
-                    if elapsed < interval && (batch == 0 || stacked < batch) {
-                        let nap = (interval - elapsed).min(Duration::from_micros(250));
-                        thread::sleep(nap);
+                    // Commit if (a) batch filled or (b) we've been
+                    // accumulating for `interval`. This preserves the
+                    // group-commit batching window — many writes amortize
+                    // one fsync — while still waking quickly.
+                    if new_work && (over_batch || past_interval) {
+                        Self::drain_pending_close(&pending_close_handle);
+                        Self::commit_once(&writer_handle, &gc, &stats);
+                        last_tick = Instant::now();
                         continue;
                     }
 
-                    Self::commit_once(&writer_handle, &gc, &stats);
-                    last_tick = Instant::now();
+                    // Sleep on the wake condvar. On idle load, writers
+                    // notify us the instant they stage the first byte so
+                    // we don't sit out the full `interval`. Under active
+                    // load, we get here only briefly between commit
+                    // cycles and the timeout caps how long we can miss
+                    // a notify.
+                    let remaining = interval.saturating_sub(elapsed)
+                        .max(Duration::from_micros(10));
+                    let mut guard = gc.wake_lock.lock();
+                    // Re-check under lock to avoid lost-wake.
+                    let written2 = gc.written_pos.load(Ordering::Acquire);
+                    let durable2 = gc.durable_pos.load(Ordering::Acquire);
+                    if written2 <= durable2
+                        && !(batch > 0 && gc.waiters.load(Ordering::Relaxed) >= batch)
+                        && !shutdown.load(Ordering::Relaxed)
+                    {
+                        gc.commit_sleeping.store(true, Ordering::Release);
+                        let _ = gc.wake_cond.wait_for(&mut guard, remaining);
+                        gc.commit_sleeping.store(false, Ordering::Release);
+                    }
                 }
             })
             .expect("Failed to spawn WAL commit thread");
@@ -376,10 +467,33 @@ impl WriteAheadLog {
         self.sync_thread = Some(handle);
     }
 
+    /// Final-flush + sync + close every writer that rotate() retired.
+    /// Called by the commit thread off the hot path so writers never
+    /// pay the rotation fsync cost.
+    fn drain_pending_close(
+        pending_close: &Arc<Mutex<Vec<Arc<Mutex<BufWriter<File>>>>>>,
+    ) {
+        let olds: Vec<_> = {
+            let mut g = pending_close.lock();
+            std::mem::take(&mut *g)
+        };
+        for old in olds {
+            let mut w = old.lock();
+            if let Err(e) = w.flush() {
+                tracing::error!("wal: retired BufWriter flush failed: {}", e);
+                continue;
+            }
+            if let Err(e) = w.get_ref().sync_data() {
+                tracing::error!("wal: retired sync_data failed: {}", e);
+            }
+            // Dropping `old` when the last Arc goes closes the File.
+        }
+    }
+
     /// Flush BufWriter → `sync_data()` → publish the new durable position.
     /// Takes the writer mutex only for as long as flush + fsync need it.
     fn commit_once(
-        writer: &Arc<Mutex<BufWriter<File>>>,
+        writer: &Arc<arc_swap::ArcSwap<Mutex<BufWriter<File>>>>,
         gc: &Arc<GroupCommit>,
         stats: &Arc<WalStats>,
     ) {
@@ -387,7 +501,8 @@ impl WriteAheadLog {
         if target == gc.durable_pos.load(Ordering::Acquire) {
             return; // nothing new, skip the syscall
         }
-        let mut w = writer.lock();
+        let current = writer.load_full();
+        let mut w = current.lock();
         if let Err(e) = w.flush() {
             tracing::error!("wal: BufWriter flush failed: {}", e);
             return;
@@ -447,6 +562,14 @@ impl WriteAheadLog {
         self.gc.durable_pos.load(Ordering::Acquire)
     }
 
+    /// Register an eventfd that should be signalled every time
+    /// durable_pos advances. The reactor sets this on startup so its
+    /// io_uring loop wakes immediately instead of polling. Pass -1 to
+    /// clear.
+    pub fn set_wake_eventfd(&self, fd: i32) {
+        self.gc.wake_eventfd.store(fd, Ordering::Relaxed);
+    }
+
     /// Block the calling thread until `durable_position() >= target`.
     /// Used by put_sync / delete_sync to keep the blocking-durability
     /// guarantee for non-reactor callers (tests, eviction thread,
@@ -501,7 +624,14 @@ impl WriteAheadLog {
         }
 
         let new_pos = {
-            let mut writer = self.writer.lock();
+            // Load the current writer Arc. If rotate() swaps concurrently
+            // after we load but before we lock, our bytes still land in the
+            // (now retired) writer we hold — recovery replays WAL files in
+            // seq order, so those bytes are found exactly once. The old
+            // file gets its final sync from the commit thread via
+            // drain_pending_close.
+            let writer_arc = self.writer.load_full();
+            let mut writer = writer_arc.lock();
 
             writer.write_all(&header.to_bytes())?;
             writer.write_all(key)?;
@@ -523,6 +653,11 @@ impl WriteAheadLog {
             new_pos
         };
 
+        // Wake the commit thread. Cheap — just a short mutex lock +
+        // notify_one. Eliminates the ~200µs polling gap that the commit
+        // thread used to sit in when load was low.
+        self.gc.notify_commit();
+
         // Caller decides whether to wait for durability. The blocking
         // wrappers (append_put / append_delete) call
         // `self.gc.wait_for_durable(new_pos)` after we return.
@@ -537,8 +672,23 @@ impl WriteAheadLog {
         hasher.finalize()
     }
 
-    /// Rotate to a new WAL file.
+    /// Rotate to a new WAL file. NON-BLOCKING: the old writer is atomically
+    /// swapped out and queued for the commit thread to drain + fsync +
+    /// close. Writers that already hold the old Arc finish their writes
+    /// against it; any new appends after the swap go to the new file.
+    /// No fsync happens under a lock held by the writer path.
     fn rotate(&self) -> io::Result<()> {
+        // Serialize rotates so two writers don't both advance file_seq
+        // and open duplicate files.
+        let _rotate_guard = self.rotate_lock.lock();
+
+        // Re-check under the rotate lock in case a peer just rotated.
+        let current_pos = self.position.load(Ordering::Relaxed);
+        if current_pos < self.config.max_file_size / 2 {
+            // Someone else already rotated; skip.
+            return Ok(());
+        }
+
         let old_seq = self.file_seq.load(Ordering::Relaxed);
         let new_seq = self.file_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let new_path = Self::wal_file_path(&self.config.dir, new_seq);
@@ -547,29 +697,31 @@ impl WriteAheadLog {
             .create(true)
             .append(true)
             .open(&new_path)?;
+        let new_writer = Arc::new(Mutex::new(BufWriter::with_capacity(
+            self.config.buffer_size.max(4096),
+            new_file,
+        )));
 
-        let mut writer = self.writer.lock();
-
-        // Flush + durable-sync the previous file so we don't lose records
-        // across a rotation.
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
-
-        // Freeze the old file's max_gen so cleanup_up_to_gen can decide
-        // when to delete it. Reset current_max_gen for the new file.
+        // Freeze the old file's max_gen BEFORE swap so cleanup_up_to_gen
+        // doesn't race. Reset current_max_gen for the new file.
         let old_max_gen = self.current_max_gen.swap(0, Ordering::AcqRel);
         self.closed_files.lock().push(ClosedFile {
             seq: old_seq,
             max_gen: old_max_gen,
         });
 
-        // Switch to new file. The new file starts at offset 0 in its own
-        // space; however the group-commit counters (written_pos/durable_pos)
-        // are process-lifetime monotonic, so we treat the rotation as a
-        // boundary where we just reset `position` (the in-file offset used
-        // for max_file_size checks). The gc counters keep going.
-        *writer = BufWriter::with_capacity(self.config.buffer_size.max(4096), new_file);
+        // Atomic pointer swap. O(1), no fsync under any lock. After this,
+        // new appends hit the new writer; in-flight appends on the old
+        // writer complete normally.
+        let old_writer = self.writer.swap(new_writer);
+
+        // Position is per-file, so reset.
         self.position.store(0, Ordering::Relaxed);
+
+        // Hand the old writer to the commit thread to drain. The commit
+        // thread does the final flush + sync_data + close off the hot
+        // path — our writer threads never see the cost.
+        self.pending_close.lock().push(old_writer);
 
         self.stats.flushes.fetch_add(1, Ordering::Relaxed);
 
@@ -580,7 +732,12 @@ impl WriteAheadLog {
     /// callers now that `append_entry` is itself group-commit durable;
     /// provided for shutdown paths.
     pub fn sync(&self) -> io::Result<()> {
-        let mut writer = self.writer.lock();
+        // Drain any pending old-file closes first so they don't get
+        // abandoned on shutdown.
+        Self::drain_pending_close(&self.pending_close);
+
+        let current = self.writer.load_full();
+        let mut writer = current.lock();
         writer.flush()?;
         writer.get_ref().sync_data()?;
         drop(writer);
@@ -731,6 +888,12 @@ impl WriteAheadLog {
 impl Drop for WriteAheadLog {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+
+        // Wake the commit thread if it's parked on the wake condvar.
+        {
+            let _g = self.gc.wake_lock.lock();
+            self.gc.wake_cond.notify_all();
+        }
 
         // Final sync
         let _ = self.sync();

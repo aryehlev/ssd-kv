@@ -17,7 +17,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -164,6 +164,20 @@ struct GroupCommit {
     waiters: AtomicU64,
     cond_lock: Mutex<()>,
     cond: Condvar,
+    /// Dedicated condvar/mutex for the commit thread's wait. Writers
+    /// notify this after staging bytes so the commit thread wakes in
+    /// microseconds instead of polling every `fsync_interval`.
+    wake_lock: Mutex<()>,
+    wake_cond: Condvar,
+    /// True while the commit thread is parked on `wake_cond`. Writers
+    /// check this Relaxed before taking `wake_lock` — if the commit
+    /// thread isn't sleeping, we skip the mutex entirely (fast path).
+    commit_sleeping: AtomicBool,
+    /// Optional eventfd written by the commit thread when durable_pos
+    /// advances. The reactor's io_uring watches this fd so it wakes
+    /// immediately on durable advance instead of waiting out its own
+    /// 200µs timeout.
+    wake_eventfd: AtomicI32,
 }
 
 impl GroupCommit {
@@ -174,6 +188,23 @@ impl GroupCommit {
             waiters: AtomicU64::new(0),
             cond_lock: Mutex::new(()),
             cond: Condvar::new(),
+            wake_lock: Mutex::new(()),
+            wake_cond: Condvar::new(),
+            commit_sleeping: AtomicBool::new(false),
+            wake_eventfd: AtomicI32::new(-1),
+        }
+    }
+
+    /// Notify the commit thread that new bytes were staged. Only takes
+    /// the wake lock if the commit thread might actually be sleeping
+    /// (indicated by `commit_sleeping`). Under high load the commit
+    /// thread is rarely asleep — it's already fsyncing — so the fast
+    /// path is a single Relaxed load and a branch.
+    #[inline]
+    fn notify_commit(&self) {
+        if self.commit_sleeping.load(Ordering::Relaxed) {
+            let _g = self.wake_lock.lock();
+            self.wake_cond.notify_one();
         }
     }
 
@@ -195,6 +226,22 @@ impl GroupCommit {
         self.durable_pos.store(pos, Ordering::Release);
         let _g = self.cond_lock.lock();
         self.cond.notify_all();
+
+        // Wake any reactor watching an eventfd for durable-pos advances.
+        // This short-circuits the reactor's 200µs wait_timeout — it gets
+        // the ready response out immediately.
+        let fd = self.wake_eventfd.load(Ordering::Relaxed);
+        if fd >= 0 {
+            // One 64-bit write is all eventfd needs.
+            let one: u64 = 1;
+            unsafe {
+                let _ = libc::write(
+                    fd,
+                    &one as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
     }
 }
 
@@ -368,25 +415,51 @@ impl WriteAheadLog {
                         // Final flush before exit so nothing dangles.
                         Self::drain_pending_close(&pending_close_handle);
                         Self::commit_once(&writer_handle, &gc, &stats);
+                        // Also wake any stragglers blocked on durability.
+                        let _g = gc.cond_lock.lock();
+                        gc.cond.notify_all();
                         return;
                     }
 
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(last_tick);
+                    let written = gc.written_pos.load(Ordering::Acquire);
+                    let durable = gc.durable_pos.load(Ordering::Acquire);
                     let stacked = gc.waiters.load(Ordering::Relaxed);
+                    let elapsed = last_tick.elapsed();
+                    let new_work = written > durable;
+                    let over_batch = batch > 0 && stacked >= batch;
+                    let past_interval = elapsed >= interval;
 
-                    // Wake on timer OR batch threshold.
-                    if elapsed < interval && (batch == 0 || stacked < batch) {
-                        let nap = (interval - elapsed).min(Duration::from_micros(250));
-                        thread::sleep(nap);
+                    // Commit if (a) batch filled or (b) we've been
+                    // accumulating for `interval`. This preserves the
+                    // group-commit batching window — many writes amortize
+                    // one fsync — while still waking quickly.
+                    if new_work && (over_batch || past_interval) {
+                        Self::drain_pending_close(&pending_close_handle);
+                        Self::commit_once(&writer_handle, &gc, &stats);
+                        last_tick = Instant::now();
                         continue;
                     }
 
-                    // Flush any WAL files rotated away since last tick.
-                    // Doing this first keeps old fds from lingering.
-                    Self::drain_pending_close(&pending_close_handle);
-                    Self::commit_once(&writer_handle, &gc, &stats);
-                    last_tick = Instant::now();
+                    // Sleep on the wake condvar. On idle load, writers
+                    // notify us the instant they stage the first byte so
+                    // we don't sit out the full `interval`. Under active
+                    // load, we get here only briefly between commit
+                    // cycles and the timeout caps how long we can miss
+                    // a notify.
+                    let remaining = interval.saturating_sub(elapsed)
+                        .max(Duration::from_micros(10));
+                    let mut guard = gc.wake_lock.lock();
+                    // Re-check under lock to avoid lost-wake.
+                    let written2 = gc.written_pos.load(Ordering::Acquire);
+                    let durable2 = gc.durable_pos.load(Ordering::Acquire);
+                    if written2 <= durable2
+                        && !(batch > 0 && gc.waiters.load(Ordering::Relaxed) >= batch)
+                        && !shutdown.load(Ordering::Relaxed)
+                    {
+                        gc.commit_sleeping.store(true, Ordering::Release);
+                        let _ = gc.wake_cond.wait_for(&mut guard, remaining);
+                        gc.commit_sleeping.store(false, Ordering::Release);
+                    }
                 }
             })
             .expect("Failed to spawn WAL commit thread");
@@ -489,6 +562,14 @@ impl WriteAheadLog {
         self.gc.durable_pos.load(Ordering::Acquire)
     }
 
+    /// Register an eventfd that should be signalled every time
+    /// durable_pos advances. The reactor sets this on startup so its
+    /// io_uring loop wakes immediately instead of polling. Pass -1 to
+    /// clear.
+    pub fn set_wake_eventfd(&self, fd: i32) {
+        self.gc.wake_eventfd.store(fd, Ordering::Relaxed);
+    }
+
     /// Block the calling thread until `durable_position() >= target`.
     /// Used by put_sync / delete_sync to keep the blocking-durability
     /// guarantee for non-reactor callers (tests, eviction thread,
@@ -571,6 +652,11 @@ impl WriteAheadLog {
 
             new_pos
         };
+
+        // Wake the commit thread. Cheap — just a short mutex lock +
+        // notify_one. Eliminates the ~200µs polling gap that the commit
+        // thread used to sit in when load was low.
+        self.gc.notify_commit();
 
         // Caller decides whether to wait for durability. The blocking
         // wrappers (append_put / append_delete) call
@@ -802,6 +888,12 @@ impl WriteAheadLog {
 impl Drop for WriteAheadLog {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+
+        // Wake the commit thread if it's parked on the wake condvar.
+        {
+            let _g = self.gc.wake_lock.lock();
+            self.gc.wake_cond.notify_all();
+        }
 
         // Final sync
         let _ = self.sync();

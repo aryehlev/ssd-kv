@@ -174,6 +174,7 @@ impl ReactorServer {
         // I/O is arriving: the WAL commit thread advances `durable_pos`
         // but the reactor sleeps forever on io_uring. Using a bounded
         // wait means we always wake within this budget to poll durability.
+        //
         let wake_budget = std::time::Duration::from_micros(200);
 
         // Per-iteration: block on at least one completion (or the budget),

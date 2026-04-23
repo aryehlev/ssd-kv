@@ -158,6 +158,12 @@ pub struct Config {
     #[arg(long, default_value = "2")]
     pub io_workers: usize,
 
+    /// Number of RESP reactor threads. Each reactor owns its own io_uring
+    /// ring; when >1 they share the listen port via SO_REUSEPORT so the
+    /// kernel load-balances connections across them. Default 1.
+    #[arg(long, default_value = "1")]
+    pub reactor_threads: usize,
+
     // --- WAL trim ---
 
     /// Periodic WAL-trim interval in seconds. Every tick, the server
@@ -306,6 +312,7 @@ impl Default for Config {
             fsync_interval_us: 500,
             fsync_batch: 256,
             io_workers: 2,
+            reactor_threads: 1,
             wal_trim_interval_secs: 30,
         }
     }

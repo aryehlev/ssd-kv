@@ -28,8 +28,7 @@ use config::Config;
 use engine::{recover_index, recover_with_wal, Index};
 use perf::PerfTuning;
 use server::{
-    Handler, DatabaseManager, DbHandler, start_reactor_server,
-    start_reactor_server_clustered, ServerTuning,
+    Handler, DatabaseManager, DbHandler, start_reactor_multi, ServerTuning,
 };
 use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
@@ -103,24 +102,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared io_uring reader for cache-miss reads. One pool shared across
     // all SSD-backed DBs keeps the total number of kernel polling threads
     // bounded. Best-effort: if io_uring isn't available the GETs fall back
-    // to the blocking pread path.
-    let async_reader: Option<Arc<AsyncReader>> = match AsyncReader::new(
-        config.io_workers.max(1),
-        256,
-    ) {
-        Ok(r) => {
-            info!(
-                "io_uring async reader enabled: {} worker(s)",
-                r.num_workers()
-            );
-            Some(r)
-        }
-        Err(e) => {
-            info!(
-                "io_uring unavailable ({}); falling back to blocking pread",
-                e
-            );
-            None
+    // to the blocking pread path. Set --io-workers 0 to force the pread
+    // path (useful for benchmarking and for environments where io_uring
+    // submissions silently fail).
+    let async_reader: Option<Arc<AsyncReader>> = if config.io_workers == 0 {
+        info!("io_uring disabled (--io-workers 0); using blocking pread");
+        None
+    } else {
+        match AsyncReader::new(config.io_workers, 256) {
+            Ok(r) => {
+                info!(
+                    "io_uring async reader enabled: {} worker(s)",
+                    r.num_workers()
+                );
+                Some(r)
+            }
+            Err(e) => {
+                info!(
+                    "io_uring unavailable ({}); falling back to blocking pread",
+                    e
+                );
+                None
+            }
         }
     };
 
@@ -424,15 +427,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         info!("Health checker started");
 
-        // Start Redis server with cluster routing (io_uring reactor)
-        let _redis_handle = start_reactor_server_clustered(
+        // Start N reactor threads (io_uring). SO_REUSEPORT when N > 1.
+        let _redis_handles = start_reactor_multi(
             config.bind,
             Arc::clone(&db_manager),
-            router,
+            Some(router),
             config.replica_read,
             tuning,
+            config.reactor_threads,
         );
-        info!("Redis-compatible reactor (clustered) on {}", config.bind);
+        info!(
+            "Redis-compatible reactor (clustered) on {} [threads={}]",
+            config.bind, config.reactor_threads
+        );
 
         // Log shard ownership
         let topo = topology.read();
@@ -447,8 +454,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(health_stop)
     } else {
         // Standalone mode
-        let _redis_handle = start_reactor_server(config.bind, Arc::clone(&db_manager), tuning);
-        info!("Redis-compatible reactor on {}", config.bind);
+        let _redis_handles = start_reactor_multi(
+            config.bind,
+            Arc::clone(&db_manager),
+            None,
+            false,
+            tuning,
+            config.reactor_threads,
+        );
+        info!(
+            "Redis-compatible reactor on {} [threads={}]",
+            config.bind, config.reactor_threads
+        );
         None
     };
 

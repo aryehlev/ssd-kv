@@ -102,13 +102,30 @@ impl ReactorServer {
     }
 
     pub fn run(&self) -> std::io::Result<()> {
+        self.run_with_reuseport(false)
+    }
+
+    /// Variant of `run` that binds with SO_REUSEPORT so multiple reactor
+    /// threads can share the same port. Intended for the multi-reactor
+    /// startup path — the kernel load-balances new connections across
+    /// reactors.
+    pub fn run_with_reuseport(&self, reuse_port: bool) -> std::io::Result<()> {
         // Generous queue depth — 4096 SQEs covers many concurrent accepts,
         // recvs and sends in flight simultaneously.
         let queue_depth: u32 = 4096;
-        let mut server = UringServer::new(self.addr, queue_depth, self.tuning.read_buf_bytes)?;
+        let mut server = UringServer::new_with_options(
+            self.addr,
+            queue_depth,
+            self.tuning.read_buf_bytes,
+            reuse_port,
+        )?;
         server.start_accept()?;
 
-        info!("Redis reactor listening on {}", self.addr);
+        info!(
+            "Redis reactor listening on {}{}",
+            self.addr,
+            if reuse_port { " [SO_REUSEPORT]" } else { "" }
+        );
 
         let mut connections: HashMap<RawFd, ConnState> = HashMap::new();
 
@@ -231,15 +248,10 @@ pub fn start_reactor_server(
     db_manager: Arc<DatabaseManager>,
     tuning: ServerTuning,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("resp-reactor".to_string())
-        .spawn(move || {
-            let server = ReactorServer::new(addr, db_manager, tuning);
-            if let Err(e) = server.run() {
-                error!("reactor fatal: {}", e);
-            }
-        })
-        .expect("failed to spawn reactor thread")
+    start_reactor_multi(addr, db_manager, None, false, tuning, 1)
+        .into_iter()
+        .next()
+        .expect("at least one reactor thread")
 }
 
 pub fn start_reactor_server_clustered(
@@ -249,14 +261,43 @@ pub fn start_reactor_server_clustered(
     replica_read: bool,
     tuning: ServerTuning,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("resp-reactor".to_string())
-        .spawn(move || {
-            let server =
-                ReactorServer::with_router(addr, db_manager, router, replica_read, tuning);
-            if let Err(e) = server.run() {
-                error!("reactor fatal: {}", e);
-            }
+    start_reactor_multi(addr, db_manager, Some(router), replica_read, tuning, 1)
+        .into_iter()
+        .next()
+        .expect("at least one reactor thread")
+}
+
+/// Start `n` reactor threads, each binding the same port via SO_REUSEPORT
+/// when n > 1. The kernel distributes incoming connections across them.
+/// Returns the spawned JoinHandles (never joined — reactors run until
+/// process exit).
+pub fn start_reactor_multi(
+    addr: SocketAddr,
+    db_manager: Arc<DatabaseManager>,
+    router: Option<Arc<ClusterRouter>>,
+    replica_read: bool,
+    tuning: ServerTuning,
+    n: usize,
+) -> Vec<std::thread::JoinHandle<()>> {
+    let n = n.max(1);
+    let reuse_port = n > 1;
+    (0..n)
+        .map(|i| {
+            let db_manager = Arc::clone(&db_manager);
+            let router = router.clone();
+            std::thread::Builder::new()
+                .name(format!("resp-reactor-{}", i))
+                .spawn(move || {
+                    let server = if let Some(r) = router {
+                        ReactorServer::with_router(addr, db_manager, r, replica_read, tuning)
+                    } else {
+                        ReactorServer::new(addr, db_manager, tuning)
+                    };
+                    if let Err(e) = server.run_with_reuseport(reuse_port) {
+                        error!("reactor {} fatal: {}", i, e);
+                    }
+                })
+                .expect("failed to spawn reactor thread")
         })
-        .expect("failed to spawn reactor thread")
+        .collect()
 }

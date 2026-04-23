@@ -365,7 +365,17 @@ impl Handler {
             drop(file_guard); // release before we block waiting for io_uring
 
             let offset = FILE_HEADER_SIZE as u64 + (wblock_id as u64 * WBLOCK_SIZE as u64);
-            return reader.pread_blocking(fd, offset, WBLOCK_SIZE);
+            match reader.pread_blocking(fd, offset, WBLOCK_SIZE) {
+                Ok(buf) => return Ok(buf),
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    // io_uring is misbehaving in this environment; fall
+                    // through to the blocking pread path for this op so
+                    // the request doesn't hang. Callers higher up decide
+                    // whether to log at every miss; we don't log here so
+                    // a systemic io_uring failure doesn't spam.
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let file = self

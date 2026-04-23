@@ -96,16 +96,33 @@ impl AsyncReader {
     }
 
     /// Submit an io_uring read and block the calling thread on a oneshot
-    /// until the completion arrives. Returns the filled buffer.
+    /// until the completion arrives, up to `timeout`. Returns the filled
+    /// buffer.
     ///
     /// `offset` must be aligned to 512 bytes and `len` must be a multiple
     /// of 512 (O_DIRECT constraints, same as the existing pread path in
     /// `DirectFile::read_at`).
+    ///
+    /// On timeout, returns `io::ErrorKind::TimedOut` — callers should
+    /// treat this as a signal to fall back to the blocking pread path
+    /// (see `Handler::read_wblock_for_get`) rather than retry io_uring
+    /// forever. A stuck dispatcher / kernel-side drop should not be a
+    /// hang.
     pub fn pread_blocking(
         &self,
         fd: RawFd,
         offset: u64,
         len: usize,
+    ) -> io::Result<AlignedBuffer> {
+        self.pread_blocking_with_timeout(fd, offset, len, Duration::from_secs(5))
+    }
+
+    pub fn pread_blocking_with_timeout(
+        &self,
+        fd: RawFd,
+        offset: u64,
+        len: usize,
+        timeout: Duration,
     ) -> io::Result<AlignedBuffer> {
         let user_data = self.pool.next_id();
         let partition = pick_partition(&self.next_partition, self.pool.num_workers());
@@ -123,10 +140,28 @@ impl AsyncReader {
             return Err(e);
         }
 
-        // Block until the dispatcher delivers our result.
-        let result = rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "async reader shut down"))?;
+        // Bounded wait on the dispatcher. If io_uring is misbehaving in the
+        // environment (SQPOLL denied, queue full without backpressure, etc.)
+        // we don't want to wedge request threads forever.
+        let result = match rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // Clean up the pending entry so a late completion doesn't
+                // leak the sender.
+                self.pending.remove(&user_data);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "io_uring read did not complete in time",
+                ));
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                self.pending.remove(&user_data);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "async reader shut down",
+                ));
+            }
+        };
 
         if result.result < 0 {
             return Err(io::Error::from_raw_os_error(-result.result));

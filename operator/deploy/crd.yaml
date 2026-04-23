@@ -27,6 +27,9 @@ spec:
               required:
                 - image
                 - resources
+              x-kubernetes-validations:
+                - rule: self.replicationFactor <= self.replicas
+                  message: "replicationFactor cannot exceed replicas"
               properties:
                 replicas:
                   type: integer

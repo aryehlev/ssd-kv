@@ -71,6 +71,12 @@ func (r *SsdkvClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		} else {
 			cluster.Status.Phase = "Pending"
 		}
+		if err := r.Status().Update(ctx, &cluster); err != nil {
+			if errors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("update status: %w", err)
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -110,10 +116,51 @@ func (r *SsdkvClusterReconciler) reconcileStatefulSet(ctx context.Context, owner
 		return err
 	}
 
+	// VolumeClaimTemplates is immutable on StatefulSets. Blindly copying
+	// other fields while silently dropping storage changes is a footgun, so
+	// reject spec.storage changes with a clear error — the user can delete
+	// and recreate the cluster if they really want to reshape storage.
+	if !volumeClaimTemplatesEqual(existing.Spec.VolumeClaimTemplates, desired.Spec.VolumeClaimTemplates) {
+		return fmt.Errorf(
+			"spec.storage changes are not supported on an existing cluster "+
+				"(StatefulSet %q VolumeClaimTemplates are immutable); "+
+				"delete the SsdkvCluster and recreate it to change storage",
+			existing.Name,
+		)
+	}
+
 	// Update mutable fields
 	existing.Spec.Replicas = desired.Spec.Replicas
 	existing.Spec.Template = desired.Spec.Template
 	return r.Update(ctx, &existing)
+}
+
+func volumeClaimTemplatesEqual(a, b []corev1.PersistentVolumeClaim) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+		aReq := a[i].Spec.Resources.Requests[corev1.ResourceStorage]
+		bReq := b[i].Spec.Resources.Requests[corev1.ResourceStorage]
+		if !aReq.Equal(bReq) {
+			return false
+		}
+		aClass := ""
+		if a[i].Spec.StorageClassName != nil {
+			aClass = *a[i].Spec.StorageClassName
+		}
+		bClass := ""
+		if b[i].Spec.StorageClassName != nil {
+			bClass = *b[i].Spec.StorageClassName
+		}
+		if aClass != bClass {
+			return false
+		}
+	}
+	return true
 }
 
 // SetupWithManager registers the controller with the manager.

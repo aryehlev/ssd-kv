@@ -62,6 +62,10 @@ func buildStatefulSet(cluster *SsdkvCluster) (*appsv1.StatefulSet, error) {
 	clusterPort := cluster.Spec.GetClusterPort()
 	rf := cluster.Spec.GetReplicationFactor()
 
+	if rf > replicas {
+		return nil, fmt.Errorf("replicationFactor (%d) cannot exceed replicas (%d)", rf, replicas)
+	}
+
 	// Build --cluster-peers DNS list
 	headlessSvc := headlessServiceName(cluster)
 	var peers []string
@@ -151,7 +155,10 @@ func buildStatefulSet(cluster *SsdkvCluster) (*appsv1.StatefulSet, error) {
 
 	// PVC template or emptyDir
 	if cluster.Spec.Storage != nil && cluster.Spec.Storage.Size != "" {
-		storageQty := resource.MustParse(cluster.Spec.Storage.Size)
+		storageQty, err := resource.ParseQuantity(cluster.Spec.Storage.Size)
+		if err != nil {
+			return nil, fmt.Errorf("invalid storage.size %q: %w", cluster.Spec.Storage.Size, err)
+		}
 		pvc := corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: "data"},
 			Spec: corev1.PersistentVolumeClaimSpec{

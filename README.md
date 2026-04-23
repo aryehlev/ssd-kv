@@ -129,40 +129,37 @@ does not implement Redis's collection types.
 
 ## Storage model
 
-- **Index in RAM.** `DashMap` from `xxh3(key)` to a fixed-size entry
-  (file id, offset, length, TTL, flags). One index entry is small (tens of
-  bytes), so 100M keys fit in a few GB.
-- **Values on SSD.** Values are appended to ~1 GB log files in the data
-  directory. Writes are sequential; reads are a single positioned read.
+- **Index in RAM.** A 256-shard `HashMap<u64, Vec<IndexEntry>>` behind
+  `parking_lot::RwLock`, keyed by `xxh3(key)`. Each entry holds the key
+  (inline if ≤ 23 bytes, else heap), the on-disk location (file id, block,
+  offset), value length, generation, and a flag byte. TTL lives in the
+  on-disk record header, not in the in-memory entry.
+- **Values on SSD.** Values are appended to log files in the data directory.
+  With the default `--wblocks-per-file 1023`, each file is 1023 × 1 MB
+  ≈ 1 GB. Writes are sequential; reads are a single positioned read.
 - **WAL + recovery.** Records are framed and CRC'd. On startup the index is
   rebuilt by scanning the log; expired and tombstoned records are skipped.
-- **Compaction.** A background thread copies live records out of files whose
-  live ratio falls below `--compaction-threshold` and frees the source file.
-- **Eviction.** Optional LRU/TTL/random sampler runs in the background once
-  any of `--max-entries`, `--max-data-mb`, or a non-`noeviction` policy is set.
-- **Cluster.** 16,384 slots are split across `--total-nodes` nodes;
-  `--replication-factor` copies per key. Heartbeats every
-  `--health-check-interval-ms`.
+- **Compaction.** A background thread copies live records out of files
+  whose live-data ratio falls below `--compaction-threshold` and frees the
+  source file.
+- **Eviction.** Optional LRU / TTL / random sampler runs in the background
+  once any of `--max-entries`, `--max-data-mb`, or a non-`noeviction`
+  policy is set.
+- **Cluster.** Keys are mapped to one of 16,384 slots, slots are split
+  across `--total-nodes` nodes, and `--replication-factor` copies per key
+  are stored. Heartbeats fire every `--health-check-interval-ms`.
 
 ---
 
 ## Resource usage
 
-These are the design targets and what falls out of the architecture; treat
-them as approximate.
+The design point is **index in RAM, values on SSD**, so RAM scales with
+*number of keys* and SSD scales with *total value bytes*. That is the
+trade-off vs an all-in-memory store like Redis (which keeps values in RAM
+too).
 
-| Workload                        | ssd-kv                          | Redis                           | Aerospike (CE)                   |
-| ------------------------------- | ------------------------------- | ------------------------------- | -------------------------------- |
-| RAM per 1 M small keys          | ~50–100 MB (index only)         | ~1–2 GB (key + value + meta)    | ~64 MB (index only)              |
-| Where values live               | SSD (log-structured)            | RAM (or RDB/AOF on disk)        | SSD (block-aligned)              |
-| Disk write pattern              | Sequential append               | Snapshot / append-only file     | Sequential append                |
-| Cold-start                      | Scan log → rebuild index        | Load RDB / replay AOF           | Scan device → rebuild index      |
-| Working set bound by            | RAM (index) + SSD (values)      | RAM (everything)                | RAM (index) + SSD (values)       |
-| Idle CPU                        | Low (event-driven RESP loop)    | Low                             | Higher (background subsystems)   |
-
-Typical sizing rule for ssd-kv: **plan for index in RAM, values on SSD**.
-For 100 M keys with 1 KB values you need a few GB of RAM and ~100 GB of SSD,
-versus ~120 GB of RAM for an all-in-memory store.
+No real numbers here yet. Benchmarks against Redis / Aerospike / others
+will be added once they're measured under apples-to-apples conditions.
 
 ---
 
@@ -170,7 +167,7 @@ versus ~120 GB of RAM for an all-in-memory store.
 
 - **Sequential writes, random reads.** Writes hit a write buffer, then go to
   disk as one big append. SSDs love this pattern.
-- **One hash lookup per GET.** The index is a sharded `DashMap` keyed by
+- **One hash lookup per GET.** The index is a 256-shard `HashMap` keyed by
   `xxh3`. No B-tree, no LSM read amplification.
 - **No copies on the hot path.** The RESP parser reuses a per-connection
   buffer; responses are built into a contiguous output buffer and flushed

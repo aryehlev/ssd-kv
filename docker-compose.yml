@@ -4,55 +4,12 @@ services:
   ssd-kv:
     build: .
     ports:
-      - "7777:7777"   # Native TCP protocol
-      - "7778:7778"   # Redis-compatible protocol
+      - "7777:7777"   # RESP (Redis-compatible) protocol
     volumes:
       - ssd-kv-data:/data
-    deploy:
-      resources:
-        limits:
-          cpus: '4'
-          memory: 4G
     environment:
       - RUST_LOG=info
-    command: ["ssd-kv", "--data-dir", "/data", "--bind", "0.0.0.0:7777", "--workers", "4"]
-
-  # Redis for comparison
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    deploy:
-      resources:
-        limits:
-          cpus: '4'
-          memory: 4G
-    command: ["redis-server", "--appendonly", "no", "--save", ""]
-
-  # Aerospike for comparison (if needed)
-  aerospike:
-    image: aerospike/aerospike-server:latest
-    ports:
-      - "3000:3000"
-      - "3001:3001"
-      - "3002:3002"
-    volumes:
-      - aerospike-data:/opt/aerospike/data
-    deploy:
-      resources:
-        limits:
-          cpus: '4'
-          memory: 4G
-
-  # Benchmark runner
-  benchmark:
-    image: redis:7-alpine
-    depends_on:
-      - ssd-kv
-      - redis
-    profiles:
-      - benchmark
+    command: ["ssd-kv", "--data-dir", "/data", "--bind", "0.0.0.0:7777"]
 
 volumes:
   ssd-kv-data:
-  aerospike-data:

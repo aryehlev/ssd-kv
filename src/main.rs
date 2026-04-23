@@ -31,6 +31,7 @@ use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
 use storage::file_manager::FileManager;
 use storage::memory_store::MemoryStore;
+use storage::wblock_cache::WblockCache;
 use storage::write_buffer::WriteBuffer;
 
 /// Use mimalloc as the global allocator for better performance.
@@ -83,6 +84,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // here had no real effect since it spends its life parked on a signal.
 
     let eviction_policy = EvictionPolicy::from_str(&config.eviction_policy);
+
+    // Optional wblock read cache, shared across SSD-backed DBs. 0 disables it;
+    // without the cache every GET does a 1 MiB SSD pread.
+    let wblock_cache = if config.wblock_cache_mb > 0 {
+        let c = WblockCache::new(config.wblock_cache_mb);
+        info!("Wblock cache enabled: {} MiB", config.wblock_cache_mb);
+        Some(c)
+    } else {
+        None
+    };
 
     // Create all databases
     info!("Initializing {} databases...", config.num_dbs);
@@ -143,6 +154,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&wb),
             );
             handler_inner.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
+            if let Some(cache) = &wblock_cache {
+                handler_inner.set_wblock_cache(Arc::clone(cache));
+            }
             let handler = Arc::new(handler_inner);
 
             // Start eviction thread for this SSD DB

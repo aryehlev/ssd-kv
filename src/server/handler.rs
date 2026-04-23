@@ -13,6 +13,7 @@ use crate::perf::simd::{batch_bloom_check, batch_hash_keys_4, group_by_shard};
 use crate::storage::eviction::EvictionPolicy;
 use crate::storage::file_manager::{FileManager, ParallelFileManager};
 use crate::storage::record::Record;
+use crate::storage::wblock_cache::WblockCache;
 use crate::storage::write_buffer::{WriteBuffer, WBLOCK_SIZE};
 
 /// Metadata about a stored record, returned by get_with_meta.
@@ -54,6 +55,7 @@ pub struct Handler {
     index: Arc<Index>,
     file_manager: Arc<FileManager>,
     write_buffer: Arc<WriteBuffer>,
+    wblock_cache: Option<Arc<WblockCache>>,
     bloom_filter: parking_lot::RwLock<BloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
@@ -73,6 +75,7 @@ impl Handler {
             index,
             file_manager,
             write_buffer,
+            wblock_cache: None,
             bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
@@ -80,6 +83,16 @@ impl Handler {
             max_entries: 0,
             max_data_bytes: 0,
         }
+    }
+
+    /// Installs a shared wblock cache (shared across databases so total
+    /// memory is bounded by `--wblock-cache-mb`).
+    pub fn set_wblock_cache(&mut self, cache: Arc<WblockCache>) {
+        self.wblock_cache = Some(cache);
+    }
+
+    pub fn wblock_cache(&self) -> Option<&Arc<WblockCache>> {
+        self.wblock_cache.as_ref()
     }
 
     /// Sets the eviction policy and capacity limits.
@@ -164,7 +177,7 @@ impl Handler {
     }
 
     /// Fast synchronous GET for UDP/Redis - returns value if found.
-    /// Priority: write buffer -> disk
+    /// Priority: write buffer -> wblock cache -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Fast path 1: Check index
@@ -175,22 +188,50 @@ impl Handler {
             return Some(value);
         }
 
-        // Slow path: Read from disk (blocking)
-        let file = self.file_manager.get_file(entry.location.file_id)?;
-        let file_guard = file.lock();
-        let wblock_data = file_guard.read_wblock(entry.location.wblock_id as u32).ok()?;
-
+        let file_id = entry.location.file_id;
+        let wblock_id = entry.location.wblock_id as u32;
         let offset = entry.location.offset as usize;
+
+        // Fast path 3: wblock cache. Avoid a 1 MB pread on repeat reads of
+        // any key in the same wblock.
+        if let Some(cache) = &self.wblock_cache {
+            if let Some(buf) = cache.get(file_id, wblock_id) {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                if offset >= buf.len() {
+                    return None;
+                }
+                let record = Record::from_bytes(&buf.as_ref()[offset..]).ok()?;
+                if record.header.is_deleted() || record.header.is_expired() {
+                    return None;
+                }
+                return Some(record.value);
+            }
+        }
+
+        // Slow path: Read from disk (blocking pread)
+        let file = self.file_manager.get_file(file_id)?;
+        let file_guard = file.lock();
+        let wblock_data = file_guard.read_wblock(wblock_id).ok()?;
+        drop(file_guard);
+
         if offset >= wblock_data.len() {
             return None;
         }
 
         let record = Record::from_bytes(&wblock_data[offset..]).ok()?;
-        if record.header.is_deleted() || record.header.is_expired() {
-            return None;
+        let result = if record.header.is_deleted() || record.header.is_expired() {
+            None
+        } else {
+            Some(record.value)
+        };
+
+        // Populate cache for future hits. We wrap the freshly-read buffer
+        // in an Arc; subsequent readers share it without re-reading disk.
+        if let Some(cache) = &self.wblock_cache {
+            cache.insert(file_id, wblock_id, Arc::new(wblock_data));
         }
 
-        Some(record.value)
+        result
     }
 
     /// Returns the full record metadata for a key (value, timestamp, ttl).
@@ -203,26 +244,54 @@ impl Handler {
             return Some(meta);
         }
 
-        // Disk read
-        let file = self.file_manager.get_file(entry.location.file_id)?;
-        let file_guard = file.lock();
-        let wblock_data = file_guard.read_wblock(entry.location.wblock_id as u32).ok()?;
-
+        let file_id = entry.location.file_id;
+        let wblock_id = entry.location.wblock_id as u32;
         let offset = entry.location.offset as usize;
+
+        if let Some(cache) = &self.wblock_cache {
+            if let Some(buf) = cache.get(file_id, wblock_id) {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                if offset >= buf.len() {
+                    return None;
+                }
+                let record = Record::from_bytes(&buf.as_ref()[offset..]).ok()?;
+                if record.header.is_deleted() || record.header.is_expired() {
+                    return None;
+                }
+                return Some(RecordMeta {
+                    value: record.value,
+                    timestamp_micros: record.header.timestamp,
+                    ttl_secs: record.header.ttl,
+                });
+            }
+        }
+
+        // Disk read
+        let file = self.file_manager.get_file(file_id)?;
+        let file_guard = file.lock();
+        let wblock_data = file_guard.read_wblock(wblock_id).ok()?;
+        drop(file_guard);
+
         if offset >= wblock_data.len() {
             return None;
         }
 
         let record = Record::from_bytes(&wblock_data[offset..]).ok()?;
-        if record.header.is_deleted() || record.header.is_expired() {
-            return None;
+        let meta = if record.header.is_deleted() || record.header.is_expired() {
+            None
+        } else {
+            Some(RecordMeta {
+                value: record.value,
+                timestamp_micros: record.header.timestamp,
+                ttl_secs: record.header.ttl,
+            })
+        };
+
+        if let Some(cache) = &self.wblock_cache {
+            cache.insert(file_id, wblock_id, Arc::new(wblock_data));
         }
 
-        Some(RecordMeta {
-            value: record.value,
-            timestamp_micros: record.header.timestamp,
-            ttl_secs: record.header.ttl,
-        })
+        meta
     }
 
     /// Updates the TTL for an existing key. Returns false if key doesn't exist.

@@ -127,6 +127,15 @@ pub struct Config {
     /// Comma-separated list of DB indices that are memory-only (e.g. "1,2,5")
     #[arg(long)]
     pub memory_dbs: Option<String>,
+
+    // --- Read cache ---
+
+    /// Size (MiB) of the wblock read cache. Shared across all SSD-backed DBs.
+    /// Every cached entry is one 1 MiB WBlock; 0 disables the cache (default).
+    /// Enable only if the working set fits (or partially fits) in the chosen
+    /// RAM budget; without it every GET = a 1 MiB SSD read.
+    #[arg(long, default_value = "0")]
+    pub wblock_cache_mb: usize,
 }
 
 impl Config {
@@ -263,6 +272,7 @@ impl Default for Config {
             replica_read: false,
             num_dbs: 16,
             memory_dbs: None,
+            wblock_cache_mb: 0,
         }
     }
 }

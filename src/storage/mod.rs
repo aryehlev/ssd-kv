@@ -15,9 +15,11 @@ pub mod compaction;
 pub mod eviction;
 pub mod memory_store;
 pub mod wal;
+pub mod wblock_cache;
 
 pub use direct_io::DirectFile;
 pub use record::{Record, RecordHeader, RecordFlags, RECORD_MAGIC, HEADER_SIZE, RECORD_ALIGNMENT};
 pub use write_buffer::{WriteBuffer, WBlock, WBLOCK_SIZE};
 pub use file_manager::{FileManager, DataFile, ParallelFileManager, FILE_SIZE, FILE_HEADER_SIZE, WBLOCKS_PER_FILE};
 pub use wal::{WriteAheadLog, WalConfig, WalEntry, WalEntryHeader, WalStats};
+pub use wblock_cache::{WblockCache, WblockCacheStats};

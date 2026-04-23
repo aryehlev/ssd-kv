@@ -275,6 +275,33 @@ struct ClosedFile {
 /// flushes + calls `sync_data()` on the underlying file and publishes the
 /// advanced durable position. Many writes amortize one fsync — the Aerospike
 /// streaming-write-buffer shape.
+/// A WAL file tracked as two handles to the same inode.
+///
+/// Writers take `buf_writer`'s Mutex for the brief memcpy into
+/// BufWriter. The commit thread uses `sync_file` (a dup'd fd) to call
+/// `sync_data()` WITHOUT holding the Mutex — so fsync and new appends
+/// can proceed concurrently. The kernel serializes at the inode level
+/// but doesn't block writes during fsync.
+///
+/// Before this split, fsync was held under the BufWriter mutex, so a
+/// ~500µs fsync on virtio-blk blocked every appending writer for that
+/// entire duration. The fsync time is unchanged, but the writer path
+/// is now freely concurrent with it.
+pub(crate) struct WalFile {
+    pub buf_writer: Mutex<BufWriter<File>>,
+    pub sync_file: File,
+}
+
+impl WalFile {
+    fn new(file: File, buffer_size: usize) -> io::Result<Self> {
+        let sync_file = file.try_clone()?;
+        Ok(Self {
+            buf_writer: Mutex::new(BufWriter::with_capacity(buffer_size.max(4096), file)),
+            sync_file,
+        })
+    }
+}
+
 pub struct WriteAheadLog {
     config: WalConfig,
     /// Current WAL file. `ArcSwap` lets rotate() atomically replace it
@@ -282,10 +309,10 @@ pub struct WriteAheadLog {
     /// take the inner Mutex for the memcpy, and move on. The old writer
     /// goes onto `pending_close` for the commit thread to drain + sync
     /// off the hot path.
-    writer: Arc<arc_swap::ArcSwap<Mutex<BufWriter<File>>>>,
+    writer: Arc<arc_swap::ArcSwap<WalFile>>,
     /// Old writers retired by rotate() that still need their final
     /// flush + sync_data + close. Drained by the commit thread.
-    pending_close: Arc<Mutex<Vec<Arc<Mutex<BufWriter<File>>>>>>,
+    pending_close: Arc<Mutex<Vec<Arc<WalFile>>>>,
     /// Held during rotate() so two writers don't race to rotate.
     rotate_lock: Mutex<()>,
     /// Current file sequence number
@@ -324,9 +351,8 @@ impl WriteAheadLog {
 
         let position = file.metadata()?.len();
 
-        let writer = Arc::new(arc_swap::ArcSwap::from(Arc::new(Mutex::new(
-            BufWriter::with_capacity(config.buffer_size.max(4096), file),
-        ))));
+        let wal_file = WalFile::new(file, config.buffer_size)?;
+        let writer = Arc::new(arc_swap::ArcSwap::from(Arc::new(wal_file)));
 
         // Any WAL files on disk older than this are from a prior run; we
         // can't reason about their max_gen without scanning, so mark them
@@ -483,36 +509,44 @@ impl WriteAheadLog {
     /// Called by the commit thread off the hot path so writers never
     /// pay the rotation fsync cost.
     fn drain_pending_close(
-        pending_close: &Arc<Mutex<Vec<Arc<Mutex<BufWriter<File>>>>>>,
+        pending_close: &Arc<Mutex<Vec<Arc<WalFile>>>>,
     ) {
         let olds: Vec<_> = {
             let mut g = pending_close.lock();
             std::mem::take(&mut *g)
         };
         for old in olds {
-            // Scope the inner Mutex lock so we can release it before
-            // touching `pending_close` on the error path — holding both
-            // at once would invert lock order vs the push site in
-            // `rotate()` and could deadlock.
-            let ok = {
-                let mut w = old.lock();
+            // Flush the BufWriter under its Mutex first, then release
+            // the Mutex and fsync through the separate sync_file handle
+            // — same concurrency shape as commit_once. This also keeps
+            // the inner lock out of scope before we touch
+            // `pending_close` on the error path (lock order vs
+            // rotate()'s push site would otherwise invert).
+            let flush_ok = {
+                let mut w = old.buf_writer.lock();
                 match w.flush() {
                     Err(e) => {
                         tracing::error!("wal: retired BufWriter flush failed: {}", e);
                         false
                     }
-                    Ok(()) => match w.get_ref().sync_data() {
-                        Err(e) => {
-                            tracing::error!("wal: retired sync_data failed: {}", e);
-                            false
-                        }
-                        Ok(()) => true,
-                    },
+                    Ok(()) => true,
                 }
             };
 
-            if ok {
-                // Dropping `old` when the last Arc goes closes the File.
+            let sync_ok = if flush_ok {
+                match old.sync_file.sync_data() {
+                    Err(e) => {
+                        tracing::error!("wal: retired sync_data failed: {}", e);
+                        false
+                    }
+                    Ok(()) => true,
+                }
+            } else {
+                false
+            };
+
+            if flush_ok && sync_ok {
+                // Dropping `old` when the last Arc goes closes both Files.
                 continue;
             }
 
@@ -528,9 +562,15 @@ impl WriteAheadLog {
     }
 
     /// Flush BufWriter → `sync_data()` → publish the new durable position.
-    /// Takes the writer mutex only for as long as flush + fsync need it.
+    ///
+    /// Only the flush is done under the BufWriter's Mutex; the fsync is
+    /// done on a separate `sync_file` handle (same inode, dup'd fd) so
+    /// writers can keep appending while fsync is in flight. On virtio
+    /// that's a ~500µs window in which the writer path used to be
+    /// blocked; on NVMe the window is smaller but the same principle
+    /// holds.
     fn commit_once(
-        writer: &Arc<arc_swap::ArcSwap<Mutex<BufWriter<File>>>>,
+        writer: &Arc<arc_swap::ArcSwap<WalFile>>,
         gc: &Arc<GroupCommit>,
         stats: &Arc<WalStats>,
     ) {
@@ -538,19 +578,29 @@ impl WriteAheadLog {
         if target == gc.durable_pos.load(Ordering::Acquire) {
             return; // nothing new, skip the syscall
         }
-        let current = writer.load_full();
-        let mut w = current.lock();
-        if let Err(e) = w.flush() {
-            tracing::error!("wal: BufWriter flush failed: {}", e);
-            return;
+        let slot = writer.load_full();
+
+        // Stage 1: flush BufWriter's buffer to the File. Needs the
+        // Mutex, but finishes in a few µs — it's just a memcpy to the
+        // kernel's page cache.
+        {
+            let mut w = slot.buf_writer.lock();
+            if let Err(e) = w.flush() {
+                tracing::error!("wal: BufWriter flush failed: {}", e);
+                return;
+            }
         }
-        // sync_data: persist contents without forcing a metadata flush
-        // (metadata doesn't change on append). Aerospike shape.
-        if let Err(e) = w.get_ref().sync_data() {
+
+        // Stage 2: sync_data on the dup'd handle, outside the Mutex.
+        // Writers may append more bytes concurrently — those bytes sit
+        // in BufWriter's buffer or hit the File via BufWriter's
+        // internal flush. Either way, `target` is the offset we promised
+        // to cover and everything up to it is now in kernel's write-back
+        // path, so this fsync makes it durable.
+        if let Err(e) = slot.sync_file.sync_data() {
             tracing::error!("wal: sync_data failed: {}", e);
             return;
         }
-        drop(w);
         stats.syncs.fetch_add(1, Ordering::Relaxed);
         gc.publish(target);
     }
@@ -693,8 +743,8 @@ impl WriteAheadLog {
             // seq order, so those bytes are found exactly once. The old
             // file gets its final sync from the commit thread via
             // drain_pending_close.
-            let writer_arc = self.writer.load_full();
-            let mut writer = writer_arc.lock();
+            let slot = self.writer.load_full();
+            let mut writer = slot.buf_writer.lock();
 
             writer.write_all(&header.to_bytes())?;
             writer.write_all(key)?;
@@ -762,10 +812,7 @@ impl WriteAheadLog {
             .create(true)
             .append(true)
             .open(&new_path)?;
-        let new_writer = Arc::new(Mutex::new(BufWriter::with_capacity(
-            self.config.buffer_size.max(4096),
-            new_file,
-        )));
+        let new_writer = Arc::new(WalFile::new(new_file, self.config.buffer_size)?);
 
         // Freeze the old file's max_gen BEFORE swap so cleanup_up_to_gen
         // doesn't race. Reset current_max_gen for the new file.
@@ -801,11 +848,12 @@ impl WriteAheadLog {
         // abandoned on shutdown.
         Self::drain_pending_close(&self.pending_close);
 
-        let current = self.writer.load_full();
-        let mut writer = current.lock();
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
-        drop(writer);
+        let slot = self.writer.load_full();
+        {
+            let mut writer = slot.buf_writer.lock();
+            writer.flush()?;
+        }
+        slot.sync_file.sync_data()?;
         let target = self.gc.written_pos.load(Ordering::Acquire);
         self.gc.publish(target);
         self.stats.syncs.fetch_add(1, Ordering::Relaxed);

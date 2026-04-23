@@ -101,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut db_handlers = Vec::with_capacity(config.num_dbs as usize);
     let mut compaction_stops: Vec<Arc<AtomicBool>> = Vec::new();
     let mut eviction_stops: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut wals: Vec<Arc<WriteAheadLog>> = Vec::new();
 
     for db_id in 0..config.num_dbs {
         if config.is_memory_db(db_id) {
@@ -178,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // From here on, every put_sync/delete_sync is durable.
             handler_inner.set_wal(Arc::clone(&wal));
+            wals.push(Arc::clone(&wal));
 
             let handler = Arc::new(handler_inner);
 
@@ -402,9 +404,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Final flush
+    // Final flush: push pending WBlocks to data files and fsync them.
     info!("Flushing pending writes...");
     db_manager.flush_all().await?;
+
+    // After a successful flush every record up to this point is durable in
+    // the data files. WAL entries that duplicate those records are
+    // redundant, so trim old WAL files down to the last 2 (current + one
+    // back) so the log doesn't accumulate unboundedly across restarts.
+    for wal in &wals {
+        if let Err(e) = wal.cleanup(2) {
+            error!("WAL cleanup failed: {}", e);
+        }
+    }
 
     info!("SSD-KV shutdown complete");
     Ok(())

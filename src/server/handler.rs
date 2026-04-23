@@ -10,9 +10,13 @@ use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
 use crate::perf::prefetch::{BloomFilter, LockFreeBloomFilter};
 use crate::perf::simd::{batch_bloom_check, batch_hash_keys_4, group_by_shard};
+use crate::io::async_reader::AsyncReader;
+use crate::io::aligned_buf::AlignedBuffer;
 use crate::storage::eviction::EvictionPolicy;
-use crate::storage::file_manager::{FileManager, ParallelFileManager};
+use crate::storage::file_manager::{FileManager, ParallelFileManager, FILE_HEADER_SIZE};
 use crate::storage::record::Record;
+use crate::storage::wal::WriteAheadLog;
+use crate::storage::wblock_cache::WblockCache;
 use crate::storage::write_buffer::{WriteBuffer, WBLOCK_SIZE};
 
 /// Metadata about a stored record, returned by get_with_meta.
@@ -54,6 +58,16 @@ pub struct Handler {
     index: Arc<Index>,
     file_manager: Arc<FileManager>,
     write_buffer: Arc<WriteBuffer>,
+    wblock_cache: Option<Arc<WblockCache>>,
+    /// Optional io_uring reader for cache-miss reads. When set, GETs that
+    /// fall through to disk go through io_uring (SQPOLL amortizes the
+    /// submission syscall) instead of a blocking pread.
+    async_reader: Option<Arc<AsyncReader>>,
+    /// Optional write-ahead log. When set, put_sync/delete_sync return only
+    /// after the record is durably in the WAL (via group commit). When not
+    /// set, writes live in RAM until a WBlock fills — used by tests that
+    /// don't care about durability.
+    wal: Option<Arc<WriteAheadLog>>,
     bloom_filter: parking_lot::RwLock<BloomFilter>,
     next_generation: AtomicU32,
     stats: Arc<HandlerStats>,
@@ -73,6 +87,9 @@ impl Handler {
             index,
             file_manager,
             write_buffer,
+            wblock_cache: None,
+            async_reader: None,
+            wal: None,
             bloom_filter: parking_lot::RwLock::new(BloomFilter::new(1_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
             stats: Arc::new(HandlerStats::default()),
@@ -80,6 +97,31 @@ impl Handler {
             max_entries: 0,
             max_data_bytes: 0,
         }
+    }
+
+    /// Installs an io_uring async reader for cache-miss reads.
+    pub fn set_async_reader(&mut self, reader: Arc<AsyncReader>) {
+        self.async_reader = Some(reader);
+    }
+
+    /// Installs a shared wblock cache (shared across databases so total
+    /// memory is bounded by `--wblock-cache-mb`).
+    pub fn set_wblock_cache(&mut self, cache: Arc<WblockCache>) {
+        self.wblock_cache = Some(cache);
+    }
+
+    pub fn wblock_cache(&self) -> Option<&Arc<WblockCache>> {
+        self.wblock_cache.as_ref()
+    }
+
+    /// Installs a write-ahead log. When set, every put/delete returns only
+    /// after the record is durably in the WAL.
+    pub fn set_wal(&mut self, wal: Arc<WriteAheadLog>) {
+        self.wal = Some(wal);
+    }
+
+    pub fn wal(&self) -> Option<&Arc<WriteAheadLog>> {
+        self.wal.as_ref()
     }
 
     /// Sets the eviction policy and capacity limits.
@@ -130,6 +172,13 @@ impl Handler {
         let key_hash = hash_key(key);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
+        // Durability first: if a WAL is installed, append + wait for group
+        // commit before we acknowledge. On crash after this point, recovery
+        // will replay the entry.
+        if let Some(wal) = &self.wal {
+            wal.append_put(key, value, generation, ttl)?;
+        }
+
         // Create record
         let mut record = Record::new(key.to_vec(), value.to_vec(), generation, ttl)?;
 
@@ -146,9 +195,61 @@ impl Handler {
         Ok(())
     }
 
+    /// Write path used by recovery / WAL replay. Uses an explicit generation
+    /// from the WAL entry, skips the WAL append, and skips capacity checks
+    /// (crash recovery shouldn't be blocked by eviction).
+    pub(crate) fn put_from_wal(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        generation: u32,
+        ttl: u32,
+    ) -> io::Result<()> {
+        let key_hash = hash_key(key);
+        let mut record = Record::new(key.to_vec(), value.to_vec(), generation, ttl)?;
+        let location = self.write_buffer.append(&mut record)?;
+        self.index
+            .insert(key, location, generation, record.header.value_len);
+        self.bloom_filter.write().add(key_hash);
+        Ok(())
+    }
+
+    /// Delete path used by recovery / WAL replay.
+    pub(crate) fn delete_from_wal(&self, key: &[u8], generation: u32) -> io::Result<()> {
+        let mut record = Record::tombstone(key.to_vec(), generation)?;
+        self.write_buffer.append(&mut record)?;
+        self.index.delete(key, generation);
+        Ok(())
+    }
+
+    /// Advance the generation counter past a value observed during recovery
+    /// so subsequent writes don't conflict with replayed records.
+    pub(crate) fn bump_generation_past(&self, seen: u32) {
+        let next = seen.saturating_add(1);
+        // Load-max-store loop; only increases.
+        loop {
+            let cur = self.next_generation.load(Ordering::Acquire);
+            if next <= cur {
+                return;
+            }
+            if self
+                .next_generation
+                .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     /// Synchronous DELETE for Redis compatibility
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+
+        // Durability first — see put_sync for rationale.
+        if let Some(wal) = &self.wal {
+            wal.append_delete(key, generation)?;
+        }
 
         // Create tombstone record
         let mut record = Record::tombstone(key.to_vec(), generation)?;
@@ -164,7 +265,7 @@ impl Handler {
     }
 
     /// Fast synchronous GET for UDP/Redis - returns value if found.
-    /// Priority: write buffer -> disk
+    /// Priority: write buffer -> wblock cache -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Fast path 1: Check index
@@ -175,22 +276,78 @@ impl Handler {
             return Some(value);
         }
 
-        // Slow path: Read from disk (blocking)
-        let file = self.file_manager.get_file(entry.location.file_id)?;
-        let file_guard = file.lock();
-        let wblock_data = file_guard.read_wblock(entry.location.wblock_id as u32).ok()?;
-
+        let file_id = entry.location.file_id;
+        let wblock_id = entry.location.wblock_id as u32;
         let offset = entry.location.offset as usize;
+
+        // Fast path 3: wblock cache. Avoid a 1 MB pread on repeat reads of
+        // any key in the same wblock.
+        if let Some(cache) = &self.wblock_cache {
+            if let Some(buf) = cache.get(file_id, wblock_id) {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                if offset >= buf.len() {
+                    return None;
+                }
+                let record = Record::from_bytes(&buf.as_ref()[offset..]).ok()?;
+                if record.header.is_deleted() || record.header.is_expired() {
+                    return None;
+                }
+                return Some(record.value);
+            }
+        }
+
+        // Slow path: read the wblock off disk (io_uring if wired,
+        // blocking pread otherwise).
+        let wblock_data = self.read_wblock_for_get(file_id, wblock_id).ok()?;
+
         if offset >= wblock_data.len() {
             return None;
         }
 
         let record = Record::from_bytes(&wblock_data[offset..]).ok()?;
-        if record.header.is_deleted() || record.header.is_expired() {
-            return None;
+        let result = if record.header.is_deleted() || record.header.is_expired() {
+            None
+        } else {
+            Some(record.value)
+        };
+
+        // Populate cache for future hits. We wrap the freshly-read buffer
+        // in an Arc; subsequent readers share it without re-reading disk.
+        if let Some(cache) = &self.wblock_cache {
+            cache.insert(file_id, wblock_id, Arc::new(wblock_data));
         }
 
-        Some(record.value)
+        result
+    }
+
+    /// Read a wblock for the GET hot path. Prefers io_uring when an
+    /// AsyncReader is installed, falls back to the blocking pread path
+    /// otherwise. Used only for request-path reads — compaction / scans
+    /// deliberately go through FileManager directly so they don't pollute
+    /// this code path.
+    fn read_wblock_for_get(
+        &self,
+        file_id: u32,
+        wblock_id: u32,
+    ) -> io::Result<AlignedBuffer> {
+        if let Some(reader) = &self.async_reader {
+            let file = self.file_manager.get_file(file_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "file not found")
+            })?;
+            let file_guard = file.lock();
+            let fd = file_guard.raw_fd();
+            drop(file_guard); // release before we block waiting for io_uring
+
+            let offset = FILE_HEADER_SIZE as u64 + (wblock_id as u64 * WBLOCK_SIZE as u64);
+            return reader.pread_blocking(fd, offset, WBLOCK_SIZE);
+        }
+
+        let file = self
+            .file_manager
+            .get_file(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+        let file_guard = file.lock();
+        file_guard.read_wblock(wblock_id)
     }
 
     /// Returns the full record metadata for a key (value, timestamp, ttl).
@@ -203,26 +360,51 @@ impl Handler {
             return Some(meta);
         }
 
-        // Disk read
-        let file = self.file_manager.get_file(entry.location.file_id)?;
-        let file_guard = file.lock();
-        let wblock_data = file_guard.read_wblock(entry.location.wblock_id as u32).ok()?;
-
+        let file_id = entry.location.file_id;
+        let wblock_id = entry.location.wblock_id as u32;
         let offset = entry.location.offset as usize;
+
+        if let Some(cache) = &self.wblock_cache {
+            if let Some(buf) = cache.get(file_id, wblock_id) {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                if offset >= buf.len() {
+                    return None;
+                }
+                let record = Record::from_bytes(&buf.as_ref()[offset..]).ok()?;
+                if record.header.is_deleted() || record.header.is_expired() {
+                    return None;
+                }
+                return Some(RecordMeta {
+                    value: record.value,
+                    timestamp_micros: record.header.timestamp,
+                    ttl_secs: record.header.ttl,
+                });
+            }
+        }
+
+        // Disk read (io_uring if wired, else pread)
+        let wblock_data = self.read_wblock_for_get(file_id, wblock_id).ok()?;
+
         if offset >= wblock_data.len() {
             return None;
         }
 
         let record = Record::from_bytes(&wblock_data[offset..]).ok()?;
-        if record.header.is_deleted() || record.header.is_expired() {
-            return None;
+        let meta = if record.header.is_deleted() || record.header.is_expired() {
+            None
+        } else {
+            Some(RecordMeta {
+                value: record.value,
+                timestamp_micros: record.header.timestamp,
+                ttl_secs: record.header.ttl,
+            })
+        };
+
+        if let Some(cache) = &self.wblock_cache {
+            cache.insert(file_id, wblock_id, Arc::new(wblock_data));
         }
 
-        Some(RecordMeta {
-            value: record.value,
-            timestamp_micros: record.header.timestamp,
-            ttl_secs: record.header.ttl,
-        })
+        meta
     }
 
     /// Updates the TTL for an existing key. Returns false if key doesn't exist.

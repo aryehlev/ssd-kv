@@ -13,6 +13,6 @@ pub mod shard_per_core;
 
 pub use index::{Index, IndexStats, NUM_SHARDS};
 pub use index_entry::{hash_key, IndexEntry, KeyStorage, MAX_INLINE_KEY_SIZE};
-pub use recovery::{recover_index, RecoveryStats};
+pub use recovery::{recover_index, recover_with_wal, RecoveryStats};
 pub use lockfree_index::{LockFreeIndex, Bucket, compare_keys_simd};
 pub use shard_per_core::{ShardPerCoreEngine, Shard, ShardMessage, ShardStats, SwmrCell};

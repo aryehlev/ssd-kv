@@ -2796,15 +2796,43 @@ pub struct RedisServer {
     replica_read: bool,
     pubsub: Arc<PubSubManager>,
     tuning: ServerTuning,
+    live_conns: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// RAII guard: increments on construction (after the cap check), decrements on drop.
+struct ConnectionGuard {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl RedisServer {
     pub fn new(addr: SocketAddr, db_manager: Arc<DatabaseManager>, tuning: ServerTuning) -> Self {
-        Self { addr, db_manager, router: None, replica_read: false, pubsub: Arc::new(PubSubManager::new()), tuning }
+        Self {
+            addr,
+            db_manager,
+            router: None,
+            replica_read: false,
+            pubsub: Arc::new(PubSubManager::new()),
+            tuning,
+            live_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     pub fn with_router(addr: SocketAddr, db_manager: Arc<DatabaseManager>, router: Arc<ClusterRouter>, replica_read: bool, tuning: ServerTuning) -> Self {
-        Self { addr, db_manager, router: Some(router), replica_read, pubsub: Arc::new(PubSubManager::new()), tuning }
+        Self {
+            addr,
+            db_manager,
+            router: Some(router),
+            replica_read,
+            pubsub: Arc::new(PubSubManager::new()),
+            tuning,
+            live_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     pub fn run(&self) -> io::Result<()> {
@@ -2816,13 +2844,43 @@ impl RedisServer {
 
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    // Enforce --max-connections. Load then CAS so we never exceed the cap
+                    // even under concurrent accepts (future reactor); Relaxed is fine —
+                    // the exact count at the boundary is allowed to be approximate.
+                    use std::sync::atomic::Ordering;
+                    let max = self.tuning.max_connections;
+                    let mut cur = self.live_conns.load(Ordering::Relaxed);
+                    let accepted = loop {
+                        if cur >= max {
+                            break false;
+                        }
+                        match self.live_conns.compare_exchange_weak(
+                            cur,
+                            cur + 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break true,
+                            Err(actual) => cur = actual,
+                        }
+                    };
+                    if !accepted {
+                        debug!("Rejecting connection; at --max-connections cap {}", max);
+                        let _ = stream.write_all(b"-ERR max number of clients reached\r\n");
+                        // Dropping the stream closes it.
+                        continue;
+                    }
+
+                    let guard = ConnectionGuard { live: Arc::clone(&self.live_conns) };
                     let db_manager = Arc::clone(&self.db_manager);
                     let router = self.router.clone();
                     let replica_read = self.replica_read;
                     let pubsub = Arc::clone(&self.pubsub);
                     let tuning = self.tuning;
                     std::thread::spawn(move || {
+                        // guard is moved in and decrements on drop when the handler returns.
+                        let _guard = guard;
                         if let Err(e) = handle_redis_client_fast(stream, db_manager, router, replica_read, pubsub, tuning) {
                             debug!("Redis client error: {}", e);
                         }

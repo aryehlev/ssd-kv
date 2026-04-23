@@ -102,24 +102,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared io_uring reader for cache-miss reads. One pool shared across
     // all SSD-backed DBs keeps the total number of kernel polling threads
     // bounded. Best-effort: if io_uring isn't available the GETs fall back
-    // to the blocking pread path.
-    let async_reader: Option<Arc<AsyncReader>> = match AsyncReader::new(
-        config.io_workers.max(1),
-        256,
-    ) {
-        Ok(r) => {
-            info!(
-                "io_uring async reader enabled: {} worker(s)",
-                r.num_workers()
-            );
-            Some(r)
-        }
-        Err(e) => {
-            info!(
-                "io_uring unavailable ({}); falling back to blocking pread",
-                e
-            );
-            None
+    // to the blocking pread path. Set --io-workers 0 to force the pread
+    // path (useful for benchmarking and for environments where io_uring
+    // submissions silently fail).
+    let async_reader: Option<Arc<AsyncReader>> = if config.io_workers == 0 {
+        info!("io_uring disabled (--io-workers 0); using blocking pread");
+        None
+    } else {
+        match AsyncReader::new(config.io_workers, 256) {
+            Ok(r) => {
+                info!(
+                    "io_uring async reader enabled: {} worker(s)",
+                    r.num_workers()
+                );
+                Some(r)
+            }
+            Err(e) => {
+                info!(
+                    "io_uring unavailable ({}); falling back to blocking pread",
+                    e
+                );
+                None
+            }
         }
     };
 

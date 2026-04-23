@@ -173,11 +173,12 @@ struct GroupCommit {
     /// check this Relaxed before taking `wake_lock` — if the commit
     /// thread isn't sleeping, we skip the mutex entirely (fast path).
     commit_sleeping: AtomicBool,
-    /// Optional eventfd written by the commit thread when durable_pos
-    /// advances. The reactor's io_uring watches this fd so it wakes
-    /// immediately on durable advance instead of waiting out its own
-    /// 200µs timeout.
-    wake_eventfd: AtomicI32,
+    /// Optional eventfds written by the commit thread when durable_pos
+    /// advances. Each reactor registers its own fd here so its io_uring
+    /// loop wakes immediately on durable advance instead of waiting out
+    /// its own 200µs timeout. Supports up to 8 reactors (which is more
+    /// than any realistic deployment). A slot of -1 means "unused".
+    wake_eventfds: [AtomicI32; 8],
 }
 
 impl GroupCommit {
@@ -191,7 +192,16 @@ impl GroupCommit {
             wake_lock: Mutex::new(()),
             wake_cond: Condvar::new(),
             commit_sleeping: AtomicBool::new(false),
-            wake_eventfd: AtomicI32::new(-1),
+            wake_eventfds: [
+                AtomicI32::new(-1),
+                AtomicI32::new(-1),
+                AtomicI32::new(-1),
+                AtomicI32::new(-1),
+                AtomicI32::new(-1),
+                AtomicI32::new(-1),
+                AtomicI32::new(-1),
+                AtomicI32::new(-1),
+            ],
         }
     }
 
@@ -227,13 +237,15 @@ impl GroupCommit {
         let _g = self.cond_lock.lock();
         self.cond.notify_all();
 
-        // Wake any reactor watching an eventfd for durable-pos advances.
-        // This short-circuits the reactor's 200µs wait_timeout — it gets
-        // the ready response out immediately.
-        let fd = self.wake_eventfd.load(Ordering::Relaxed);
-        if fd >= 0 {
-            // One 64-bit write is all eventfd needs.
-            let one: u64 = 1;
+        // Wake every reactor watching an eventfd. Each reactor has its
+        // own fd so the kernel's eventfd counter isn't consumed by one
+        // reactor at the expense of the others.
+        let one: u64 = 1;
+        for slot in &self.wake_eventfds {
+            let fd = slot.load(Ordering::Relaxed);
+            if fd < 0 {
+                continue;
+            }
             unsafe {
                 let _ = libc::write(
                     fd,
@@ -563,11 +575,33 @@ impl WriteAheadLog {
     }
 
     /// Register an eventfd that should be signalled every time
-    /// durable_pos advances. The reactor sets this on startup so its
-    /// io_uring loop wakes immediately instead of polling. Pass -1 to
-    /// clear.
-    pub fn set_wake_eventfd(&self, fd: i32) {
-        self.gc.wake_eventfd.store(fd, Ordering::Relaxed);
+    /// durable_pos advances. Each reactor registers its own fd so
+    /// its io_uring loop wakes immediately instead of timing out.
+    /// Returns `true` if a slot was available. Up to 8 reactors
+    /// may register.
+    pub fn register_wake_eventfd(&self, fd: i32) -> bool {
+        for slot in &self.gc.wake_eventfds {
+            if slot
+                .compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove a previously-registered wake eventfd. Call on reactor
+    /// shutdown before closing the fd.
+    pub fn unregister_wake_eventfd(&self, fd: i32) {
+        for slot in &self.gc.wake_eventfds {
+            if slot
+                .compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     /// Block the calling thread until `durable_position() >= target`.

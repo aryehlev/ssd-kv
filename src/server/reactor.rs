@@ -156,6 +156,32 @@ impl ReactorServer {
                     .and_then(|h| h.wal().cloned())
             })
             .collect();
+
+        // Create a wake eventfd and register it with every WAL. The WAL
+        // commit thread writes to this fd every time durable_pos
+        // advances; our io_uring has a persistent read on it so we wake
+        // immediately and can flush any now-durable responses out. The
+        // `wait_timeout` below remains as a safety net.
+        //
+        // On Linux-only — eventfd isn't available elsewhere, and the
+        // reactor is already Linux-only via io_uring anyway.
+        let wake_fd = unsafe {
+            libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)
+        };
+        if wake_fd >= 0 {
+            for w in wals.iter().flatten() {
+                w.register_wake_eventfd(wake_fd);
+            }
+            if let Err(e) = server.watch_eventfd(wake_fd) {
+                tracing::warn!("Could not arm eventfd wake: {e}; falling back to poll");
+                for w in wals.iter().flatten() {
+                    w.unregister_wake_eventfd(wake_fd);
+                }
+                unsafe {
+                    libc::close(wake_fd);
+                }
+            }
+        }
         // Smallest durable position across all DBs. It's safe to flush a
         // pending response only when every WAL this connection may have
         // written to is durable — but since a single connection is pinned

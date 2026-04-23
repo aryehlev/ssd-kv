@@ -25,6 +25,10 @@ pub enum NetOperation {
     Recv,
     Send,
     Close,
+    /// Persistent read on an eventfd used by the WAL commit thread to
+    /// wake this reactor when `durable_pos` advances. Completions for
+    /// this op are re-armed and never surface to the reactor handler.
+    EventfdWake,
 }
 
 /// Result of a network operation.
@@ -212,6 +216,40 @@ mod linux {
                 if self.ring.submission().push(&recv_op).is_err() {
                     self.pending.remove(&id);
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "Submission queue full"));
+                }
+            }
+
+            Ok(id)
+        }
+
+        /// Submit a persistent read on an eventfd. The reactor uses this
+        /// so its io_uring wakes immediately when the WAL commit thread
+        /// signals durable-pos advance. The 8-byte buffer holds the
+        /// eventfd counter and is discarded on re-arm. Re-arming is the
+        /// caller's responsibility (on completion, submit again).
+        pub fn submit_eventfd_read(&mut self, fd: RawFd) -> io::Result<u64> {
+            let id = self.next_id();
+            // eventfd always reads exactly 8 bytes (the counter).
+            let buffer = vec![0u8; 8];
+            let ptr = buffer.as_ptr() as *mut u8;
+
+            self.pending.insert(id, PendingOp {
+                operation: NetOperation::EventfdWake,
+                fd,
+                buffer: Some(buffer),
+            });
+
+            let read_op = opcode::Read::new(types::Fd(fd), ptr, 8)
+                .build()
+                .user_data(id);
+
+            unsafe {
+                if self.ring.submission().push(&read_op).is_err() {
+                    self.pending.remove(&id);
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "Submission queue full",
+                    ));
                 }
             }
 
@@ -714,6 +752,18 @@ impl UringServer {
         Ok(())
     }
 
+    /// Start watching an eventfd. The WAL commit thread writes to this
+    /// fd when durable_pos advances, and the pending read in io_uring
+    /// completes → the reactor wakes immediately.
+    ///
+    /// The reactor is responsible for creating the eventfd and for
+    /// registering it with all relevant WALs. This method just wires
+    /// the io_uring side.
+    pub fn watch_eventfd(&mut self, fd: RawFd) -> io::Result<()> {
+        self.net.submit_eventfd_read(fd)?;
+        Ok(())
+    }
+
     /// Queue a send for a connection.
     pub fn queue_send(&mut self, fd: RawFd, data: Vec<u8>) -> io::Result<()> {
         if let Some(conn) = self.connections.get_mut(&fd) {
@@ -851,6 +901,15 @@ impl UringServer {
 
                 NetOperation::Close => {
                     // Connection fully closed
+                }
+
+                NetOperation::EventfdWake => {
+                    // The wake fired: discard the 8-byte counter value
+                    // and re-arm the read so we get the next wake too.
+                    // Completion doesn't surface to the handler — the
+                    // side effect of waking the io_uring loop is the
+                    // whole point.
+                    let _ = self.net.submit_eventfd_read(result.fd);
                 }
             }
         }

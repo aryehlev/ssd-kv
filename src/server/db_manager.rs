@@ -22,6 +22,27 @@ impl DbHandler {
         }
     }
 
+    /// Non-blocking PUT. Reactor path. Returns the WAL position the caller
+    /// must wait on for durability. Memory-only DBs return `None` (no WAL,
+    /// no wait).
+    pub fn put_nowait(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<Option<u64>> {
+        match self {
+            DbHandler::Ssd(h) => h.put_nowait(key, value, ttl),
+            DbHandler::Memory(m) => {
+                m.put_sync(key, value, ttl)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Non-blocking DELETE. Returns `(was_live, Option<wal_pos>)`.
+    pub fn delete_nowait(&self, key: &[u8]) -> io::Result<(bool, Option<u64>)> {
+        match self {
+            DbHandler::Ssd(h) => h.delete_nowait(key),
+            DbHandler::Memory(m) => Ok((m.delete_sync(key)?, None)),
+        }
+    }
+
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self {
             DbHandler::Ssd(h) => h.get_value(key),

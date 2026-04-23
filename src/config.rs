@@ -127,6 +127,51 @@ pub struct Config {
     /// Comma-separated list of DB indices that are memory-only (e.g. "1,2,5")
     #[arg(long)]
     pub memory_dbs: Option<String>,
+
+    // --- Read cache ---
+
+    /// Size (MiB) of the wblock read cache. Shared across all SSD-backed DBs.
+    /// Every cached entry is one 1 MiB WBlock; 0 disables the cache (default).
+    /// Enable only if the working set fits (or partially fits) in the chosen
+    /// RAM budget; without it every GET = a 1 MiB SSD read.
+    #[arg(long, default_value = "0")]
+    pub wblock_cache_mb: usize,
+
+    // --- Durability (group-commit WAL) ---
+
+    /// Group-commit interval in microseconds. The WAL commit thread wakes at
+    /// least this often to fsync. Smaller = lower tail latency, higher
+    /// syscall rate.
+    #[arg(long, default_value = "500")]
+    pub fsync_interval_us: u64,
+
+    /// Number of writers that may stack up waiting for fsync before the
+    /// commit thread wakes early. Bounds worst-case queue depth at high QPS.
+    #[arg(long, default_value = "256")]
+    pub fsync_batch: usize,
+
+    // --- io_uring ---
+
+    /// Number of io_uring workers (one kernel polling thread each in SQPOLL
+    /// mode) that service cache-miss disk reads. Falls back to blocking
+    /// pread if io_uring is unavailable.
+    #[arg(long, default_value = "2")]
+    pub io_workers: usize,
+
+    /// Number of RESP reactor threads. Each reactor owns its own io_uring
+    /// ring; when >1 they share the listen port via SO_REUSEPORT so the
+    /// kernel load-balances connections across them. Default 1.
+    #[arg(long, default_value = "1")]
+    pub reactor_threads: usize,
+
+    // --- WAL trim ---
+
+    /// Periodic WAL-trim interval in seconds. Every tick, the server
+    /// flushes pending WBlocks to data files and deletes WAL files whose
+    /// records are now redundant. 0 disables runtime trimming; WAL still
+    /// gets trimmed at shutdown.
+    #[arg(long, default_value = "30")]
+    pub wal_trim_interval_secs: u64,
 }
 
 impl Config {
@@ -263,6 +308,12 @@ impl Default for Config {
             replica_read: false,
             num_dbs: 16,
             memory_dbs: None,
+            wblock_cache_mb: 0,
+            fsync_interval_us: 500,
+            fsync_batch: 256,
+            io_workers: 2,
+            reactor_threads: 1,
+            wal_trim_interval_secs: 30,
         }
     }
 }

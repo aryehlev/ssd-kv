@@ -19,6 +19,9 @@ libc = "0.2"
 once_cell = "1.19"
 itoa = "1.0"
 dashmap = "6"
+lru = "0.12"
+memchr = "2.7"
+arc-swap = "1.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.12", optional = true }

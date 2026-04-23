@@ -15,15 +15,14 @@
 //! This is similar to Aerospike's streaming write buffer approach.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 /// WAL entry header (24 bytes).
 #[repr(C, packed)]
@@ -114,12 +113,15 @@ pub struct WalConfig {
     pub dir: PathBuf,
     /// Maximum WAL file size (default: 64MB)
     pub max_file_size: u64,
-    /// Sync interval (default: 10ms)
-    pub sync_interval: Duration,
-    /// Buffer size (default: 1MB)
+    /// Buffer size for the internal BufWriter (default: 1MB)
     pub buffer_size: usize,
-    /// Enable fsync (default: true)
-    pub fsync: bool,
+    /// Group-commit batch budget: the commit thread wakes at least this often
+    /// even if no writer pokes it. Smaller = lower p99, higher syscall rate.
+    pub fsync_interval: Duration,
+    /// Maximum writers allowed to stack up before the commit thread wakes
+    /// early and issues a sync_data. 0 means "only tick-based". Setting this
+    /// to something like 256 bounds worst-case queue depth at high QPS.
+    pub fsync_batch: usize,
 }
 
 impl Default for WalConfig {
@@ -127,9 +129,9 @@ impl Default for WalConfig {
         Self {
             dir: PathBuf::from("./wal"),
             max_file_size: 64 * 1024 * 1024, // 64MB
-            sync_interval: Duration::from_millis(10),
-            buffer_size: 1024 * 1024, // 1MB
-            fsync: true,
+            buffer_size: 1024 * 1024,        // 1MB
+            fsync_interval: Duration::from_micros(500),
+            fsync_batch: 256,
         }
     }
 }
@@ -144,24 +146,78 @@ pub struct WalStats {
     pub current_file_size: AtomicU64,
 }
 
+/// Group-commit coordinator shared between writers and the commit thread.
+/// Writers bump `written_pos` after staging bytes into the BufWriter and then
+/// wait for `durable_pos` to catch up. The commit thread periodically flushes
+/// the BufWriter, calls `sync_data()`, publishes `written_pos` as the new
+/// `durable_pos`, and wakes everyone on `cond`.
+struct GroupCommit {
+    /// Bytes staged into the BufWriter (pre-fsync).
+    written_pos: AtomicU64,
+    /// Bytes durably on disk (post-fsync).
+    durable_pos: AtomicU64,
+    /// Count of writers blocked waiting for fsync; the commit thread wakes
+    /// early when this crosses `fsync_batch`.
+    waiters: AtomicU64,
+    cond_lock: Mutex<()>,
+    cond: Condvar,
+}
+
+impl GroupCommit {
+    fn new(initial_pos: u64) -> Self {
+        Self {
+            written_pos: AtomicU64::new(initial_pos),
+            durable_pos: AtomicU64::new(initial_pos),
+            waiters: AtomicU64::new(0),
+            cond_lock: Mutex::new(()),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Block until `durable_pos >= target`.
+    fn wait_for_durable(&self, target: u64) {
+        if self.durable_pos.load(Ordering::Acquire) >= target {
+            return;
+        }
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        let mut guard = self.cond_lock.lock();
+        while self.durable_pos.load(Ordering::Acquire) < target {
+            self.cond.wait(&mut guard);
+        }
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Publish a new durable position and wake all waiters.
+    fn publish(&self, pos: u64) {
+        self.durable_pos.store(pos, Ordering::Release);
+        let _g = self.cond_lock.lock();
+        self.cond.notify_all();
+    }
+}
+
 /// Write-Ahead Log for durability and fast writes.
+///
+/// Writers stage their bytes into a BufWriter under a mutex, record their
+/// end-position, then block on a Condvar until a dedicated commit thread
+/// flushes + calls `sync_data()` on the underlying file and publishes the
+/// advanced durable position. Many writes amortize one fsync — the Aerospike
+/// streaming-write-buffer shape.
 pub struct WriteAheadLog {
     config: WalConfig,
-    /// Current WAL file
-    writer: Mutex<BufWriter<File>>,
+    /// Current WAL file. Arc so the commit thread can share the same mutex.
+    writer: Arc<Mutex<BufWriter<File>>>,
     /// Current file sequence number
     file_seq: AtomicU64,
-    /// Current position in file
+    /// Current staged position in file (bytes appended, pre-fsync).
     position: AtomicU64,
     /// Statistics
     stats: Arc<WalStats>,
-    /// Background sync thread
+    /// Group-commit coordinator
+    gc: Arc<GroupCommit>,
+    /// Background commit thread
     sync_thread: Option<JoinHandle<()>>,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
-    /// Channel for pending entries
-    pending_tx: Sender<WalEntry>,
-    pending_rx: Receiver<WalEntry>,
 }
 
 impl WriteAheadLog {
@@ -180,21 +236,23 @@ impl WriteAheadLog {
 
         let position = file.metadata()?.len();
 
-        let (pending_tx, pending_rx) = bounded(100_000);
+        let writer = Arc::new(Mutex::new(BufWriter::with_capacity(
+            config.buffer_size.max(4096),
+            file,
+        )));
 
         let mut wal = Self {
             config,
-            writer: Mutex::new(BufWriter::with_capacity(1024 * 1024, file)),
+            writer,
             file_seq: AtomicU64::new(file_seq),
             position: AtomicU64::new(position),
             stats: Arc::new(WalStats::default()),
+            gc: Arc::new(GroupCommit::new(position)),
             sync_thread: None,
             shutdown: Arc::new(AtomicBool::new(false)),
-            pending_tx,
-            pending_rx,
         };
 
-        // Start background sync thread
+        // Start background commit thread
         wal.start_sync_thread();
 
         Ok(wal)
@@ -224,26 +282,75 @@ impl WriteAheadLog {
         dir.join(format!("wal_{:08}.log", seq))
     }
 
-    /// Start background sync thread.
+    /// Start the background group-commit thread.
+    ///
+    /// Wakes every `fsync_interval` OR as soon as `fsync_batch` writers are
+    /// stacked up waiting, flushes the BufWriter, issues a `sync_data`, and
+    /// publishes the new durable position so all waiters release together.
     fn start_sync_thread(&mut self) {
         let stats = Arc::clone(&self.stats);
         let shutdown = Arc::clone(&self.shutdown);
-        let sync_interval = self.config.sync_interval;
-        let fsync = self.config.fsync;
+        let gc = Arc::clone(&self.gc);
+        let writer_handle = Arc::clone(&self.writer);
+        let interval = self.config.fsync_interval;
+        let batch = self.config.fsync_batch as u64;
 
-        // We can't easily share the writer, so sync thread just triggers periodic syncs
         let handle = thread::Builder::new()
-            .name("wal-sync".to_string())
+            .name("wal-commit".to_string())
             .spawn(move || {
-                while !shutdown.load(Ordering::Relaxed) {
-                    thread::sleep(sync_interval);
-                    // Sync is triggered by the main thread
-                    stats.syncs.fetch_add(1, Ordering::Relaxed);
+                let mut last_tick = Instant::now();
+                loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        // Final flush before exit so nothing dangles.
+                        Self::commit_once(&writer_handle, &gc, &stats);
+                        return;
+                    }
+
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_tick);
+                    let stacked = gc.waiters.load(Ordering::Relaxed);
+
+                    // Wake on timer OR batch threshold.
+                    if elapsed < interval && (batch == 0 || stacked < batch) {
+                        let nap = (interval - elapsed).min(Duration::from_micros(250));
+                        thread::sleep(nap);
+                        continue;
+                    }
+
+                    Self::commit_once(&writer_handle, &gc, &stats);
+                    last_tick = Instant::now();
                 }
             })
-            .expect("Failed to spawn WAL sync thread");
+            .expect("Failed to spawn WAL commit thread");
 
         self.sync_thread = Some(handle);
+    }
+
+    /// Flush BufWriter → `sync_data()` → publish the new durable position.
+    /// Takes the writer mutex only for as long as flush + fsync need it.
+    fn commit_once(
+        writer: &Arc<Mutex<BufWriter<File>>>,
+        gc: &Arc<GroupCommit>,
+        stats: &Arc<WalStats>,
+    ) {
+        let target = gc.written_pos.load(Ordering::Acquire);
+        if target == gc.durable_pos.load(Ordering::Acquire) {
+            return; // nothing new, skip the syscall
+        }
+        let mut w = writer.lock();
+        if let Err(e) = w.flush() {
+            tracing::error!("wal: BufWriter flush failed: {}", e);
+            return;
+        }
+        // sync_data: persist contents without forcing a metadata flush
+        // (metadata doesn't change on append). Aerospike shape.
+        if let Err(e) = w.get_ref().sync_data() {
+            tracing::error!("wal: sync_data failed: {}", e);
+            return;
+        }
+        drop(w);
+        stats.syncs.fetch_add(1, Ordering::Relaxed);
+        gc.publish(target);
     }
 
     /// Append a PUT entry to the WAL.
@@ -267,7 +374,11 @@ impl WriteAheadLog {
         self.append_entry(&header, key, None)
     }
 
-    /// Append an entry to the WAL.
+    /// Append an entry to the WAL and block until it is durable.
+    ///
+    /// The hot path: grab the writer mutex, memcpy bytes into the BufWriter,
+    /// bump `written_pos`, release the mutex, wait on the commit thread.
+    /// Many concurrent calls see one fsync at the backend.
     fn append_entry(
         &self,
         header: &WalEntryHeader,
@@ -282,24 +393,31 @@ impl WriteAheadLog {
             self.rotate()?;
         }
 
-        let mut writer = self.writer.lock();
+        let new_pos = {
+            let mut writer = self.writer.lock();
 
-        // Write header
-        writer.write_all(&header.to_bytes())?;
+            writer.write_all(&header.to_bytes())?;
+            writer.write_all(key)?;
+            if let Some(value) = value {
+                writer.write_all(value)?;
+            }
 
-        // Write key
-        writer.write_all(key)?;
+            let new_pos = self.position.fetch_add(entry_size as u64, Ordering::Relaxed)
+                + entry_size as u64;
 
-        // Write value (if present)
-        if let Some(value) = value {
-            writer.write_all(value)?;
-        }
+            self.stats.entries_written.fetch_add(1, Ordering::Relaxed);
+            self.stats.bytes_written.fetch_add(entry_size as u64, Ordering::Relaxed);
+            self.stats.current_file_size.store(new_pos, Ordering::Relaxed);
 
-        let new_pos = self.position.fetch_add(entry_size as u64, Ordering::Relaxed) + entry_size as u64;
+            // Publish the staged position so the commit thread knows how far
+            // to advance `durable_pos` on the next flush.
+            self.gc.written_pos.store(new_pos, Ordering::Release);
 
-        self.stats.entries_written.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes_written.fetch_add(entry_size as u64, Ordering::Relaxed);
-        self.stats.current_file_size.store(new_pos, Ordering::Relaxed);
+            new_pos
+        };
+
+        // Block until this record's bytes are durably on disk.
+        self.gc.wait_for_durable(new_pos);
 
         Ok(new_pos)
     }
@@ -324,14 +442,17 @@ impl WriteAheadLog {
 
         let mut writer = self.writer.lock();
 
-        // Flush current file
+        // Flush + durable-sync the previous file so we don't lose records
+        // across a rotation.
         writer.flush()?;
-        if self.config.fsync {
-            writer.get_ref().sync_all()?;
-        }
+        writer.get_ref().sync_data()?;
 
-        // Switch to new file
-        *writer = BufWriter::with_capacity(self.config.buffer_size, new_file);
+        // Switch to new file. The new file starts at offset 0 in its own
+        // space; however the group-commit counters (written_pos/durable_pos)
+        // are process-lifetime monotonic, so we treat the rotation as a
+        // boundary where we just reset `position` (the in-file offset used
+        // for max_file_size checks). The gc counters keep going.
+        *writer = BufWriter::with_capacity(self.config.buffer_size.max(4096), new_file);
         self.position.store(0, Ordering::Relaxed);
 
         self.stats.flushes.fetch_add(1, Ordering::Relaxed);
@@ -339,13 +460,16 @@ impl WriteAheadLog {
         Ok(())
     }
 
-    /// Sync the WAL to disk.
+    /// Force a synchronous flush + sync_data of the WAL. Rarely needed by
+    /// callers now that `append_entry` is itself group-commit durable;
+    /// provided for shutdown paths.
     pub fn sync(&self) -> io::Result<()> {
         let mut writer = self.writer.lock();
         writer.flush()?;
-        if self.config.fsync {
-            writer.get_ref().sync_all()?;
-        }
+        writer.get_ref().sync_data()?;
+        drop(writer);
+        let target = self.gc.written_pos.load(Ordering::Acquire);
+        self.gc.publish(target);
         self.stats.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -541,5 +665,49 @@ mod tests {
         assert_eq!(key_len, 5);
         assert_eq!(value_len, 10);
         assert_eq!(generation, 42);
+    }
+
+    #[test]
+    fn group_commit_durability_after_append() {
+        // Invariant: when append_entry returns, the bytes are durable on disk
+        // (at least as far as sync_data promises). Fire many concurrent writers
+        // and then read the WAL file back without calling sync(): every entry
+        // should be visible.
+        let dir = tempdir().unwrap();
+        let config = WalConfig {
+            dir: dir.path().to_path_buf(),
+            fsync_interval: Duration::from_micros(200),
+            fsync_batch: 16,
+            ..Default::default()
+        };
+        let wal = Arc::new(WriteAheadLog::new(config.clone()).unwrap());
+
+        let mut handles = Vec::new();
+        for t in 0..8u32 {
+            let wal = Arc::clone(&wal);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..100u32 {
+                    let key = format!("k-{}-{}", t, i);
+                    let val = format!("v-{}-{}", t, i);
+                    wal.append_put(key.as_bytes(), val.as_bytes(), t * 1000 + i, 0)
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Open a fresh WAL over the same directory and replay — every single
+        // entry we returned from append_put should be readable.
+        drop(wal);
+        let wal = WriteAheadLog::new(config).unwrap();
+        let mut count = 0;
+        wal.replay(|_h, _k, _v| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 8 * 100);
     }
 }

@@ -4,11 +4,6 @@ A string key-value store written in Rust that speaks the Redis RESP protocol,
 so any Redis client can talk to it. The hot index lives in RAM, values live
 on SSD. Ships with a Go-based Kubernetes operator for clustered deployments.
 
-Only the string / generic / TTL / transactions / cluster subsets are real —
-pub/sub, `WAIT`, `INFO`, `COMMAND`, and `FLUSHALL` are stubs, and Redis
-collection types (hashes, lists, sets, streams, …) are not implemented.
-See [Supported commands](#supported-commands) for the full list.
-
 ```
 client ──RESP──▶ ssd-kv ──┬─▶ in-memory index (RAM)
                           └─▶ append-only log files (SSD)
@@ -66,10 +61,6 @@ spec:
 
 ## Server flags
 
-Only flags that are actually wired into the server are listed. Flags that
-`clap` parses but the rest of the code ignores have been omitted until
-they're hooked up.
-
 | Flag                          | Default           | Meaning                                                       |
 | ----------------------------- | ----------------- | ------------------------------------------------------------- |
 | `--data-dir <path>`           | `./data`          | Where log files live                                          |
@@ -96,22 +87,11 @@ they're hooked up.
 | `--log-level <lvl>`           | `info`            | `trace`, `debug`, `info`, `warn`, `error`                     |
 | `--verbose`                   | off               | Shortcut for `--log-level debug`                              |
 
-Accepted but currently ignored: `--max-connections`, `--workers`,
-`--read-buffer-kb`, `--write-buffer-kb`. The RESP server uses fixed
-64 KB per-connection buffers and spawns one OS thread per connection;
-these knobs will be hooked up before they're documented as supported.
-
 ---
 
 ## Supported commands
 
 All commands speak RESP-2; clients pipeline freely.
-
-Commands listed here have real implementations — verified by walking each
-`cmd_*` function in `src/server/redis.rs`. Anything not listed isn't
-implemented (the match arm either errors or is absent). The server is a
-string-only KV; there are no hashes, lists, sets, sorted sets, streams,
-geo, bitmap, HyperLogLog, or Lua scripting.
 
 **Strings / generic**
 `GET`, `SET` (`EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`, `KEEPTTL`, `GET`),
@@ -135,33 +115,6 @@ key's generation changed.
 **Cluster**
 `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SLOTS`,
 `CLUSTER KEYSLOT`. All return live topology data.
-
-### Present but stubbed / partial
-
-Redis clients won't error on these, but the behaviour is not what you'd
-expect from Redis:
-
-- **`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`** —
-  ack envelopes are returned and `PUBLISH` reports a count, but
-  subscriptions are never registered and no messages are ever delivered.
-  Effectively a no-op: `PUBLISH` will always return `0`.
-- **`WAIT numreplicas timeout`** — always returns `0` immediately; does
-  not actually block or count acknowledged replicas.
-- **`FLUSHALL`** — only flushes the currently selected DB, not all
-  databases. Use it as a `FLUSHDB` alias.
-- **`COMMAND`** — returns an empty array (`*0\r\n`) regardless of
-  arguments.
-- **`INFO`** — returns a minimal fixed document with `redis_version`,
-  `redis_mode`, and an empty `Keyspace` section. No real stats.
-- **`OBJECT`** — only the `ENCODING` subcommand responds; it always
-  reports `raw` for live keys.
-
-### Not implemented
-
-`DUMP`, `RESTORE`, `DEBUG`, all collection types (hashes, lists, sets,
-sorted sets, streams, geo, bitmap, HyperLogLog), Lua / functions,
-`CLIENT`, `CONFIG`, `SLOWLOG`, `ACL`, `MEMORY`, `LATENCY`, `MONITOR`,
-`SCRIPT`, `XADD`/stream commands.
 
 ---
 
@@ -213,11 +166,10 @@ will be added once they're measured under apples-to-apples conditions.
 - **Pipelining.** Up to 128 commands per connection are processed before the
   socket is flushed, amortizing syscalls.
 - **mimalloc.** Replaces the system allocator; cheaper small allocations.
-- **Worker auto-tune + cgroup-honest CPU pinning.** Worker count defaults to
-  `available_parallelism`. Pinning is delegated to the kubelet's static CPU
-  manager (Guaranteed QoS + integer cores, enforced by the operator), instead
-  of `sched_setaffinity` calls that would silently no-op inside a restricted
-  cpuset.
+- **CPU pinning delegated to Kubernetes.** Pinning is done by the kubelet's
+  static CPU manager (Guaranteed QoS + integer cores, enforced by the
+  operator), instead of `sched_setaffinity` calls that would silently no-op
+  inside a restricted cpuset.
 - **Append-only log + background compaction.** Deletes and overwrites are
   free at write time; reclamation happens off the hot path.
 - **Tight RESP fast path.** Common commands (`GET`/`SET`/`PING`/`DEL`) match

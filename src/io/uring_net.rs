@@ -278,6 +278,28 @@ mod linux {
             self.ring.submit_and_wait(want).map_err(io::Error::from)
         }
 
+        /// Submit and wait for up to `timeout` — used by the reactor so it
+        /// wakes periodically to poll WAL durability even when no new
+        /// network I/O arrives. Returns Ok(_) on wake (either I/O or the
+        /// timeout); Err only on kernel-level failure.
+        pub fn submit_and_wait_timeout(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> io::Result<()> {
+            use io_uring::types::{SubmitArgs, Timespec};
+            let ts = Timespec::new()
+                .sec(timeout.as_secs())
+                .nsec(timeout.subsec_nanos());
+            let args = SubmitArgs::new().timespec(&ts);
+            match self.ring.submitter().submit_with_args(1, &args) {
+                Ok(_) => Ok(()),
+                // ETIME is returned when the timeout fired without any
+                // completion; that's our expected "nothing happened" path.
+                Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
+                Err(e) => Err(io::Error::from(e)),
+            }
+        }
+
         /// Collect completed operations.
         pub fn collect_completions(&mut self) -> Vec<NetResult> {
             let mut results = Vec::new();
@@ -451,6 +473,14 @@ mod fallback {
 
         pub fn submit_and_wait(&mut self, _want: usize) -> io::Result<usize> {
             Ok(self.pending.len())
+        }
+
+        pub fn submit_and_wait_timeout(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> io::Result<()> {
+            std::thread::sleep(timeout);
+            Ok(())
         }
 
         pub fn collect_completions(&mut self) -> Vec<NetResult> {
@@ -706,6 +736,13 @@ impl UringServer {
     /// Wait for completions.
     pub fn wait(&mut self, min_completions: usize) -> io::Result<usize> {
         self.net.submit_and_wait(min_completions)
+    }
+
+    /// Submit + wait with a bounded timeout, so the reactor wakes
+    /// periodically to poll things outside io_uring (e.g. WAL
+    /// durability).
+    pub fn wait_timeout(&mut self, timeout: std::time::Duration) -> io::Result<()> {
+        self.net.submit_and_wait_timeout(timeout)
     }
 
     /// Process completions and return events.

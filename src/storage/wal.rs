@@ -403,32 +403,66 @@ impl WriteAheadLog {
         gc.publish(target);
     }
 
-    /// Append a PUT entry to the WAL.
+    /// Append a PUT entry to the WAL and block until durable.
     pub fn append_put(&self, key: &[u8], value: &[u8], generation: u32, ttl: u32) -> io::Result<u64> {
+        let pos = self.append_put_nowait(key, value, generation, ttl)?;
+        self.gc.wait_for_durable(pos);
+        Ok(pos)
+    }
+
+    /// Append a PUT entry to the WAL but DON'T wait for durability.
+    /// Returns the WAL position at which the record ends. The caller is
+    /// responsible for checking `durable_position()` before treating the
+    /// write as durable (this is how the reactor pipelines many writes
+    /// per fsync).
+    pub fn append_put_nowait(&self, key: &[u8], value: &[u8], generation: u32, ttl: u32) -> io::Result<u64> {
         let mut header = WalEntryHeader::new_put(
             key.len() as u16,
             value.len() as u32,
             generation,
             ttl,
         );
-
-        // Calculate CRC
         header.crc = self.calculate_crc(key, value);
-
         self.append_entry(&header, key, Some(value))
     }
 
-    /// Append a DELETE entry to the WAL.
+    /// Append a DELETE entry to the WAL and block until durable.
     pub fn append_delete(&self, key: &[u8], generation: u32) -> io::Result<u64> {
+        let pos = self.append_delete_nowait(key, generation)?;
+        self.gc.wait_for_durable(pos);
+        Ok(pos)
+    }
+
+    /// Append a DELETE entry to the WAL but DON'T wait for durability.
+    pub fn append_delete_nowait(&self, key: &[u8], generation: u32) -> io::Result<u64> {
         let header = WalEntryHeader::new_delete(key.len() as u16, generation);
         self.append_entry(&header, key, None)
     }
 
-    /// Append an entry to the WAL and block until it is durable.
+    /// Current durable position — every WAL byte up to this offset is
+    /// safely on disk. Reactors poll this to decide when a pipelined
+    /// write's response can be sent.
+    #[inline]
+    pub fn durable_position(&self) -> u64 {
+        self.gc.durable_pos.load(Ordering::Acquire)
+    }
+
+    /// Block the calling thread until `durable_position() >= target`.
+    /// Used by put_sync / delete_sync to keep the blocking-durability
+    /// guarantee for non-reactor callers (tests, eviction thread,
+    /// WAL-trim thread's final flush).
+    pub fn wait_for_durable(&self, target: u64) {
+        self.gc.wait_for_durable(target);
+    }
+
+    /// Append an entry to the WAL. Returns the WAL position immediately
+    /// after writing. Does NOT wait for durability — that's the caller's
+    /// responsibility (see `append_put` / `append_delete` for the blocking
+    /// wrappers).
     ///
     /// The hot path: grab the writer mutex, memcpy bytes into the BufWriter,
-    /// bump `written_pos`, release the mutex, wait on the commit thread.
-    /// Many concurrent calls see one fsync at the backend.
+    /// bump `written_pos`, release the mutex. Many concurrent calls see
+    /// one fsync at the backend once the commit thread wakes.
     fn append_entry(
         &self,
         header: &WalEntryHeader,
@@ -489,9 +523,9 @@ impl WriteAheadLog {
             new_pos
         };
 
-        // Block until this record's bytes are durably on disk.
-        self.gc.wait_for_durable(new_pos);
-
+        // Caller decides whether to wait for durability. The blocking
+        // wrappers (append_put / append_delete) call
+        // `self.gc.wait_for_durable(new_pos)` after we return.
         Ok(new_pos)
     }
 

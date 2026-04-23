@@ -21,17 +21,23 @@ use tracing::{debug, error, info};
 
 use crate::cluster::router::ClusterRouter;
 use crate::io::uring_net::{NetEvent, UringServer};
-use crate::server::db_manager::DatabaseManager;
+use crate::server::db_manager::{DatabaseManager, DbHandler};
 use crate::server::redis::{PubSubManager, RedisHandler, RespParser, ServerTuning};
+use crate::storage::wal::WriteAheadLog;
 
 /// Per-connection state. RESP parser, its pending output buffer, and the
 /// handler holding this client's SELECT / MULTI / WATCH state.
 struct ConnState {
     parser: RespParser,
     handler: RedisHandler,
-    /// Responses we've produced but haven't yet handed to UringServer.
-    /// process_completions() returns it per Data event.
+    /// Response bytes produced but not yet sent. May be pending durability
+    /// (pending_up_to > 0) or ready to flush (pending_up_to == 0).
     pending_out: Vec<u8>,
+    /// Max WAL position this connection is waiting on for durability.
+    /// Set after a handle_command that did a put_nowait / delete_nowait;
+    /// cleared once the reactor observes durable_position() >= it and
+    /// flushes pending_out to the socket.
+    pending_up_to: u64,
 }
 
 impl ConnState {
@@ -51,6 +57,7 @@ impl ConnState {
             parser: RespParser::new(tuning.read_buf_bytes),
             handler,
             pending_out: Vec::with_capacity(tuning.write_buf_bytes),
+            pending_up_to: 0,
         }
     }
 }
@@ -137,12 +144,45 @@ impl ReactorServer {
         let live_conns = Arc::clone(&self.live_conns);
         let max_conns = self.tuning.max_connections;
 
-        // Per-iteration: block on at least one completion, then drain. The
-        // closure only captures &mut refs to things we own via move above.
+        // Snapshot the SSD handlers so the reactor can poll their WALs'
+        // durable_position each iteration. Kept outside the closure to
+        // avoid the db_manager borrow. Memory-only DBs have no WAL; we
+        // ignore those indices.
+        let wals: Vec<Option<Arc<WriteAheadLog>>> = (0..db_manager.num_dbs())
+            .map(|i| {
+                db_manager
+                    .db(i)
+                    .and_then(|d| d.as_ssd())
+                    .and_then(|h| h.wal().cloned())
+            })
+            .collect();
+        // Smallest durable position across all DBs. It's safe to flush a
+        // pending response only when every WAL this connection may have
+        // written to is durable — but since a single connection is pinned
+        // to one current_db at a time, taking the min is the conservative
+        // shortcut that sidesteps per-conn DB-index bookkeeping at the
+        // cost of tiny extra wait when DBs advance unevenly.
+        let current_min_durable = |wals: &[Option<Arc<WriteAheadLog>>]| -> u64 {
+            wals.iter()
+                .filter_map(|w| w.as_ref().map(|w| w.durable_position()))
+                .min()
+                .unwrap_or(u64::MAX)
+        };
+
+        // Wake cadence for the reactor. A plain `wait(1)` would deadlock
+        // when every client's response is pending durability and no new
+        // I/O is arriving: the WAL commit thread advances `durable_pos`
+        // but the reactor sleeps forever on io_uring. Using a bounded
+        // wait means we always wake within this budget to poll durability.
+        let wake_budget = std::time::Duration::from_micros(200);
+
+        // Per-iteration: block on at least one completion (or the budget),
+        // then drain. The closure only captures &mut refs to things we
+        // own via move above.
         loop {
-            // Block until something completes. On error, log and continue —
-            // the event loop must never exit silently.
-            if let Err(e) = server.wait(1) {
+            // Bounded wait; returns on any io_uring completion or when the
+            // timeout fires.
+            if let Err(e) = server.wait_timeout(wake_budget) {
                 error!("reactor wait error: {}", e);
                 continue;
             }
@@ -201,11 +241,18 @@ impl ReactorServer {
                         return None;
                     }
 
-                    // Drain every complete value.
+                    // Drain every complete value. After each command,
+                    // capture any WAL position the handler reported via
+                    // put_nowait / delete_nowait — that becomes this
+                    // connection's pending durability watermark.
                     loop {
                         match state.parser.next_value() {
                             Ok(Some(value)) => {
                                 state.handler.handle_command(value, &mut state.pending_out);
+                                let pos = state.handler.take_wal_position();
+                                if pos > state.pending_up_to {
+                                    state.pending_up_to = pos;
+                                }
                             }
                             Ok(None) => break, // partial, wait for more
                             Err(e) => {
@@ -215,7 +262,10 @@ impl ReactorServer {
                         }
                     }
 
-                    if state.pending_out.is_empty() {
+                    // If nothing to send, nothing to do. If something is
+                    // pending but needs durability, hold onto it —
+                    // the outer loop flushes when the WAL catches up.
+                    if state.pending_out.is_empty() || state.pending_up_to > 0 {
                         None
                     } else {
                         Some(std::mem::take(&mut state.pending_out))
@@ -232,6 +282,35 @@ impl ReactorServer {
             if let Err(e) = process_result {
                 error!("reactor process_completions error: {}", e);
                 // continue; a transient error shouldn't kill the server
+            }
+
+            // Durability flush: check each connection's pending_up_to
+            // against the min durable position. Every WAL byte the
+            // connection wrote is now on disk — send the buffered
+            // response. This is what pipelines hundreds of writes per
+            // fsync: the commit thread advances durable_pos for the
+            // whole batch at once, and one reactor iteration flushes
+            // every ready response.
+            let min_durable = current_min_durable(&wals);
+            if min_durable > 0 {
+                for (&fd, state) in connections.iter_mut() {
+                    if state.pending_up_to > 0
+                        && state.pending_up_to <= min_durable
+                        && !state.pending_out.is_empty()
+                    {
+                        let bytes = std::mem::take(&mut state.pending_out);
+                        state.pending_up_to = 0;
+                        if let Err(e) = server.queue_send(fd, bytes) {
+                            error!("reactor queue_send error on fd={}: {}", fd, e);
+                        }
+                    } else if state.pending_up_to > 0
+                        && state.pending_up_to <= min_durable
+                    {
+                        // pending_out is empty but we were waiting — no-op
+                        // apart from clearing the watermark.
+                        state.pending_up_to = 0;
+                    }
+                }
             }
 
             // Submit any queued SQEs (sends etc.)

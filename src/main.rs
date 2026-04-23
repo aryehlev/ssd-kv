@@ -129,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut db_handlers = Vec::with_capacity(config.num_dbs as usize);
     let mut compaction_stops: Vec<Arc<AtomicBool>> = Vec::new();
     let mut eviction_stops: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut wal_trim_stops: Vec<Arc<AtomicBool>> = Vec::new();
     let mut wals: Vec<Arc<WriteAheadLog>> = Vec::new();
 
     for db_id in 0..config.num_dbs {
@@ -232,6 +233,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Arc::clone(&idx),
                 );
                 eviction_stops.push(stop);
+            }
+
+            // Periodic WAL-trim thread: every few seconds, force a
+            // handler.flush() so WBlocks land in data files, then delete
+            // WAL files whose contents are now fully redundant. Keeps the
+            // WAL bounded on long-running servers.
+            if config.wal_trim_interval_secs > 0 {
+                let handler_for_trim = Arc::clone(&handler);
+                let wal_for_trim = Arc::clone(&wal);
+                let interval = std::time::Duration::from_secs(config.wal_trim_interval_secs);
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_clone = Arc::clone(&stop);
+                let trim_runtime = tokio::runtime::Handle::try_current().ok();
+                std::thread::Builder::new()
+                    .name(format!("wal-trim-db{}", db_id))
+                    .spawn(move || {
+                        while !stop_clone.load(Ordering::Relaxed) {
+                            std::thread::sleep(interval);
+                            if stop_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            // Handler::flush is async; drive it from the
+                            // tokio runtime if we're inside one, else a
+                            // small ad-hoc current-thread runtime.
+                            let flush_res = if let Some(h) = &trim_runtime {
+                                h.block_on(handler_for_trim.flush())
+                            } else {
+                                match tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                {
+                                    Ok(rt) => rt.block_on(handler_for_trim.flush()),
+                                    Err(e) => {
+                                        error!("wal-trim: failed to build runtime: {}", e);
+                                        continue;
+                                    }
+                                }
+                            };
+                            if let Err(e) = flush_res {
+                                error!("wal-trim: flush failed: {}", e);
+                                continue;
+                            }
+                            let dg = handler_for_trim.durable_generation();
+                            if dg == 0 {
+                                continue;
+                            }
+                            match wal_for_trim.cleanup_up_to_gen(dg) {
+                                Ok(n) if n > 0 => {
+                                    info!("wal-trim: removed {} files (durable_gen={})", n, dg);
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("wal-trim: cleanup failed: {}", e);
+                                }
+                            }
+                        }
+                    })
+                    .expect("failed to spawn wal-trim thread");
+                wal_trim_stops.push(stop);
             }
 
             db_handlers.push(DbHandler::Ssd(handler));
@@ -433,6 +493,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !compaction_stops.is_empty() {
         info!("Waiting for compaction threads to stop...");
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Stop WAL-trim threads
+    for stop in &wal_trim_stops {
+        stop.store(true, Ordering::SeqCst);
     }
 
     // Final flush: push pending WBlocks to data files and fsync them.

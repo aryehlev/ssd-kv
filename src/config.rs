@@ -157,6 +157,15 @@ pub struct Config {
     /// pread if io_uring is unavailable.
     #[arg(long, default_value = "2")]
     pub io_workers: usize,
+
+    // --- WAL trim ---
+
+    /// Periodic WAL-trim interval in seconds. Every tick, the server
+    /// flushes pending WBlocks to data files and deletes WAL files whose
+    /// records are now redundant. 0 disables runtime trimming; WAL still
+    /// gets trimmed at shutdown.
+    #[arg(long, default_value = "30")]
+    pub wal_trim_interval_secs: u64,
 }
 
 impl Config {
@@ -297,6 +306,7 @@ impl Default for Config {
             fsync_interval_us: 500,
             fsync_batch: 256,
             io_workers: 2,
+            wal_trim_interval_secs: 30,
         }
     }
 }

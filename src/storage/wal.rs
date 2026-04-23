@@ -490,15 +490,40 @@ impl WriteAheadLog {
             std::mem::take(&mut *g)
         };
         for old in olds {
-            let mut w = old.lock();
-            if let Err(e) = w.flush() {
-                tracing::error!("wal: retired BufWriter flush failed: {}", e);
+            // Scope the inner Mutex lock so we can release it before
+            // touching `pending_close` on the error path — holding both
+            // at once would invert lock order vs the push site in
+            // `rotate()` and could deadlock.
+            let ok = {
+                let mut w = old.lock();
+                match w.flush() {
+                    Err(e) => {
+                        tracing::error!("wal: retired BufWriter flush failed: {}", e);
+                        false
+                    }
+                    Ok(()) => match w.get_ref().sync_data() {
+                        Err(e) => {
+                            tracing::error!("wal: retired sync_data failed: {}", e);
+                            false
+                        }
+                        Ok(()) => true,
+                    },
+                }
+            };
+
+            if ok {
+                // Dropping `old` when the last Arc goes closes the File.
                 continue;
             }
-            if let Err(e) = w.get_ref().sync_data() {
-                tracing::error!("wal: retired sync_data failed: {}", e);
-            }
-            // Dropping `old` when the last Arc goes closes the File.
+
+            // Error path: re-queue so the next tick retries. Dropping the
+            // Arc here would drop the BufWriter and discard any bytes
+            // still in its buffer — we'd lose data that a writer has
+            // already been told is staged. ENOSPC / EIO may be transient,
+            // and persistent failures just produce log noise until the
+            // operator intervenes, which is strictly better than silent
+            // loss.
+            pending_close.lock().push(old);
         }
     }
 
@@ -628,10 +653,14 @@ impl WriteAheadLog {
     ) -> io::Result<u64> {
         let entry_size = WAL_HEADER_SIZE + key.len() + value.map(|v| v.len()).unwrap_or(0);
 
-        // Check if we need to rotate
+        // Check if we need to rotate. Snapshot the file_seq we're about
+        // to write to so rotate() can skip if a peer already rotated —
+        // a position-based check can misfire when the new file has
+        // already been written past our old position's threshold.
         let current_pos = self.position.load(Ordering::Relaxed);
         if current_pos + entry_size as u64 > self.config.max_file_size {
-            self.rotate()?;
+            let observed_seq = self.file_seq.load(Ordering::Acquire);
+            self.rotate(observed_seq)?;
         }
 
         // Bump the per-file high-water generation so cleanup_up_to_gen
@@ -711,19 +740,21 @@ impl WriteAheadLog {
     /// close. Writers that already hold the old Arc finish their writes
     /// against it; any new appends after the swap go to the new file.
     /// No fsync happens under a lock held by the writer path.
-    fn rotate(&self) -> io::Result<()> {
+    fn rotate(&self, observed_file_seq: u64) -> io::Result<()> {
         // Serialize rotates so two writers don't both advance file_seq
         // and open duplicate files.
         let _rotate_guard = self.rotate_lock.lock();
 
-        // Re-check under the rotate lock in case a peer just rotated.
-        let current_pos = self.position.load(Ordering::Relaxed);
-        if current_pos < self.config.max_file_size / 2 {
-            // Someone else already rotated; skip.
+        // Re-check under the rotate lock using the caller's observed
+        // sequence. If the sequence has advanced, a peer already rotated
+        // the file we were trying to rotate — our observation is stale
+        // and we should skip rather than rotate again.
+        let current_file_seq = self.file_seq.load(Ordering::Acquire);
+        if current_file_seq != observed_file_seq {
             return Ok(());
         }
 
-        let old_seq = self.file_seq.load(Ordering::Relaxed);
+        let old_seq = current_file_seq;
         let new_seq = self.file_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let new_path = Self::wal_file_path(&self.config.dir, new_seq);
 

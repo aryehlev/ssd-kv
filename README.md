@@ -5,9 +5,24 @@ so any Redis client can talk to it. The hot index lives in RAM, values live
 on SSD. Ships with a Go-based Kubernetes operator for clustered deployments.
 
 ```
+                                  ┌─▶ WAL files (durability log: fsync
+                                  │    per batch, trimmed once records
+                                  │    are in a data file)
 client ──RESP──▶ ssd-kv ──┬─▶ in-memory index (RAM)
-                          └─▶ append-only log files (SSD)
+                          │
+                          ├─▶ WriteBuffer: 1 MiB WBlock staging in RAM
+                          │    (rotates to a pending queue when full)
+                          │
+                          └─▶ data files: 1023 × 1 MiB WBlocks per file
+                               (≈ 1 GiB, O_DIRECT aligned sequential
+                               append; unlinked when fully reclaimed)
 ```
+
+Writes go to the WAL first for durability, then accumulate in the in-RAM
+WriteBuffer, then flush to a data file as one 4 KiB-aligned `pwrite`.
+Reads take one index lookup → one positioned read from a data file (or
+from the optional read-side cache, or directly out of the WriteBuffer if
+the record hasn't flushed yet).
 
 ---
 
@@ -17,7 +32,8 @@ client ──RESP──▶ ssd-kv ──┬─▶ in-memory index (RAM)
 # Build
 cargo build --release
 
-# Run standalone (default: 127.0.0.1:7777, data in ./data)
+# Run standalone (default: 127.0.0.1:7777, data in ./data,
+# --wal-mode odirect with fsync per batch)
 ./target/release/ssd-kv
 
 # Then talk to it with any Redis client
@@ -61,20 +77,34 @@ spec:
 
 ## Server flags
 
+### Storage & durability
+| Flag                              | Default          | Meaning                                                       |
+| --------------------------------- | ---------------- | ------------------------------------------------------------- |
+| `--data-dir <path>`               | `./data`         | Where data files live (repeat flag for multi-device striping) |
+| `--wal-mode <mode>`               | `odirect`        | `buffered`, `odirect`, or `odirect-trust-device`. `odirect` bypasses the page cache + fsyncs per batch. `odirect-trust-device` drops the fsync entirely — only safe on PLP-class NVMe. |
+| `--reactor-threads <n>`           | CPU-derived      | Number of network threads; also drives WAL shard count (one shard per reactor for independent fsync pipelines). |
+| `--wblock-cache-mb <n>`           | `0`              | RAM budget for the read-side WBlock cache (0 = off)           |
+| `--wal-trim-interval-secs <s>`    | `30`             | How often old WAL files get unlinked once their records are in a data file |
+| `--io-workers <n>`                | `2`              | io_uring workers serving cache-miss reads                     |
+| `--wblocks-per-file <1..1023>`    | `1023`           | 1 MB blocks per data file (1023 → ~1 GB files)                |
+
+### Compaction & eviction
 | Flag                          | Default           | Meaning                                                       |
 | ----------------------------- | ----------------- | ------------------------------------------------------------- |
-| `--data-dir <path>`           | `./data`          | Where log files live                                          |
-| `--bind <addr>`               | `127.0.0.1:7777`  | Listen address                                                |
-| `--num-dbs <1..16>`           | `16`              | Number of logical DBs (`SELECT 0..N-1`)                       |
-| `--memory-dbs <list>`         | —                 | DB indices that are memory-only (e.g. `--memory-dbs 1,2`)     |
 | `--no-compaction`             | off               | Disable background compaction                                 |
-| `--compaction-threshold <f>`  | `0.5`             | Compact files below this live-data ratio                      |
+| `--compaction-threshold <f>`  | `0.5`             | Compact blocks below this live-data ratio                     |
 | `--compaction-interval <s>`   | `60`              | Compaction check interval                                     |
-| `--wblocks-per-file <1..1023>`| `1023`            | 1 MB blocks per data file (1023 → ~1 GB files)                |
 | `--eviction-policy <p>`       | `noeviction`      | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-random`, `volatile-ttl` |
 | `--max-entries <n>`           | `0`               | Index size cap (0 = unlimited)                                |
 | `--max-data-mb <n>`           | `0`               | Data size cap (0 = unlimited)                                 |
 | `--eviction-interval <s>`     | `1`               | Eviction check interval                                       |
+
+### Server & cluster
+| Flag                          | Default           | Meaning                                                       |
+| ----------------------------- | ----------------- | ------------------------------------------------------------- |
+| `--bind <addr>`               | `127.0.0.1:7777`  | Listen address                                                |
+| `--num-dbs <1..16>`           | `16`              | Number of logical DBs (`SELECT 0..N-1`)                       |
+| `--memory-dbs <list>`         | —                 | DB indices that are memory-only (e.g. `--memory-dbs 1,2`)     |
 | `--cluster-mode`              | off               | Run as a cluster member                                       |
 | `--node-id <n>`               | —                 | This node's ordinal (required in cluster mode)                |
 | `--total-nodes <n>`           | —                 | Cluster size                                                  |
@@ -105,12 +135,27 @@ All commands speak RESP-2; clients pipeline freely.
 `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`.
 
 **Connection / server**
-`PING`, `ECHO`, `TIME`, `DBSIZE`, `SELECT`, `READONLY`, `READWRITE`.
+`PING`, `ECHO`, `TIME`, `DBSIZE`, `SELECT`, `READONLY`, `READWRITE`,
+`INFO`, `CONFIG GET`, `CONFIG RESETSTAT`, `WAIT`.
+
+`INFO` exposes `# Server`, `# Memory` (`used_memory`, peak, `maxmemory`,
+eviction policy, wblock cache hit ratio), `# Replication` (per-replica
+`sent`/`acked`/`failed`/`lag`/`diverged` counters), `# Latencystats`
+(p50/p99/p999 per SET/GET/DEL), and `# Wal` (per-shard entries, bytes,
+syncs, flushes, current file size, durable position).
+
+`CONFIG GET` returns a read-only view of `maxmemory`, `maxmemory-policy`,
+`max-entries`, `appendonly`, `appendfsync`, `save`. `CONFIG SET` returns
+an error — every knob is a startup-only CLI flag.
 
 **Transactions**
 `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`. `WATCH` snapshots the
 per-key generation counter; `EXEC` aborts and returns nil if any watched
 key's generation changed.
+
+**Pub/sub**
+`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`.
+In-process only — no cross-node fan-out in cluster mode.
 
 **Cluster**
 `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SLOTS`,
@@ -120,25 +165,48 @@ key's generation changed.
 
 ## Storage model
 
-- **Index in RAM.** A 256-shard `HashMap<u64, Vec<IndexEntry>>` behind
-  `parking_lot::RwLock`, keyed by `xxh3(key)`. Each entry holds the key
-  (inline if ≤ 23 bytes, else heap), the on-disk location (file id, block,
-  offset), value length, generation, and a flag byte. TTL lives in the
-  on-disk record header, not in the in-memory entry.
-- **Values on SSD.** Values are appended to log files in the data directory.
-  With the default `--wblocks-per-file 1023`, each file is 1023 × 1 MB
-  ≈ 1 GB. Writes are sequential; reads are a single positioned read.
-- **WAL + recovery.** Records are framed and CRC'd. On startup the index is
-  rebuilt by scanning the log; expired and tombstoned records are skipped.
-- **Compaction.** A background thread copies live records out of files
-  whose live-data ratio falls below `--compaction-threshold` and frees the
-  source file.
-- **Eviction.** Optional LRU / TTL / random sampler runs in the background
-  once any of `--max-entries`, `--max-data-mb`, or a non-`noeviction`
-  policy is set.
+- **Index in RAM.** 256 shards, each a `HashMap<u64, Vec<IndexEntry>>`
+  keyed by `xxh3(key)` behind its own `parking_lot::RwLock`. Each entry
+  holds the key (inline if ≤ 23 bytes, else heap), the on-disk location
+  (file id, block, offset), value length, generation, and a flag byte.
+  TTL lives in the on-disk record header, not in the in-memory entry.
+- **Write-ahead log.** Every write first goes to a WAL shard (one per
+  reactor thread) with an xxh3-framed record. `odirect` mode fsyncs per
+  batch; `odirect-trust-device` drops the fsync for PLP hardware. Once
+  all records in a WAL file are durable in a data file, the WAL file is
+  unlinked by the trim thread.
+- **WriteBuffer (staging).** After WAL commit, records append into a
+  1 MiB in-RAM WBlock. When it fills, it rotates into a pending queue
+  (bounded — returns `OOM command not allowed` under sustained overload
+  so clients can back off rather than the server getting OOM-killed)
+  and a background flush writes it to a data file as one aligned
+  `pwrite`.
+- **Data files.** Each file is 1023 × 1 MiB WBlocks ≈ 1 GiB. Writes are
+  sequential-append; reads are a single positioned read. Each WBlock
+  carries an xxh3 integrity footer checked on recovery — sufficient to
+  distinguish clean shutdown from torn flush on top of the per-record
+  CRC.
+- **Read path.** Index → WriteBuffer (unflushed records) → optional
+  WBlock cache (`--wblock-cache-mb`) → positioned read from the data
+  file. Cache misses can be served by io_uring workers.
+- **Recovery.** Scan data files to rebuild the index, then replay any
+  WAL entries past the highest durable generation. Records that fail
+  per-record CRC are skipped; each WBlock's footer match/miss/corrupt
+  is surfaced in recovery stats.
+- **Compaction.** A background thread copies live records out of blocks
+  whose live-data ratio falls below `--compaction-threshold`, marks the
+  source blocks reclaimed, and **unlinks the whole 1 GiB data file**
+  once every block in it is reclaimed and the file is sealed. Read-side
+  cache entries are invalidated before unlink.
+- **Eviction.** Optional LRU / TTL / random sampler runs in the
+  background once any of `--max-entries`, `--max-data-mb`, or a
+  non-`noeviction` policy is set.
 - **Cluster.** Keys are mapped to one of 16,384 slots, slots are split
-  across `--total-nodes` nodes, and `--replication-factor` copies per key
-  are stored. Heartbeats fire every `--health-check-interval-ms`.
+  across `--total-nodes` nodes, and `--replication-factor` copies per
+  key are stored. Replication is async — the primary doesn't block on
+  replica ack — but per-replica `sent`/`acked`/`failed`/`lag` counters
+  surface divergence in `INFO`. Heartbeats fire every
+  `--health-check-interval-ms`.
 
 ---
 
@@ -146,34 +214,74 @@ key's generation changed.
 
 The design point is **index in RAM, values on SSD**, so RAM scales with
 *number of keys* and SSD scales with *total value bytes*. That is the
-trade-off vs an all-in-memory store like Redis (which keeps values in RAM
-too).
+trade-off vs an all-in-memory store like Redis (which keeps values in
+RAM too).
 
-No real numbers here yet. Benchmarks against Redis / Aerospike / others
-will be added once they're measured under apples-to-apples conditions.
+### Benchmarks
+
+Single-node, `-c 16 -P <pipeline>`, one VM, Redis 7 with `--save ''`,
+three durability tiers compared apples-to-apples:
+
+**Tier 3: strong durability (every ACK fsynced to disk).**
+
+| Workload        | Redis `appendfsync=always` | **ssd-kv `odirect`** (default) | ssd-kv `odirect-trust-device` (PLP) |
+| --------------- | -------------------------- | ------------------------------ | ----------------------------------- |
+| d=100 P=1       | 16.1k                      | 14.9k                          | **24.5k**                           |
+| d=100 P=4       | 42.6k                      | **52.1k**                      | **96.2k**                           |
+| d=100 P=16      | 132.5k                     | **192.3k** (+45%)              | **344.8k** (+160%)                  |
+| d=4096 P=1      | 8.6k                       | **10.3k**                      | **18.5k**                           |
+| d=4096 P=4      | 19.7k                      | **30.3k** (+54%)               | **44.1k**                           |
+| d=4096 P=16     | 22.8k                      | **52.7k** (+131%)              | **45.6k**                           |
+
+**Tier 2: weak durability (Redis `appendfsync=everysec`, ≤ 1 s loss
+window on crash).** This is the common "production Redis" config and
+sits above both of our per-ACK-durable modes because it doesn't fsync
+on the critical path: 82k (P=1) → 476k (P=16) at 100 B, 55k → 114k at
+4 KiB.
+
+**Tier 1: no durability (Redis `appendonly no`, pure in-RAM).** The
+theoretical ceiling for anything disk-backed: 909k at d=100 P=16.
+
+All ssd-kv numbers are from the post-fix build: per-WBlock xxh3
+integrity footer on the flush path, per-replica divergence counters
+on the replication path, compaction actually unlinks reclaimed files.
 
 ---
 
 ## Why it's fast
 
-- **Sequential writes, random reads.** Writes hit a write buffer, then go to
-  disk as one big append. SSDs love this pattern.
-- **One hash lookup per GET.** The index is a 256-shard `HashMap` keyed by
-  `xxh3`. No B-tree, no LSM read amplification.
+- **O_DIRECT WAL with batched group commit.** The WAL path bypasses the
+  kernel page cache and fsyncs per *batch* rather than per *write*, so
+  many concurrent clients amortise a single sync. An opt-in
+  `odirect-trust-device` mode skips the fsync entirely — safe only on
+  PLP-class NVMe, but lands another 40-290% throughput in exchange.
+- **Parallel WAL shards.** One WAL shard per reactor thread → N
+  independent fsync pipelines running concurrently instead of serialising
+  through a single log. Each shard keeps its own durable-position cursor;
+  there's no cross-shard ordering dependency.
+- **Sequential writes, random reads.** Writes hit the WriteBuffer, then
+  go to disk as one big aligned append. SSDs love this pattern. Reads
+  are one positioned read per hit.
+- **One hash lookup per GET.** The index is 256 sharded `HashMap`s keyed
+  by `xxh3`. No B-tree, no LSM read amplification.
 - **No copies on the hot path.** The RESP parser reuses a per-connection
   buffer; responses are built into a contiguous output buffer and flushed
   once per pipeline batch.
-- **Pipelining.** Up to 128 commands per connection are processed before the
-  socket is flushed, amortizing syscalls.
+- **Pipelining.** Up to 128 commands per connection are processed before
+  the socket is flushed, amortising syscalls.
+- **io_uring async reader** for cache-miss reads so the reactor doesn't
+  block on slow SSD reads.
 - **mimalloc.** Replaces the system allocator; cheaper small allocations.
-- **CPU pinning delegated to Kubernetes.** Pinning is done by the kubelet's
-  static CPU manager (Guaranteed QoS + integer cores, enforced by the
-  operator), instead of `sched_setaffinity` calls that would silently no-op
-  inside a restricted cpuset.
-- **Append-only log + background compaction.** Deletes and overwrites are
-  free at write time; reclamation happens off the hot path.
-- **Tight RESP fast path.** Common commands (`GET`/`SET`/`PING`/`DEL`) match
-  early in the dispatch and skip most argument validation.
+- **CPU pinning delegated to Kubernetes.** Pinning is done by the
+  kubelet's static CPU manager (Guaranteed QoS + integer cores, enforced
+  by the operator), instead of `sched_setaffinity` calls that would
+  silently no-op inside a restricted cpuset.
+- **Append-only log + real background compaction.** Deletes and
+  overwrites are free at write time; reclamation happens off the hot
+  path, and fully-reclaimed 1 GiB files are actually unlinked so disk
+  usage doesn't grow forever.
+- **Tight RESP fast path.** Common commands (`GET`/`SET`/`PING`/`DEL`)
+  match early in the dispatch and skip most argument validation.
 
 ---
 
@@ -183,7 +291,8 @@ will be added once they're measured under apples-to-apples conditions.
 src/
   server/        # RESP server, command dispatch, multi-DB
   engine/        # In-memory index, recovery
-  storage/       # WAL, write buffer, file manager, compaction, eviction
+  storage/       # WAL, write buffer, file manager, compaction, eviction,
+                 # wblock cache
   cluster/       # Topology, replication, routing, health
   io/            # io_uring helpers, aligned buffers
   perf/          # Tuning helpers (CPU pinning, NUMA, prefetch, ...)

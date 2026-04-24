@@ -1380,36 +1380,92 @@ impl RedisHandler {
 
     #[inline]
     fn cmd_info(&self, out: &mut Vec<u8>) {
+        use std::sync::atomic::Ordering;
         let mode = if self.router.is_some() { "cluster" } else { "standalone" };
         // Percentiles in µs (coarse — log-bucketed to factor-of-2).
         // Matches Redis's `INFO latencystats` section so monitoring
         // tooling that reads `latency_percentiles_usec_*` keys works
         // transparently. Memory-only DBs have no histograms; skip the
         // section for those.
-        let latency_section = if let Some(h) = self.current_handler().as_ssd() {
-            let stats = h.stats();
-            let set = &stats.set_latency;
-            let get = &stats.get_latency;
-            let del = &stats.del_latency;
-            format!(
-                "# Latencystats\r\n\
-                 latency_percentiles_usec_set:p50={},p99={},p999={},max={}\r\n\
-                 latency_percentiles_usec_get:p50={},p99={},p999={},max={}\r\n\
-                 latency_percentiles_usec_del:p50={},p99={},p999={},max={}\r\n\
-                 set_ops:{}\r\n\
-                 get_ops:{}\r\n\
-                 del_ops:{}\r\n",
-                set.percentile(0.50), set.percentile(0.99), set.percentile(0.999), set.max_us(),
-                get.percentile(0.50), get.percentile(0.99), get.percentile(0.999), get.max_us(),
-                del.percentile(0.50), del.percentile(0.99), del.percentile(0.999), del.max_us(),
-                set.count(), get.count(), del.count(),
-            )
-        } else {
-            String::new()
-        };
+        let (latency_section, wal_section) =
+            if let Some(h) = self.current_handler().as_ssd() {
+                let stats = h.stats();
+                let set = &stats.set_latency;
+                let get = &stats.get_latency;
+                let del = &stats.del_latency;
+                let latency = format!(
+                    "# Latencystats\r\n\
+                     latency_percentiles_usec_set:p50={},p99={},p999={},max={}\r\n\
+                     latency_percentiles_usec_get:p50={},p99={},p999={},max={}\r\n\
+                     latency_percentiles_usec_del:p50={},p99={},p999={},max={}\r\n\
+                     set_ops:{}\r\n\
+                     get_ops:{}\r\n\
+                     del_ops:{}\r\n",
+                    set.percentile(0.50), set.percentile(0.99), set.percentile(0.999), set.max_us(),
+                    get.percentile(0.50), get.percentile(0.99), get.percentile(0.999), get.max_us(),
+                    del.percentile(0.50), del.percentile(0.99), del.percentile(0.999), del.max_us(),
+                    set.count(), get.count(), del.count(),
+                );
+
+                // Per-shard WAL stats. With parallel WAL shards, each
+                // reactor pins to one shard — imbalance across
+                // `bytes_written` is the first thing to check when
+                // one reactor's latency diverges. Also exposes
+                // `durable_position` so ops can watch how far behind
+                // a busy shard is from its committed writes.
+                let shards = h.wal_shards();
+                let wal = if shards.is_empty() {
+                    String::new()
+                } else {
+                    let mut s = String::from("# Wal\r\n");
+                    s.push_str(&format!("wal_num_shards:{}\r\n", shards.len()));
+
+                    let mut total_bytes = 0u64;
+                    let mut max_bytes = 0u64;
+                    let mut min_bytes = u64::MAX;
+                    for w in shards {
+                        let b = w.stats().bytes_written.load(Ordering::Relaxed);
+                        total_bytes = total_bytes.saturating_add(b);
+                        if b > max_bytes { max_bytes = b; }
+                        if b < min_bytes { min_bytes = b; }
+                    }
+                    if min_bytes == u64::MAX { min_bytes = 0; }
+                    s.push_str(&format!("wal_total_bytes_written:{}\r\n", total_bytes));
+                    s.push_str(&format!("wal_max_bytes_written:{}\r\n", max_bytes));
+                    s.push_str(&format!("wal_min_bytes_written:{}\r\n", min_bytes));
+
+                    for (i, w) in shards.iter().enumerate() {
+                        let st = w.stats();
+                        s.push_str(&format!(
+                            "wal_shard_{}_entries_written:{}\r\n\
+                             wal_shard_{}_bytes_written:{}\r\n\
+                             wal_shard_{}_syncs:{}\r\n\
+                             wal_shard_{}_flushes:{}\r\n\
+                             wal_shard_{}_current_file_size:{}\r\n\
+                             wal_shard_{}_durable_position:{}\r\n",
+                            i, st.entries_written.load(Ordering::Relaxed),
+                            i, st.bytes_written.load(Ordering::Relaxed),
+                            i, st.syncs.load(Ordering::Relaxed),
+                            i, st.flushes.load(Ordering::Relaxed),
+                            i, st.current_file_size.load(Ordering::Relaxed),
+                            i, w.durable_position(),
+                        ));
+                    }
+                    s
+                };
+
+                (latency, wal)
+            } else {
+                (String::new(), String::new())
+            };
 
         let info = format!(
-            "# Server\r\nredis_version:7.0.0-ssd-kv\r\nredis_mode:{mode}\r\n{latency_section}# Keyspace\r\n",
+            "# Server\r\n\
+             redis_version:7.0.0-ssd-kv\r\n\
+             redis_mode:{mode}\r\n\
+             {latency_section}\
+             {wal_section}\
+             # Keyspace\r\n",
         );
         let info_bytes = info.as_bytes();
         out.push(b'$');

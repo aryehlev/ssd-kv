@@ -150,6 +150,17 @@ pub struct Config {
     #[arg(long, default_value = "256")]
     pub fsync_batch: usize,
 
+    /// Directories for WAL shards — one per physical device unlocks
+    /// parallel fsync pipelines past a single device's IOPS ceiling.
+    /// When set with N paths, N WAL shards round-robin across them;
+    /// when unset, all shards live under `data_dir/db_i/wal` (single
+    /// device). Pass multiple times: `--wal-dir /nvme0/wal --wal-dir /nvme1/wal`.
+    /// Number of shards per DB is driven by `--reactor-threads`, not
+    /// by the path count — extra paths past the reactor count are
+    /// unused.
+    #[arg(long = "wal-dir")]
+    pub wal_dirs: Vec<PathBuf>,
+
     // --- io_uring ---
 
     /// Number of io_uring workers (one kernel polling thread each in SQPOLL
@@ -311,6 +322,7 @@ impl Default for Config {
             wblock_cache_mb: 0,
             fsync_interval_us: 500,
             fsync_batch: 256,
+            wal_dirs: Vec::new(),
             io_workers: 2,
             reactor_threads: 1,
             wal_trim_interval_secs: 30,

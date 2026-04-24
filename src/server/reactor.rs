@@ -78,6 +78,12 @@ pub struct ReactorServer {
     pubsub: Arc<PubSubManager>,
     tuning: ServerTuning,
     live_conns: Arc<AtomicUsize>,
+    /// Which WAL shard this reactor's connections should write to.
+    /// Each reactor owns one shard end-to-end: accept → shard_hint
+    /// on ConnState → writes hit that shard's WAL → durability wait
+    /// polls that shard's durable_pos only. Default 0 keeps
+    /// single-reactor deployments unchanged.
+    reactor_id: usize,
 }
 
 impl ReactorServer {
@@ -85,6 +91,15 @@ impl ReactorServer {
         addr: SocketAddr,
         db_manager: Arc<DatabaseManager>,
         tuning: ServerTuning,
+    ) -> Self {
+        Self::new_with_reactor_id(addr, db_manager, tuning, 0)
+    }
+
+    pub fn new_with_reactor_id(
+        addr: SocketAddr,
+        db_manager: Arc<DatabaseManager>,
+        tuning: ServerTuning,
+        reactor_id: usize,
     ) -> Self {
         Self {
             addr,
@@ -94,6 +109,7 @@ impl ReactorServer {
             pubsub: Arc::new(PubSubManager::new()),
             tuning,
             live_conns: Arc::new(AtomicUsize::new(0)),
+            reactor_id,
         }
     }
 
@@ -104,6 +120,17 @@ impl ReactorServer {
         replica_read: bool,
         tuning: ServerTuning,
     ) -> Self {
+        Self::with_router_and_reactor_id(addr, db_manager, router, replica_read, tuning, 0)
+    }
+
+    pub fn with_router_and_reactor_id(
+        addr: SocketAddr,
+        db_manager: Arc<DatabaseManager>,
+        router: Arc<ClusterRouter>,
+        replica_read: bool,
+        tuning: ServerTuning,
+        reactor_id: usize,
+    ) -> Self {
         Self {
             addr,
             db_manager,
@@ -112,6 +139,7 @@ impl ReactorServer {
             pubsub: Arc::new(PubSubManager::new()),
             tuning,
             live_conns: Arc::new(AtomicUsize::new(0)),
+            reactor_id,
         }
     }
 
@@ -151,16 +179,30 @@ impl ReactorServer {
         let live_conns = Arc::clone(&self.live_conns);
         let max_conns = self.tuning.max_connections;
 
-        // Snapshot the SSD handlers so the reactor can poll their WALs'
-        // durable_position each iteration. Kept outside the closure to
-        // avoid the db_manager borrow. Memory-only DBs have no WAL; we
-        // ignore those indices.
+        // Snapshot each SSD DB's WAL SHARD belonging to this reactor so
+        // we can poll its `durable_position()` for durability-pending
+        // responses. Each reactor watches exactly one shard per DB; if
+        // another reactor's shard advances, that's irrelevant to us.
+        // This is the core of parallel WAL shards: N reactors, N
+        // independent fsync pipelines, zero cross-reactor coordination.
+        //
+        // If a DB has fewer shards than reactors (extra reactor threads
+        // vs configured shards), `wal_for` clamps to the last shard —
+        // degraded but correct: those reactors share a shard.
+        let my_shard = self.reactor_id;
         let wals: Vec<Option<Arc<WriteAheadLog>>> = (0..db_manager.num_dbs())
             .map(|i| {
                 db_manager
                     .db(i)
                     .and_then(|d| d.as_ssd())
-                    .and_then(|h| h.wal().cloned())
+                    .and_then(|h| {
+                        let shards = h.wal_shards();
+                        if shards.is_empty() {
+                            None
+                        } else {
+                            Some(Arc::clone(&shards[my_shard.min(shards.len() - 1)]))
+                        }
+                    })
             })
             .collect();
 
@@ -270,6 +312,12 @@ impl ReactorServer {
                         Arc::clone(&pubsub),
                         tuning,
                     );
+                    // Pin this connection to our reactor's WAL shard.
+                    // Every write on this connection goes through the
+                    // same shard, so writers never cross reactor
+                    // boundaries and each shard's commit thread owns
+                    // one reactor's worth of load.
+                    state.handler.shard_hint.set(my_shard);
                     connections.insert(fd, state);
                     None
                 }
@@ -434,9 +482,13 @@ pub fn start_reactor_multi(
                 .name(format!("resp-reactor-{}", i))
                 .spawn(move || {
                     let server = if let Some(r) = router {
-                        ReactorServer::with_router(addr, db_manager, r, replica_read, tuning)
+                        ReactorServer::with_router_and_reactor_id(
+                            addr, db_manager, r, replica_read, tuning, i,
+                        )
                     } else {
-                        ReactorServer::new(addr, db_manager, tuning)
+                        ReactorServer::new_with_reactor_id(
+                            addr, db_manager, tuning, i,
+                        )
                     };
                     if let Err(e) = server.run_with_reuseport(reuse_port) {
                         error!("reactor {} fatal: {}", i, e);

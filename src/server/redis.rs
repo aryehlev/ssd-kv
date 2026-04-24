@@ -672,6 +672,13 @@ pub struct RedisHandler {
     /// requirement. The reactor reads + resets this after each
     /// handle_command call.
     pub last_wal_position: Cell<u64>,
+    /// Which WAL shard this connection's writes should land in. Set
+    /// once by the reactor on connection accept — each reactor pins
+    /// its connections to its own shard so writes never cross reactor
+    /// boundaries and every shard gets its own fsync pipeline.
+    /// Default 0 keeps single-shard deployments (and tests) working
+    /// unchanged.
+    pub shard_hint: Cell<usize>,
 }
 
 impl RedisHandler {
@@ -686,6 +693,7 @@ impl RedisHandler {
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
             last_wal_position: Cell::new(0),
+            shard_hint: Cell::new(0),
         }
     }
 
@@ -700,6 +708,7 @@ impl RedisHandler {
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
             last_wal_position: Cell::new(0),
+            shard_hint: Cell::new(0),
         }
     }
 
@@ -714,6 +723,7 @@ impl RedisHandler {
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
             last_wal_position: Cell::new(0),
+            shard_hint: Cell::new(0),
         }
     }
 
@@ -733,6 +743,7 @@ impl RedisHandler {
             tx_queue: std::cell::RefCell::new(None),
             watched_keys: std::cell::RefCell::new(HashMap::new()),
             last_wal_position: Cell::new(0),
+            shard_hint: Cell::new(0),
         }
     }
 
@@ -744,10 +755,15 @@ impl RedisHandler {
 
     /// PUT via the non-blocking path, tracking the WAL position so the
     /// reactor knows when the response is safe to send. A thin wrapper
-    /// callers use instead of `current_handler().put_sync(…)`.
+    /// callers use instead of `current_handler().put_sync(…)`. Routes
+    /// to this connection's pinned WAL shard — set once by the reactor
+    /// on accept via `shard_hint`.
     #[inline]
     fn put_and_track(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
-        let pos = self.current_handler().put_nowait(key, value, ttl)?;
+        let shard = self.shard_hint.get();
+        let pos = self
+            .current_handler()
+            .put_nowait_on(shard, key, value, ttl)?;
         if let Some(p) = pos {
             let cur = self.last_wal_position.get();
             if p > cur {
@@ -758,10 +774,11 @@ impl RedisHandler {
     }
 
     /// DELETE via the non-blocking path, tracking WAL position like
-    /// `put_and_track`.
+    /// `put_and_track`. Routes to this connection's pinned shard.
     #[inline]
     fn delete_and_track(&self, key: &[u8]) -> io::Result<bool> {
-        let (deleted, pos) = self.current_handler().delete_nowait(key)?;
+        let shard = self.shard_hint.get();
+        let (deleted, pos) = self.current_handler().delete_nowait_on(shard, key)?;
         if let Some(p) = pos {
             let cur = self.last_wal_position.get();
             if p > cur {

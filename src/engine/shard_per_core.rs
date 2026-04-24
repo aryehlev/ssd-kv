@@ -21,7 +21,6 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::engine::index_entry::hash_key;
-use crate::storage::write_buffer::{DiskLocation, WriteBuffer};
 
 /// Message types for cross-core communication.
 #[derive(Debug)]
@@ -76,19 +75,16 @@ pub struct Shard {
 }
 
 /// Entry in the shard's local index.
+///
+/// This engine is a RAM-only fast path — values live inline in the
+/// `HashMap`. An earlier revision had an `OnDisk` variant that was
+/// never wired up (GET returned `None`, PUT silently inlined), which
+/// produced wrong answers if anything actually used the disk path.
+/// Removed until someone ships the real disk tier for this engine.
 #[derive(Clone)]
 struct ShardEntry {
-    /// Inline value (if small enough) OR disk location
-    data: ShardData,
+    value: Vec<u8>,
     generation: u32,
-}
-
-#[derive(Clone)]
-enum ShardData {
-    /// Value stored inline (no disk I/O needed)
-    Inline(Vec<u8>),
-    /// Value on disk
-    OnDisk { location: DiskLocation, value_len: u32 },
 }
 
 impl Shard {
@@ -111,13 +107,7 @@ impl Shard {
 
         if let Some(entry) = self.index.get(key) {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return match &entry.data {
-                ShardData::Inline(value) => Some(value.clone()),
-                ShardData::OnDisk { .. } => {
-                    // TODO: Read from disk
-                    None
-                }
-            };
+            return Some(entry.value.clone());
         }
 
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
@@ -131,15 +121,8 @@ impl Shard {
 
         self.generation += 1;
 
-        let data = if value.len() <= self.inline_threshold {
-            ShardData::Inline(value)
-        } else {
-            // TODO: Write to disk, get location
-            ShardData::Inline(value) // Temporary: inline everything
-        };
-
         let entry = ShardEntry {
-            data,
+            value,
             generation: self.generation,
         };
 

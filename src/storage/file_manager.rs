@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -123,6 +123,14 @@ pub struct DataFile {
     header: FileHeader,
     wblock_meta: Vec<WBlockMeta>,
     next_wblock: AtomicU32,
+    /// Bitmap-of-sorts tracking which blocks have been compacted away.
+    /// A block is "reclaimed" once the compactor has moved its live
+    /// records to a newer block and the index no longer points here.
+    /// When every allocated block is reclaimed AND the file is sealed
+    /// (no longer the current write target), the whole 1 GiB file can
+    /// be unlinked — which is what finally frees SSD space.
+    reclaimed_wblocks: Vec<AtomicBool>,
+    reclaimed_count: AtomicU32,
 }
 
 impl DataFile {
@@ -158,6 +166,8 @@ impl DataFile {
                 WBLOCKS_PER_FILE as usize
             ],
             next_wblock: AtomicU32::new(0),
+            reclaimed_wblocks: (0..WBLOCKS_PER_FILE).map(|_| AtomicBool::new(false)).collect(),
+            reclaimed_count: AtomicU32::new(0),
         })
     }
 
@@ -203,6 +213,8 @@ impl DataFile {
                 WBLOCKS_PER_FILE as usize
             ],
             next_wblock: AtomicU32::new(wblock_count),
+            reclaimed_wblocks: (0..WBLOCKS_PER_FILE).map(|_| AtomicBool::new(false)).collect(),
+            reclaimed_count: AtomicU32::new(0),
         })
     }
 
@@ -349,13 +361,47 @@ impl DataFile {
     }
 
     /// Returns blocks with utilization below threshold.
+    /// Skips blocks already reclaimed by a previous compaction run so
+    /// the compactor doesn't keep rewriting the same (now-empty) block.
     pub fn get_fragmented_blocks(&self, threshold: f32) -> Vec<u32> {
         self.wblock_meta
             .iter()
             .enumerate()
-            .filter(|(_, meta)| meta.utilization() < threshold && meta.total_records > 0)
+            .filter(|(i, meta)| {
+                meta.utilization() < threshold
+                    && meta.total_records > 0
+                    && !self.reclaimed_wblocks[*i].load(Ordering::Relaxed)
+            })
             .map(|(i, _)| i as u32)
             .collect()
+    }
+
+    /// Marks a block as reclaimed after its live records were moved out.
+    /// Returns `true` if this call transitioned the block from "live" to
+    /// "reclaimed" (i.e. first time it was marked).
+    pub fn mark_wblock_reclaimed(&self, wblock_id: u32) -> bool {
+        if (wblock_id as usize) >= self.reclaimed_wblocks.len() {
+            return false;
+        }
+        let first = !self.reclaimed_wblocks[wblock_id as usize]
+            .swap(true, Ordering::SeqCst);
+        if first {
+            self.reclaimed_count.fetch_add(1, Ordering::SeqCst);
+        }
+        first
+    }
+
+    /// Returns `true` iff every allocated block in this file has been
+    /// reclaimed. The caller must additionally confirm the file is
+    /// sealed (not the current write target) before unlinking.
+    pub fn is_fully_reclaimed(&self) -> bool {
+        let allocated = self.next_wblock.load(Ordering::SeqCst);
+        if allocated == 0 {
+            // Freshly created file with nothing written yet — don't
+            // mistake "empty" for "reclaimed" and delete it.
+            return false;
+        }
+        self.reclaimed_count.load(Ordering::SeqCst) >= allocated
     }
 }
 
@@ -607,6 +653,57 @@ mod tests {
         assert_eq!(file1_id, 0);
         assert_eq!(file2_id, 1);
         assert_eq!(manager.file_count(), 2);
+    }
+
+    #[test]
+    fn is_fully_reclaimed_flips_only_after_every_block_is_marked() {
+        // Regression: compaction previously moved records out of
+        // WBlocks but left the 1 GiB data file on disk forever.
+        // `is_fully_reclaimed()` drives the new unlink-after-compaction
+        // path, so verify it's exact — not "close", not "approximately".
+        let dir = tempdir().unwrap();
+        let file = DataFile::create(dir.path(), 0).unwrap();
+
+        // A freshly created file with zero blocks written MUST NOT
+        // report as reclaimed — otherwise compaction would delete
+        // empty files that are about to receive the current writer's
+        // output.
+        assert!(!file.is_fully_reclaimed());
+
+        // Simulate 3 blocks being allocated (via write_wblock would
+        // actually write to disk; here we just bump next_wblock to
+        // mirror the state post-flush).
+        file.next_wblock.store(3, Ordering::SeqCst);
+
+        assert!(file.mark_wblock_reclaimed(0));
+        assert!(!file.is_fully_reclaimed());
+        assert!(file.mark_wblock_reclaimed(1));
+        assert!(!file.is_fully_reclaimed());
+        assert!(file.mark_wblock_reclaimed(2));
+        assert!(file.is_fully_reclaimed());
+
+        // Idempotent — marking the same block twice is a no-op and
+        // must not double-count.
+        assert!(!file.mark_wblock_reclaimed(2));
+    }
+
+    #[test]
+    fn get_fragmented_blocks_skips_already_reclaimed() {
+        // Without this filter the compactor would rewrite the same
+        // now-empty block on every run, because reclaiming a block
+        // doesn't change its (live=0 / total>0) utilization.
+        let dir = tempdir().unwrap();
+        let mut file = DataFile::create(dir.path(), 0).unwrap();
+
+        file.update_wblock_meta(5, WBlockMeta {
+            live_records: 0,
+            total_records: 10,
+            bytes_used: 500,
+        });
+        assert_eq!(file.get_fragmented_blocks(0.5), vec![5]);
+
+        file.mark_wblock_reclaimed(5);
+        assert!(file.get_fragmented_blocks(0.5).is_empty());
     }
 
     #[test]

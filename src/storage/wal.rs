@@ -106,6 +106,30 @@ pub struct WalEntry {
     pub value: Vec<u8>,
 }
 
+/// How WAL writes reach the disk. Runtime counterpart of the CLI
+/// `--wal-mode` flag — see `crate::config::WalModeArg` for the
+/// hardware-safety story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalSyncMode {
+    /// Default. `BufWriter<File>` + `sync_data()` per group-commit.
+    /// Safe on any hardware.
+    Buffered,
+    /// `O_DIRECT` + AlignedBuffer staging + aligned pwrite + `sync_data()`.
+    /// Bypass the page cache for predictable latency; fsync still
+    /// gives strong durability on any hardware.
+    ODirect,
+    /// `O_DIRECT` + AlignedBuffer staging + aligned pwrite, **no**
+    /// fsync. Trust the drive's write-ack as durable. ONLY SAFE on
+    /// Power-Loss-Protected enterprise NVMe.
+    ODirectNoFsync,
+}
+
+impl Default for WalSyncMode {
+    fn default() -> Self {
+        Self::Buffered
+    }
+}
+
 /// WAL configuration.
 #[derive(Debug, Clone)]
 pub struct WalConfig {
@@ -122,6 +146,9 @@ pub struct WalConfig {
     /// early and issues a sync_data. 0 means "only tick-based". Setting this
     /// to something like 256 bounds worst-case queue depth at high QPS.
     pub fsync_batch: usize,
+    /// How writes reach disk — buffered, O_DIRECT, or O_DIRECT
+    /// without fsync. See [`WalSyncMode`].
+    pub sync_mode: WalSyncMode,
 }
 
 impl Default for WalConfig {
@@ -135,6 +162,7 @@ impl Default for WalConfig {
             buffer_size: 1024 * 1024,         // 1MB
             fsync_interval: Duration::from_micros(500),
             fsync_batch: 256,
+            sync_mode: WalSyncMode::Buffered,
         }
     }
 }
@@ -287,18 +315,226 @@ struct ClosedFile {
 /// ~500µs fsync on virtio-blk blocked every appending writer for that
 /// entire duration. The fsync time is unchanged, but the writer path
 /// is now freely concurrent with it.
-pub(crate) struct WalFile {
+///
+/// The two variants share the dup'd `sync_file` trick and differ in
+/// how they hold bytes before they hit the disk:
+///
+/// - `Buffered` keeps a `BufWriter<File>` under a mutex. Writes go
+///   through the page cache; `sync_data()` on the dup handle forces
+///   them to the drive on each group-commit cycle.
+/// - `Direct` keeps an `AlignedStaging` under a mutex: a 4 KB-aligned
+///   buffer that gets pwritten at `file_offset` when full or on
+///   commit. Pairs with `O_DIRECT` to bypass the page cache; pad
+///   bytes at the end of the filled region are **explicitly zeroed
+///   before every pwrite** so the stale bytes from a prior flush
+///   don't leak into recovery as phantom entries (the bug that bit
+///   the earlier O_DIRECT attempt).
+///
+/// The Direct path also supports a "no fsync" commit — behind
+/// `WalSyncMode::ODirectNoFsync`, the commit thread skips
+/// `sync_data()` and publishes durable_pos on the strength of the
+/// pwrite-ack alone. **Only safe on Power-Loss-Protected NVMe.**
+#[inline]
+fn align_up_u64(x: u64, align: u64) -> u64 {
+    (x + align - 1) & !(align - 1)
+}
+
+pub(crate) enum WalFile {
+    Buffered(BufferedWalFile),
+    Direct(DirectWalFile),
+}
+
+pub(crate) struct BufferedWalFile {
     pub buf_writer: Mutex<BufWriter<File>>,
     pub sync_file: File,
 }
 
+pub(crate) struct DirectWalFile {
+    /// Dup'd fd for `sync_data()` — used in `ODirect` mode, ignored
+    /// in `ODirectNoFsync`. Holding it keeps the inode alive for the
+    /// lifetime of the wal file.
+    pub sync_file: File,
+    pub staging: Mutex<AlignedStaging>,
+}
+
+pub(crate) struct AlignedStaging {
+    pub buf: crate::io::aligned_buf::AlignedBuffer,
+    /// Raw O_DIRECT file. pwrites target this at `file_offset`. Held
+    /// inside the staging mutex because the offset advancement and
+    /// pwrite must be atomic wrt. other writers.
+    pub file: File,
+    /// Next file offset to pwrite at. Always a 4 KB multiple; each
+    /// flush advances it by the padded length which is also aligned.
+    pub file_offset: u64,
+}
+
 impl WalFile {
-    fn new(file: File, buffer_size: usize) -> io::Result<Self> {
-        let sync_file = file.try_clone()?;
-        Ok(Self {
-            buf_writer: Mutex::new(BufWriter::with_capacity(buffer_size.max(4096), file)),
-            sync_file,
-        })
+    /// Construct the appropriate variant for the requested sync mode.
+    fn new(
+        sync_mode: WalSyncMode,
+        path: &Path,
+        buffer_size: usize,
+    ) -> io::Result<Self> {
+        match sync_mode {
+            WalSyncMode::Buffered => {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                let sync_file = file.try_clone()?;
+                Ok(Self::Buffered(BufferedWalFile {
+                    buf_writer: Mutex::new(BufWriter::with_capacity(
+                        buffer_size.max(4096),
+                        file,
+                    )),
+                    sync_file,
+                }))
+            }
+            WalSyncMode::ODirect | WalSyncMode::ODirectNoFsync => {
+                let mut file = Self::open_odirect(path, true)?;
+                let existing_len = file.metadata()?.len();
+                use crate::io::aligned_buf::ALIGNMENT;
+                let file_offset = align_up_u64(existing_len, ALIGNMENT as u64);
+                use std::io::Seek;
+                file.seek(std::io::SeekFrom::Start(file_offset))?;
+                let sync_file = file.try_clone()?;
+                let staging = AlignedStaging {
+                    buf: crate::io::aligned_buf::AlignedBuffer::new(
+                        buffer_size.max(ALIGNMENT),
+                    ),
+                    file,
+                    file_offset,
+                };
+                Ok(Self::Direct(DirectWalFile {
+                    sync_file,
+                    staging: Mutex::new(staging),
+                }))
+            }
+        }
+    }
+
+    /// Try to open `path` with `O_DIRECT | O_CLOEXEC`. Falls back to
+    /// buffered open (with a warning) on filesystems that reject
+    /// O_DIRECT — the aligned-staging path still works there, just
+    /// without page-cache bypass.
+    fn open_odirect(path: &Path, create: bool) -> io::Result<File> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(true);
+            if create {
+                opts.create(true);
+            }
+            let direct = opts
+                .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+                .open(path);
+            if let Ok(f) = direct {
+                return Ok(f);
+            }
+            tracing::warn!(
+                "O_DIRECT unavailable on WAL path {:?} — falling back to buffered open",
+                path
+            );
+        }
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        if create {
+            opts.create(true);
+        }
+        opts.open(path)
+    }
+
+    /// Append `chunks` (header, key, value) as a single logical entry.
+    fn append_entry(&self, chunks: &[&[u8]]) -> io::Result<()> {
+        match self {
+            Self::Buffered(b) => {
+                let mut w = b.buf_writer.lock();
+                for c in chunks {
+                    w.write_all(c)?;
+                }
+                Ok(())
+            }
+            Self::Direct(d) => {
+                let total: usize = chunks.iter().map(|c| c.len()).sum();
+                let mut st = d.staging.lock();
+                if st.buf.len() + total > st.buf.capacity() {
+                    Self::flush_staging_locked(&mut st)?;
+                }
+                for c in chunks {
+                    let n = st.buf.extend_from_slice(c);
+                    if n != c.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "WAL entry size {} exceeds staging capacity {}",
+                                total,
+                                st.buf.capacity()
+                            ),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Flush any buffered bytes to the underlying file. No fsync.
+    fn flush(&self) -> io::Result<()> {
+        match self {
+            Self::Buffered(b) => {
+                let mut w = b.buf_writer.lock();
+                w.flush()
+            }
+            Self::Direct(d) => {
+                let mut st = d.staging.lock();
+                Self::flush_staging_locked(&mut st)
+            }
+        }
+    }
+
+    /// Call `sync_data()` on the dup handle — outside any writer
+    /// mutex, so it doesn't block appends. Caller decides whether
+    /// to do this (skipped in `ODirectNoFsync` mode).
+    fn sync_data(&self) -> io::Result<()> {
+        match self {
+            Self::Buffered(b) => b.sync_file.sync_data(),
+            Self::Direct(d) => d.sync_file.sync_data(),
+        }
+    }
+
+    /// Pad the staging buffer up to the next 4 KB boundary and pwrite
+    /// it at `staging.file_offset`. Explicitly zeros the pad region
+    /// so stale bytes from a prior flush don't survive as phantom
+    /// entries in recovery. Advances `file_offset` by the padded
+    /// length (itself 4 KB-aligned, preserving the invariant).
+    fn flush_staging_locked(staging: &mut AlignedStaging) -> io::Result<()> {
+        use crate::io::aligned_buf::ALIGNMENT;
+        use std::os::unix::fs::FileExt;
+
+        if staging.buf.is_empty() {
+            return Ok(());
+        }
+
+        let filled = staging.buf.len();
+        let padded_len = (filled + ALIGNMENT - 1) & !(ALIGNMENT - 1);
+
+        // Zero the pad region [filled..padded_len] before pwrite.
+        // AlignedBuffer::clear() only resets len=0, leaving the raw
+        // memory holding whatever was there from the previous flush.
+        // Pwriting it as "pad" would leak stale real entries into the
+        // file and recovery would replay them a second time.
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(staging.buf.as_mut_ptr(), padded_len)
+        };
+        if padded_len > filled {
+            slice[filled..padded_len].fill(0);
+        }
+
+        staging.file.write_all_at(slice, staging.file_offset)?;
+        staging.file_offset += padded_len as u64;
+        staging.buf.clear();
+        Ok(())
     }
 }
 
@@ -344,14 +580,14 @@ impl WriteAheadLog {
         let file_seq = Self::find_latest_seq(&config.dir)?;
         let file_path = Self::wal_file_path(&config.dir, file_seq);
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)?;
+        // The position we track for rotation decisions is the existing
+        // file size. In Direct mode the staging buffer will start
+        // pwriting at the next 4 KB boundary past that.
+        let position = std::fs::metadata(&file_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
-        let position = file.metadata()?.len();
-
-        let wal_file = WalFile::new(file, config.buffer_size)?;
+        let wal_file = WalFile::new(config.sync_mode, &file_path, config.buffer_size)?;
         let writer = Arc::new(arc_swap::ArcSwap::from(Arc::new(wal_file)));
 
         // Any WAL files on disk older than this are from a prior run; we
@@ -443,6 +679,7 @@ impl WriteAheadLog {
         let pending_close_handle = Arc::clone(&self.pending_close);
         let interval = self.config.fsync_interval;
         let batch = self.config.fsync_batch as u64;
+        let sync_mode = self.config.sync_mode;
 
         let handle = thread::Builder::new()
             .name("wal-commit".to_string())
@@ -452,7 +689,7 @@ impl WriteAheadLog {
                     if shutdown.load(Ordering::Relaxed) {
                         // Final flush before exit so nothing dangles.
                         Self::drain_pending_close(&pending_close_handle);
-                        Self::commit_once(&writer_handle, &gc, &stats);
+                        Self::commit_once(&writer_handle, &gc, &stats, sync_mode);
                         // Also wake any stragglers blocked on durability.
                         let _g = gc.cond_lock.lock();
                         gc.cond.notify_all();
@@ -473,7 +710,7 @@ impl WriteAheadLog {
                     // one fsync — while still waking quickly.
                     if new_work && (over_batch || past_interval) {
                         Self::drain_pending_close(&pending_close_handle);
-                        Self::commit_once(&writer_handle, &gc, &stats);
+                        Self::commit_once(&writer_handle, &gc, &stats, sync_mode);
                         last_tick = Instant::now();
                         continue;
                     }
@@ -516,25 +753,24 @@ impl WriteAheadLog {
             std::mem::take(&mut *g)
         };
         for old in olds {
-            // Flush the BufWriter under its Mutex first, then release
-            // the Mutex and fsync through the separate sync_file handle
-            // — same concurrency shape as commit_once. This also keeps
-            // the inner lock out of scope before we touch
-            // `pending_close` on the error path (lock order vs
-            // rotate()'s push site would otherwise invert).
-            let flush_ok = {
-                let mut w = old.buf_writer.lock();
-                match w.flush() {
-                    Err(e) => {
-                        tracing::error!("wal: retired BufWriter flush failed: {}", e);
-                        false
-                    }
-                    Ok(()) => true,
+            // Flush under the inner mutex first, then release and
+            // fsync through the dup handle — same concurrency shape as
+            // commit_once, regardless of whether `old` is the Buffered
+            // or Direct variant.
+            let flush_ok = match old.flush() {
+                Err(e) => {
+                    tracing::error!("wal: retired flush failed: {}", e);
+                    false
                 }
+                Ok(()) => true,
             };
 
+            // Always fsync retired files, even in ODirectNoFsync mode —
+            // drain happens on close/rotate, not on the hot commit path,
+            // so the extra call is free and we get a durable close
+            // point for every file.
             let sync_ok = if flush_ok {
-                match old.sync_file.sync_data() {
+                match old.sync_data() {
                     Err(e) => {
                         tracing::error!("wal: retired sync_data failed: {}", e);
                         false
@@ -573,6 +809,7 @@ impl WriteAheadLog {
         writer: &Arc<arc_swap::ArcSwap<WalFile>>,
         gc: &Arc<GroupCommit>,
         stats: &Arc<WalStats>,
+        sync_mode: WalSyncMode,
     ) {
         let target = gc.written_pos.load(Ordering::Acquire);
         if target == gc.durable_pos.load(Ordering::Acquire) {
@@ -580,28 +817,27 @@ impl WriteAheadLog {
         }
         let slot = writer.load_full();
 
-        // Stage 1: flush BufWriter's buffer to the File. Needs the
-        // Mutex, but finishes in a few µs — it's just a memcpy to the
-        // kernel's page cache.
-        {
-            let mut w = slot.buf_writer.lock();
-            if let Err(e) = w.flush() {
-                tracing::error!("wal: BufWriter flush failed: {}", e);
-                return;
-            }
-        }
-
-        // Stage 2: sync_data on the dup'd handle, outside the Mutex.
-        // Writers may append more bytes concurrently — those bytes sit
-        // in BufWriter's buffer or hit the File via BufWriter's
-        // internal flush. Either way, `target` is the offset we promised
-        // to cover and everything up to it is now in kernel's write-back
-        // path, so this fsync makes it durable.
-        if let Err(e) = slot.sync_file.sync_data() {
-            tracing::error!("wal: sync_data failed: {}", e);
+        // Stage 1: flush buffered/staged bytes to the file. Under the
+        // inner mutex; finishes in a few µs. For Buffered: memcpy to
+        // kernel page cache. For Direct: aligned pwrite to the drive's
+        // write queue.
+        if let Err(e) = slot.flush() {
+            tracing::error!("wal: flush failed: {}", e);
             return;
         }
-        stats.syncs.fetch_add(1, Ordering::Relaxed);
+
+        // Stage 2: optional fsync on the dup'd handle, outside the
+        // mutex. Writers can stage more bytes concurrently. Skipped in
+        // ODirectNoFsync mode — the drive's write-ack (from the pwrite
+        // above) is the durability boundary on PLP hardware.
+        let do_fsync = !matches!(sync_mode, WalSyncMode::ODirectNoFsync);
+        if do_fsync {
+            if let Err(e) = slot.sync_data() {
+                tracing::error!("wal: sync_data failed: {}", e);
+                return;
+            }
+            stats.syncs.fetch_add(1, Ordering::Relaxed);
+        }
         gc.publish(target);
     }
 
@@ -744,13 +980,13 @@ impl WriteAheadLog {
             // file gets its final sync from the commit thread via
             // drain_pending_close.
             let slot = self.writer.load_full();
-            let mut writer = slot.buf_writer.lock();
 
-            writer.write_all(&header.to_bytes())?;
-            writer.write_all(key)?;
-            if let Some(value) = value {
-                writer.write_all(value)?;
-            }
+            let header_bytes = header.to_bytes();
+            let chunks: &[&[u8]] = match value {
+                Some(v) => &[&header_bytes, key, v],
+                None => &[&header_bytes, key],
+            };
+            slot.append_entry(chunks)?;
 
             let new_pos = self.position.fetch_add(entry_size as u64, Ordering::Relaxed)
                 + entry_size as u64;
@@ -808,11 +1044,11 @@ impl WriteAheadLog {
         let new_seq = self.file_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let new_path = Self::wal_file_path(&self.config.dir, new_seq);
 
-        let new_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&new_path)?;
-        let new_writer = Arc::new(WalFile::new(new_file, self.config.buffer_size)?);
+        let new_writer = Arc::new(WalFile::new(
+            self.config.sync_mode,
+            &new_path,
+            self.config.buffer_size,
+        )?);
 
         // Freeze the old file's max_gen BEFORE swap so cleanup_up_to_gen
         // doesn't race. Reset current_max_gen for the new file.
@@ -849,11 +1085,10 @@ impl WriteAheadLog {
         Self::drain_pending_close(&self.pending_close);
 
         let slot = self.writer.load_full();
-        {
-            let mut writer = slot.buf_writer.lock();
-            writer.flush()?;
-        }
-        slot.sync_file.sync_data()?;
+        slot.flush()?;
+        // Always fsync on explicit `sync()` — used by shutdown paths
+        // where correctness trumps whatever mode says on the hot path.
+        slot.sync_data()?;
         let target = self.gc.written_pos.load(Ordering::Acquire);
         self.gc.publish(target);
         self.stats.syncs.fetch_add(1, Ordering::Relaxed);
@@ -921,35 +1156,72 @@ impl WriteAheadLog {
 
         files.sort();
 
-        // Replay each file in order
+        // Replay each file in order.
+        //
+        // In ODirect modes the staging buffer pads each flush up to a
+        // 4 KB boundary before pwriting, so the file has zero-regions
+        // between the last entry of a flush and the next aligned
+        // block. Recovery handles those: on an invalid-magic header,
+        // round the file position up to the next 4 KB boundary and
+        // try one more read. If that's also invalid, stop — either a
+        // truncated tail or real corruption. One retry, no recursion,
+        // no risk of infinite loops.
+        use std::io::Seek;
+        use crate::io::aligned_buf::ALIGNMENT;
         for seq in files {
             let path = Self::wal_file_path(&self.config.dir, seq);
             let mut file = File::open(&path)?;
+            let file_len = file.metadata()?.len();
 
             let mut header_buf = [0u8; WAL_HEADER_SIZE];
 
-            loop {
-                // Read header
-                match file.read_exact(&mut header_buf) {
+            'entries: loop {
+                let pre_read = file.stream_position()?;
+                let header = match file.read_exact(&mut header_buf) {
+                    Ok(()) => WalEntryHeader::from_bytes(&header_buf),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                };
+
+                let header = if header.is_valid() {
+                    header
+                } else {
+                    // Pad-zero region from a partial commit in ODirect
+                    // mode, OR corrupt tail. Jump to the next 4 KB
+                    // boundary past where we started reading and
+                    // retry once.
+                    let rounded = align_up_u64(pre_read + 1, ALIGNMENT as u64);
+                    if rounded >= file_len {
+                        break 'entries;
+                    }
+                    file.seek(std::io::SeekFrom::Start(rounded))?;
+                    match file.read_exact(&mut header_buf) {
+                        Ok(()) => {
+                            let h2 = WalEntryHeader::from_bytes(&header_buf);
+                            if !h2.is_valid() {
+                                break 'entries;
+                            }
+                            h2
+                        }
+                        Err(_) => break 'entries,
+                    }
+                };
+
+                // Read key. Short read (torn mid-entry) ⇒ stop.
+                let mut key = vec![0u8; header.key_len as usize];
+                match file.read_exact(&mut key) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e),
                 }
 
-                let header = WalEntryHeader::from_bytes(&header_buf);
-
-                if !header.is_valid() {
-                    break; // Corrupted entry, stop replay
-                }
-
-                // Read key
-                let mut key = vec![0u8; header.key_len as usize];
-                file.read_exact(&mut key)?;
-
-                // Read value (if PUT)
                 let value = if header.is_put() {
                     let mut value = vec![0u8; header.value_len as usize];
-                    file.read_exact(&mut value)?;
+                    match file.read_exact(&mut value) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(e),
+                    }
                     value
                 } else {
                     Vec::new()

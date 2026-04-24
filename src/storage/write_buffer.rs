@@ -13,6 +13,25 @@ use crate::storage::record::{Record, RECORD_ALIGNMENT};
 /// Size of a write block (1MB).
 pub const WBLOCK_SIZE: usize = 1024 * 1024;
 
+/// Footer written by `WBlock::finalize()` immediately after the last
+/// record in the block. Recovery uses it to tell "this block was
+/// flushed cleanly" apart from "this block was torn mid-flush" —
+/// information record-level CRCs alone can't give you, because a
+/// partial flush may land a run of valid records followed by stale
+/// bytes that happen to have the right magic.
+///
+/// Layout (16 bytes, little-endian):
+///   [0..8]   magic  = WBLOCK_FOOTER_MAGIC
+///   [8..16]  xxh3   = xxh3_64 over bytes [0 .. records_end]
+///
+/// `records_end` (the offset we write the footer at) is implicit: the
+/// reader scans records forward and the footer starts where the scan
+/// halts on a non-record magic. Readers that don't find the marker
+/// just fall back to "trust per-record CRCs" — safe, and means old
+/// data files opened by a new binary keep working.
+pub const WBLOCK_FOOTER_MAGIC: u64 = 0xF00DFACEB10CDA7A;
+pub const WBLOCK_FOOTER_SIZE: usize = 16;
+
 /// A write block (WBlock) that accumulates records until full.
 #[derive(Debug)]
 pub struct WBlock {
@@ -122,9 +141,22 @@ impl WBlock {
         }
     }
 
-    /// Prepares the buffer for writing (pads to alignment).
+    /// Prepares the buffer for writing: appends an integrity footer
+    /// (magic + xxh3_64 over records) and pads to 4 KiB alignment for
+    /// O_DIRECT. Idempotent — a second call is a no-op because
+    /// `write_pos` hasn't advanced.
     pub fn finalize(&mut self) -> &AlignedBuffer {
-        // Pad to 4KB alignment for O_DIRECT
+        // Skip footer if there's no room (nearly-full block). Recovery
+        // still works via per-record CRCs; footer is a nice-to-have.
+        if self.write_pos + WBLOCK_FOOTER_SIZE <= WBLOCK_SIZE && !self.is_empty() {
+            let hash = xxhash_rust::xxh3::xxh3_64(&self.buffer[..self.write_pos]);
+            let mut footer = [0u8; WBLOCK_FOOTER_SIZE];
+            footer[0..8].copy_from_slice(&WBLOCK_FOOTER_MAGIC.to_le_bytes());
+            footer[8..16].copy_from_slice(&hash.to_le_bytes());
+            self.buffer.extend_from_slice(&footer);
+            self.write_pos += WBLOCK_FOOTER_SIZE;
+        }
+
         let aligned_len = (self.write_pos + ALIGNMENT - 1) & !(ALIGNMENT - 1);
         self.buffer.resize(aligned_len);
         &self.buffer
@@ -211,9 +243,22 @@ pub struct WriteBuffer {
     current_file_id: AtomicU32,
     /// Maximum blocks per file.
     max_blocks_per_file: u32,
+    /// Backpressure cap — refuse new appends when `pending.len()` is
+    /// at or above this. 0 disables the cap. Each WBlock is 1 MiB, so
+    /// 128 pending blocks ≈ 128 MiB of RAM tied up. Under sustained
+    /// write overload (write rate × size > disk bandwidth) this
+    /// prevents unbounded memory growth and lets the server return a
+    /// proper "OOM command not allowed" to clients instead of getting
+    /// OOM-killed.
+    max_pending_wblocks: usize,
 }
 
 impl WriteBuffer {
+    /// Default cap on pending WBlocks. 128 blocks × 1 MiB = 128 MiB of
+    /// staged-but-not-flushed data. Operator-tunable via
+    /// `set_max_pending_wblocks`.
+    pub const DEFAULT_MAX_PENDING_WBLOCKS: usize = 128;
+
     /// Creates a new write buffer.
     pub fn new(initial_file_id: u32, max_blocks_per_file: u32) -> Self {
         Self {
@@ -223,7 +268,13 @@ impl WriteBuffer {
             next_block_id: AtomicU32::new(1),
             current_file_id: AtomicU32::new(initial_file_id),
             max_blocks_per_file,
+            max_pending_wblocks: Self::DEFAULT_MAX_PENDING_WBLOCKS,
         }
+    }
+
+    /// Override the pending-WBlock cap. 0 disables.
+    pub fn set_max_pending_wblocks(&mut self, cap: usize) {
+        self.max_pending_wblocks = cap;
     }
 
     /// Appends a record to the write buffer.
@@ -242,10 +293,26 @@ impl WriteBuffer {
             }
             Err(()) => {
                 // Current block is full, rotate
-                let file_id = current.file_id;
-                let block_id = current.block_id;
+                let _file_id = current.file_id;
+                let _block_id = current.block_id;
 
-                // Move current to pending
+                // Move current to pending — but first enforce the
+                // backpressure cap so we don't accumulate unbounded
+                // WBlocks when the flush thread can't keep up with
+                // incoming writes. Client sees the standard
+                // `OOM command not allowed when used memory > 'maxmemory'`
+                // reply, same as our NoEviction path.
+                {
+                    let pending = self.pending.lock();
+                    if self.max_pending_wblocks > 0
+                        && pending.len() >= self.max_pending_wblocks
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "OOM command not allowed when used memory > 'maxmemory'",
+                        ));
+                    }
+                }
                 let old_block = std::mem::replace(
                     &mut *current,
                     self.allocate_new_block(),
@@ -303,6 +370,12 @@ impl WriteBuffer {
     /// Returns the number of pending blocks.
     pub fn pending_count(&self) -> usize {
         self.pending.lock().len()
+    }
+
+    /// File ID the next append will land in. Compactor uses this to
+    /// avoid unlinking the file we're still actively writing to.
+    pub fn current_file_id(&self) -> u32 {
+        self.current_file_id.load(Ordering::Relaxed)
     }
 
     /// Returns the current block's utilization.
@@ -470,5 +543,76 @@ mod tests {
         assert_eq!(loc.file_id, 0);
         assert_eq!(loc.wblock_id, 0);
         assert_eq!(loc.offset, 0);
+    }
+
+    /// Incompressible 500 KB payload — LZ4 can't shrink random-looking
+    /// bytes, so each record takes a predictable ~500 KB on disk.
+    /// Without this, the test's `vec![b'x'; N]` compresses to a few
+    /// hundred bytes and hundreds of records fit per 1 MB WBlock, so
+    /// the cap never trips.
+    fn incompressible_value(seed: u64, len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        let mut x = seed.wrapping_add(0x9E3779B97F4A7C15);
+        while v.len() + 8 <= len {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        while v.len() < len {
+            v.push(0);
+        }
+        v
+    }
+
+    #[test]
+    fn pending_wblock_cap_returns_oom_on_overflow() {
+        // Cap pending at 2 WBlocks. Records are ~500 KB incompressible
+        // (so compression doesn't shrink them below the WBlock size)
+        // → 2 per WBlock → the 3rd rotation should hit the cap and
+        // return the standard OOM reply so the Redis layer can surface
+        // it to clients instead of the store growing memory
+        // unboundedly.
+        let mut buffer = WriteBuffer::new(0, 1023);
+        buffer.set_max_pending_wblocks(2);
+
+        let mut saw_oom = false;
+        for i in 0u32..20 {
+            let mut record = Record::new(
+                format!("k{:03}", i).into_bytes(),
+                incompressible_value(i as u64, 500 * 1024),
+                i,
+                0,
+            )
+            .unwrap();
+            match buffer.append(&mut record) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("OOM command not allowed") => {
+                    saw_oom = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert!(saw_oom, "expected OOM once pending cap was hit");
+        assert!(buffer.pending_count() >= 2, "cap should hold ≥ 2 before rejecting");
+    }
+
+    #[test]
+    fn pending_wblock_cap_zero_disables() {
+        // cap = 0 means "no limit" — used by tests or workloads that
+        // want to opt out. Should never OOM regardless of pending
+        // depth.
+        let mut buffer = WriteBuffer::new(0, 1023);
+        buffer.set_max_pending_wblocks(0);
+        for i in 0u32..10 {
+            let mut record = Record::new(
+                format!("k{:03}", i).into_bytes(),
+                incompressible_value(i as u64, 500 * 1024),
+                i,
+                0,
+            )
+            .unwrap();
+            buffer.append(&mut record).unwrap();
+        }
     }
 }

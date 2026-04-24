@@ -1,5 +1,6 @@
 //! SSD-KV: High-Performance Key-Value Store
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,15 +156,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let idx = Arc::new(Index::new());
             let wb = Arc::new(WriteBuffer::new(fm.file_count() as u32, config.wblocks_per_file));
 
-            // Group-commit WAL for this DB. Every durable write goes here
-            // before we ack to the client; recovery replays it on startup.
-            let wal_dir = db_data_dir.join("wal");
-            let wal = Arc::new(WriteAheadLog::new(WalConfig {
-                dir: wal_dir,
-                fsync_interval: std::time::Duration::from_micros(config.fsync_interval_us),
-                fsync_batch: config.fsync_batch,
-                ..Default::default()
-            })?);
+            // Group-commit WAL shards for this DB. One shard per
+            // reactor thread, so each reactor has its own fsync
+            // pipeline — that's the change that lifts the per-device
+            // IOPS ceiling. Each shard is an independent WAL
+            // instance with its own commit thread and wake eventfd.
+            //
+            // When `--wal-dirs` is supplied, shards pin round-robin to
+            // those paths so different shards can target different
+            // devices (e.g. separate NVMes). Without it, all shards
+            // live under `data_dir/db_i/wal` in per-shard
+            // subdirectories so they don't stomp on each other.
+            let num_shards = config.reactor_threads.max(1);
+            let wal_base_dirs: Vec<PathBuf> = if config.wal_dirs.is_empty() {
+                vec![db_data_dir.join("wal")]
+            } else {
+                config.wal_dirs.clone()
+            };
+            let wal_shards: Vec<Arc<WriteAheadLog>> = (0..num_shards)
+                .map(|shard_idx| {
+                    let base = &wal_base_dirs[shard_idx % wal_base_dirs.len()];
+                    let shard_dir = if num_shards == 1 && config.wal_dirs.is_empty() {
+                        // Single-shard, default-path: keep the legacy
+                        // `data/db_i/wal` layout so existing deployments
+                        // recover their WAL files on upgrade.
+                        base.clone()
+                    } else {
+                        base.join(format!("db_{}_shard_{}", db_id, shard_idx))
+                    };
+                    Ok::<_, std::io::Error>(Arc::new(WriteAheadLog::new(WalConfig {
+                        dir: shard_dir,
+                        fsync_interval: std::time::Duration::from_micros(config.fsync_interval_us),
+                        fsync_batch: config.fsync_batch,
+                        sync_mode: match config.wal_mode {
+                            crate::config::WalModeArg::Buffered => {
+                                crate::storage::wal::WalSyncMode::Buffered
+                            }
+                            crate::config::WalModeArg::Odirect => {
+                                crate::storage::wal::WalSyncMode::ODirect
+                            }
+                            crate::config::WalModeArg::OdirectTrustDevice => {
+                                crate::storage::wal::WalSyncMode::ODirectNoFsync
+                            }
+                        },
+                        ..Default::default()
+                    })?))
+                })
+                .collect::<Result<_, _>>()?;
+            // Primary shard reference for recovery and WAL-trim paths
+            // that still want a single WAL. WAL-trim is per-shard but
+            // the interval thread is shared.
+            let wal = Arc::clone(&wal_shards[0]);
 
             if fm.file_count() == 0 {
                 fm.create_file()?;
@@ -181,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Arc::clone(&idx),
                     Arc::clone(&fm),
                     Arc::clone(&wb),
+                    wblock_cache.as_ref().map(Arc::clone),
                 );
                 compaction_stops.push(stop);
             }
@@ -198,10 +242,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 handler_inner.set_async_reader(Arc::clone(reader));
             }
 
-            // Recover: scan data files, then replay WAL for records that were
-            // ack'd but not yet flushed. Done BEFORE wiring the WAL into the
-            // handler so replayed records don't re-append to the log.
-            let recovery_stats = recover_with_wal(&handler_inner, &fm, &wal)?;
+            // Recover: scan data files, then replay every WAL shard
+            // for records that were ack'd but not yet flushed. Done
+            // BEFORE wiring the WAL into the handler so replayed
+            // records don't re-append to the log.
+            //
+            // Shards are independent WAL streams — each replays its
+            // own file-sequence order. Since every record carries a
+            // globally-unique generation and the index's insert is
+            // generation-aware, the ORDER in which we process shards
+            // doesn't matter. Only that all ack'd records land.
+            let recovery_stats = {
+                let mut stats = recover_with_wal(&handler_inner, &fm, &wal_shards[0])?;
+                for extra in &wal_shards[1..] {
+                    let extra_stats = recover_with_wal(&handler_inner, &fm, extra)?;
+                    stats.wal_entries_replayed += extra_stats.wal_entries_replayed;
+                    stats.records_indexed += extra_stats.records_indexed;
+                    stats.records_deleted += extra_stats.records_deleted;
+                    stats.records_expired += extra_stats.records_expired;
+                    stats.max_generation = stats.max_generation.max(extra_stats.max_generation);
+                }
+                stats
+            };
             info!(
                 "DB {}: SSD, recovered {} records ({} expired, {} deleted, {} from WAL, max gen {})",
                 db_id,
@@ -213,8 +275,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             // From here on, every put_sync/delete_sync is durable.
-            handler_inner.set_wal(Arc::clone(&wal));
-            wals.push(Arc::clone(&wal));
+            // Reactors will pick their shard by reactor_id; non-reactor
+            // callers (tests, eviction thread) funnel through shard 0.
+            handler_inner.set_wal_shards(wal_shards.clone());
+            // Expose every shard to outer cleanup paths (trim thread,
+            // shutdown) so nothing is missed.
+            for w in &wal_shards {
+                wals.push(Arc::clone(w));
+            }
 
             let handler = Arc::new(handler_inner);
 

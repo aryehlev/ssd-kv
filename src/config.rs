@@ -3,7 +3,29 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// How WAL writes reach the disk.
+///
+/// - `Buffered`: writes go through `BufWriter<File>` to the kernel
+///   page cache; a `sync_data()` per group-commit cycle forces them
+///   to the drive. Safe on any hardware.
+/// - `ODirect`: writes bypass the page cache via `O_DIRECT` with
+///   4 KB-aligned pwrites, followed by `sync_data()`. Same durability
+///   as `Buffered` but predictable latency (no page-cache variability).
+/// - `ODirectNoFsync`: O_DIRECT pwrites with **no fsync**. The
+///   drive's write-ack is treated as durable. ONLY SAFE ON
+///   Power-Loss-Protected enterprise NVMe (Intel DC, Samsung
+///   PM17xx+ / PM9xxx, etc.) where the drive's DRAM cache is
+///   battery-backed. On commodity SSDs without PLP, a power loss
+///   can lose acknowledged writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WalModeArg {
+    Buffered,
+    Odirect,
+    #[value(name = "odirect-trust-device")]
+    OdirectTrustDevice,
+}
 
 /// SSD-KV: High-Performance Key-Value Store
 #[derive(Parser, Debug, Clone)]
@@ -149,6 +171,30 @@ pub struct Config {
     /// commit thread wakes early. Bounds worst-case queue depth at high QPS.
     #[arg(long, default_value = "256")]
     pub fsync_batch: usize,
+
+    /// Directories for WAL shards — one per physical device unlocks
+    /// parallel fsync pipelines past a single device's IOPS ceiling.
+    /// When set with N paths, N WAL shards round-robin across them;
+    /// when unset, all shards live under `data_dir/db_i/wal` (single
+    /// device). Pass multiple times: `--wal-dir /nvme0/wal --wal-dir /nvme1/wal`.
+    /// Number of shards per DB is driven by `--reactor-threads`, not
+    /// by the path count — extra paths past the reactor count are
+    /// unused.
+    #[arg(long = "wal-dir")]
+    pub wal_dirs: Vec<PathBuf>,
+
+    /// How WAL writes reach the disk. Default `odirect` — bypasses the
+    /// kernel page cache via O_DIRECT + 4 KB-aligned pwrites, still
+    /// calls fsync per group-commit. On virtio-blk this matches or
+    /// beats the buffered path; on NVMe it's a larger win (no
+    /// page-cache memcpy, predictable latency). `buffered` is
+    /// available for filesystems that reject O_DIRECT (tmpfs; very
+    /// old kernels). `odirect-trust-device` drops fsync entirely —
+    /// ONLY safe on enterprise NVMe with Power-Loss Protection (PLP);
+    /// without PLP, a power loss can lose acknowledged writes. Pairs
+    /// with `--wal-dir` for multi-device NVMe deployments.
+    #[arg(long, default_value = "odirect")]
+    pub wal_mode: WalModeArg,
 
     // --- io_uring ---
 
@@ -311,6 +357,8 @@ impl Default for Config {
             wblock_cache_mb: 0,
             fsync_interval_us: 500,
             fsync_batch: 256,
+            wal_dirs: Vec::new(),
+            wal_mode: WalModeArg::Odirect,
             io_workers: 2,
             reactor_threads: 1,
             wal_trim_interval_secs: 30,

@@ -24,10 +24,25 @@ impl DbHandler {
 
     /// Non-blocking PUT. Reactor path. Returns the WAL position the caller
     /// must wait on for durability. Memory-only DBs return `None` (no WAL,
-    /// no wait).
+    /// no wait). Shard 0 — for callers that don't know their reactor's
+    /// shard id.
     pub fn put_nowait(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<Option<u64>> {
+        self.put_nowait_on(0, key, value, ttl)
+    }
+
+    /// Shard-aware non-blocking PUT. The reactor passes its shard id so
+    /// the write lands on that shard's WAL and the corresponding
+    /// commit thread is the one fsyncing it. SSD path only — memory
+    /// DBs ignore the shard (they have no WAL).
+    pub fn put_nowait_on(
+        &self,
+        shard_hint: usize,
+        key: &[u8],
+        value: &[u8],
+        ttl: u32,
+    ) -> io::Result<Option<u64>> {
         match self {
-            DbHandler::Ssd(h) => h.put_nowait(key, value, ttl),
+            DbHandler::Ssd(h) => h.put_nowait_on(shard_hint, key, value, ttl),
             DbHandler::Memory(m) => {
                 m.put_sync(key, value, ttl)?;
                 Ok(None)
@@ -35,10 +50,19 @@ impl DbHandler {
         }
     }
 
-    /// Non-blocking DELETE. Returns `(was_live, Option<wal_pos>)`.
+    /// Non-blocking DELETE. Returns `(was_live, Option<wal_pos>)`. Shard 0.
     pub fn delete_nowait(&self, key: &[u8]) -> io::Result<(bool, Option<u64>)> {
+        self.delete_nowait_on(0, key)
+    }
+
+    /// Shard-aware non-blocking DELETE.
+    pub fn delete_nowait_on(
+        &self,
+        shard_hint: usize,
+        key: &[u8],
+    ) -> io::Result<(bool, Option<u64>)> {
         match self {
-            DbHandler::Ssd(h) => h.delete_nowait(key),
+            DbHandler::Ssd(h) => h.delete_nowait_on(shard_hint, key),
             DbHandler::Memory(m) => Ok((m.delete_sync(key)?, None)),
         }
     }

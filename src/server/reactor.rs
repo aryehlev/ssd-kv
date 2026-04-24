@@ -38,6 +38,12 @@ struct ConnState {
     /// cleared once the reactor observes durable_position() >= it and
     /// flushes pending_out to the socket.
     pending_up_to: u64,
+    /// Timestamp of when `pending_up_to` was set. Measured at the point
+    /// the SET/DEL command completed its synchronous work and the
+    /// response got buffered awaiting durability. Used to record total
+    /// latency (including the fsync wait) into the SSD handler's
+    /// `set_latency` histogram when the response finally flushes.
+    pending_since: Option<std::time::Instant>,
 }
 
 impl ConnState {
@@ -58,6 +64,7 @@ impl ConnState {
             handler,
             pending_out: Vec::with_capacity(tuning.write_buf_bytes),
             pending_up_to: 0,
+            pending_since: None,
         }
     }
 }
@@ -71,6 +78,12 @@ pub struct ReactorServer {
     pubsub: Arc<PubSubManager>,
     tuning: ServerTuning,
     live_conns: Arc<AtomicUsize>,
+    /// Which WAL shard this reactor's connections should write to.
+    /// Each reactor owns one shard end-to-end: accept → shard_hint
+    /// on ConnState → writes hit that shard's WAL → durability wait
+    /// polls that shard's durable_pos only. Default 0 keeps
+    /// single-reactor deployments unchanged.
+    reactor_id: usize,
 }
 
 impl ReactorServer {
@@ -78,6 +91,15 @@ impl ReactorServer {
         addr: SocketAddr,
         db_manager: Arc<DatabaseManager>,
         tuning: ServerTuning,
+    ) -> Self {
+        Self::new_with_reactor_id(addr, db_manager, tuning, 0)
+    }
+
+    pub fn new_with_reactor_id(
+        addr: SocketAddr,
+        db_manager: Arc<DatabaseManager>,
+        tuning: ServerTuning,
+        reactor_id: usize,
     ) -> Self {
         Self {
             addr,
@@ -87,6 +109,7 @@ impl ReactorServer {
             pubsub: Arc::new(PubSubManager::new()),
             tuning,
             live_conns: Arc::new(AtomicUsize::new(0)),
+            reactor_id,
         }
     }
 
@@ -97,6 +120,17 @@ impl ReactorServer {
         replica_read: bool,
         tuning: ServerTuning,
     ) -> Self {
+        Self::with_router_and_reactor_id(addr, db_manager, router, replica_read, tuning, 0)
+    }
+
+    pub fn with_router_and_reactor_id(
+        addr: SocketAddr,
+        db_manager: Arc<DatabaseManager>,
+        router: Arc<ClusterRouter>,
+        replica_read: bool,
+        tuning: ServerTuning,
+        reactor_id: usize,
+    ) -> Self {
         Self {
             addr,
             db_manager,
@@ -105,6 +139,7 @@ impl ReactorServer {
             pubsub: Arc::new(PubSubManager::new()),
             tuning,
             live_conns: Arc::new(AtomicUsize::new(0)),
+            reactor_id,
         }
     }
 
@@ -144,18 +179,41 @@ impl ReactorServer {
         let live_conns = Arc::clone(&self.live_conns);
         let max_conns = self.tuning.max_connections;
 
-        // Snapshot the SSD handlers so the reactor can poll their WALs'
-        // durable_position each iteration. Kept outside the closure to
-        // avoid the db_manager borrow. Memory-only DBs have no WAL; we
-        // ignore those indices.
+        // Snapshot each SSD DB's WAL SHARD belonging to this reactor so
+        // we can poll its `durable_position()` for durability-pending
+        // responses. Each reactor watches exactly one shard per DB; if
+        // another reactor's shard advances, that's irrelevant to us.
+        // This is the core of parallel WAL shards: N reactors, N
+        // independent fsync pipelines, zero cross-reactor coordination.
+        //
+        // If a DB has fewer shards than reactors (extra reactor threads
+        // vs configured shards), `wal_for` clamps to the last shard —
+        // degraded but correct: those reactors share a shard.
+        let my_shard = self.reactor_id;
         let wals: Vec<Option<Arc<WriteAheadLog>>> = (0..db_manager.num_dbs())
             .map(|i| {
                 db_manager
                     .db(i)
                     .and_then(|d| d.as_ssd())
-                    .and_then(|h| h.wal().cloned())
+                    .and_then(|h| {
+                        let shards = h.wal_shards();
+                        if shards.is_empty() {
+                            None
+                        } else {
+                            Some(Arc::clone(&shards[my_shard.min(shards.len() - 1)]))
+                        }
+                    })
             })
             .collect();
+
+        // Snapshot DB 0's stats for recording per-write latency on the
+        // reactor flush path. Multi-DB deployments record into DB 0
+        // unconditionally — per-DB histograms would need connection-to-
+        // DB tracking, and the dominant use case has 1 DB anyway.
+        let latency_sink: Option<Arc<crate::server::handler::HandlerStats>> = db_manager
+            .db(0)
+            .and_then(|d| d.as_ssd())
+            .map(|h| h.stats());
 
         // Create a wake eventfd and register it with every WAL. The WAL
         // commit thread writes to this fd every time durable_pos
@@ -254,6 +312,12 @@ impl ReactorServer {
                         Arc::clone(&pubsub),
                         tuning,
                     );
+                    // Pin this connection to our reactor's WAL shard.
+                    // Every write on this connection goes through the
+                    // same shard, so writers never cross reactor
+                    // boundaries and each shard's commit thread owns
+                    // one reactor's worth of load.
+                    state.handler.shard_hint.set(my_shard);
                     connections.insert(fd, state);
                     None
                 }
@@ -279,6 +343,15 @@ impl ReactorServer {
                                 let pos = state.handler.take_wal_position();
                                 if pos > state.pending_up_to {
                                     state.pending_up_to = pos;
+                                    // First write in this pending batch —
+                                    // start the latency clock. Subsequent
+                                    // pipelined writes don't reset it; we
+                                    // measure the first-to-durable time,
+                                    // which is the reply latency the
+                                    // client sees.
+                                    if state.pending_since.is_none() {
+                                        state.pending_since = Some(std::time::Instant::now());
+                                    }
                                 }
                             }
                             Ok(None) => break, // partial, wait for more
@@ -327,6 +400,19 @@ impl ReactorServer {
                     {
                         let bytes = std::mem::take(&mut state.pending_out);
                         state.pending_up_to = 0;
+                        // Record the end-to-end durable-write latency for
+                        // this batch. `set_latency` is the coarse
+                        // aggregate across SET/DEL/writes since we don't
+                        // split here — that's fine, the user can read
+                        // per-op breakdown from the individual
+                        // put_sync/delete_sync paths used by non-reactor
+                        // callers.
+                        if let (Some(start), Some(sink)) =
+                            (state.pending_since.take(), latency_sink.as_ref())
+                        {
+                            let us = start.elapsed().as_micros() as u64;
+                            sink.set_latency.record(us);
+                        }
                         if let Err(e) = server.queue_send(fd, bytes) {
                             error!("reactor queue_send error on fd={}: {}", fd, e);
                         }
@@ -336,6 +422,7 @@ impl ReactorServer {
                         // pending_out is empty but we were waiting — no-op
                         // apart from clearing the watermark.
                         state.pending_up_to = 0;
+                        state.pending_since = None;
                     }
                 }
             }
@@ -395,9 +482,13 @@ pub fn start_reactor_multi(
                 .name(format!("resp-reactor-{}", i))
                 .spawn(move || {
                     let server = if let Some(r) = router {
-                        ReactorServer::with_router(addr, db_manager, r, replica_read, tuning)
+                        ReactorServer::with_router_and_reactor_id(
+                            addr, db_manager, r, replica_read, tuning, i,
+                        )
                     } else {
-                        ReactorServer::new(addr, db_manager, tuning)
+                        ReactorServer::new_with_reactor_id(
+                            addr, db_manager, tuning, i,
+                        )
                     };
                     if let Err(e) = server.run_with_reuseport(reuse_port) {
                         error!("reactor {} fatal: {}", i, e);

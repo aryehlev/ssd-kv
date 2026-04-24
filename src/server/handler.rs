@@ -36,6 +36,12 @@ pub struct HandlerStats {
     pub get_misses: AtomicU64,
     pub cache_hits: AtomicU64,
     pub errors: AtomicU64,
+    /// Per-op latency histograms. Recording is a handful of relaxed
+    /// atomics in the hot path; percentiles are computed lazily when
+    /// `INFO latencystats` runs.
+    pub set_latency: crate::perf::latency_hist::LatencyHistogram,
+    pub get_latency: crate::perf::latency_hist::LatencyHistogram,
+    pub del_latency: crate::perf::latency_hist::LatencyHistogram,
 }
 
 impl HandlerStats {
@@ -63,11 +69,14 @@ pub struct Handler {
     /// fall through to disk go through io_uring (SQPOLL amortizes the
     /// submission syscall) instead of a blocking pread.
     async_reader: Option<Arc<AsyncReader>>,
-    /// Optional write-ahead log. When set, put_sync/delete_sync return only
-    /// after the record is durably in the WAL (via group commit). When not
-    /// set, writes live in RAM until a WBlock fills — used by tests that
-    /// don't care about durability.
-    wal: Option<Arc<WriteAheadLog>>,
+    /// Parallel WAL shards. Each reactor pins to one shard; all writes
+    /// from that reactor go into that shard. When empty, writes live in
+    /// RAM until a WBlock fills (tests that don't care about
+    /// durability). When length is 1, behaves exactly like the previous
+    /// single-WAL code. When length > 1, each shard has its own commit
+    /// thread and fsync pipeline — the architectural move that lets
+    /// total throughput scale past a single device's IOPS ceiling.
+    wal_shards: Vec<Arc<WriteAheadLog>>,
     /// Highest record generation that is durably in a data file. Bumped
     /// by `flush()` after a successful fsync. The periodic WAL-trim path
     /// uses this to decide when old WAL files are redundant.
@@ -96,7 +105,7 @@ impl Handler {
             write_buffer,
             wblock_cache: None,
             async_reader: None,
-            wal: None,
+            wal_shards: Vec::new(),
             durable_gen: AtomicU32::new(0),
             bloom_filter: Arc::new(LockFreeBloomFilter::new(10_000_000, 0.01)),
             next_generation: AtomicU32::new(1),
@@ -143,14 +152,63 @@ impl Handler {
         self.wblock_cache.as_ref()
     }
 
-    /// Installs a write-ahead log. When set, every put/delete returns only
-    /// after the record is durably in the WAL.
-    pub fn set_wal(&mut self, wal: Arc<WriteAheadLog>) {
-        self.wal = Some(wal);
+    /// Configured cap on live entries (0 = unlimited). Used by CONFIG GET.
+    pub fn max_entries(&self) -> u64 {
+        self.max_entries
     }
 
+    /// Configured cap on total data bytes (0 = unlimited). Used by CONFIG GET.
+    pub fn max_data_bytes(&self) -> u64 {
+        self.max_data_bytes
+    }
+
+    /// Current eviction policy (read-only for CONFIG GET).
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
+    }
+
+    /// Installs a single write-ahead log. Back-compat shim for the
+    /// pre-sharded API: equivalent to `set_wal_shards(vec![wal])`.
+    /// New code should use `set_wal_shards` directly with N shards
+    /// sized to the reactor-thread count.
+    pub fn set_wal(&mut self, wal: Arc<WriteAheadLog>) {
+        self.wal_shards = vec![wal];
+    }
+
+    /// Install N parallel WAL shards. Reactor `i` will write into
+    /// shard `i`. The length of this vec sets how many reactor threads
+    /// get independent fsync pipelines; the common case is
+    /// `shards.len() == --reactor-threads`.
+    pub fn set_wal_shards(&mut self, shards: Vec<Arc<WriteAheadLog>>) {
+        self.wal_shards = shards;
+    }
+
+    /// Returns the first WAL shard if any exist. Back-compat accessor
+    /// for callers that only care "does this handler have durable
+    /// writes enabled"; do not use for shard-aware hot-path logic.
     pub fn wal(&self) -> Option<&Arc<WriteAheadLog>> {
-        self.wal.as_ref()
+        self.wal_shards.first()
+    }
+
+    /// Read-only view of all WAL shards. Reactors use this to pick
+    /// their assigned shard.
+    pub fn wal_shards(&self) -> &[Arc<WriteAheadLog>] {
+        &self.wal_shards
+    }
+
+    /// Pick the WAL shard a write should land in, given a hint
+    /// (typically the reactor's own index). Returns None if no WAL is
+    /// configured (memory-only). Clamps out-of-range hints rather than
+    /// panicking — extra reactors past the shard count simply share
+    /// the last shard, which is a reasonable degradation vs crashing.
+    #[inline]
+    fn wal_for(&self, hint: usize) -> Option<&Arc<WriteAheadLog>> {
+        if self.wal_shards.is_empty() {
+            None
+        } else {
+            let idx = hint.min(self.wal_shards.len() - 1);
+            Some(&self.wal_shards[idx])
+        }
     }
 
     /// Sets the eviction policy and capacity limits.
@@ -176,21 +234,44 @@ impl Handler {
     }
 
     /// Synchronous PUT for Redis compatibility. Blocks until the record
-    /// is durably in the WAL (if one is installed).
+    /// is durably in the WAL (if one is installed). Lands on WAL shard
+    /// 0 — non-reactor callers (tests, eviction thread) don't care
+    /// about sharding, so funnelling them all to the first shard keeps
+    /// the API simple.
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
-        let wal_pos = self.put_nowait(key, value, ttl)?;
-        if let (Some(pos), Some(wal)) = (wal_pos, &self.wal) {
+        let start = std::time::Instant::now();
+        let wal_pos = self.put_nowait_on(0, key, value, ttl)?;
+        if let (Some(pos), Some(wal)) = (wal_pos, self.wal_for(0)) {
             wal.wait_for_durable(pos);
         }
+        self.stats.set_latency.record(start.elapsed().as_micros() as u64);
         Ok(())
     }
 
-    /// Non-blocking PUT. Updates the WAL, write_buffer, and index, then
-    /// returns immediately. Returns the WAL position at which the record
-    /// ends if a WAL is installed (so the reactor can poll
-    /// `wal.durable_position()` and send the +OK once it's covered).
-    /// Returns `Ok(None)` if there's no WAL (memory-only, tests).
+    /// Non-blocking PUT on WAL shard 0 — back-compat wrapper for
+    /// callers that don't know or care about sharding. Reactor code
+    /// should use `put_nowait_on` with its own shard index.
+    #[inline]
     pub fn put_nowait(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<Option<u64>> {
+        self.put_nowait_on(0, key, value, ttl)
+    }
+
+    /// Non-blocking PUT with explicit shard routing. Updates the shard's
+    /// WAL, the write_buffer, and the index, then returns immediately.
+    /// Returns the WAL position within that shard at which the record
+    /// ends (so the reactor can poll
+    /// `wal_shards[shard_id].durable_position()` and send the +OK once
+    /// it's covered). Returns `Ok(None)` if there's no WAL configured.
+    ///
+    /// The write_buffer and index remain global — sharding is only
+    /// about parallel fsync pipelines, not data partitioning.
+    pub fn put_nowait_on(
+        &self,
+        shard_hint: usize,
+        key: &[u8],
+        value: &[u8],
+        ttl: u32,
+    ) -> io::Result<Option<u64>> {
         // Capacity check: reject writes if NoEviction and at capacity
         if matches!(self.eviction_policy, EvictionPolicy::NoEviction) {
             if self.max_entries > 0 {
@@ -215,9 +296,11 @@ impl Handler {
         let key_hash = hash_key(key);
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
-        // Stage into the WAL (BufWriter memcpy, no fsync yet). The commit
-        // thread picks it up on the next tick.
-        let wal_pos = if let Some(wal) = &self.wal {
+        // Stage into the shard's WAL (BufWriter memcpy, no fsync yet).
+        // That shard's commit thread picks it up on the next tick.
+        // `wal_for` clamps out-of-range hints to the last shard so extra
+        // reactors degrade gracefully.
+        let wal_pos = if let Some(wal) = self.wal_for(shard_hint) {
             Some(wal.append_put_nowait(key, value, generation, ttl)?)
         } else {
             None
@@ -285,21 +368,36 @@ impl Handler {
     }
 
     /// Synchronous DELETE for Redis compatibility. Blocks until durable.
+    /// Lands on WAL shard 0 like `put_sync` — non-reactor callers don't
+    /// need shard-aware routing.
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
-        let (deleted, wal_pos) = self.delete_nowait(key)?;
-        if let (Some(pos), Some(wal)) = (wal_pos, &self.wal) {
+        let start = std::time::Instant::now();
+        let (deleted, wal_pos) = self.delete_nowait_on(0, key)?;
+        if let (Some(pos), Some(wal)) = (wal_pos, self.wal_for(0)) {
             wal.wait_for_durable(pos);
         }
+        self.stats.del_latency.record(start.elapsed().as_micros() as u64);
         Ok(deleted)
     }
 
-    /// Non-blocking DELETE. Returns `(was_live, Option<wal_pos>)`. Reactor
-    /// path: stash the response, poll `wal.durable_position()` before
-    /// sending the `:N\r\n` reply.
+    /// Back-compat wrapper for non-sharded callers.
+    #[inline]
     pub fn delete_nowait(&self, key: &[u8]) -> io::Result<(bool, Option<u64>)> {
+        self.delete_nowait_on(0, key)
+    }
+
+    /// Non-blocking DELETE with explicit shard routing. Returns
+    /// `(was_live, Option<wal_pos>)`. The position is within the chosen
+    /// shard's WAL — the reactor polls that shard's `durable_position()`
+    /// before sending the `:N\r\n` reply.
+    pub fn delete_nowait_on(
+        &self,
+        shard_hint: usize,
+        key: &[u8],
+    ) -> io::Result<(bool, Option<u64>)> {
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
 
-        let wal_pos = if let Some(wal) = &self.wal {
+        let wal_pos = if let Some(wal) = self.wal_for(shard_hint) {
             Some(wal.append_delete_nowait(key, generation)?)
         } else {
             None
@@ -317,6 +415,14 @@ impl Handler {
     /// Priority: write buffer -> wblock cache -> disk
     #[inline]
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let start = std::time::Instant::now();
+        let result = self.get_value_inner(key);
+        self.stats.get_latency.record(start.elapsed().as_micros() as u64);
+        result
+    }
+
+    #[inline]
+    fn get_value_inner(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Fast path 1: Check index
         let entry = self.index.get(key)?;
 

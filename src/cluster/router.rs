@@ -11,8 +11,17 @@ use std::net::SocketAddr;
 
 use crate::cluster::node::NodeId;
 use crate::cluster::peer_pool::{PeerConnectionPool, PeerMessage, PeerOp};
+use crate::cluster::replication::ReplicationStats;
 use crate::cluster::topology::ClusterTopology;
 use crate::server::handler::Handler;
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Result of routing a key to a node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +37,12 @@ pub struct ClusterRouter {
     topology: Arc<RwLock<ClusterTopology>>,
     local_handler: Arc<Handler>,
     peers: Arc<PeerConnectionPool>,
+    /// Per-replica send/ack/failure counters. Same type `ReplicationManager`
+    /// uses — kept here because the router has its own async replication
+    /// path (it calls `peers.send_async` directly rather than going through
+    /// `ReplicationManager`), and divergence must be observable on whichever
+    /// path is actually live.
+    replication_stats: Arc<ReplicationStats>,
 }
 
 impl ClusterRouter {
@@ -40,7 +55,12 @@ impl ClusterRouter {
             topology,
             local_handler,
             peers,
+            replication_stats: Arc::new(ReplicationStats::default()),
         }
+    }
+
+    pub fn replication_stats(&self) -> Arc<ReplicationStats> {
+        Arc::clone(&self.replication_stats)
     }
 
     /// Determines where a key should be routed using CRC16 hash slots.
@@ -186,10 +206,23 @@ impl ClusterRouter {
         };
 
         let peers = Arc::clone(&self.peers);
+        let stats = Arc::clone(&self.replication_stats);
         tokio::spawn(async move {
             for replica_id in replicas {
-                if let Err(e) = peers.send_async(replica_id, &msg).await {
-                    debug!("Replication to node {} failed: {}", replica_id, e);
+                let r = stats.replica(replica_id);
+                r.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats.entries_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match peers.send_async(replica_id, &msg).await {
+                    Ok(()) => {
+                        r.acked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        r.last_ack_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        warn!("Replication PUT to node {} failed: {} — replica now diverged", replica_id, e);
+                        r.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        r.last_failure_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        stats.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -217,14 +250,29 @@ impl ClusterRouter {
         };
 
         let peers = Arc::clone(&self.peers);
+        let stats = Arc::clone(&self.replication_stats);
         tokio::spawn(async move {
             for replica_id in replicas {
-                if let Err(e) = peers.send_async(replica_id, &msg).await {
-                    debug!("Replication DELETE to node {} failed: {}", replica_id, e);
+                let r = stats.replica(replica_id);
+                r.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats.entries_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match peers.send_async(replica_id, &msg).await {
+                    Ok(()) => {
+                        r.acked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        r.last_ack_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        warn!("Replication DELETE to node {} failed: {} — replica now diverged", replica_id, e);
+                        r.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        r.last_failure_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        stats.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         });
     }
+
+
 
     /// Forward a request synchronously (blocking the current thread).
     /// Creates a fresh TCP connection per forward to avoid cross-runtime issues.

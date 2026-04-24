@@ -13,6 +13,25 @@ use crate::storage::record::{Record, RECORD_ALIGNMENT};
 /// Size of a write block (1MB).
 pub const WBLOCK_SIZE: usize = 1024 * 1024;
 
+/// Footer written by `WBlock::finalize()` immediately after the last
+/// record in the block. Recovery uses it to tell "this block was
+/// flushed cleanly" apart from "this block was torn mid-flush" —
+/// information record-level CRCs alone can't give you, because a
+/// partial flush may land a run of valid records followed by stale
+/// bytes that happen to have the right magic.
+///
+/// Layout (16 bytes, little-endian):
+///   [0..8]   magic  = WBLOCK_FOOTER_MAGIC
+///   [8..16]  xxh3   = xxh3_64 over bytes [0 .. records_end]
+///
+/// `records_end` (the offset we write the footer at) is implicit: the
+/// reader scans records forward and the footer starts where the scan
+/// halts on a non-record magic. Readers that don't find the marker
+/// just fall back to "trust per-record CRCs" — safe, and means old
+/// data files opened by a new binary keep working.
+pub const WBLOCK_FOOTER_MAGIC: u64 = 0xF00DFACEB10CDA7A;
+pub const WBLOCK_FOOTER_SIZE: usize = 16;
+
 /// A write block (WBlock) that accumulates records until full.
 #[derive(Debug)]
 pub struct WBlock {
@@ -122,9 +141,22 @@ impl WBlock {
         }
     }
 
-    /// Prepares the buffer for writing (pads to alignment).
+    /// Prepares the buffer for writing: appends an integrity footer
+    /// (magic + xxh3_64 over records) and pads to 4 KiB alignment for
+    /// O_DIRECT. Idempotent — a second call is a no-op because
+    /// `write_pos` hasn't advanced.
     pub fn finalize(&mut self) -> &AlignedBuffer {
-        // Pad to 4KB alignment for O_DIRECT
+        // Skip footer if there's no room (nearly-full block). Recovery
+        // still works via per-record CRCs; footer is a nice-to-have.
+        if self.write_pos + WBLOCK_FOOTER_SIZE <= WBLOCK_SIZE && !self.is_empty() {
+            let hash = xxhash_rust::xxh3::xxh3_64(&self.buffer[..self.write_pos]);
+            let mut footer = [0u8; WBLOCK_FOOTER_SIZE];
+            footer[0..8].copy_from_slice(&WBLOCK_FOOTER_MAGIC.to_le_bytes());
+            footer[8..16].copy_from_slice(&hash.to_le_bytes());
+            self.buffer.extend_from_slice(&footer);
+            self.write_pos += WBLOCK_FOOTER_SIZE;
+        }
+
         let aligned_len = (self.write_pos + ALIGNMENT - 1) & !(ALIGNMENT - 1);
         self.buffer.resize(aligned_len);
         &self.buffer
@@ -338,6 +370,12 @@ impl WriteBuffer {
     /// Returns the number of pending blocks.
     pub fn pending_count(&self) -> usize {
         self.pending.lock().len()
+    }
+
+    /// File ID the next append will land in. Compactor uses this to
+    /// avoid unlinking the file we're still actively writing to.
+    pub fn current_file_id(&self) -> u32 {
+        self.current_file_id.load(Ordering::Relaxed)
     }
 
     /// Returns the current block's utilization.

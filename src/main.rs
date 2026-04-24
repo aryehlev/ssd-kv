@@ -224,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Arc::clone(&idx),
                     Arc::clone(&fm),
                     Arc::clone(&wb),
+                    wblock_cache.as_ref().map(Arc::clone),
                 );
                 compaction_stops.push(stop);
             }

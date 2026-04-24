@@ -13,6 +13,7 @@ use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
 use crate::storage::file_manager::{FileManager, WBLOCKS_PER_FILE, FILE_HEADER_SIZE};
 use crate::storage::record::{Record, RECORD_MAGIC};
+use crate::storage::wblock_cache::WblockCache;
 use crate::storage::write_buffer::{DiskLocation, WBlock, WriteBuffer, WBLOCK_SIZE};
 
 /// Compaction configuration.
@@ -47,16 +48,22 @@ pub struct CompactionStats {
     pub records_moved: AtomicU64,
     pub bytes_reclaimed: AtomicU64,
     pub errors: AtomicU64,
+    /// Number of 1 GiB data files actually unlinked from disk after
+    /// every WBlock in them was compacted away. Without this the
+    /// `bytes_reclaimed` counter above was misleading: blocks were
+    /// "reclaimed" in memory but the bytes stayed on the SSD forever.
+    pub files_deleted: AtomicU64,
 }
 
 impl CompactionStats {
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"runs":{},"blocks_compacted":{},"records_moved":{},"bytes_reclaimed":{},"errors":{}}}"#,
+            r#"{{"runs":{},"blocks_compacted":{},"records_moved":{},"bytes_reclaimed":{},"files_deleted":{},"errors":{}}}"#,
             self.runs.load(Ordering::Relaxed),
             self.blocks_compacted.load(Ordering::Relaxed),
             self.records_moved.load(Ordering::Relaxed),
             self.bytes_reclaimed.load(Ordering::Relaxed),
+            self.files_deleted.load(Ordering::Relaxed),
             self.errors.load(Ordering::Relaxed),
         )
     }
@@ -68,6 +75,10 @@ pub struct Compactor {
     index: Arc<Index>,
     file_manager: Arc<FileManager>,
     write_buffer: Arc<WriteBuffer>,
+    /// Optional read-side cache. Entries for a file must be invalidated
+    /// before the file is unlinked, otherwise a cache hit could return
+    /// records that belong to a now-deleted block.
+    wblock_cache: Option<Arc<WblockCache>>,
     stats: Arc<CompactionStats>,
     running: AtomicBool,
 }
@@ -85,9 +96,17 @@ impl Compactor {
             index,
             file_manager,
             write_buffer,
+            wblock_cache: None,
             stats: Arc::new(CompactionStats::default()),
             running: AtomicBool::new(false),
         }
+    }
+
+    /// Wire up the read-side WBlock cache so the compactor can
+    /// invalidate entries before unlinking a file.
+    pub fn with_wblock_cache(mut self, cache: Arc<WblockCache>) -> Self {
+        self.wblock_cache = Some(cache);
+        self
     }
 
     /// Returns compaction statistics.
@@ -165,6 +184,8 @@ impl Compactor {
 
     /// Compacts the given blocks by moving live records to new locations.
     fn compact_blocks(&self, blocks: &[(u32, u32)]) -> io::Result<()> {
+        let mut touched_files: HashSet<u32> = HashSet::new();
+
         for &(file_id, wblock_id) in blocks {
             match self.compact_block(file_id, wblock_id) {
                 Ok(moved) => {
@@ -174,9 +195,52 @@ impl Compactor {
                         "Compacted block {}/{}, moved {} records",
                         file_id, wblock_id, moved
                     );
+                    touched_files.insert(file_id);
                 }
                 Err(e) => {
                     warn!("Failed to compact block {}/{}: {}", file_id, wblock_id, e);
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Second pass: for every file we just compacted blocks in,
+        // check whether *all* of its blocks are now reclaimed. A file
+        // only becomes collectable once it's sealed (not the current
+        // write target) — otherwise we'd race with the writer.
+        let current_write_file = self.write_buffer.current_file_id();
+        for file_id in touched_files {
+            if file_id == current_write_file {
+                continue;
+            }
+            let fully_reclaimed = self
+                .file_manager
+                .get_file(file_id)
+                .map(|f| f.lock().is_fully_reclaimed())
+                .unwrap_or(false);
+            if !fully_reclaimed {
+                continue;
+            }
+
+            // Invalidate cache entries BEFORE unlink so concurrent
+            // readers don't serve records from a file that's about to
+            // disappear. POSIX unlink-with-open-fd semantics keep
+            // in-flight reads safe; this just prevents serving cached
+            // bytes post-deletion.
+            if let Some(cache) = &self.wblock_cache {
+                cache.invalidate_file(file_id);
+            }
+
+            match self.file_manager.remove_file(file_id) {
+                Ok(()) => {
+                    self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "Compaction deleted fully-reclaimed data file {} (~1 GiB freed)",
+                        file_id
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to unlink reclaimed file {}: {}", file_id, e);
                     self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -254,8 +318,12 @@ impl Compactor {
             offset += record_size;
         }
 
-        // Mark the old block as reclaimable
-        // In a full implementation, we'd track this and eventually delete the file
+        // Mark the block reclaimed on its owning file. Once every
+        // block in the file is marked, `compact_blocks()` will unlink
+        // the 1 GiB data file and that's where `bytes_reclaimed`
+        // becomes a real disk-space reduction rather than an accounting
+        // fiction.
+        file.lock().mark_wblock_reclaimed(wblock_id);
         self.stats
             .bytes_reclaimed
             .fetch_add(WBLOCK_SIZE as u64, Ordering::Relaxed);
@@ -275,8 +343,13 @@ pub fn start_compaction_thread(
     index: Arc<Index>,
     file_manager: Arc<FileManager>,
     write_buffer: Arc<WriteBuffer>,
+    wblock_cache: Option<Arc<WblockCache>>,
 ) -> (Arc<Compactor>, Arc<AtomicBool>) {
-    let compactor = Arc::new(Compactor::new(config, index, file_manager, write_buffer));
+    let mut c = Compactor::new(config, index, file_manager, write_buffer);
+    if let Some(cache) = wblock_cache {
+        c = c.with_wblock_cache(cache);
+    }
+    let compactor = Arc::new(c);
     let stop = Arc::new(AtomicBool::new(false));
 
     let compactor_clone = Arc::clone(&compactor);

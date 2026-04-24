@@ -183,14 +183,17 @@ pub struct Config {
     #[arg(long = "wal-dir")]
     pub wal_dirs: Vec<PathBuf>,
 
-    /// How WAL writes reach the disk. `buffered` is the default and
-    /// safe on any hardware. `odirect` bypasses the kernel page cache
-    /// via O_DIRECT + aligned pwrites (still calls fsync).
-    /// `odirect-trust-device` skips fsync entirely — ONLY safe on
-    /// enterprise NVMe with Power-Loss Protection (PLP); without it,
-    /// a power loss can lose acknowledged writes. Pairs with
-    /// `--wal-dir` for multi-device NVMe deployments.
-    #[arg(long, default_value = "buffered")]
+    /// How WAL writes reach the disk. Default `odirect` — bypasses the
+    /// kernel page cache via O_DIRECT + 4 KB-aligned pwrites, still
+    /// calls fsync per group-commit. On virtio-blk this matches or
+    /// beats the buffered path; on NVMe it's a larger win (no
+    /// page-cache memcpy, predictable latency). `buffered` is
+    /// available for filesystems that reject O_DIRECT (tmpfs; very
+    /// old kernels). `odirect-trust-device` drops fsync entirely —
+    /// ONLY safe on enterprise NVMe with Power-Loss Protection (PLP);
+    /// without PLP, a power loss can lose acknowledged writes. Pairs
+    /// with `--wal-dir` for multi-device NVMe deployments.
+    #[arg(long, default_value = "odirect")]
     pub wal_mode: WalModeArg,
 
     // --- io_uring ---
@@ -355,7 +358,7 @@ impl Default for Config {
             fsync_interval_us: 500,
             fsync_batch: 256,
             wal_dirs: Vec::new(),
-            wal_mode: WalModeArg::Buffered,
+            wal_mode: WalModeArg::Odirect,
             io_workers: 2,
             reactor_threads: 1,
             wal_trim_interval_secs: 30,

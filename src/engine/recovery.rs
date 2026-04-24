@@ -10,7 +10,7 @@ use crate::server::Handler;
 use crate::storage::file_manager::{FileManager, WBLOCKS_PER_FILE};
 use crate::storage::record::{Record, HEADER_SIZE, RECORD_ALIGNMENT, RECORD_MAGIC};
 use crate::storage::wal::WriteAheadLog;
-use crate::storage::write_buffer::DiskLocation;
+use crate::storage::write_buffer::{DiskLocation, WBLOCK_FOOTER_MAGIC, WBLOCK_FOOTER_SIZE};
 
 /// Recovery statistics.
 #[derive(Debug, Default)]
@@ -26,6 +26,19 @@ pub struct RecoveryStats {
     pub wal_entries_replayed: u64,
     /// Highest generation observed across data files + WAL.
     pub max_generation: u32,
+    /// WBlocks whose trailing footer matched (flushed cleanly).
+    pub wblocks_footer_ok: u64,
+    /// WBlocks with no footer — written by an older binary, or a
+    /// write that was torn mid-flush. Records that parsed are still
+    /// usable (per-record CRC guarantees that); this counter is a
+    /// crash-cleanliness signal for operators.
+    pub wblocks_footer_missing: u64,
+    /// WBlocks whose footer magic was present but the integrity hash
+    /// didn't match. A real corruption signal — bits flipped on disk
+    /// or a torn flush landed enough bytes to produce the magic but
+    /// not the right hash. Any records that individually passed CRC
+    /// are still indexed; the count is surfaced so ops can act on it.
+    pub wblocks_footer_corrupt: u64,
 }
 
 /// Recovers the index from data files.
@@ -198,6 +211,47 @@ fn recover_wblock(
                 offset = ((offset / RECORD_ALIGNMENT) + 1) * RECORD_ALIGNMENT;
             }
         }
+    }
+
+    // After the record scan halts (on a non-record magic or end of
+    // block), check for the integrity footer written by
+    // `WBlock::finalize`. Three outcomes:
+    //   - footer found + hash matches → clean flush
+    //   - footer found + hash mismatch → corruption; records that
+    //     individually CRC'd still got indexed, but surface the count
+    //   - no footer → either an old-format file or a torn flush;
+    //     silent fallback to per-record CRC (no data loss either way)
+    if offset + WBLOCK_FOOTER_SIZE <= wblock_data.len() {
+        let magic = u64::from_le_bytes([
+            wblock_data[offset], wblock_data[offset + 1],
+            wblock_data[offset + 2], wblock_data[offset + 3],
+            wblock_data[offset + 4], wblock_data[offset + 5],
+            wblock_data[offset + 6], wblock_data[offset + 7],
+        ]);
+        if magic == WBLOCK_FOOTER_MAGIC {
+            let stored_hash = u64::from_le_bytes([
+                wblock_data[offset + 8], wblock_data[offset + 9],
+                wblock_data[offset + 10], wblock_data[offset + 11],
+                wblock_data[offset + 12], wblock_data[offset + 13],
+                wblock_data[offset + 14], wblock_data[offset + 15],
+            ]);
+            let computed = xxhash_rust::xxh3::xxh3_64(&wblock_data[..offset]);
+            if computed == stored_hash {
+                stats.wblocks_footer_ok += 1;
+            } else {
+                warn!(
+                    "WBlock {}/{} footer hash mismatch (stored {:016x}, \
+                     computed {:016x}) — records that passed per-record \
+                     CRC were indexed; block had a torn flush or bit-flip",
+                    file_id, wblock_id, stored_hash, computed
+                );
+                stats.wblocks_footer_corrupt += 1;
+            }
+        } else {
+            stats.wblocks_footer_missing += 1;
+        }
+    } else {
+        stats.wblocks_footer_missing += 1;
     }
 
     Ok(())

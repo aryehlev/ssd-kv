@@ -4,27 +4,94 @@
 //! asynchronously using the peer protocol. Replicas apply operations to
 //! their local handler to maintain a copy of the data.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::cluster::peer_pool::{PeerConnectionPool, PeerMessage, PeerOp};
 use crate::cluster::topology::ClusterTopology;
 use crate::server::handler::Handler;
 
+/// Per-replica send counters. Replication is async (primary doesn't
+/// wait for the ack before returning to the client), but we still
+/// track per-replica acks so divergence is observable. If a replica's
+/// `acked` falls behind `sent` for long enough, something is wrong
+/// — either the network to that peer is lossy or the peer itself is
+/// failing to apply.
+#[derive(Debug, Default)]
+pub struct ReplicaStats {
+    pub sent: AtomicU64,
+    pub acked: AtomicU64,
+    pub failed: AtomicU64,
+    /// Monotonic timestamp (ms since startup) of the last successful
+    /// ack from this replica. Zero = never acked.
+    pub last_ack_ms: AtomicU64,
+    /// Monotonic timestamp of the last failure. Useful for "when did
+    /// this replica start diverging?"
+    pub last_failure_ms: AtomicU64,
+}
+
+impl ReplicaStats {
+    /// A replica is considered "diverged" when it has sent items
+    /// that never acked. `sent - acked - failed` == in-flight; any
+    /// non-zero `failed` is a hard divergence signal.
+    pub fn is_diverged(&self) -> bool {
+        self.failed.load(Ordering::Relaxed) > 0
+    }
+
+    pub fn lag(&self) -> u64 {
+        let sent = self.sent.load(Ordering::Relaxed);
+        let acked = self.acked.load(Ordering::Relaxed);
+        sent.saturating_sub(acked)
+    }
+}
+
 /// Statistics for replication.
 #[derive(Debug, Default)]
 pub struct ReplicationStats {
-    /// Total entries sent to replicas.
+    /// Total entries sent to replicas (summed across replicas).
     pub entries_sent: AtomicU64,
-    /// Total entries received from primary.
+    /// Total entries received from primary (for replica-side counts).
     pub entries_received: AtomicU64,
-    /// Total replication errors.
+    /// Total replication errors (summed across replicas).
     pub errors: AtomicU64,
+    /// Per-replica stats keyed by `NodeId`. Populated lazily as we
+    /// see each replica. Read-mostly: the hot path uses the RwLock
+    /// in shared mode and only takes the exclusive lock on first
+    /// encounter of a replica id.
+    per_replica: RwLock<HashMap<u32, Arc<ReplicaStats>>>,
+}
+
+impl ReplicationStats {
+    /// Returns (and lazily creates) the per-replica counter block.
+    pub fn replica(&self, node_id: u32) -> Arc<ReplicaStats> {
+        if let Some(s) = self.per_replica.read().get(&node_id) {
+            return Arc::clone(s);
+        }
+        let mut w = self.per_replica.write();
+        Arc::clone(w.entry(node_id).or_insert_with(|| Arc::new(ReplicaStats::default())))
+    }
+
+    /// Snapshot of all per-replica counters for observability.
+    pub fn per_replica_snapshot(&self) -> Vec<(u32, Arc<ReplicaStats>)> {
+        let r = self.per_replica.read();
+        let mut v: Vec<_> = r.iter().map(|(k, v)| (*k, Arc::clone(v))).collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Manages replication for this node.
@@ -80,12 +147,18 @@ impl ReplicationManager {
         let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
             for replica_id in replicas {
+                let replica_stats = stats.replica(replica_id);
+                replica_stats.sent.fetch_add(1, Ordering::Relaxed);
+                stats.entries_sent.fetch_add(1, Ordering::Relaxed);
                 match peers.send_async(replica_id, &msg).await {
                     Ok(()) => {
-                        stats.entries_sent.fetch_add(1, Ordering::Relaxed);
+                        replica_stats.acked.fetch_add(1, Ordering::Relaxed);
+                        replica_stats.last_ack_ms.store(now_ms(), Ordering::Relaxed);
                     }
                     Err(e) => {
-                        debug!("Replication PUT to node {} failed: {}", replica_id, e);
+                        warn!("Replication PUT to node {} failed: {} — replica now diverged", replica_id, e);
+                        replica_stats.failed.fetch_add(1, Ordering::Relaxed);
+                        replica_stats.last_failure_ms.store(now_ms(), Ordering::Relaxed);
                         stats.errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -116,12 +189,18 @@ impl ReplicationManager {
         let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
             for replica_id in replicas {
+                let replica_stats = stats.replica(replica_id);
+                replica_stats.sent.fetch_add(1, Ordering::Relaxed);
+                stats.entries_sent.fetch_add(1, Ordering::Relaxed);
                 match peers.send_async(replica_id, &msg).await {
                     Ok(()) => {
-                        stats.entries_sent.fetch_add(1, Ordering::Relaxed);
+                        replica_stats.acked.fetch_add(1, Ordering::Relaxed);
+                        replica_stats.last_ack_ms.store(now_ms(), Ordering::Relaxed);
                     }
                     Err(e) => {
-                        debug!("Replication DELETE to node {} failed: {}", replica_id, e);
+                        warn!("Replication DELETE to node {} failed: {} — replica now diverged", replica_id, e);
+                        replica_stats.failed.fetch_add(1, Ordering::Relaxed);
+                        replica_stats.last_failure_ms.store(now_ms(), Ordering::Relaxed);
                         stats.errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }

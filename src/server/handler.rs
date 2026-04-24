@@ -80,12 +80,12 @@ pub struct Handler {
     /// Highest record generation that is durably in a data file. Bumped
     /// by `flush()` after a successful fsync. The periodic WAL-trim path
     /// uses this to decide when old WAL files are redundant.
-    durable_gen: AtomicU32,
+    durable_gen: AtomicU64,
     /// Global bloom filter for membership hints. Lock-free — every
     /// put_nowait CAS-adds without taking a mutex, so hot-key
     /// workloads don't serialize here.
     bloom_filter: Arc<LockFreeBloomFilter>,
-    next_generation: AtomicU32,
+    next_generation: AtomicU64,
     stats: Arc<HandlerStats>,
     eviction_policy: EvictionPolicy,
     max_entries: u64,
@@ -106,9 +106,9 @@ impl Handler {
             wblock_cache: None,
             async_reader: None,
             wal_shards: Vec::new(),
-            durable_gen: AtomicU32::new(0),
+            durable_gen: AtomicU64::new(0),
             bloom_filter: Arc::new(LockFreeBloomFilter::new(10_000_000, 0.01)),
-            next_generation: AtomicU32::new(1),
+            next_generation: AtomicU64::new(1),
             stats: Arc::new(HandlerStats::default()),
             eviction_policy: EvictionPolicy::NoEviction,
             max_entries: 0,
@@ -118,11 +118,11 @@ impl Handler {
 
     /// Highest generation that is durable in a data file (not just WAL).
     /// The WAL trim path uses this to decide which log files are redundant.
-    pub fn durable_generation(&self) -> u32 {
+    pub fn durable_generation(&self) -> u64 {
         self.durable_gen.load(Ordering::Acquire)
     }
 
-    fn bump_durable_gen(&self, seen: u32) {
+    fn bump_durable_gen(&self, seen: u64) {
         let mut prev = self.durable_gen.load(Ordering::Relaxed);
         while seen > prev {
             match self.durable_gen.compare_exchange_weak(
@@ -265,6 +265,25 @@ impl Handler {
     ///
     /// The write_buffer and index remain global — sharding is only
     /// about parallel fsync pipelines, not data partitioning.
+    ///
+    /// ## Visibility (NOT strictly Redis-like)
+    ///
+    /// The index is updated BEFORE the WAL byte is fsynced, so a concurrent
+    /// GET from a different connection can observe the new value before
+    /// the writer has received its `+OK`. If the process crashes in the
+    /// window between "index updated" and "WAL durable", the record is
+    /// lost on restart — WAL replay never picks it up — and any reader
+    /// that saw the value during that window saw data that the system
+    /// subsequently forgot.
+    ///
+    /// In Redis this window doesn't exist because Redis only exposes a
+    /// value after the command has completed on the single command
+    /// thread. Here we trade that guarantee for ~10x write throughput:
+    /// reactors pipeline many PUTs per fsync, so fsync latency doesn't
+    /// block index publication.
+    ///
+    /// Callers that need strict "visible ⇒ durable" semantics must use
+    /// `put_sync`, which blocks until WAL durability before returning.
     pub fn put_nowait_on(
         &self,
         shard_hint: usize,
@@ -327,7 +346,7 @@ impl Handler {
         &self,
         key: &[u8],
         value: &[u8],
-        generation: u32,
+        generation: u64,
         ttl: u32,
     ) -> io::Result<()> {
         let key_hash = hash_key(key);
@@ -340,7 +359,7 @@ impl Handler {
     }
 
     /// Delete path used by recovery / WAL replay.
-    pub(crate) fn delete_from_wal(&self, key: &[u8], generation: u32) -> io::Result<()> {
+    pub(crate) fn delete_from_wal(&self, key: &[u8], generation: u64) -> io::Result<()> {
         let mut record = Record::tombstone(key.to_vec(), generation)?;
         self.write_buffer.append(&mut record)?;
         self.index.delete(key, generation);
@@ -349,7 +368,7 @@ impl Handler {
 
     /// Advance the generation counter past a value observed during recovery
     /// so subsequent writes don't conflict with replayed records.
-    pub(crate) fn bump_generation_past(&self, seen: u32) {
+    pub(crate) fn bump_generation_past(&self, seen: u64) {
         let next = seen.saturating_add(1);
         // Load-max-store loop; only increases.
         loop {
@@ -451,8 +470,22 @@ impl Handler {
             }
         }
 
-        // Slow path: read the wblock off disk (io_uring if wired,
-        // blocking pread otherwise).
+        // Slow path: if we know the exact record size (populated by the
+        // write path or recovery scan), do a sub-WBlock partial pread;
+        // otherwise fall back to a full-WBlock read and populate the
+        // cache for future reads in the same block.
+        if entry.location.supports_partial_read() {
+            let (buf, start) = self.read_record_for_get(&entry.location).ok()?;
+            if start >= buf.len() {
+                return None;
+            }
+            let record = Record::from_bytes(&buf[start..]).ok()?;
+            if record.header.is_deleted() || record.header.is_expired() {
+                return None;
+            }
+            return Some(record.value);
+        }
+
         let wblock_data = self.read_wblock_for_get(file_id, wblock_id).ok()?;
 
         if offset >= wblock_data.len() {
@@ -515,6 +548,47 @@ impl Handler {
         file_guard.read_wblock(wblock_id)
     }
 
+    /// Read just enough bytes off disk to parse the target record.
+    /// Skips the WBlock cache intentionally: partial reads are used for
+    /// small values where the 1 MiB full-block read would be wasteful,
+    /// and keeping partial buffers in the cache would defeat its
+    /// "amortize many keys in one block" purpose.
+    ///
+    /// Falls back to `read_wblock_for_get` (full WBlock) when the
+    /// record size isn't known — which is the case for anything
+    /// written through the legacy `DiskLocation::new` path or a
+    /// pre-existing data file that hasn't been re-scanned.
+    fn read_record_for_get(
+        &self,
+        location: &crate::storage::write_buffer::DiskLocation,
+    ) -> io::Result<(AlignedBuffer, usize)> {
+        if location.supports_partial_read() {
+            let file = self
+                .file_manager
+                .get_file(location.file_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+            let file_guard = file.lock();
+            let buf = file_guard.read_partial_wblock(
+                location.wblock_id as u32,
+                location.offset,
+                location.record_size,
+            )?;
+            // The partial read aligns `offset` down to a 4 KiB
+            // boundary. Compute how far into the returned buffer the
+            // record actually starts.
+            let absolute = FILE_HEADER_SIZE as u64
+                + (location.wblock_id as u64 * WBLOCK_SIZE as u64)
+                + location.offset as u64;
+            let aligned = absolute & !(crate::io::aligned_buf::ALIGNMENT as u64 - 1);
+            let start_in_buf = (absolute - aligned) as usize;
+            Ok((buf, start_in_buf))
+        } else {
+            let buf = self
+                .read_wblock_for_get(location.file_id, location.wblock_id as u32)?;
+            Ok((buf, location.offset as usize))
+        }
+    }
+
     /// Returns the full record metadata for a key (value, timestamp, ttl).
     /// Same read path as get_value but returns the full record info.
     pub fn get_with_meta(&self, key: &[u8]) -> Option<RecordMeta> {
@@ -545,6 +619,25 @@ impl Handler {
                     ttl_secs: record.header.ttl,
                 });
             }
+        }
+
+        // Partial-read fast path for small records. See `get_value_inner`
+        // for the rationale — keeps the common small-value GET off the
+        // 1 MiB full-block read.
+        if entry.location.supports_partial_read() {
+            let (buf, start) = self.read_record_for_get(&entry.location).ok()?;
+            if start >= buf.len() {
+                return None;
+            }
+            let record = Record::from_bytes(&buf[start..]).ok()?;
+            if record.header.is_deleted() || record.header.is_expired() {
+                return None;
+            }
+            return Some(RecordMeta {
+                value: record.value,
+                timestamp_micros: record.header.timestamp,
+                ttl_secs: record.header.ttl,
+            });
         }
 
         // Disk read (io_uring if wired, else pread)
@@ -634,7 +727,7 @@ pub struct OptimizedHandler {
     parallel_fm: Arc<ParallelFileManager>,
     write_buffers: Vec<Arc<WriteBuffer>>,
     bloom_filter: Arc<LockFreeBloomFilter>,
-    next_generation: AtomicU32,
+    next_generation: AtomicU64,
     stats: Arc<HandlerStats>,
 }
 
@@ -657,7 +750,7 @@ impl OptimizedHandler {
             parallel_fm,
             write_buffers,
             bloom_filter: Arc::new(LockFreeBloomFilter::new(10_000_000, 0.01)),
-            next_generation: AtomicU32::new(1),
+            next_generation: AtomicU64::new(1),
             stats: Arc::new(HandlerStats::default()),
         }
     }

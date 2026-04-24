@@ -16,6 +16,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::io::aligned_buf::{AlignedBuffer, ALIGNMENT};
 use crate::storage::direct_io::DirectFile;
+use crate::storage::record::RECORD_MAGIC;
 use crate::storage::write_buffer::{WBlock, WBLOCK_SIZE};
 
 /// File header size (4KB).
@@ -172,6 +173,19 @@ impl DataFile {
     }
 
     /// Opens an existing data file.
+    ///
+    /// Does **not** trust `header.wblock_count` for the in-memory
+    /// `next_wblock` counter: `write_wblock` only bumps the atomic
+    /// counter, not the persisted header. A file written by the
+    /// previous process and then reopened would report zero blocks and
+    /// we'd silently drop every flushed record — catastrophic if the
+    /// WAL had already been trimmed past those records.
+    ///
+    /// Instead, probe each block's first 4 KiB for a record magic and
+    /// take the highest block that looks written. Records inside a
+    /// half-written block still get filtered by per-record CRC during
+    /// recovery, so this boundary only needs to be conservative about
+    /// "was anything at all written here?".
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let file = DirectFile::open(&path)?;
@@ -198,7 +212,11 @@ impl DataFile {
             ));
         }
 
-        let wblock_count = header.wblock_count;
+        let scanned = Self::scan_highest_written_block(&file)?;
+        // If the header was persisted past our scan (old cleanly-
+        // rotated files used to bump it) take whichever is larger.
+        let wblock_count = scanned.max(header.wblock_count);
+
         Ok(Self {
             id: header.file_id,
             path: path_buf,
@@ -216,6 +234,33 @@ impl DataFile {
             reclaimed_wblocks: (0..WBLOCKS_PER_FILE).map(|_| AtomicBool::new(false)).collect(),
             reclaimed_count: AtomicU32::new(0),
         })
+    }
+
+    /// Scan backwards from the last possible block for the highest
+    /// slot whose first 4 KiB starts with a record magic. Returns
+    /// `highest + 1` (the `next_wblock` semantics) or 0 if nothing
+    /// was written. Reads are 4 KiB each — O(N) worst case on a
+    /// fully-empty preallocated file but O(1) on anything with data
+    /// near the end of the file, which is the common case.
+    fn scan_highest_written_block(file: &DirectFile) -> io::Result<u32> {
+        let mut probe = AlignedBuffer::new(ALIGNMENT);
+        for wblock_id in (0..WBLOCKS_PER_FILE).rev() {
+            let offset =
+                FILE_HEADER_SIZE as u64 + (wblock_id as u64 * WBLOCK_SIZE as u64);
+            probe.clear();
+            let n = match file.read_at(&mut probe, offset, ALIGNMENT) {
+                Ok(n) => n,
+                Err(_) => continue, // unreadable slot — try the next one down
+            };
+            if n < 2 {
+                continue;
+            }
+            let magic = u16::from_le_bytes([probe[0], probe[1]]);
+            if magic == RECORD_MAGIC {
+                return Ok(wblock_id + 1);
+            }
+        }
+        Ok(0)
     }
 
     /// Writes a WBlock to the file.
@@ -638,6 +683,45 @@ mod tests {
         let file = DataFile::create(dir.path(), 0).unwrap();
 
         assert_eq!(file.file_id(), 0);
+    }
+
+    #[test]
+    fn reopen_recovers_wblock_count_even_when_header_is_stale() {
+        // Regression: previously, write_wblock bumped only the in-memory
+        // AtomicU32 and never persisted the count back to the file
+        // header. On reopen the count came from the (stale, still zero)
+        // header and the recovery loop visited no blocks — every
+        // flushed record was lost if the WAL had been trimmed past it.
+        use crate::storage::record::Record;
+        use crate::storage::write_buffer::WBlock;
+
+        let dir = tempdir().unwrap();
+        let path = {
+            let file = DataFile::create(dir.path(), 7).unwrap();
+            for block_id in 0u32..3 {
+                let mut wb = WBlock::new(7, block_id);
+                let mut rec = Record::new(
+                    format!("k-{}", block_id).into_bytes(),
+                    format!("v-{}", block_id).into_bytes(),
+                    (block_id + 1) as u64,
+                    0,
+                )
+                .unwrap();
+                wb.try_append(&mut rec).unwrap();
+                file.write_wblock(&mut wb).unwrap();
+            }
+            file.sync().unwrap();
+            file.path.clone()
+        };
+
+        // Reopen. The header still says zero; scan must find 3.
+        let reopened = DataFile::open(&path).unwrap();
+        assert_eq!(
+            reopened.wblock_count(),
+            3,
+            "scan_highest_written_block must recover count from disk \
+             contents, not trust the stale header"
+        );
     }
 
     #[test]

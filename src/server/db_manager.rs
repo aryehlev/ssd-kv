@@ -169,8 +169,9 @@ impl DbHandler {
         }
     }
 
-    /// Get the generation for a key (for WATCH support).
-    pub fn get_generation(&self, key: &[u8]) -> Option<u32> {
+    /// Get the generation for a key (for WATCH support). Returns the
+    /// u64 generation from whichever backend owns this db.
+    pub fn get_generation(&self, key: &[u8]) -> Option<u64> {
         match self {
             DbHandler::Ssd(h) => h.index().get(key).map(|e| e.generation),
             DbHandler::Memory(m) => m.get_generation(key),

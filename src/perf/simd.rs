@@ -703,7 +703,7 @@ mod tests {
             let key = format!("key_{}", i);
             let key_bytes = key.as_bytes();
             let hash = xxhash_rust::xxh3::xxh3_64(key_bytes);
-            index.insert(key_bytes, DiskLocation::new(0, 0, i), i, 100);
+            index.insert(key_bytes, DiskLocation::new(0, 0, i), i as u64, 100);
             bloom.add(hash);
         }
 

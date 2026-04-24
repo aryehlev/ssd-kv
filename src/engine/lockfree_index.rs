@@ -45,7 +45,7 @@ pub struct Bucket {
     /// Flags (inline_key)
     flags: u8,
     /// Generation number
-    generation: AtomicU32,
+    generation: AtomicU64,
     /// Key hash (for fast comparison)
     key_hash: u64,
     /// Inline key (up to 24 bytes)
@@ -67,7 +67,7 @@ impl Bucket {
             key_len: 0,
             _reserved: 0,
             flags: 0,
-            generation: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
             key_hash: 0,
             inline_key: [0; MAX_INLINE_KEY],
             disk_location: [0; DISK_LOCATION_SIZE],
@@ -209,7 +209,7 @@ impl Bucket {
         key: &[u8],
         key_hash: u64,
         location: &DiskLocation,
-        generation: u32,
+        generation: u64,
     ) {
         self.key_hash = key_hash;
         self.key_len = key.len() as u8;
@@ -404,7 +404,7 @@ impl LockFreeIndex {
         &self,
         key: &[u8],
         location: &DiskLocation,
-        generation: u32,
+        generation: u64,
     ) -> io::Result<()> {
         let key_hash = hash_key(key);
 

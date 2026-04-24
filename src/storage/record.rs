@@ -1,15 +1,20 @@
-//! On-disk record format with 32-byte header.
+//! On-disk record format with 40-byte header.
 //!
 //! Record layout:
 //! - Magic: 2 bytes (0x4B56 = "KV")
 //! - Key length: 2 bytes
 //! - Value length: 4 bytes
-//! - Generation: 4 bytes
+//! - Generation: 8 bytes (u64; wide enough that we don't wrap under
+//!   any realistic workload — at 10M writes/sec it would take 58k
+//!   years to overflow, so conflict resolution stays correct even
+//!   across very long-running processes)
 //! - Timestamp: 8 bytes (microseconds since epoch)
 //! - TTL: 4 bytes (seconds, 0 = no expiry)
 //! - Flags: 1 byte
 //! - Reserved: 3 bytes
 //! - CRC32: 4 bytes (covers header + key + value)
+//! - Pad: 4 bytes (round header to 40 bytes so it stays
+//!   u32-aligned and future field additions don't need to renumber)
 //! - Key: variable
 //! - Value: variable
 //! - Padding: to 128-byte boundary
@@ -23,7 +28,7 @@ use crate::perf::simd::{crc32c, simd_memcpy};
 pub const RECORD_MAGIC: u16 = 0x564B; // 'K' 'V'
 
 /// Record header size in bytes.
-pub const HEADER_SIZE: usize = 32;
+pub const HEADER_SIZE: usize = 40;
 
 /// Alignment for records on disk.
 pub const RECORD_ALIGNMENT: usize = 128;
@@ -60,7 +65,7 @@ pub struct RecordHeader {
     pub magic: u16,
     pub key_len: u16,
     pub value_len: u32,
-    pub generation: u32,
+    pub generation: u64,
     pub timestamp: u64,
     pub ttl: u32,
     pub flags: u8,
@@ -70,7 +75,7 @@ pub struct RecordHeader {
 
 impl RecordHeader {
     /// Creates a new record header.
-    pub fn new(key_len: u16, value_len: u32, generation: u32, ttl: u32, flags: RecordFlags) -> Self {
+    pub fn new(key_len: u16, value_len: u32, generation: u64, ttl: u32, flags: RecordFlags) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
@@ -129,12 +134,13 @@ impl RecordHeader {
         buf[0..2].copy_from_slice(&self.magic.to_le_bytes());
         buf[2..4].copy_from_slice(&self.key_len.to_le_bytes());
         buf[4..8].copy_from_slice(&self.value_len.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.generation.to_le_bytes());
-        buf[12..20].copy_from_slice(&self.timestamp.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.ttl.to_le_bytes());
-        buf[24] = self.flags;
-        buf[25..28].copy_from_slice(&self.reserved);
-        buf[28..32].copy_from_slice(&self.crc32.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.generation.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.timestamp.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.ttl.to_le_bytes());
+        buf[28] = self.flags;
+        buf[29..32].copy_from_slice(&self.reserved);
+        buf[32..36].copy_from_slice(&self.crc32.to_le_bytes());
+        // buf[36..40] reserved for future use, already zero
         buf
     }
 
@@ -144,14 +150,16 @@ impl RecordHeader {
             magic: u16::from_le_bytes([buf[0], buf[1]]),
             key_len: u16::from_le_bytes([buf[2], buf[3]]),
             value_len: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            generation: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            timestamp: u64::from_le_bytes([
-                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+            generation: u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
             ]),
-            ttl: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
-            flags: buf[24],
-            reserved: [buf[25], buf[26], buf[27]],
-            crc32: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
+            timestamp: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+            ttl: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+            flags: buf[28],
+            reserved: [buf[29], buf[30], buf[31]],
+            crc32: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
         }
     }
 }
@@ -166,7 +174,7 @@ pub struct Record {
 
 impl Record {
     /// Creates a new record.
-    pub fn new(key: Vec<u8>, value: Vec<u8>, generation: u32, ttl: u32) -> io::Result<Self> {
+    pub fn new(key: Vec<u8>, value: Vec<u8>, generation: u64, ttl: u32) -> io::Result<Self> {
         if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -192,7 +200,7 @@ impl Record {
     }
 
     /// Creates a tombstone record for deletion.
-    pub fn tombstone(key: Vec<u8>, generation: u32) -> io::Result<Self> {
+    pub fn tombstone(key: Vec<u8>, generation: u64) -> io::Result<Self> {
         if key.len() > MAX_KEY_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -211,15 +219,18 @@ impl Record {
 
     /// Computes the CRC32 of the record using hardware acceleration.
     pub fn compute_crc(&self) -> u32 {
-        // CRC covers header (excluding CRC field) + key + value
-        // Build contiguous buffer for SIMD-accelerated CRC
+        // CRC covers header bytes PRECEDING the crc32 field + key + value.
+        // After the u64-generation widening the crc field sits at [32..36),
+        // so we feed [0..32) into the hash (matching HEADER_SIZE minus the
+        // crc and trailing padding).
+        const CRC_COVER: usize = 32;
         let header_bytes = self.header.to_bytes();
-        let total_len = 28 + self.key.len() + self.value.len();
+        let total_len = CRC_COVER + self.key.len() + self.value.len();
         let mut buf = vec![0u8; total_len];
 
-        buf[..28].copy_from_slice(&header_bytes[..28]); // Exclude CRC field
-        buf[28..28 + self.key.len()].copy_from_slice(&self.key);
-        buf[28 + self.key.len()..].copy_from_slice(&self.value);
+        buf[..CRC_COVER].copy_from_slice(&header_bytes[..CRC_COVER]);
+        buf[CRC_COVER..CRC_COVER + self.key.len()].copy_from_slice(&self.key);
+        buf[CRC_COVER + self.key.len()..].copy_from_slice(&self.value);
 
         // Hardware-accelerated CRC32C (SSE4.2 on x86_64)
         crc32c(&buf)

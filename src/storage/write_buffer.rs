@@ -52,7 +52,7 @@ pub struct WBlock {
     /// Maximum record generation seen in this block. Used by the WAL
     /// cleanup path to know "everything up to this gen is durable in a
     /// data file once this block is fsynced".
-    pub max_generation: u32,
+    pub max_generation: u64,
 }
 
 impl WBlock {
@@ -278,17 +278,25 @@ impl WriteBuffer {
     }
 
     /// Appends a record to the write buffer.
-    /// Returns the disk location where the record will be written.
+    /// Returns the disk location where the record will be written,
+    /// including the on-disk record size so cold GETs can do partial
+    /// (sub-WBlock) reads instead of always pulling a full 1 MiB block.
+    ///
+    /// `record.serialize()` runs inside `try_append`, which may compress
+    /// the value and mutate `header.value_len` — so `serialized_size()`
+    /// is only accurate AFTER the append returns.
     pub fn append(&self, record: &mut Record) -> io::Result<DiskLocation> {
         let mut current = self.current.lock();
 
         // Try to append to current block
         match current.try_append(record) {
             Ok(offset) => {
-                Ok(DiskLocation::new(
+                let size = record.serialized_size() as u32;
+                Ok(DiskLocation::with_size(
                     current.file_id,
                     current.block_id as u16,
                     offset,
+                    size,
                 ))
             }
             Err(()) => {
@@ -321,11 +329,15 @@ impl WriteBuffer {
 
                 // Try again with new block
                 match current.try_append(record) {
-                    Ok(offset) => Ok(DiskLocation::new(
-                        current.file_id,
-                        current.block_id as u16,
-                        offset,
-                    )),
+                    Ok(offset) => {
+                        let size = record.serialized_size() as u32;
+                        Ok(DiskLocation::with_size(
+                            current.file_id,
+                            current.block_id as u16,
+                            offset,
+                            size,
+                        ))
+                    }
                     Err(()) => Err(io::Error::new(
                         io::ErrorKind::Other,
                         "Record too large for WBlock",
@@ -506,7 +518,7 @@ mod tests {
             let mut record = Record::new(
                 format!("key{}", count).into_bytes(),
                 vec![0u8; 1000],
-                count as u32,
+                count as u64,
                 0,
             )
             .unwrap();
@@ -575,10 +587,10 @@ mod tests {
         buffer.set_max_pending_wblocks(2);
 
         let mut saw_oom = false;
-        for i in 0u32..20 {
+        for i in 0u64..20 {
             let mut record = Record::new(
                 format!("k{:03}", i).into_bytes(),
-                incompressible_value(i as u64, 500 * 1024),
+                incompressible_value(i, 500 * 1024),
                 i,
                 0,
             )
@@ -604,10 +616,10 @@ mod tests {
         // depth.
         let mut buffer = WriteBuffer::new(0, 1023);
         buffer.set_max_pending_wblocks(0);
-        for i in 0u32..10 {
+        for i in 0u64..10 {
             let mut record = Record::new(
                 format!("k{:03}", i).into_bytes(),
-                incompressible_value(i as u64, 500 * 1024),
+                incompressible_value(i, 500 * 1024),
                 i,
                 0,
             )

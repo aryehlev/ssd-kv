@@ -170,7 +170,7 @@ fn batch_writer_thread(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut current_batch = WriteBatch::new();
-    let mut generation_counter = 1u32;
+    let mut generation_counter = 1u64;
 
     loop {
         if shutdown.load(Ordering::Relaxed) && current_batch.is_empty() {

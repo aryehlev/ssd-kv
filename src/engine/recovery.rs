@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use crate::engine::index::Index;
 use crate::engine::index_entry::hash_key;
 use crate::server::Handler;
-use crate::storage::file_manager::{FileManager, WBLOCKS_PER_FILE};
+use crate::storage::file_manager::{FileManager, WBlockMeta, WBLOCKS_PER_FILE};
 use crate::storage::record::{Record, HEADER_SIZE, RECORD_ALIGNMENT, RECORD_MAGIC};
 use crate::storage::wal::WriteAheadLog;
 use crate::storage::write_buffer::{DiskLocation, WBLOCK_FOOTER_MAGIC, WBLOCK_FOOTER_SIZE};
@@ -25,7 +25,7 @@ pub struct RecoveryStats {
     /// WAL entries replayed (if a WAL was passed to `recover_with_wal`).
     pub wal_entries_replayed: u64,
     /// Highest generation observed across data files + WAL.
-    pub max_generation: u32,
+    pub max_generation: u64,
     /// WBlocks whose trailing footer matched (flushed cleanly).
     pub wblocks_footer_ok: u64,
     /// WBlocks with no footer — written by an older binary, or a
@@ -120,6 +120,14 @@ pub fn recover_with_wal(
 }
 
 /// Recovers a single data file.
+///
+/// Also rebuilds the per-WBlock metadata table (`live_records`,
+/// `total_records`, `bytes_used`) that compaction uses to decide
+/// which blocks are worth rewriting. Before this, `DataFile::open`
+/// initialised the table to all-zeroes and the recovery pass never
+/// populated it, so after any restart `get_fragmented_blocks` returned
+/// an empty list and compaction sat idle even on highly-fragmented
+/// files.
 fn recover_file(
     index: &Index,
     file_manager: &FileManager,
@@ -130,16 +138,17 @@ fn recover_file(
         .get_file(file_id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
 
-    let file_guard = file.lock();
+    let mut file_guard = file.lock();
     let wblock_count = file_guard.wblock_count();
 
     debug!("Recovering file {} with {} wblocks", file_id, wblock_count);
 
     // Scan each WBlock
     for wblock_id in 0..wblock_count.min(WBLOCKS_PER_FILE) {
-        match recover_wblock(index, &file_guard, file_id, wblock_id, stats) {
-            Ok(_) => {
+        match recover_wblock(index, &*file_guard, file_id, wblock_id, stats) {
+            Ok(meta) => {
                 stats.wblocks_scanned += 1;
+                file_guard.update_wblock_meta(wblock_id, meta);
             }
             Err(e) => {
                 debug!("Error in wblock {} of file {}: {}", wblock_id, file_id, e);
@@ -151,17 +160,22 @@ fn recover_file(
     Ok(())
 }
 
-/// Recovers records from a single WBlock.
+/// Recovers records from a single WBlock. Returns per-block metadata
+/// for the compactor. The caller installs it via
+/// `DataFile::update_wblock_meta`.
 fn recover_wblock(
     index: &Index,
     file: &crate::storage::file_manager::DataFile,
     file_id: u32,
     wblock_id: u32,
     stats: &mut RecoveryStats,
-) -> io::Result<()> {
+) -> io::Result<WBlockMeta> {
     let wblock_data = file.read_wblock(wblock_id)?;
 
     let mut offset = 0usize;
+    let mut live_records: u32 = 0;
+    let mut total_records: u32 = 0;
+    let mut bytes_used: u32 = 0;
 
     while offset + HEADER_SIZE <= wblock_data.len() {
         // Check for end of data (zero magic)
@@ -179,6 +193,8 @@ fn recover_wblock(
             Ok(record) => {
                 stats.records_found += 1;
                 let record_size = record.serialized_size();
+                total_records = total_records.saturating_add(1);
+                bytes_used = bytes_used.saturating_add(record_size as u32);
 
                 if record.header.generation > stats.max_generation {
                     stats.max_generation = record.header.generation;
@@ -193,7 +209,12 @@ fn recover_wblock(
                     index.delete(&record.key, record.header.generation);
                 } else {
                     // Index the record
-                    let location = DiskLocation::new(file_id, wblock_id as u16, offset as u32);
+                    let location = DiskLocation::with_size(
+                        file_id,
+                        wblock_id as u16,
+                        offset as u32,
+                        record_size as u32,
+                    );
                     index.insert(
                         &record.key,
                         location,
@@ -201,6 +222,7 @@ fn recover_wblock(
                         record.header.value_len,
                     );
                     stats.records_indexed += 1;
+                    live_records = live_records.saturating_add(1);
                 }
 
                 offset += record_size;
@@ -254,7 +276,11 @@ fn recover_wblock(
         stats.wblocks_footer_missing += 1;
     }
 
-    Ok(())
+    Ok(WBlockMeta {
+        live_records,
+        total_records,
+        bytes_used,
+    })
 }
 
 #[cfg(test)]
@@ -290,7 +316,7 @@ mod tests {
                 let mut record = Record::new(
                     format!("key_{}", i).into_bytes(),
                     format!("value_{}", i).into_bytes(),
-                    i as u32,
+                    i as u64,
                     0,
                 ).unwrap();
                 wblock.try_append(&mut record).unwrap();
@@ -310,7 +336,7 @@ mod tests {
         for i in 0..10 {
             let key = format!("key_{}", i);
             let entry = index.get(key.as_bytes()).unwrap();
-            assert_eq!(entry.generation, i as u32);
+            assert_eq!(entry.generation, i as u64);
         }
     }
 }

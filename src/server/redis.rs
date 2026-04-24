@@ -666,7 +666,7 @@ pub struct RedisHandler {
     /// Transaction state: None = not in transaction, Some = queued commands.
     tx_queue: std::cell::RefCell<Option<Vec<Vec<RespValue>>>>,
     /// Watched keys for optimistic locking (key -> generation at watch time).
-    watched_keys: std::cell::RefCell<HashMap<Vec<u8>, Option<u32>>>,
+    watched_keys: std::cell::RefCell<HashMap<Vec<u8>, Option<u64>>>,
     /// WAL position the most-recently-dispatched command needs durable
     /// before its response can be sent to the client. 0 = no durability
     /// requirement. The reactor reads + resets this after each

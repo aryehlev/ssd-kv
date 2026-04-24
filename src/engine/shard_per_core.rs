@@ -67,7 +67,7 @@ pub struct Shard {
     /// Local write buffer
     write_buffer: Vec<u8>,
     /// Generation counter
-    generation: u32,
+    generation: u64,
     /// Statistics
     stats: ShardStats,
     /// Inline value threshold
@@ -84,7 +84,7 @@ pub struct Shard {
 #[derive(Clone)]
 struct ShardEntry {
     value: Vec<u8>,
-    generation: u32,
+    generation: u64,
 }
 
 impl Shard {

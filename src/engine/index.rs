@@ -79,7 +79,7 @@ impl IndexShard {
 
     /// Marks an entry as deleted.
     /// Returns true if the entry was found and deleted.
-    pub fn delete(&mut self, key: &[u8], key_hash: u64, generation: u32) -> bool {
+    pub fn delete(&mut self, key: &[u8], key_hash: u64, generation: u64) -> bool {
         if let Some(bucket) = self.entries.get_mut(&key_hash) {
             for entry in bucket.iter_mut() {
                 if entry.matches(key, key_hash) {
@@ -183,7 +183,7 @@ impl Index {
         &self,
         key: &[u8],
         location: DiskLocation,
-        generation: u32,
+        generation: u64,
         value_len: u32,
     ) -> Option<IndexEntry> {
         let key_hash = hash_key(key);
@@ -214,7 +214,7 @@ impl Index {
     }
 
     /// Marks a key as deleted.
-    pub fn delete(&self, key: &[u8], generation: u32) -> bool {
+    pub fn delete(&self, key: &[u8], generation: u64) -> bool {
         let key_hash = hash_key(key);
         let shard_idx = self.shard_for(key_hash);
         let mut shard = self.shards[shard_idx].write();
@@ -375,13 +375,13 @@ mod tests {
 
         for i in 0..100 {
             let key = format!("key_{}", i);
-            index.insert(key.as_bytes(), DiskLocation::new(0, 0, i as u32), i as u32, 100);
+            index.insert(key.as_bytes(), DiskLocation::new(0, 0, i as u32), i as u64, 100);
         }
 
         // Delete some
         for i in 0..50 {
             let key = format!("key_{}", i);
-            index.delete(key.as_bytes(), 1000 + i as u32);
+            index.delete(key.as_bytes(), 1000 + i as u64);
         }
 
         let stats = index.stats();

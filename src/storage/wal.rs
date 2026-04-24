@@ -24,7 +24,13 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-/// WAL entry header (24 bytes).
+/// WAL entry header (28 bytes).
+///
+/// Format v2: `generation` is u64 so the counter cannot wrap under any
+/// realistic workload. The magic was bumped alongside this change so
+/// an old v1 WAL (24-byte header with u32 generation) is detected and
+/// refused at replay — mixing a v1 key/value parse with a v2 layout
+/// would leak 4 bytes into the key bytes and produce corrupted entries.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct WalEntryHeader {
@@ -38,21 +44,25 @@ pub struct WalEntryHeader {
     pub key_len: u16,
     /// Value length
     pub value_len: u32,
-    /// Generation number
-    pub generation: u32,
+    /// Generation number (u64 — wide enough that 10M writes/sec
+    /// would take 58k years to overflow)
+    pub generation: u64,
     /// TTL (seconds, 0 = no expiry)
     pub ttl: u32,
     /// CRC32 of key + value
     pub crc: u32,
 }
 
-const WAL_MAGIC: u32 = 0x57414C21; // "WAL!"
+/// v2 magic — bumped when we widened `generation` from u32 to u64.
+/// Old v1 files (magic `0x57414C21`, "WAL!") are intentionally
+/// rejected because the size of the header changed.
+const WAL_MAGIC: u32 = 0x57414C32; // "WAL2"
 const WAL_ENTRY_PUT: u8 = 1;
 const WAL_ENTRY_DELETE: u8 = 2;
 const WAL_HEADER_SIZE: usize = std::mem::size_of::<WalEntryHeader>();
 
 impl WalEntryHeader {
-    pub fn new_put(key_len: u16, value_len: u32, generation: u32, ttl: u32) -> Self {
+    pub fn new_put(key_len: u16, value_len: u32, generation: u64, ttl: u32) -> Self {
         Self {
             magic: WAL_MAGIC,
             entry_type: WAL_ENTRY_PUT,
@@ -65,7 +75,7 @@ impl WalEntryHeader {
         }
     }
 
-    pub fn new_delete(key_len: u16, generation: u32) -> Self {
+    pub fn new_delete(key_len: u16, generation: u64) -> Self {
         Self {
             magic: WAL_MAGIC,
             entry_type: WAL_ENTRY_DELETE,
@@ -291,9 +301,9 @@ struct ClosedFile {
     seq: u64,
     /// Highest generation ever appended to this file while it was current.
     /// Only meaningful for files we wrote during this process's lifetime;
-    /// files carried over from a previous run have `max_gen = u32::MAX`
+    /// files carried over from a previous run have `max_gen = u64::MAX`
     /// so we never prematurely delete them.
-    max_gen: u32,
+    max_gen: u64,
 }
 
 /// Write-Ahead Log for durability and fast writes.
@@ -557,7 +567,7 @@ pub struct WriteAheadLog {
     position: AtomicU64,
     /// Highest generation appended to the current WAL file. Bumped by every
     /// append_put / append_delete; frozen into `closed_files` on rotate.
-    current_max_gen: AtomicU32,
+    current_max_gen: AtomicU64,
     /// Closed WAL files in seq order; used by `cleanup_up_to_gen` to
     /// delete files whose entire contents are safely on disk.
     closed_files: Mutex<Vec<ClosedFile>>,
@@ -597,7 +607,7 @@ impl WriteAheadLog {
         // the shutdown `cleanup(keep_files)` call) takes care of those.
         let closed = Self::find_closed_file_seqs(&config.dir, file_seq)?
             .into_iter()
-            .map(|seq| ClosedFile { seq, max_gen: u32::MAX })
+            .map(|seq| ClosedFile { seq, max_gen: u64::MAX })
             .collect::<Vec<_>>();
 
         let mut wal = Self {
@@ -607,7 +617,7 @@ impl WriteAheadLog {
             rotate_lock: Mutex::new(()),
             file_seq: AtomicU64::new(file_seq),
             position: AtomicU64::new(position),
-            current_max_gen: AtomicU32::new(0),
+            current_max_gen: AtomicU64::new(0),
             closed_files: Mutex::new(closed),
             stats: Arc::new(WalStats::default()),
             gc: Arc::new(GroupCommit::new(position)),
@@ -842,7 +852,7 @@ impl WriteAheadLog {
     }
 
     /// Append a PUT entry to the WAL and block until durable.
-    pub fn append_put(&self, key: &[u8], value: &[u8], generation: u32, ttl: u32) -> io::Result<u64> {
+    pub fn append_put(&self, key: &[u8], value: &[u8], generation: u64, ttl: u32) -> io::Result<u64> {
         let pos = self.append_put_nowait(key, value, generation, ttl)?;
         self.gc.wait_for_durable(pos);
         Ok(pos)
@@ -853,7 +863,7 @@ impl WriteAheadLog {
     /// responsible for checking `durable_position()` before treating the
     /// write as durable (this is how the reactor pipelines many writes
     /// per fsync).
-    pub fn append_put_nowait(&self, key: &[u8], value: &[u8], generation: u32, ttl: u32) -> io::Result<u64> {
+    pub fn append_put_nowait(&self, key: &[u8], value: &[u8], generation: u64, ttl: u32) -> io::Result<u64> {
         let mut header = WalEntryHeader::new_put(
             key.len() as u16,
             value.len() as u32,
@@ -865,14 +875,14 @@ impl WriteAheadLog {
     }
 
     /// Append a DELETE entry to the WAL and block until durable.
-    pub fn append_delete(&self, key: &[u8], generation: u32) -> io::Result<u64> {
+    pub fn append_delete(&self, key: &[u8], generation: u64) -> io::Result<u64> {
         let pos = self.append_delete_nowait(key, generation)?;
         self.gc.wait_for_durable(pos);
         Ok(pos)
     }
 
     /// Append a DELETE entry to the WAL but DON'T wait for durability.
-    pub fn append_delete_nowait(&self, key: &[u8], generation: u32) -> io::Result<u64> {
+    pub fn append_delete_nowait(&self, key: &[u8], generation: u64) -> io::Result<u64> {
         let header = WalEntryHeader::new_delete(key.len() as u16, generation);
         self.append_entry(&header, key, None)
     }
@@ -954,8 +964,8 @@ impl WriteAheadLog {
         //
         // SAFETY of the read-from-packed-struct pattern: WalEntryHeader is
         // #[repr(C, packed)] with no unaligned references escaping; we
-        // copy the u32 out directly.
-        let header_gen = {
+        // copy the u64 out directly.
+        let header_gen: u64 = {
             let g = header.generation;
             g
         };
@@ -1106,7 +1116,7 @@ impl WriteAheadLog {
     /// Called by the periodic WAL-trim thread right after a successful
     /// `handler.flush()` has fsynced the WBlocks that carried all records
     /// up to `durable_gen` into data files.
-    pub fn cleanup_up_to_gen(&self, durable_gen: u32) -> io::Result<usize> {
+    pub fn cleanup_up_to_gen(&self, durable_gen: u64) -> io::Result<usize> {
         let mut to_delete = Vec::new();
         {
             let mut closed = self.closed_files.lock();
@@ -1226,6 +1236,37 @@ impl WriteAheadLog {
                 } else {
                     Vec::new()
                 };
+
+                // Integrity check. `append_put` stores
+                // `crc32fast(key || value)` in the header; a mismatch
+                // means either the entry was torn mid-flush (we read the
+                // header before the tail was fsynced) or the file was
+                // corrupted. Either way: stop replay for this file. An
+                // accepted corrupt entry would publish a bogus value in
+                // the index that survives future durable writes.
+                //
+                // The stored CRC for PUT covers (key, value); DELETE
+                // entries in the current format don't CRC their key
+                // (crc field stays 0), so only validate PUTs. If you
+                // later extend DELETE to CRC its key, drop this branch.
+                let stored_crc = {
+                    let c = header.crc;
+                    c
+                };
+                if header.is_put() {
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&key);
+                    hasher.update(&value);
+                    let computed = hasher.finalize();
+                    if computed != stored_crc {
+                        tracing::warn!(
+                            "WAL replay: CRC mismatch in file {} (stored {:08x}, \
+                             computed {:08x}) — stopping at torn/corrupt entry",
+                            seq, stored_crc, computed
+                        );
+                        break 'entries;
+                    }
+                }
 
                 callback(header, key, value)?;
                 count += 1;
@@ -1380,10 +1421,10 @@ mod tests {
         let wal = Arc::new(WriteAheadLog::new(config.clone()).unwrap());
 
         let mut handles = Vec::new();
-        for t in 0..8u32 {
+        for t in 0..8u64 {
             let wal = Arc::clone(&wal);
             handles.push(std::thread::spawn(move || {
-                for i in 0..100u32 {
+                for i in 0..100u64 {
                     let key = format!("k-{}-{}", t, i);
                     let val = format!("v-{}-{}", t, i);
                     wal.append_put(key.as_bytes(), val.as_bytes(), t * 1000 + i, 0)
@@ -1425,7 +1466,7 @@ mod tests {
         // Write three "batches" with increasing generations. Each batch
         // is large enough to force a rotation so we end up with multiple
         // closed files.
-        for i in 1u32..=3 {
+        for i in 1u64..=3 {
             let val = vec![b'x'; 40];
             wal.append_put(format!("k{}", i).as_bytes(), &val, i * 100, 0)
                 .unwrap();

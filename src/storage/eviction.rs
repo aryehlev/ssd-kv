@@ -167,11 +167,11 @@ impl Evictor {
 
     /// Collects candidate keys by scanning shards. More thorough than pure random
     /// sampling because it visits shards that actually have entries.
-    fn collect_candidates(&self, rng: &mut Rng) -> Vec<(Vec<u8>, u32)> {
+    fn collect_candidates(&self, rng: &mut Rng) -> Vec<(Vec<u8>, u64)> {
         use crate::engine::index::NUM_SHARDS;
 
         let sample_size = self.config.sample_size;
-        let mut candidates: Vec<(Vec<u8>, u32)> = Vec::with_capacity(sample_size);
+        let mut candidates: Vec<(Vec<u8>, u64)> = Vec::with_capacity(sample_size);
 
         // Scan shards round-robin starting from a random offset
         let start_shard = (rng.next() as usize) % NUM_SHARDS;
@@ -232,7 +232,7 @@ impl Evictor {
     }
 
     /// Selects a victim from candidates based on the eviction policy.
-    fn select_victim(&self, candidates: &[(Vec<u8>, u32)]) -> Option<Vec<u8>> {
+    fn select_victim(&self, candidates: &[(Vec<u8>, u64)]) -> Option<Vec<u8>> {
         match self.config.policy {
             EvictionPolicy::AllKeysLru => {
                 // Lowest generation ≈ oldest write ≈ LRU
@@ -246,7 +246,7 @@ impl Evictor {
             }
             EvictionPolicy::VolatileLru => {
                 // Filter to keys with TTL, then pick lowest generation
-                let mut best: Option<(Vec<u8>, u32)> = None;
+                let mut best: Option<(Vec<u8>, u64)> = None;
                 for (key, gen) in candidates {
                     if let Some(meta) = self.handler.get_with_meta(key) {
                         if meta.ttl_secs > 0 {

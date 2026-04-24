@@ -104,7 +104,7 @@ fn bench_index_operations(c: &mut Criterion) {
     for i in 0..100000 {
         let key = format!("index_key_{:08}", i);
         let location = ssd_kv::storage::write_buffer::DiskLocation::new(0, 0, i as u32);
-        index.insert(key.as_bytes(), location, i as u32, 100);
+        index.insert(key.as_bytes(), location, i as u64, 100);
     }
 
     let mut group = c.benchmark_group("index");
@@ -125,7 +125,7 @@ fn bench_index_operations(c: &mut Criterion) {
             i = i.wrapping_add(1);
             let key = format!("new_key_{}", i);
             let location = ssd_kv::storage::write_buffer::DiskLocation::new(0, 0, i);
-            index.insert(key.as_bytes(), location, i, 100)
+            index.insert(key.as_bytes(), location, i as u64, 100)
         })
     });
 

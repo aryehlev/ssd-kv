@@ -15,7 +15,7 @@ use crate::storage::eviction::EvictionPolicy;
 /// A single entry stored in the memory store.
 struct MemoryEntry {
     value: Vec<u8>,
-    generation: u32,
+    generation: u64,
     timestamp_micros: u64,
     ttl_secs: u32,
 }
@@ -37,7 +37,7 @@ impl MemoryEntry {
 /// Concurrent in-memory key-value store.
 pub struct MemoryStore {
     data: DashMap<Vec<u8>, MemoryEntry>,
-    next_generation: AtomicU32,
+    next_generation: AtomicU64,
     total_entries: AtomicU64,
     total_data_bytes: AtomicU64,
     eviction_policy: EvictionPolicy,
@@ -50,7 +50,7 @@ impl MemoryStore {
         Self {
             // Use at least 64 shards for good concurrency regardless of CPU count
             data: DashMap::with_shard_amount(64),
-            next_generation: AtomicU32::new(1),
+            next_generation: AtomicU64::new(1),
             total_entries: AtomicU64::new(0),
             total_data_bytes: AtomicU64::new(0),
             eviction_policy: EvictionPolicy::NoEviction,
@@ -229,7 +229,7 @@ impl MemoryStore {
     /// Iterate all keys (for KEYS/SCAN commands). Returns (key, generation) pairs.
     pub fn iter_keys<F>(&self, mut f: F)
     where
-        F: FnMut(&[u8], u32),
+        F: FnMut(&[u8], u64),
     {
         for entry in self.data.iter() {
             if !entry.value().is_expired() {
@@ -239,7 +239,7 @@ impl MemoryStore {
     }
 
     /// Get the generation for a key (for WATCH support).
-    pub fn get_generation(&self, key: &[u8]) -> Option<u32> {
+    pub fn get_generation(&self, key: &[u8]) -> Option<u64> {
         let entry = self.data.get(key)?;
         if entry.is_expired() {
             return None;

@@ -115,7 +115,7 @@ pub struct IndexEntry {
     /// Location on disk.
     pub location: DiskLocation,
     /// Generation number for conflict resolution.
-    pub generation: u32,
+    pub generation: u64,
     /// Value length in bytes.
     pub value_len: u32,
     /// Entry flags.
@@ -128,7 +128,7 @@ impl IndexEntry {
         key: &[u8],
         key_hash: u64,
         location: DiskLocation,
-        generation: u32,
+        generation: u64,
         value_len: u32,
     ) -> Self {
         Self {
@@ -142,7 +142,7 @@ impl IndexEntry {
     }
 
     /// Creates a deleted entry (tombstone in index).
-    pub fn deleted(key: &[u8], key_hash: u64, generation: u32) -> Self {
+    pub fn deleted(key: &[u8], key_hash: u64, generation: u64) -> Self {
         Self {
             key_hash,
             key: KeyStorage::new(key),
@@ -184,7 +184,7 @@ impl IndexEntry {
     }
 
     /// Updates the entry with a new location and generation.
-    pub fn update(&mut self, location: DiskLocation, generation: u32, value_len: u32) {
+    pub fn update(&mut self, location: DiskLocation, generation: u64, value_len: u32) {
         self.location = location;
         self.generation = generation;
         self.value_len = value_len;
@@ -192,7 +192,7 @@ impl IndexEntry {
     }
 
     /// Marks the entry as deleted.
-    pub fn mark_deleted(&mut self, generation: u32) {
+    pub fn mark_deleted(&mut self, generation: u64) {
         self.generation = generation;
         self.flags = EntryFlags::Deleted;
     }

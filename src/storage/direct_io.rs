@@ -133,6 +133,13 @@ impl DirectFile {
 
     /// Writes an aligned buffer at the specified offset.
     /// The buffer and offset must both be aligned to ALIGNMENT.
+    ///
+    /// Loops on short writes and retries on `EINTR`. A single `pwrite`
+    /// is permitted to return fewer bytes than requested (e.g. when a
+    /// signal interrupts it mid-call), so treating the first return as
+    /// "done" can silently drop the tail of a WBlock. Short writes are
+    /// rare on O_DIRECT but legal, and a storage engine must not
+    /// tolerate even rare silent truncation.
     pub fn write_at(&self, buf: &AlignedBuffer, offset: u64) -> io::Result<usize> {
         if offset as usize % ALIGNMENT != 0 {
             return Err(io::Error::new(
@@ -141,43 +148,47 @@ impl DirectFile {
             ));
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let written = unsafe {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.file.as_raw_fd();
+        let total = buf.len();
+        let mut written = 0usize;
+        while written < total {
+            let remaining = total - written;
+            let n = unsafe {
                 libc::pwrite(
-                    self.file.as_raw_fd(),
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
-                    offset as libc::off_t,
+                    fd,
+                    buf.as_ptr().add(written) as *const libc::c_void,
+                    remaining,
+                    (offset + written as u64) as libc::off_t,
                 )
             };
-            if written < 0 {
-                return Err(io::Error::last_os_error());
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
             }
-            Ok(written as usize)
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            use std::os::unix::io::AsRawFd;
-            let written = unsafe {
-                libc::pwrite(
-                    self.file.as_raw_fd(),
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
-                    offset as libc::off_t,
-                )
-            };
-            if written < 0 {
-                return Err(io::Error::last_os_error());
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "pwrite returned 0 with bytes remaining",
+                ));
             }
-            Ok(written as usize)
+            written += n as usize;
         }
+        Ok(written)
     }
 
     /// Reads into an aligned buffer at the specified offset.
     /// The buffer capacity and offset must both be aligned to ALIGNMENT.
+    ///
+    /// Loops on short reads and retries on `EINTR`. Returns the total
+    /// bytes read; on EOF before the full `len` was satisfied, returns
+    /// what was actually read (matching `read_exact`-like semantics
+    /// would require an error — but data files are preallocated, so a
+    /// short read only happens past the file's logical end, which
+    /// callers already tolerate).
     pub fn read_at(&self, buf: &mut AlignedBuffer, offset: u64, len: usize) -> io::Result<usize> {
         if offset as usize % ALIGNMENT != 0 {
             return Err(io::Error::new(
@@ -195,21 +206,37 @@ impl DirectFile {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let read_bytes = unsafe {
-                libc::pread(
-                    self.file.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    len,
-                    offset as libc::off_t,
-                )
-            };
-            if read_bytes < 0 {
-                return Err(io::Error::last_os_error());
+            let fd = self.file.as_raw_fd();
+            let mut read_total = 0usize;
+            while read_total < len {
+                let remaining = len - read_total;
+                let n = unsafe {
+                    libc::pread(
+                        fd,
+                        buf.as_mut_ptr().add(read_total) as *mut libc::c_void,
+                        remaining,
+                        (offset + read_total as u64) as libc::off_t,
+                    )
+                };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if n == 0 {
+                    // EOF — file is shorter than requested read. Return
+                    // what we got; callers that need strict len must
+                    // check the returned size.
+                    break;
+                }
+                read_total += n as usize;
             }
             unsafe {
-                buf.set_len(read_bytes as usize);
+                buf.set_len(read_total);
             }
-            Ok(read_bytes as usize)
+            Ok(read_total)
         }
 
         #[cfg(not(unix))]

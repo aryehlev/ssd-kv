@@ -29,7 +29,7 @@ fn serial_roundtrip(mode: WalSyncMode) {
     let dir = tempdir().unwrap();
     {
         let wal = make_wal(dir.path(), mode);
-        for i in 0..20u32 {
+        for i in 0..20u64 {
             let key = format!("k-{:03}", i);
             let val = format!("v-{:03}", i);
             wal.append_put(key.as_bytes(), val.as_bytes(), i, 0)
@@ -54,10 +54,10 @@ fn concurrent_roundtrip(mode: WalSyncMode) {
     {
         let wal = make_wal(dir.path(), mode);
         let mut handles = Vec::new();
-        for t in 0..4u32 {
+        for t in 0..4u64 {
             let wal = Arc::clone(&wal);
             handles.push(std::thread::spawn(move || {
-                for i in 0..125u32 {
+                for i in 0..125u64 {
                     let key = format!("k-{:02}-{:03}", t, i);
                     let val = format!("v-{:02}-{:03}", t, i);
                     wal.append_put(

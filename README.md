@@ -165,6 +165,42 @@ In-process only — no cross-node fan-out in cluster mode.
 
 ## Storage model
 
+### Write path (every SET is 2× to SSD, on purpose)
+
+```
+client SET k v
+   │
+   ▼
+ ① append to WAL shard      ─ fsync per batch → ACK to client
+   │                          (skip fsync in odirect-trust-device)
+   ▼
+ ② append to WriteBuffer    ─ 1 MiB staging WBlock in RAM
+   │        (when full…)
+   ▼
+ ③ flush to data file       ─ one aligned pwrite
+   │
+   ▼
+ ④ once every record in a   ─ WAL trim thread unlinks the WAL file
+   WAL file is durable in     (default: check every 30 s)
+   a data file
+```
+
+Yes, every byte hits SSD twice: once as a WAL record, once as a
+data-file record. Same pattern as Postgres WAL + heap, RocksDB WAL +
+SSTable, Redis AOF. The WAL is ephemeral — it's trimmed as soon as its
+records are in a data file — so the **steady-state disk footprint is
+~1× the data, not 2×.** Peak footprint is ~1× data + a few WAL files
+worth of not-yet-trimmed log.
+
+Why not skip the WAL and ACK only after the WriteBuffer flushes? Then
+small writes have to wait for ~1 MiB of other writes to accumulate
+before they're safe, or we fsync on every record (brutal write-amp).
+The WAL lets us ACK after a tiny append-and-fsync while the WriteBuffer
+keeps batching in the background — same tradeoff every durable KV
+makes.
+
+### Components
+
 - **Index in RAM.** 256 shards, each a `HashMap<u64, Vec<IndexEntry>>`
   keyed by `xxh3(key)` behind its own `parking_lot::RwLock`. Each entry
   holds the key (inline if ≤ 23 bytes, else heap), the on-disk location
@@ -245,6 +281,45 @@ theoretical ceiling for anything disk-backed: 909k at d=100 P=16.
 All ssd-kv numbers are from the post-fix build: per-WBlock xxh3
 integrity footer on the flush path, per-replica divergence counters
 on the replication path, compaction actually unlinks reclaimed files.
+
+---
+
+## Durability tradeoffs vs similar systems
+
+Disks have a volatile write cache. A `write()` returning successfully
+doesn't mean the bytes are on flash — they may still be in the drive's
+DRAM, which vanishes on power-cut. `fsync` sends a FLUSH CACHE command
+that forces the drive to drain that DRAM. Every durable KV picks where
+on the safety/throughput curve to sit:
+
+|                                          | fsync on hot path | Requires PLP hardware | Assumes replication | Safe on a laptop / consumer SSD | Single-node durable on power-cut |
+| ---------------------------------------- | :---------------: | :-------------------: | :-----------------: | :-----------------------------: | :------------------------------: |
+| **ssd-kv `odirect`** (default)           | ✅                | ❌                    | ❌                  | ✅                              | ✅                               |
+| ssd-kv `odirect-trust-device`            | ❌                | ✅                    | ❌                  | ❌                              | ❌                               |
+| Redis `appendfsync=always`               | ✅                | ❌                    | ❌                  | ✅                              | ✅                               |
+| Redis `appendfsync=everysec`             | every 1 s         | ❌                    | ❌                  | ✅ (≤ 1 s loss)                 | ⚠️ (≤ 1 s loss)                  |
+| Aerospike `commit-to-device=false` (def) | ❌                | ✅                    | ✅ (RF≥2)           | ❌                              | ❌                               |
+| Aerospike `commit-to-device=true`        | ✅                | ❌                    | ❌                  | ✅                              | ✅                               |
+
+Two observations:
+
+- **Aerospike's default is ssd-kv's opt-in (`odirect-trust-device`).**
+  Both skip fsync and rely on PLP hardware. The difference is
+  positioning: Aerospike is sold as an enterprise product, ships as
+  "no fsync" out of the box, and loudly requires PLP drives + RF ≥ 2.
+  ssd-kv is open-source, so we assume people will run it on whatever,
+  and default to fsync-on. If you know you have PLP NVMe, flip
+  `--wal-mode odirect-trust-device` and take the win (same as setting
+  Aerospike defaults).
+- **ssd-kv `odirect` and Redis `appendfsync=always` are in the same
+  class.** Same fsync-per-batch story, same single-node durability, no
+  hardware prerequisites. The benchmark table above compares them
+  directly; `odirect` runs 45-131% ahead at pipeline ≥ 4.
+
+If you want Redis-`everysec` semantics (accept ≤ 1 s data loss for
+throughput), the analogous ssd-kv mode is currently **not** exposed —
+our `buffered` mode still fsyncs per batch, it just goes through the
+page cache. A periodic-fsync mode would be a reasonable addition.
 
 ---
 

@@ -188,6 +188,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dir: shard_dir,
                         fsync_interval: std::time::Duration::from_micros(config.fsync_interval_us),
                         fsync_batch: config.fsync_batch,
+                        sync_mode: match config.wal_mode {
+                            crate::config::WalModeArg::Buffered => {
+                                crate::storage::wal::WalSyncMode::Buffered
+                            }
+                            crate::config::WalModeArg::Odirect => {
+                                crate::storage::wal::WalSyncMode::ODirect
+                            }
+                            crate::config::WalModeArg::OdirectTrustDevice => {
+                                crate::storage::wal::WalSyncMode::ODirectNoFsync
+                            }
+                        },
                         ..Default::default()
                     })?))
                 })

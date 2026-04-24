@@ -3,7 +3,29 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// How WAL writes reach the disk.
+///
+/// - `Buffered`: writes go through `BufWriter<File>` to the kernel
+///   page cache; a `sync_data()` per group-commit cycle forces them
+///   to the drive. Safe on any hardware.
+/// - `ODirect`: writes bypass the page cache via `O_DIRECT` with
+///   4 KB-aligned pwrites, followed by `sync_data()`. Same durability
+///   as `Buffered` but predictable latency (no page-cache variability).
+/// - `ODirectNoFsync`: O_DIRECT pwrites with **no fsync**. The
+///   drive's write-ack is treated as durable. ONLY SAFE ON
+///   Power-Loss-Protected enterprise NVMe (Intel DC, Samsung
+///   PM17xx+ / PM9xxx, etc.) where the drive's DRAM cache is
+///   battery-backed. On commodity SSDs without PLP, a power loss
+///   can lose acknowledged writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WalModeArg {
+    Buffered,
+    Odirect,
+    #[value(name = "odirect-trust-device")]
+    OdirectTrustDevice,
+}
 
 /// SSD-KV: High-Performance Key-Value Store
 #[derive(Parser, Debug, Clone)]
@@ -160,6 +182,16 @@ pub struct Config {
     /// unused.
     #[arg(long = "wal-dir")]
     pub wal_dirs: Vec<PathBuf>,
+
+    /// How WAL writes reach the disk. `buffered` is the default and
+    /// safe on any hardware. `odirect` bypasses the kernel page cache
+    /// via O_DIRECT + aligned pwrites (still calls fsync).
+    /// `odirect-trust-device` skips fsync entirely — ONLY safe on
+    /// enterprise NVMe with Power-Loss Protection (PLP); without it,
+    /// a power loss can lose acknowledged writes. Pairs with
+    /// `--wal-dir` for multi-device NVMe deployments.
+    #[arg(long, default_value = "buffered")]
+    pub wal_mode: WalModeArg,
 
     // --- io_uring ---
 
@@ -323,6 +355,7 @@ impl Default for Config {
             fsync_interval_us: 500,
             fsync_batch: 256,
             wal_dirs: Vec::new(),
+            wal_mode: WalModeArg::Buffered,
             io_workers: 2,
             reactor_threads: 1,
             wal_trim_interval_secs: 30,

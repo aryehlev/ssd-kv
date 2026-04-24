@@ -152,6 +152,21 @@ impl Handler {
         self.wblock_cache.as_ref()
     }
 
+    /// Configured cap on live entries (0 = unlimited). Used by CONFIG GET.
+    pub fn max_entries(&self) -> u64 {
+        self.max_entries
+    }
+
+    /// Configured cap on total data bytes (0 = unlimited). Used by CONFIG GET.
+    pub fn max_data_bytes(&self) -> u64 {
+        self.max_data_bytes
+    }
+
+    /// Current eviction policy (read-only for CONFIG GET).
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
+    }
+
     /// Installs a single write-ahead log. Back-compat shim for the
     /// pre-sharded API: equivalent to `set_wal_shards(vec![wal])`.
     /// New code should use `set_wal_shards` directly with N shards

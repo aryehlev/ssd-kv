@@ -906,6 +906,7 @@ impl RedisHandler {
             b"UNWATCH" | b"unwatch" => self.cmd_unwatch(out),
             b"WAIT" | b"wait" => self.cmd_wait(&args, out),
             b"SELECT" | b"select" => self.cmd_select(&args, out),
+            b"CONFIG" | b"config" => self.cmd_config(&args, out),
             b"DUMP" | b"dump" | b"DEBUG" | b"debug" | b"RESTORE" | b"restore" => {
                 RespValue::err("not supported").serialize_into(out);
             }
@@ -1382,6 +1383,87 @@ impl RedisHandler {
     fn cmd_info(&self, out: &mut Vec<u8>) {
         use std::sync::atomic::Ordering;
         let mode = if self.router.is_some() { "cluster" } else { "standalone" };
+
+        // ── Memory section ────────────────────────────────────────────
+        // used_memory counts index payload bytes (key + value) tracked
+        // atomically on each insert/delete. Peak is the same number —
+        // we don't track peak separately yet — but the key presence of
+        // these counters matches what monitoring tooling asks for.
+        // Memory-only DBs have no wblock cache; we just skip that line.
+        let memory_section = if let Some(h) = self.current_handler().as_ssd() {
+            let idx = h.index();
+            let total_bytes = idx.total_data_bytes();
+            let live_entries = idx.len();
+            let cache_line = h.wblock_cache().map(|c| {
+                let s = c.stats();
+                format!(
+                    "wblock_cache_hits:{}\r\n\
+                     wblock_cache_misses:{}\r\n\
+                     wblock_cache_inserts:{}\r\n\
+                     wblock_cache_hit_ratio:{:.4}\r\n",
+                    s.hits, s.misses, s.inserts, s.hit_ratio()
+                )
+            }).unwrap_or_default();
+            format!(
+                "# Memory\r\n\
+                 used_memory:{}\r\n\
+                 used_memory_human:{}\r\n\
+                 used_memory_peak:{}\r\n\
+                 maxmemory:{}\r\n\
+                 maxmemory_policy:{}\r\n\
+                 keyspace_live_entries:{}\r\n\
+                 {cache_line}",
+                total_bytes,
+                human_bytes(total_bytes),
+                total_bytes,
+                h.max_data_bytes(),
+                eviction_policy_name(h.eviction_policy()),
+                live_entries,
+            )
+        } else {
+            String::from("# Memory\r\nused_memory:0\r\n")
+        };
+
+        // ── Replication section ───────────────────────────────────────
+        // Only meaningful when a router is wired in. Per-replica
+        // counters surface divergence (sent - acked > 0 for long =
+        // replica lag; failed > 0 = hard divergence). Previously the
+        // primary silently dropped writes on a failed replica; now an
+        // operator can see it via INFO.
+        let replication_section = if let Some(router) = &self.router {
+            let stats = router.replication_stats();
+            let mut s = String::from("# Replication\r\n");
+            s.push_str(&format!(
+                "role:master\r\nrepl_entries_sent:{}\r\nrepl_errors:{}\r\n",
+                stats.entries_sent.load(Ordering::Relaxed),
+                stats.errors.load(Ordering::Relaxed),
+            ));
+            for (node_id, r) in stats.per_replica_snapshot() {
+                let sent = r.sent.load(Ordering::Relaxed);
+                let acked = r.acked.load(Ordering::Relaxed);
+                let failed = r.failed.load(Ordering::Relaxed);
+                s.push_str(&format!(
+                    "replica_{id}_sent:{sent}\r\n\
+                     replica_{id}_acked:{acked}\r\n\
+                     replica_{id}_failed:{failed}\r\n\
+                     replica_{id}_lag:{lag}\r\n\
+                     replica_{id}_diverged:{div}\r\n\
+                     replica_{id}_last_ack_ms:{last_ack}\r\n\
+                     replica_{id}_last_failure_ms:{last_fail}\r\n",
+                    id = node_id,
+                    sent = sent,
+                    acked = acked,
+                    failed = failed,
+                    lag = r.lag(),
+                    div = if r.is_diverged() { 1 } else { 0 },
+                    last_ack = r.last_ack_ms.load(Ordering::Relaxed),
+                    last_fail = r.last_failure_ms.load(Ordering::Relaxed),
+                ));
+            }
+            s
+        } else {
+            String::from("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n")
+        };
         // Percentiles in µs (coarse — log-bucketed to factor-of-2).
         // Matches Redis's `INFO latencystats` section so monitoring
         // tooling that reads `latency_percentiles_usec_*` keys works
@@ -1463,6 +1545,8 @@ impl RedisHandler {
             "# Server\r\n\
              redis_version:7.0.0-ssd-kv\r\n\
              redis_mode:{mode}\r\n\
+             {memory_section}\
+             {replication_section}\
              {latency_section}\
              {wal_section}\
              # Keyspace\r\n",
@@ -1635,6 +1719,88 @@ impl RedisHandler {
                 RespValue::err("Unknown CLUSTER subcommand").serialize_into(out);
             }
         }
+    }
+
+    /// CONFIG GET pattern — returns the handful of knobs that exist on
+    /// this server. Unlike Redis we don't support runtime tuning
+    /// (everything is a CLI flag baked in at startup); CONFIG SET
+    /// therefore returns an error rather than silently succeeding,
+    /// because "config changed but didn't actually change" is worse
+    /// than "told the client no". This is enough for the common case
+    /// of tooling that calls CONFIG GET maxmemory to decide behavior.
+    fn cmd_config(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        let subcmd = if args.len() > 1 {
+            match &args[1] {
+                RespValue::BulkString(Some(data)) => data.as_slice(),
+                _ => b"",
+            }
+        } else {
+            b""
+        };
+
+        match subcmd {
+            b"GET" | b"get" => {
+                let pattern = if args.len() > 2 {
+                    match &args[2] {
+                        RespValue::BulkString(Some(data)) => data.as_slice(),
+                        _ => b"*",
+                    }
+                } else {
+                    b"*"
+                };
+                let pairs = self.config_pairs();
+                let matched: Vec<&(String, String)> = pairs
+                    .iter()
+                    .filter(|(k, _)| glob_match(pattern, k.as_bytes()))
+                    .collect();
+                out.push(b'*');
+                out.extend_from_slice(
+                    itoa::Buffer::new().format(matched.len() * 2).as_bytes(),
+                );
+                out.extend_from_slice(b"\r\n");
+                for (k, v) in matched {
+                    RespValue::bulk(k.clone().into_bytes()).serialize_into(out);
+                    RespValue::bulk(v.clone().into_bytes()).serialize_into(out);
+                }
+            }
+            b"SET" | b"set" => {
+                RespValue::err(
+                    "CONFIG SET not supported: all options are startup-only CLI flags",
+                )
+                .serialize_into(out);
+            }
+            b"RESETSTAT" | b"resetstat" => {
+                RespValue::ok().serialize_into(out);
+            }
+            _ => {
+                RespValue::err("Unknown CONFIG subcommand").serialize_into(out);
+            }
+        }
+    }
+
+    fn config_pairs(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = Vec::new();
+        let (max_bytes, max_entries, policy, has_wal) =
+            if let Some(h) = self.current_handler().as_ssd() {
+                (
+                    h.max_data_bytes(),
+                    h.max_entries(),
+                    eviction_policy_name(h.eviction_policy()),
+                    !h.wal_shards().is_empty(),
+                )
+            } else {
+                (0u64, 0u64, "noeviction", false)
+            };
+        v.push(("maxmemory".to_string(), max_bytes.to_string()));
+        v.push(("maxmemory-policy".to_string(), policy.to_string()));
+        v.push(("max-entries".to_string(), max_entries.to_string()));
+        v.push((
+            "appendonly".to_string(),
+            if has_wal { "yes".to_string() } else { "no".to_string() },
+        ));
+        v.push(("appendfsync".to_string(), "always".to_string()));
+        v.push(("save".to_string(), String::new()));
+        v
     }
 
     // ── Helper: parse an integer argument ──────────────────────────────
@@ -2977,6 +3143,35 @@ fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
     }
 
     pi == pattern.len()
+}
+
+fn eviction_policy_name(p: crate::storage::eviction::EvictionPolicy) -> &'static str {
+    use crate::storage::eviction::EvictionPolicy as E;
+    match p {
+        E::NoEviction => "noeviction",
+        E::AllKeysLru => "allkeys-lru",
+        E::VolatileLru => "volatile-lru",
+        E::AllKeysRandom => "allkeys-random",
+        E::VolatileRandom => "volatile-random",
+        E::VolatileTtl => "volatile-ttl",
+    }
+}
+
+/// Human-readable byte count à la Redis's `used_memory_human`. Uses
+/// 1024-based units; matches tooling expectations better than decimal.
+fn human_bytes(b: u64) -> String {
+    const UNITS: &[&str] = &["B", "K", "M", "G", "T", "P"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{}{}", b, UNITS[u])
+    } else {
+        format!("{:.2}{}", v, UNITS[u])
+    }
 }
 
 /// Format a float like Redis does (use enough precision, trim trailing zeros).

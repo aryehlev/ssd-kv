@@ -49,3 +49,7 @@ criterion = "0.5"
 [[bench]]
 name = "throughput"
 harness = false
+
+[[bench]]
+name = "realistic"
+harness = false

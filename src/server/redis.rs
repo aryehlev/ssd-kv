@@ -1393,17 +1393,8 @@ impl RedisHandler {
         let memory_section = if let Some(h) = self.current_handler().as_ssd() {
             let idx = h.index();
             let total_bytes = idx.total_data_bytes();
-            let live_entries = idx.len();
-            let cache_line = h.wblock_cache().map(|c| {
-                let s = c.stats();
-                format!(
-                    "wblock_cache_hits:{}\r\n\
-                     wblock_cache_misses:{}\r\n\
-                     wblock_cache_inserts:{}\r\n\
-                     wblock_cache_hit_ratio:{:.4}\r\n",
-                    s.hits, s.misses, s.inserts, s.hit_ratio()
-                )
-            }).unwrap_or_default();
+            let live_entries = idx.stats().live_entries;
+            let cache_line = String::new();
             format!(
                 "# Memory\r\n\
                  used_memory:{}\r\n\

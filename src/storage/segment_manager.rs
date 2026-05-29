@@ -11,8 +11,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use dashmap::DashMap;
+use parking_lot::RwLock as PRwLock;
 
 use crate::engine::index::Index;
 use crate::engine::index_entry::{RecordLocation};
@@ -31,6 +35,53 @@ pub struct SegmentConfig {
 impl Default for SegmentConfig {
     fn default() -> Self {
         Self { segment_size: 64 * 1024 * 1024, gc_threshold: 0.5, inline_value_max: 3800 }
+    }
+}
+
+// ─── Write-staging buffer ─────────────────────────────────────────────────────
+//
+// Sealed ipages are kept here after being written to disk so that reads of
+// recently-written data are served from RAM (O(1) lookup) rather than
+// issuing a pread(). This is the paper's two-stage design: data lives in the
+// staging buffer until it's cold, then only on SSD.
+//
+// The ring holds up to STAGE_CAPACITY entries keyed by absolute page index.
+// When the ring is full the oldest entry is evicted. Reads check this before
+// going to disk, then fall through to the active ipage check, then pread.
+
+// 4096 pages × 4 KB = 16 MB of staging RAM.  Covers ~200 K entries at 50
+// entries/page and is negligible compared to even a small NVMe.
+const STAGE_CAPACITY: usize = 4096;
+
+// DashMap shards staging across 16 internal buckets — concurrent reads from
+// multiple reactor threads proceed with no global lock, only a per-bucket
+// read-lock. The eviction ring uses a separate Mutex (only ever locked under
+// write_lock.write(), so effectively uncontested) to keep the code safe.
+struct WriteStaging {
+    map:  DashMap<(u32, u32), IPage>,
+    // Insertion-order ring for LRU eviction.
+    ring: parking_lot::Mutex<std::collections::VecDeque<(u32, u32)>>,
+}
+
+impl WriteStaging {
+    fn new() -> Self {
+        Self {
+            map:  DashMap::with_capacity(STAGE_CAPACITY),
+            ring: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(STAGE_CAPACITY + 1)),
+        }
+    }
+
+    // Called under exclusive write_lock — ring.lock() is uncontested here.
+    fn insert(&self, file_id: u32, abs_page_idx: u32, ipage: IPage) {
+        let key = (file_id, abs_page_idx);
+        let mut ring = self.ring.lock();
+        if self.map.len() >= STAGE_CAPACITY {
+            if let Some(old) = ring.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, ipage);
+        ring.push_back(key);
     }
 }
 
@@ -55,8 +106,18 @@ impl ActiveState {
 pub struct SegmentManager {
     pub data_dir: PathBuf,
     pub config: SegmentConfig,
-    write_lock: Mutex<ActiveState>,
-    files: Mutex<HashMap<u32, SegmentFile>>,
+    // Write lock: exclusive for writes/sealing, shared only for the rare
+    // active-page read (most reads skip this lock via active_encoded).
+    write_lock: PRwLock<ActiveState>,
+    // Old (sealed) segment files. Shared reads allow concurrent pread.
+    files: PRwLock<HashMap<u32, SegmentFile>>,
+    // Atomic encoding of the active page: upper 32 bits = file_id,
+    // lower 32 bits = abs_page_idx.  Readers do a single AtomicU64 load
+    // to check membership without taking write_lock.  0xFFFF_FFFF_FFFF_FFFF
+    // means "no active page".
+    active_encoded: AtomicU64,
+    // Recently-sealed pages (DashMap → concurrent read, no global lock).
+    staging: WriteStaging,
     next_file_id: Mutex<u32>,
     next_generation: Mutex<u32>,
 }
@@ -94,8 +155,10 @@ impl SegmentManager {
             return Ok(Self {
                 data_dir: data_dir.as_ref().to_owned(),
                 config,
-                write_lock: Mutex::new(active),
-                files: Mutex::new(HashMap::new()),
+                write_lock: PRwLock::new(active),
+                files: PRwLock::new(HashMap::new()),
+                active_encoded: AtomicU64::new(u64::MAX),
+                staging: WriteStaging::new(),
                 next_file_id: Mutex::new(1),
                 next_generation: Mutex::new(1),
             });
@@ -114,8 +177,10 @@ impl SegmentManager {
                 return Ok(Self {
                     data_dir: data_dir.as_ref().to_owned(),
                     config,
-                    write_lock: Mutex::new(active),
-                    files: Mutex::new(files_map),
+                    write_lock: PRwLock::new(active),
+                    files: PRwLock::new(files_map),
+                    active_encoded: AtomicU64::new(u64::MAX),
+                    staging: WriteStaging::new(),
                     next_file_id: Mutex::new(next_file_id),
                     next_generation: Mutex::new(1),
                 });
@@ -143,49 +208,76 @@ impl SegmentManager {
     /// Read a previously-written entry from disk (or from the active in-memory
     /// ipage when the entry has not yet been flushed).
     pub fn read_at(&self, loc: RecordLocation) -> io::Result<PageEntry> {
-        // Fast path: if the location points to the active in-memory ipage,
-        // serve it directly without a disk read. This is always correct
-        // because write_ipage() only returns a RecordLocation after appending
-        // the slot to current_ipage — the slot is live in RAM until the page
-        // seals and is written to disk by flush() / ensure_seg_capacity().
-        {
-            let st = self.write_lock.lock().unwrap();
-            if st.page_allocated
-                && loc.file_id == st.sf.file_id
-                && !loc.is_large()
-            {
-                let abs = st.sf.seg_page_to_abs(st.current_seg, st.current_page);
-                if loc.ipage_idx == abs {
-                    return st.current_ipage
-                        .read_entry(loc.slot_idx)
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "slot missing"));
+        if !loc.is_large() {
+            // Fast path 1: atomic active-page check — one cache-line load, no lock.
+            // active_encoded = (file_id << 32) | abs_page_idx.
+            let enc = self.active_encoded.load(Ordering::Acquire);
+            let afile = (enc >> 32) as u32;
+            let apage = (enc & 0xFFFF_FFFF) as u32;
+            if loc.file_id == afile && loc.ipage_idx == apage {
+                // Match: take shared lock to read the actual ipage bytes.
+                let st = self.write_lock.read();
+                if st.page_allocated {
+                    let abs = st.sf.seg_page_to_abs(st.current_seg, st.current_page);
+                    if loc.ipage_idx == abs {
+                        return st.current_ipage
+                            .read_entry(loc.slot_idx)
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "slot missing"));
+                    }
                 }
+                // Page was sealed between the atomic load and the lock — fall
+                // through to staging below.
             }
-            // Check if the location is in the active segment file so we can
-            // read from it while still holding the lock.
+
+            // Fast path 2: staging DashMap — no global lock, O(1), concurrent.
+            if let Some(ipage) = self.staging.map.get(&(loc.file_id, loc.ipage_idx)) {
+                return ipage.read_entry(loc.slot_idx)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "slot missing"));
+            }
+        }
+
+        // Slow path: pread from disk. Multiple concurrent preads on the same
+        // fd are safe — pread uses an explicit offset, not the fd position.
+        let enc = self.active_encoded.load(Ordering::Acquire);
+        let afile = (enc >> 32) as u32;
+        if loc.file_id == afile {
+            let st = self.write_lock.read();
             if loc.file_id == st.sf.file_id {
                 return self.read_from_file(&st.sf, loc);
             }
-            // Drop the lock before the (potentially slow) disk read below.
         }
-        let files = self.files.lock().unwrap();
+
+        let files = self.files.read();
         let sf = files.get(&loc.file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
         self.read_from_file(sf, loc)
     }
 
+    // ─── Internal: seal the active ipage to disk and stage it in RAM ─────
+
+    // Called with write_lock held exclusively. Writes the current ipage to
+    // disk and stages a copy in the DashMap so subsequent reads of the same
+    // page hit RAM instead of disk.
+    fn seal_active_page(
+        st: &mut ActiveState,
+        staging: &WriteStaging,
+        active_encoded: &AtomicU64,
+    ) -> io::Result<()> {
+        if !st.page_allocated { return Ok(()); }
+        st.current_ipage.write_checksum();
+        let abs = st.sf.seg_page_to_abs(st.current_seg, st.current_page);
+        st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
+        staging.insert(st.sf.file_id, abs, st.current_ipage.clone());
+        // Clear active-page atomic so readers don't spin into the lock path.
+        active_encoded.store(u64::MAX, Ordering::Release);
+        Ok(())
+    }
+
     // ─── Flush ────────────────────────────────────────────────────────────
 
     pub fn flush(&self) -> io::Result<()> {
-        let mut st = self.write_lock.lock().unwrap();
-        // Seal the active in-memory ipage to disk before calling fdatasync so
-        // that any entries appended since the last page-seal are durable.
-        // Without this step, entries in the current (partially-filled) ipage
-        // would survive only in RAM and be lost on crash.
-        if st.page_allocated {
-            st.current_ipage.write_checksum();
-            st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
-        }
+        let mut st = self.write_lock.write();
+        Self::seal_active_page(&mut st, &self.staging, &self.active_encoded)?;
         st.sf.fdatasync()
     }
 
@@ -206,7 +298,7 @@ impl SegmentManager {
     // ─── File-manager compatibility API ───────────────────────────────────
 
     pub fn file_count(&self) -> usize {
-        self.files.lock().unwrap().len() + 1
+        self.files.write().len() + 1
     }
 
     pub fn create_file(&self) -> io::Result<u32> {
@@ -219,7 +311,7 @@ impl SegmentManager {
         let name = format!("seg_{:06}.dat", file_id);
         let sf = SegmentFile::create(self.data_dir.join(&name), file_id, self.config.segment_size)?;
         sf.start_new_segment()?;
-        self.files.lock().unwrap().insert(file_id, sf);
+        self.files.write().insert(file_id, sf);
         Ok(file_id)
     }
 
@@ -227,8 +319,8 @@ impl SegmentManager {
 
     /// Scan all segment files on disk and populate `index` with live entries.
     pub fn recover_from_segments(&self, index: &Index) -> io::Result<()> {
-        let active_id = self.write_lock.lock().unwrap().sf.file_id;
-        let mut file_ids: Vec<u32> = self.files.lock().unwrap().keys().copied().collect();
+        let active_id = self.write_lock.write().sf.file_id;
+        let mut file_ids: Vec<u32> = self.files.write().keys().copied().collect();
         file_ids.push(active_id);
         file_ids.sort();
 
@@ -239,12 +331,12 @@ impl SegmentManager {
     }
 
     fn recover_file(&self, file_id: u32, index: &Index) -> io::Result<()> {
-        let active_id = self.write_lock.lock().unwrap().sf.file_id;
+        let active_id = self.write_lock.write().sf.file_id;
 
         let seg_count = if file_id == active_id {
-            self.write_lock.lock().unwrap().sf.segment_count.load(std::sync::atomic::Ordering::Relaxed)
+            self.write_lock.write().sf.segment_count.load(std::sync::atomic::Ordering::Relaxed)
         } else {
-            self.files.lock().unwrap()
+            self.files.write()
                 .get(&file_id)
                 .map(|sf| sf.segment_count.load(std::sync::atomic::Ordering::Relaxed))
                 .unwrap_or(0)
@@ -252,9 +344,9 @@ impl SegmentManager {
 
         for seg_id in 0..seg_count {
             let meta_result = if file_id == active_id {
-                self.write_lock.lock().unwrap().sf.read_segment_header(seg_id)
+                self.write_lock.write().sf.read_segment_header(seg_id)
             } else {
-                self.files.lock().unwrap()
+                self.files.write()
                     .get(&file_id)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, ""))?
                     .read_segment_header(seg_id)
@@ -267,9 +359,9 @@ impl SegmentManager {
             if meta.state == SegmentState::Reclaimed { continue; }
 
             let cap = if file_id == active_id {
-                self.write_lock.lock().unwrap().sf.data_pages_per_segment()
+                self.write_lock.write().sf.data_pages_per_segment()
             } else {
-                self.files.lock().unwrap()
+                self.files.write()
                     .get(&file_id)
                     .map(|sf| sf.data_pages_per_segment())
                     .unwrap_or(0)
@@ -325,9 +417,9 @@ impl SegmentManager {
 
     fn read_raw_page(&self, file_id: u32, active_id: u32, seg_id: u32, page_idx: u32, span: u32) -> io::Result<Vec<u8>> {
         if file_id == active_id {
-            self.write_lock.lock().unwrap().sf.read_pages(seg_id, page_idx, span)
+            self.write_lock.write().sf.read_pages(seg_id, page_idx, span)
         } else {
-            self.files.lock().unwrap()
+            self.files.write()
                 .get(&file_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, ""))?
                 .read_pages(seg_id, page_idx, span)
@@ -336,9 +428,9 @@ impl SegmentManager {
 
     fn seg_page_to_abs(&self, file_id: u32, active_id: u32, seg_id: u32, page_idx: u32) -> u32 {
         if file_id == active_id {
-            self.write_lock.lock().unwrap().sf.seg_page_to_abs(seg_id, page_idx)
+            self.write_lock.write().sf.seg_page_to_abs(seg_id, page_idx)
         } else {
-            self.files.lock().unwrap()
+            self.files.write()
                 .get(&file_id)
                 .map(|sf| sf.seg_page_to_abs(seg_id, page_idx))
                 .unwrap_or(0)
@@ -350,20 +442,16 @@ impl SegmentManager {
     fn write_ipage(
         &self, key: &[u8], value: &[u8], ts: u64, ttl: u32, generation: u32, is_deleted: bool,
     ) -> io::Result<RecordLocation> {
-        let mut st = self.write_lock.lock().unwrap();
+        let mut st = self.write_lock.write();
 
         if st.page_allocated && !st.current_ipage.fits(key.len(), value.len()) {
-            // Seal the outgoing page to disk before abandoning it. The page
-            // will not be written again (a new one is allocated below), so
-            // this is the only opportunity to persist it.
-            st.current_ipage.write_checksum();
-            st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
+            Self::seal_active_page(&mut st, &self.staging, &self.active_encoded)?;
             st.current_ipage = IPage::new();
             st.page_allocated = false;
         }
 
         if !st.page_allocated {
-            let (seg_id, page_idx) = Self::alloc_page_slot(&mut st)?;
+            let (seg_id, page_idx) = Self::alloc_page_slot(&mut st, &self.staging, &self.active_encoded)?;
             st.current_seg = seg_id;
             st.current_page = page_idx;
             st.page_allocated = true;
@@ -373,12 +461,10 @@ impl SegmentManager {
             .try_append(key, value, generation, ts, ttl, is_deleted)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "ipage slot full"))?;
 
-        // Do NOT write to disk here. The page accumulates slots in memory and
-        // is flushed lazily: when it seals (page full or segment rolls over)
-        // or when flush() is called. Reads of not-yet-flushed slots are served
-        // directly from the in-memory page in read_at().
         let abs = st.sf.seg_page_to_abs(st.current_seg, st.current_page);
         let file_id = st.sf.file_id;
+        // Publish active-page so readers can check without taking write_lock.
+        self.active_encoded.store(((file_id as u64) << 32) | (abs as u64), Ordering::Release);
         Ok(RecordLocation::ipage(file_id, abs, slot_idx))
     }
 
@@ -390,8 +476,8 @@ impl SegmentManager {
             value: value.to_vec(), ts, ttl, generation };
         let encoded = large.encode();
 
-        let mut st = self.write_lock.lock().unwrap();
-        Self::ensure_seg_capacity(&mut st, span as u32)?;
+        let mut st = self.write_lock.write();
+        Self::ensure_seg_capacity(&mut st, &self.staging, &self.active_encoded, span as u32)?;
 
         let seg_id = st.sf.active_seg_id();
         let page_idx = st.sf.advance_page_offset(span as u32);
@@ -401,24 +487,25 @@ impl SegmentManager {
         Ok(RecordLocation::large(st.sf.file_id, abs, span))
     }
 
-    fn alloc_page_slot(st: &mut ActiveState) -> io::Result<(u32, u32)> {
-        Self::ensure_seg_capacity(st, 1)?;
+    fn alloc_page_slot(
+        st: &mut ActiveState,
+        sg: &WriteStaging,
+        active_encoded: &AtomicU64,
+    ) -> io::Result<(u32, u32)> {
+        Self::ensure_seg_capacity(st, sg, active_encoded, 1)?;
         let seg_id = st.sf.active_seg_id();
         let page_idx = st.sf.advance_page_offset(1);
         Ok((seg_id, page_idx))
     }
 
-    fn ensure_seg_capacity(st: &mut ActiveState, pages_needed: u32) -> io::Result<()> {
+    fn ensure_seg_capacity(
+        st: &mut ActiveState,
+        sg: &WriteStaging,
+        active_encoded: &AtomicU64,
+        pages_needed: u32,
+    ) -> io::Result<()> {
         if st.sf.is_active_segment_full(pages_needed) {
-            // Seal the active in-memory ipage to disk before starting a new
-            // segment. Once start_new_segment() runs, the page can no longer
-            // be written at its slot (the segment is sealed), so we must
-            // persist it now.
-            if st.page_allocated {
-                st.current_ipage.write_checksum();
-                st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
-            }
-
+            Self::seal_active_page(st, sg, active_encoded)?;
             let seg_id = st.sf.active_seg_id();
             let used = st.sf.active_pages_used();
             let meta = SegmentMeta {

@@ -44,7 +44,16 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
-    let config = Config::parse();
+    let mut config = Config::parse();
+
+    // Auto-detect reactor thread count: default 0 means half the hardware
+    // Default to 1 reactor (single-threaded like Redis/Valkey). This gives
+    // the best GET latency/throughput because all index lookups are on one
+    // core (hot cache, no cross-core synchronization). Use --reactor-threads
+    // to increase for SET-heavy workloads where parallel WAL shards help.
+    if config.reactor_threads == 0 {
+        config.reactor_threads = 1;
+    }
 
     // Validate configuration
     config.validate()?;

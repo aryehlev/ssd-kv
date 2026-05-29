@@ -77,6 +77,7 @@ impl PageEntry {
 // ─── IPage ───────────────────────────────────────────────────────────────────
 
 /// A 4 KB page holding many small entries.
+#[derive(Clone)]
 pub struct IPage {
     data: Box<[u8; PAGE_SIZE]>,
 }

@@ -797,6 +797,14 @@ impl RedisHandler {
         self.last_wal_position.replace(0)
     }
 
+    /// Returns the current database index selected by this connection.
+    /// Used by the reactor to look up the right WAL when tracking which
+    /// WAL a pending response is waiting on.
+    #[inline]
+    pub fn current_db(&self) -> usize {
+        self.current_db.get() as usize
+    }
+
     /// Handles a Redis command and writes response to buffer
     #[inline]
     pub fn handle_command(&self, value: RespValue, out: &mut Vec<u8>) {

@@ -3,8 +3,10 @@
 //! This module handles only storage — it never touches the in-memory index.
 //! All index operations live in Handler (server/handler.rs).
 //!
-//! Write path: Handler → write_entry() → eager ipage flush → RecordLocation.
-//! Read path:  Handler → read_at(RecordLocation) → PageEntry.
+//! Write path: Handler → write_entry() → lazy ipage flush → RecordLocation.
+//! Read path:  Handler → read_at(RecordLocation) → PageEntry (served from
+//!             the in-memory active ipage when the page has not yet been
+//!             flushed to disk).
 
 use std::collections::HashMap;
 use std::io;
@@ -138,24 +140,53 @@ impl SegmentManager {
 
     // ─── Core disk read API ───────────────────────────────────────────────
 
-    /// Read a previously-written entry from disk.
+    /// Read a previously-written entry from disk (or from the active in-memory
+    /// ipage when the entry has not yet been flushed).
     pub fn read_at(&self, loc: RecordLocation) -> io::Result<PageEntry> {
-        let active_file_id = self.write_lock.lock().unwrap().sf.file_id;
-        if loc.file_id == active_file_id {
+        // Fast path: if the location points to the active in-memory ipage,
+        // serve it directly without a disk read. This is always correct
+        // because write_ipage() only returns a RecordLocation after appending
+        // the slot to current_ipage — the slot is live in RAM until the page
+        // seals and is written to disk by flush() / ensure_seg_capacity().
+        {
             let st = self.write_lock.lock().unwrap();
-            self.read_from_file(&st.sf, loc)
-        } else {
-            let files = self.files.lock().unwrap();
-            let sf = files.get(&loc.file_id)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
-            self.read_from_file(sf, loc)
+            if st.page_allocated
+                && loc.file_id == st.sf.file_id
+                && !loc.is_large()
+            {
+                let abs = st.sf.seg_page_to_abs(st.current_seg, st.current_page);
+                if loc.ipage_idx == abs {
+                    return st.current_ipage
+                        .read_entry(loc.slot_idx)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "slot missing"));
+                }
+            }
+            // Check if the location is in the active segment file so we can
+            // read from it while still holding the lock.
+            if loc.file_id == st.sf.file_id {
+                return self.read_from_file(&st.sf, loc);
+            }
+            // Drop the lock before the (potentially slow) disk read below.
         }
+        let files = self.files.lock().unwrap();
+        let sf = files.get(&loc.file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+        self.read_from_file(sf, loc)
     }
 
     // ─── Flush ────────────────────────────────────────────────────────────
 
     pub fn flush(&self) -> io::Result<()> {
-        self.write_lock.lock().unwrap().sf.fdatasync()
+        let mut st = self.write_lock.lock().unwrap();
+        // Seal the active in-memory ipage to disk before calling fdatasync so
+        // that any entries appended since the last page-seal are durable.
+        // Without this step, entries in the current (partially-filled) ipage
+        // would survive only in RAM and be lost on crash.
+        if st.page_allocated {
+            st.current_ipage.write_checksum();
+            st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
+        }
+        st.sf.fdatasync()
     }
 
     // ─── Generation counter ───────────────────────────────────────────────
@@ -322,6 +353,11 @@ impl SegmentManager {
         let mut st = self.write_lock.lock().unwrap();
 
         if st.page_allocated && !st.current_ipage.fits(key.len(), value.len()) {
+            // Seal the outgoing page to disk before abandoning it. The page
+            // will not be written again (a new one is allocated below), so
+            // this is the only opportunity to persist it.
+            st.current_ipage.write_checksum();
+            st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
             st.current_ipage = IPage::new();
             st.page_allocated = false;
         }
@@ -337,9 +373,10 @@ impl SegmentManager {
             .try_append(key, value, generation, ts, ttl, is_deleted)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "ipage slot full"))?;
 
-        st.current_ipage.write_checksum();
-        st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
-
+        // Do NOT write to disk here. The page accumulates slots in memory and
+        // is flushed lazily: when it seals (page full or segment rolls over)
+        // or when flush() is called. Reads of not-yet-flushed slots are served
+        // directly from the in-memory page in read_at().
         let abs = st.sf.seg_page_to_abs(st.current_seg, st.current_page);
         let file_id = st.sf.file_id;
         Ok(RecordLocation::ipage(file_id, abs, slot_idx))
@@ -373,6 +410,15 @@ impl SegmentManager {
 
     fn ensure_seg_capacity(st: &mut ActiveState, pages_needed: u32) -> io::Result<()> {
         if st.sf.is_active_segment_full(pages_needed) {
+            // Seal the active in-memory ipage to disk before starting a new
+            // segment. Once start_new_segment() runs, the page can no longer
+            // be written at its slot (the segment is sealed), so we must
+            // persist it now.
+            if st.page_allocated {
+                st.current_ipage.write_checksum();
+                st.sf.write_ipage_at(st.current_seg, st.current_page, &st.current_ipage)?;
+            }
+
             let seg_id = st.sf.active_seg_id();
             let used = st.sf.active_pages_used();
             let meta = SegmentMeta {

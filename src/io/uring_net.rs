@@ -632,8 +632,7 @@ impl UringServer {
             fd
         };
 
-        let net = UringNet::new(queue_depth)
-            .or_else(|_| UringNet::new_simple(queue_depth))?;
+        let net = UringNet::new_simple(queue_depth)?;
 
         Ok(Self {
             net,

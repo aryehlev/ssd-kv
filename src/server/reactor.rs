@@ -38,6 +38,12 @@ struct ConnState {
     /// cleared once the reactor observes durable_position() >= it and
     /// flushes pending_out to the socket.
     pending_up_to: u64,
+    /// The specific WAL shard this connection's pending write was sent
+    /// to. We watch only this WAL's durable_position() rather than
+    /// taking a global minimum across all DBs — idle DBs (never written
+    /// to) have durable_position() == 0 forever and would stall all
+    /// responses if included in a global min.
+    pending_wal: Option<Arc<WriteAheadLog>>,
     /// Timestamp of when `pending_up_to` was set. Measured at the point
     /// the SET/DEL command completed its synchronous work and the
     /// response got buffered awaiting durability. Used to record total
@@ -64,6 +70,7 @@ impl ConnState {
             handler,
             pending_out: Vec::with_capacity(tuning.write_buf_bytes),
             pending_up_to: 0,
+            pending_wal: None,
             pending_since: None,
         }
     }
@@ -240,19 +247,6 @@ impl ReactorServer {
                 }
             }
         }
-        // Smallest durable position across all DBs. It's safe to flush a
-        // pending response only when every WAL this connection may have
-        // written to is durable — but since a single connection is pinned
-        // to one current_db at a time, taking the min is the conservative
-        // shortcut that sidesteps per-conn DB-index bookkeeping at the
-        // cost of tiny extra wait when DBs advance unevenly.
-        let current_min_durable = |wals: &[Option<Arc<WriteAheadLog>>]| -> u64 {
-            wals.iter()
-                .filter_map(|w| w.as_ref().map(|w| w.durable_position()))
-                .min()
-                .unwrap_or(u64::MAX)
-        };
-
         // Wake cadence for the reactor. A plain `wait(1)` would deadlock
         // when every client's response is pending durability and no new
         // I/O is arriving: the WAL commit thread advances `durable_pos`
@@ -343,6 +337,17 @@ impl ReactorServer {
                                 let pos = state.handler.take_wal_position();
                                 if pos > state.pending_up_to {
                                     state.pending_up_to = pos;
+                                    // Record which WAL this write landed in so
+                                    // the durability flush below checks only
+                                    // the relevant shard. Idle DBs (no writes)
+                                    // stay at durable_position == 0 forever
+                                    // and must not block this connection's
+                                    // response via a global minimum.
+                                    let db_idx = state.handler.current_db();
+                                    state.pending_wal = wals
+                                        .get(db_idx)
+                                        .and_then(|w| w.as_ref())
+                                        .map(Arc::clone);
                                     // First write in this pending batch —
                                     // start the latency clock. Subsequent
                                     // pipelined writes don't reset it; we
@@ -385,45 +390,52 @@ impl ReactorServer {
             }
 
             // Durability flush: check each connection's pending_up_to
-            // against the min durable position. Every WAL byte the
-            // connection wrote is now on disk — send the buffered
-            // response. This is what pipelines hundreds of writes per
-            // fsync: the commit thread advances durable_pos for the
-            // whole batch at once, and one reactor iteration flushes
-            // every ready response.
-            let min_durable = current_min_durable(&wals);
-            if min_durable > 0 {
-                for (&fd, state) in connections.iter_mut() {
-                    if state.pending_up_to > 0
-                        && state.pending_up_to <= min_durable
-                        && !state.pending_out.is_empty()
+            // against that connection's own WAL's durable_position().
+            // Every WAL byte the connection wrote is now on disk — send
+            // the buffered response. This is what pipelines hundreds of
+            // writes per fsync: the commit thread advances durable_pos
+            // for the whole batch at once, and one reactor iteration
+            // flushes every ready response.
+            //
+            // We check per-connection WALs (not a global minimum) so
+            // that idle DBs whose durable_position stays at 0 forever
+            // do not block connections that only write to active DBs.
+            for (&fd, state) in connections.iter_mut() {
+                if state.pending_up_to == 0 {
+                    continue;
+                }
+                let conn_durable = state
+                    .pending_wal
+                    .as_ref()
+                    .map_or(u64::MAX, |w| w.durable_position());
+                if state.pending_up_to <= conn_durable
+                    && !state.pending_out.is_empty()
+                {
+                    let bytes = std::mem::take(&mut state.pending_out);
+                    state.pending_up_to = 0;
+                    state.pending_wal = None;
+                    // Record the end-to-end durable-write latency for
+                    // this batch. `set_latency` is the coarse
+                    // aggregate across SET/DEL/writes since we don't
+                    // split here — that's fine, the user can read
+                    // per-op breakdown from the individual
+                    // put_sync/delete_sync paths used by non-reactor
+                    // callers.
+                    if let (Some(start), Some(sink)) =
+                        (state.pending_since.take(), latency_sink.as_ref())
                     {
-                        let bytes = std::mem::take(&mut state.pending_out);
-                        state.pending_up_to = 0;
-                        // Record the end-to-end durable-write latency for
-                        // this batch. `set_latency` is the coarse
-                        // aggregate across SET/DEL/writes since we don't
-                        // split here — that's fine, the user can read
-                        // per-op breakdown from the individual
-                        // put_sync/delete_sync paths used by non-reactor
-                        // callers.
-                        if let (Some(start), Some(sink)) =
-                            (state.pending_since.take(), latency_sink.as_ref())
-                        {
-                            let us = start.elapsed().as_micros() as u64;
-                            sink.set_latency.record(us);
-                        }
-                        if let Err(e) = server.queue_send(fd, bytes) {
-                            error!("reactor queue_send error on fd={}: {}", fd, e);
-                        }
-                    } else if state.pending_up_to > 0
-                        && state.pending_up_to <= min_durable
-                    {
-                        // pending_out is empty but we were waiting — no-op
-                        // apart from clearing the watermark.
-                        state.pending_up_to = 0;
-                        state.pending_since = None;
+                        let us = start.elapsed().as_micros() as u64;
+                        sink.set_latency.record(us);
                     }
+                    if let Err(e) = server.queue_send(fd, bytes) {
+                        error!("reactor queue_send error on fd={}: {}", fd, e);
+                    }
+                } else if state.pending_up_to <= conn_durable {
+                    // pending_out is empty but we were waiting — no-op
+                    // apart from clearing the watermark.
+                    state.pending_up_to = 0;
+                    state.pending_wal = None;
+                    state.pending_since = None;
                 }
             }
 

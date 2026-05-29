@@ -247,20 +247,22 @@ impl ReactorServer {
                 }
             }
         }
-        // Wake cadence for the reactor. A plain `wait(1)` would deadlock
-        // when every client's response is pending durability and no new
-        // I/O is arriving: the WAL commit thread advances `durable_pos`
-        // but the reactor sleeps forever on io_uring. Using a bounded
-        // wait means we always wake within this budget to poll durability.
-        //
-        let wake_budget = std::time::Duration::from_micros(200);
-
         // Per-iteration: block on at least one completion (or the budget),
         // then drain. The closure only captures &mut refs to things we
         // own via move above.
+        //
+        // Adaptive wake budget: when connections are waiting for WAL
+        // durability before we can send their response, we use a short
+        // 200µs timeout so responses go out quickly after the fsync.
+        // When no durability is pending (pure idle or GET-only traffic)
+        // we use a much longer 5ms timeout — the eventfd from the WAL
+        // commit thread will interrupt us early if needed anyway.
+        let wake_budget_active  = std::time::Duration::from_micros(200);
+        let wake_budget_idle    = std::time::Duration::from_millis(5);
+
         loop {
-            // Bounded wait; returns on any io_uring completion or when the
-            // timeout fires.
+            let has_pending = connections.values().any(|s| s.pending_up_to > 0);
+            let wake_budget = if has_pending { wake_budget_active } else { wake_budget_idle };
             if let Err(e) = server.wait_timeout(wake_budget) {
                 error!("reactor wait error: {}", e);
                 continue;

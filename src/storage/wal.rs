@@ -721,8 +721,12 @@ impl WriteAheadLog {
                     // load, we get here only briefly between commit
                     // cycles and the timeout caps how long we can miss
                     // a notify.
-                    let remaining = interval.saturating_sub(elapsed)
-                        .max(Duration::from_micros(10));
+                    //
+                    // Always sleep for the full `interval` from now.
+                    // Without this, once `elapsed >= interval` the
+                    // remaining duration hits the 10µs floor and the
+                    // thread spins at 100 K/s per shard forever.
+                    last_tick = Instant::now();
                     let mut guard = gc.wake_lock.lock();
                     // Re-check under lock to avoid lost-wake.
                     let written2 = gc.written_pos.load(Ordering::Acquire);
@@ -732,7 +736,7 @@ impl WriteAheadLog {
                         && !shutdown.load(Ordering::Relaxed)
                     {
                         gc.commit_sleeping.store(true, Ordering::Release);
-                        let _ = gc.wake_cond.wait_for(&mut guard, remaining);
+                        let _ = gc.wake_cond.wait_for(&mut guard, interval);
                         gc.commit_sleeping.store(false, Ordering::Release);
                     }
                 }

@@ -268,9 +268,13 @@ impl SegmentFile {
 
     pub fn active_seg_id(&self) -> u32 { self.active_seg_id.load(Ordering::Acquire) }
 
-    pub fn fdatasync(&self) -> io::Result<()> {
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         use std::os::unix::io::AsRawFd;
-        let ret = unsafe { libc::fdatasync(self.file.as_raw_fd()) };
+        self.file.as_raw_fd()
+    }
+
+    pub fn fdatasync(&self) -> io::Result<()> {
+        let ret = unsafe { libc::fdatasync(self.as_raw_fd()) };
         if ret != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 

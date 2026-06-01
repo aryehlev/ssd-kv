@@ -205,6 +205,53 @@ impl SegmentManager {
 
     // ─── Core disk read API ───────────────────────────────────────────────
 
+    /// Check staging + active page only — no disk I/O. Returns `None` if the
+    /// page is not in RAM and the caller must issue an async pread.
+    pub fn try_read_staged(&self, loc: RecordLocation) -> Option<PageEntry> {
+        if loc.is_large() { return None; }
+
+        let enc = self.active_encoded.load(Ordering::Acquire);
+        let afile = (enc >> 32) as u32;
+        let apage = (enc & 0xFFFF_FFFF) as u32;
+        if loc.file_id == afile && loc.ipage_idx == apage {
+            let st = self.write_lock.read();
+            if st.page_allocated {
+                let abs = st.sf.seg_page_to_abs(st.current_seg, st.current_page);
+                if loc.ipage_idx == abs {
+                    return st.current_ipage.read_entry(loc.slot_idx);
+                }
+            }
+        }
+
+        self.staging.map.get(&(loc.file_id, loc.ipage_idx))
+            .and_then(|ipage| ipage.read_entry(loc.slot_idx))
+    }
+
+    /// Return `(fd, byte_offset, byte_len)` for an async pread of this record.
+    /// The `RawFd` is valid for the lifetime of this `SegmentManager`.
+    pub fn disk_read_coords(&self, loc: RecordLocation) -> io::Result<(std::os::unix::io::RawFd, u64, usize)> {
+        let page_count = if loc.is_large() { loc.span as usize } else { 1 };
+        let size = page_count * PAGE_SIZE;
+
+        let enc = self.active_encoded.load(Ordering::Acquire);
+        let afile = (enc >> 32) as u32;
+        if loc.file_id == afile {
+            let st = self.write_lock.read();
+            if loc.file_id == st.sf.file_id {
+                let (seg_id, page_idx) = st.sf.abs_to_seg_page(loc.ipage_idx);
+                let offset = st.sf.page_offset(seg_id, page_idx);
+                return Ok((st.sf.as_raw_fd(), offset, size));
+            }
+        }
+
+        let files = self.files.read();
+        let sf = files.get(&loc.file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+        let (seg_id, page_idx) = sf.abs_to_seg_page(loc.ipage_idx);
+        let offset = sf.page_offset(seg_id, page_idx);
+        Ok((sf.as_raw_fd(), offset, size))
+    }
+
     /// Read a previously-written entry from disk (or from the active in-memory
     /// ipage when the entry has not yet been flushed).
     pub fn read_at(&self, loc: RecordLocation) -> io::Result<PageEntry> {

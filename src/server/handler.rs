@@ -52,6 +52,23 @@ impl HandlerStats {
     }
 }
 
+// ─── Async GET result ─────────────────────────────────────────────────────────
+
+/// Return value from [`Handler::try_get_async`].
+pub enum GetResult {
+    /// Served from memory; RESP response already written into caller's buffer.
+    Immediate,
+    /// Key found but data is on disk — caller must issue an async pread.
+    NeedsDisk {
+        fd: std::os::unix::io::RawFd,
+        offset: u64,
+        size: usize,
+        loc: crate::engine::index_entry::RecordLocation,
+    },
+    /// Key not found.
+    Miss,
+}
+
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 pub struct Handler {
@@ -245,6 +262,40 @@ impl Handler {
         self.index.delete(key, generation);
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
         Ok((true, wal_pos))
+    }
+
+    /// Try to serve a GET from RAM. If the page is in the staging buffer or
+    /// the active in-memory ipage the value is encoded directly into `out`
+    /// and `Immediate` is returned. If the page is on disk, `NeedsDisk`
+    /// is returned with the coordinates needed for an async pread — the
+    /// reactor submits the read and delivers the response later.
+    ///
+    /// Only works for SSD-backed databases (checks the index + SegmentManager).
+    pub fn try_get_async(&self, key: &[u8], out: &mut Vec<u8>) -> GetResult {
+        let entry = match self.index.get(key) {
+            None => return GetResult::Miss,
+            Some(e) => e,
+        };
+        if entry.is_deleted() { return GetResult::Miss; }
+
+        // Fast path: in-memory staging or active ipage.
+        if let Some(pe) = self.sm.try_read_staged(entry.location) {
+            if pe.is_deleted || pe.is_expired() { return GetResult::Miss; }
+            // Encode RESP bulk string into caller's buffer.
+            let vlen = pe.value.len();
+            out.push(b'$');
+            out.extend_from_slice(itoa::Buffer::new().format(vlen).as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(&pe.value);
+            out.extend_from_slice(b"\r\n");
+            return GetResult::Immediate;
+        }
+
+        // Slow path: caller must read from disk asynchronously.
+        match self.sm.disk_read_coords(entry.location) {
+            Ok((fd, offset, size)) => GetResult::NeedsDisk { fd, offset, size, loc: entry.location },
+            Err(_) => GetResult::Miss,
+        }
     }
 
     /// Synchronous GET — returns raw value bytes.

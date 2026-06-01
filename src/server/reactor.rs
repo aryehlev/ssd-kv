@@ -11,7 +11,7 @@
 //! add IO worker threads for the parse/write split.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,10 +20,36 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::cluster::router::ClusterRouter;
+use crate::engine::index_entry::RecordLocation;
 use crate::io::uring_net::{NetEvent, UringServer};
 use crate::server::db_manager::{DatabaseManager, DbHandler};
-use crate::server::redis::{PubSubManager, RedisHandler, RespParser, ServerTuning};
+use crate::server::handler::GetResult;
+use crate::server::redis::{PubSubManager, RespValue, RedisHandler, RespParser, ServerTuning};
+use crate::storage::ipage::{IPage, LargePage, PAGE_SIZE};
 use crate::storage::wal::WriteAheadLog;
+
+/// An in-flight async disk read for a GET command.
+struct PendingRead {
+    req_id: u64,
+    loc: RecordLocation,
+    /// Byte offset into `pending_out` at the time the read was submitted.
+    /// When the completion arrives the response is appended after this offset.
+    output_offset: usize,
+    started: std::time::Instant,
+}
+
+/// A disk read that needs to be submitted after `process_completions` returns.
+/// We can't call `server.submit_disk_read` inside the closure (double &mut borrow),
+/// so we collect them here and submit in a second pass.
+struct PendingDiskSubmit {
+    file_fd: RawFd,
+    offset: u64,
+    size: usize,
+    conn_fd: RawFd,
+    req_id: u64,
+    loc: RecordLocation,
+    out_offset: usize,
+}
 
 /// Per-connection state. RESP parser, its pending output buffer, and the
 /// handler holding this client's SELECT / MULTI / WATCH state.
@@ -50,6 +76,14 @@ struct ConnState {
     /// latency (including the fsync wait) into the SSD handler's
     /// `set_latency` histogram when the response finally flushes.
     pending_since: Option<std::time::Instant>,
+    /// True when a disk read is in-flight for this connection. While set,
+    /// recv is suppressed so pipelined commands are not processed out of
+    /// order. Re-armed when the DiskRead completion arrives.
+    disk_read_inflight: bool,
+    /// Monotonically increasing per-connection request ID for disk reads.
+    next_req_id: u64,
+    /// Queue of pending disk reads (ordered by submission).
+    pending_reads: VecDeque<PendingRead>,
 }
 
 impl ConnState {
@@ -72,6 +106,9 @@ impl ConnState {
             pending_up_to: 0,
             pending_wal: None,
             pending_since: None,
+            disk_read_inflight: false,
+            next_req_id: 0,
+            pending_reads: VecDeque::new(),
         }
     }
 }
@@ -260,6 +297,10 @@ impl ReactorServer {
         let wake_budget_active  = std::time::Duration::from_micros(200);
         let wake_budget_idle    = std::time::Duration::from_millis(5);
 
+        // Disk reads collected during process_completions that need to be
+        // submitted after the closure releases its &mut server borrow.
+        let mut pending_disk_submits: Vec<PendingDiskSubmit> = Vec::new();
+
         loop {
             let has_pending = connections.values().any(|s| s.pending_up_to > 0);
             let wake_budget = if has_pending { wake_budget_active } else { wake_budget_idle };
@@ -332,32 +373,67 @@ impl ReactorServer {
                     // capture any WAL position the handler reported via
                     // put_nowait / delete_nowait — that becomes this
                     // connection's pending durability watermark.
+                    //
+                    // GET intercept: if a parsed command is a simple GET on
+                    // an SSD-backed DB, we attempt to serve from staging RAM
+                    // (O(1) no-lock). On a staging miss we submit an async
+                    // io_uring read — the response is delivered in the
+                    // DiskRead completion arm below.  While a disk read is
+                    // in flight we stop draining this connection's recv
+                    // buffer so responses go out in order.
                     loop {
+                        if state.disk_read_inflight {
+                            break; // wait for DiskRead completion
+                        }
                         match state.parser.next_value() {
                             Ok(Some(value)) => {
-                                state.handler.handle_command(value, &mut state.pending_out);
-                                let pos = state.handler.take_wal_position();
-                                if pos > state.pending_up_to {
-                                    state.pending_up_to = pos;
-                                    // Record which WAL this write landed in so
-                                    // the durability flush below checks only
-                                    // the relevant shard. Idle DBs (no writes)
-                                    // stay at durable_position == 0 forever
-                                    // and must not block this connection's
-                                    // response via a global minimum.
-                                    let db_idx = state.handler.current_db();
-                                    state.pending_wal = wals
-                                        .get(db_idx)
-                                        .and_then(|w| w.as_ref())
-                                        .map(Arc::clone);
-                                    // First write in this pending batch —
-                                    // start the latency clock. Subsequent
-                                    // pipelined writes don't reset it; we
-                                    // measure the first-to-durable time,
-                                    // which is the reply latency the
-                                    // client sees.
-                                    if state.pending_since.is_none() {
-                                        state.pending_since = Some(std::time::Instant::now());
+                                // Try async GET intercept for SSD-backed DBs.
+                                let ssd_handler = state.handler.current_handler_ssd();
+                                if let (Some(key), Some(h)) =
+                                    (peek_disk_get(&value), ssd_handler)
+                                {
+                                    match h.try_get_async(key, &mut state.pending_out) {
+                                        GetResult::Immediate => {
+                                            // Served from staging; response already
+                                            // appended to pending_out.
+                                        }
+                                        GetResult::Miss => {
+                                            state.pending_out.extend_from_slice(b"$-1\r\n");
+                                        }
+                                        GetResult::NeedsDisk { fd: file_fd, offset, size, loc } => {
+                                            // Cannot call server.submit_disk_read here
+                                            // (double &mut borrow). Collect and submit
+                                            // after process_completions returns.
+                                            let req_id = state.next_req_id;
+                                            state.next_req_id += 1;
+                                            let out_offset = state.pending_out.len();
+                                            state.disk_read_inflight = true;
+                                            state.pending_reads.push_back(PendingRead {
+                                                req_id,
+                                                loc,
+                                                output_offset: out_offset,
+                                                started: std::time::Instant::now(),
+                                            });
+                                            pending_disk_submits.push(PendingDiskSubmit {
+                                                file_fd, offset, size,
+                                                conn_fd: fd, req_id, loc,
+                                                out_offset,
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    state.handler.handle_command(value, &mut state.pending_out);
+                                    let pos = state.handler.take_wal_position();
+                                    if pos > state.pending_up_to {
+                                        state.pending_up_to = pos;
+                                        let db_idx = state.handler.current_db();
+                                        state.pending_wal = wals
+                                            .get(db_idx)
+                                            .and_then(|w| w.as_ref())
+                                            .map(Arc::clone);
+                                        if state.pending_since.is_none() {
+                                            state.pending_since = Some(std::time::Instant::now());
+                                        }
                                     }
                                 }
                             }
@@ -372,7 +448,12 @@ impl ReactorServer {
                     // If nothing to send, nothing to do. If something is
                     // pending but needs durability, hold onto it —
                     // the outer loop flushes when the WAL catches up.
-                    if state.pending_out.is_empty() || state.pending_up_to > 0 {
+                    // If a disk read is in-flight, also hold — DiskRead
+                    // completion will trigger the send.
+                    if state.pending_out.is_empty()
+                        || state.pending_up_to > 0
+                        || state.disk_read_inflight
+                    {
                         None
                     } else {
                         Some(std::mem::take(&mut state.pending_out))
@@ -384,11 +465,83 @@ impl ReactorServer {
                     }
                     None
                 }
+                NetEvent::DiskRead(dr) => {
+                    let conn_fd = dr.conn_fd;
+                    let state = match connections.get_mut(&conn_fd) {
+                        Some(s) => s,
+                        None => {
+                            // Connection closed before the read completed;
+                            // return buffer to pool via drop (pool is inside
+                            // UringServer which handles cleanup).
+                            return None;
+                        }
+                    };
+
+                    // Pop the matching pending read (should be the front).
+                    let pending = state.pending_reads.pop_front();
+                    state.disk_read_inflight = false;
+
+                    // Decode the buffer into a RESP response.
+                    let resp_bytes = if dr.result > 0 {
+                        let buf = &dr.buffer;
+                        decode_disk_page(buf, &dr.loc)
+                    } else {
+                        b"$-1\r\n".to_vec()
+                    };
+
+                    // Record async GET latency.
+                    if let Some(pr) = pending {
+                        if let Some(sink) = latency_sink.as_ref() {
+                            sink.get_latency.record(pr.started.elapsed().as_micros() as u64);
+                            sink.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if dr.result > 0 {
+                                sink.get_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                sink.get_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+
+                    // Append to pending_out (in order) and flush if ready.
+                    state.pending_out.extend_from_slice(&resp_bytes);
+
+                    // Now try to drain any further commands from the parser
+                    // that were queued while the disk read was in-flight.
+                    // (single-pass to keep latency bounded; the loop runs again
+                    // next iteration via re-armed recv).
+
+                    if state.pending_out.is_empty()
+                        || state.pending_up_to > 0
+                        || state.disk_read_inflight
+                    {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut state.pending_out))
+                    }
+                }
             });
 
             if let Err(e) = process_result {
                 error!("reactor process_completions error: {}", e);
                 // continue; a transient error shouldn't kill the server
+            }
+
+            // Submit disk reads collected during process_completions.
+            // This is a separate pass because we can't call server.submit_disk_read
+            // inside the process_completions closure (double &mut borrow).
+            for ds in pending_disk_submits.drain(..) {
+                match server.submit_disk_read(ds.file_fd, ds.offset, ds.size, ds.conn_fd, ds.req_id, ds.loc) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        error!("disk read submit failed fd={}: {}", ds.conn_fd, e);
+                        // Undo inflight state and emit $-1
+                        if let Some(state) = connections.get_mut(&ds.conn_fd) {
+                            state.disk_read_inflight = false;
+                            state.pending_reads.pop_back();
+                            state.pending_out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                }
             }
 
             // Durability flush: check each connection's pending_up_to
@@ -511,4 +664,69 @@ pub fn start_reactor_multi(
                 .expect("failed to spawn reactor thread")
         })
         .collect()
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// If `value` is a `GET key` command, return the key bytes; otherwise `None`.
+/// Used to intercept GET before `handle_command` so we can serve from staging
+/// or submit an async disk read instead of blocking.
+fn peek_disk_get(value: &RespValue) -> Option<&[u8]> {
+    if let RespValue::Array(Some(args)) = value {
+        if args.len() == 2 {
+            if let RespValue::BulkString(Some(cmd)) = &args[0] {
+                if cmd.eq_ignore_ascii_case(b"get") {
+                    if let RespValue::BulkString(Some(key)) = &args[1] {
+                        return Some(key.as_slice());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Decode a raw 4 KB page buffer into a RESP bulk-string response.
+fn decode_disk_page(buf: &[u8], loc: &RecordLocation) -> Vec<u8> {
+    let bytes = if buf.len() >= PAGE_SIZE {
+        &buf[..PAGE_SIZE * loc.span.max(1) as usize]
+    } else {
+        buf
+    };
+    if loc.is_large() {
+        match LargePage::decode(bytes) {
+            Ok(lp) => {
+                let pe = lp.into_entry();
+                if pe.is_deleted || pe.is_expired() {
+                    return b"$-1\r\n".to_vec();
+                }
+                let vlen = pe.value.len();
+                let mut out = Vec::with_capacity(16 + vlen);
+                out.push(b'$');
+                out.extend_from_slice(itoa::Buffer::new().format(vlen).as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&pe.value);
+                out.extend_from_slice(b"\r\n");
+                out
+            }
+            Err(_) => b"$-1\r\n".to_vec(),
+        }
+    } else {
+        match IPage::from_bytes(bytes) {
+            Ok(ipage) => match ipage.read_entry(loc.slot_idx) {
+                Some(pe) if !pe.is_deleted && !pe.is_expired() => {
+                    let vlen = pe.value.len();
+                    let mut out = Vec::with_capacity(16 + vlen);
+                    out.push(b'$');
+                    out.extend_from_slice(itoa::Buffer::new().format(vlen).as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                    out.extend_from_slice(&pe.value);
+                    out.extend_from_slice(b"\r\n");
+                    out
+                }
+                _ => b"$-1\r\n".to_vec(),
+            },
+            Err(_) => b"$-1\r\n".to_vec(),
+        }
+    }
 }

@@ -753,6 +753,13 @@ impl RedisHandler {
         self.db_manager.db(self.current_db.get()).unwrap()
     }
 
+    /// If the current database is SSD-backed, returns its `Handler`.
+    /// Used by the reactor to call `try_get_async` for the GET fast path.
+    #[inline]
+    pub fn current_handler_ssd(&self) -> Option<&Arc<Handler>> {
+        self.current_handler().as_ssd()
+    }
+
     /// PUT via the non-blocking path, tracking the WAL position so the
     /// reactor knows when the response is safe to send. A thin wrapper
     /// callers use instead of `current_handler().put_sync(…)`. Routes

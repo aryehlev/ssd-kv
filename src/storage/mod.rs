@@ -2,6 +2,7 @@
 
 pub mod ipage;
 pub mod file_manager;
+pub mod gc;
 pub mod segment_file;
 pub mod segment_manager;
 pub mod write_buffer;

@@ -137,6 +137,24 @@ impl Index {
         deleted
     }
 
+    /// Update a key's on-disk location iff its generation exactly matches
+    /// `expected_gen` and the entry is still live.  Used by GC to redirect
+    /// the index from the old segment to the new one without overwriting any
+    /// write that happened between GC scan and GC write.
+    pub fn relocate(&self, key: &[u8], expected_gen: u32, new_loc: RecordLocation) -> bool {
+        let h = hash_key(key);
+        let mut shard = self.shards[self.shard_for(h)].write();
+        if let Some(bucket) = shard.entries.get_mut(&h) {
+            for e in bucket.iter_mut() {
+                if e.matches(key, h) && e.is_live() && e.generation == expected_gen {
+                    e.location = new_loc;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn remove(&self, key: &[u8]) {
         let h = hash_key(key);
         let mut shard = self.shards[self.shard_for(h)].write();

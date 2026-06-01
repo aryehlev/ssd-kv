@@ -302,8 +302,8 @@ impl ReactorServer {
         let mut pending_disk_submits: Vec<PendingDiskSubmit> = Vec::new();
 
         loop {
-            let has_pending = connections.values().any(|s| s.pending_up_to > 0);
-            let wake_budget = if has_pending { wake_budget_active } else { wake_budget_idle };
+            let has_inflight = connections.values().any(|s| s.pending_up_to > 0 || s.disk_read_inflight);
+            let wake_budget = if has_inflight { wake_budget_active } else { wake_budget_idle };
             if let Err(e) = server.wait_timeout(wake_budget) {
                 error!("reactor wait error: {}", e);
                 continue;

@@ -189,6 +189,10 @@ impl Handler {
             }
         }
 
+        // Snapshot the old entry location before overwriting it so we can
+        // tell GC that one page in the old segment is now dead.
+        let old_loc = self.index.get(key).filter(|e| e.is_live()).map(|e| e.location);
+
         let generation = self.sm.next_generation();
         let ts = now_micros();
 
@@ -201,6 +205,11 @@ impl Handler {
         let loc = self.sm.write_entry(key, value, ts, ttl, generation, false)?;
         self.index.insert(key, loc, generation, value.len() as u32);
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
+
+        // Inform GC tracking that the old page location has one fewer live entry.
+        if let Some(old) = old_loc {
+            self.sm.decrement_live(old.file_id, old.ipage_idx, old.span.max(1) as u32);
+        }
         Ok(wal_pos)
     }
 
@@ -244,10 +253,11 @@ impl Handler {
     pub fn delete_nowait_on(
         &self, shard_hint: usize, key: &[u8],
     ) -> io::Result<(bool, Option<u64>)> {
-        let existed = self.index.get(key).map(|e| e.is_live()).unwrap_or(false);
-        if !existed {
+        let old = self.index.get(key).filter(|e| e.is_live());
+        if old.is_none() {
             return Ok((false, None));
         }
+        let old_loc = old.map(|e| e.location);
 
         let generation = self.sm.next_generation();
         let ts = now_micros();
@@ -261,6 +271,11 @@ impl Handler {
         self.sm.write_entry(key, b"", ts, 0, generation, true)?;
         self.index.delete(key, generation);
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
+
+        // Inform GC that the old page location now has one fewer live entry.
+        if let Some(old) = old_loc {
+            self.sm.decrement_live(old.file_id, old.ipage_idx, old.span.max(1) as u32);
+        }
         Ok((true, wal_pos))
     }
 

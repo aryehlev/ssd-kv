@@ -32,6 +32,7 @@ use server::{
     Handler, DatabaseManager, DbHandler, start_reactor_multi, ServerTuning,
 };
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
+use storage::gc::{start_gc_thread, GcConfig};
 use storage::memory_store::MemoryStore;
 use storage::wal::{WalConfig, WriteAheadLog};
 use storage::write_buffer::WriteBuffer;
@@ -267,6 +268,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let handler = Arc::new(handler_inner);
+
+            // Start GC thread for this SSD DB. Runs at throttled IOPS so
+            // background compaction never causes foreground latency spikes.
+            let _gc_handle = start_gc_thread(
+                Arc::clone(&idx),
+                Arc::clone(&fm),
+                GcConfig {
+                    check_interval_secs: 30,
+                    gc_threshold: config.compaction_threshold,
+                    max_writes_per_sec: 1000,
+                },
+            );
 
             // Start eviction thread for this SSD DB
             if config.eviction_policy != "noeviction"

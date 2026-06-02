@@ -113,6 +113,22 @@ impl GcRunner {
         Ok((relocated, skipped))
     }
 
+    /// Run a single GC pass (scan for candidates, compact them). Returns total
+    /// (relocated, skipped) counts across all compacted segments.
+    pub fn run_once(&self) -> (usize, usize) {
+        let candidates = self.sm.gc_sealed_segments(self.config.gc_threshold);
+        let mut total_relocated = 0;
+        let mut total_skipped   = 0;
+        for (file_id, seg_id, util) in candidates {
+            debug!("GC run_once: compacting ({},{}) util={:.2}", file_id, seg_id, util);
+            match self.compact_segment(file_id, seg_id) {
+                Ok((r, s)) => { total_relocated += r; total_skipped += s; }
+                Err(e)     => error!("GC run_once: ({},{}) failed: {}", file_id, seg_id, e),
+            }
+        }
+        (total_relocated, total_skipped)
+    }
+
     pub fn run(self) {
         let interval = Duration::from_secs(self.config.check_interval_secs.max(1));
         loop {

@@ -215,6 +215,13 @@ impl Handler {
 
     /// Write path for WAL replay (skips WAL append, uses the replayed generation).
     pub fn put_from_wal(&self, key: &[u8], value: &[u8], generation: u32, ttl: u32) -> io::Result<()> {
+        // Skip entries already on disk from the segment scan: same generation means
+        // the data is already at the index's recorded location. Writing it again
+        // would place it in a new ipage slot (different order from the original),
+        // corrupting reads that still use the old slot indices.
+        if self.index.get(key).map_or(false, |e| e.generation >= generation && e.is_live()) {
+            return Ok(());
+        }
         let ts = now_micros();
         let loc = self.sm.write_entry(key, value, ts, ttl, generation, false)?;
         self.index.insert(key, loc, generation, value.len() as u32);

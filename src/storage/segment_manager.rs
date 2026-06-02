@@ -325,17 +325,18 @@ impl SegmentManager {
             }
         }
 
-        // Slow path: pread from disk. Multiple concurrent preads on the same
-        // fd are safe — pread uses an explicit offset, not the fd position.
-        let enc = self.active_encoded.load(Ordering::Acquire);
-        let afile = (enc >> 32) as u32;
-        if loc.file_id == afile {
+        // Slow path: pread from disk.
+        // Try the active segment file first (takes read lock; safe even during
+        // concurrent writes because write_lock.read() blocks until the write
+        // completes and active_encoded is updated).
+        {
             let st = self.write_lock.read();
             if loc.file_id == st.sf.file_id {
                 return self.read_from_file(&st.sf, loc);
             }
         }
 
+        // Not the active file — must be an older sealed file.
         let files = self.files.read();
         let sf = files.get(&loc.file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
@@ -658,6 +659,16 @@ impl SegmentManager {
                 } else {
                     break;
                 }
+            }
+
+            // After scanning the active segment, restore the write position so
+            // WAL replay appends AFTER existing pages rather than overwriting them.
+            // Without this, WAL replay starts at page 0 and corrupts slot
+            // assignments that the index already maps to from the scan above.
+            if file_id == active_id {
+                let mut st = self.write_lock.write();
+                st.sf.active_seg_id.store(seg_id, std::sync::atomic::Ordering::Release);
+                st.sf.active_page_offset.store(page_idx, std::sync::atomic::Ordering::Release);
             }
         }
         Ok(())

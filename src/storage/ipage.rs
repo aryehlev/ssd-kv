@@ -46,7 +46,7 @@ pub const IPAGE_MAGIC: u32 = 0x47415049; // "IPAG"
 pub const LRGP_MAGIC: u32 = 0x4C524750;  // "LRGP"
 pub const PAGE_HEADER_SIZE: usize = 32;
 pub const SLOT_SIZE: usize = 4;          // (data_offset: u16, entry_len: u16)
-pub const ENTRY_HEADER_SIZE: usize = 20; // key_len+val_len+flags+pad+ts+ttl+gen
+pub const ENTRY_HEADER_SIZE: usize = 24; // key_len+val_len+flags+pad+ts+ttl+gen
 
 pub const FLAG_DELETED: u8 = 0x01;
 pub const LRGP_HEADER_SIZE: usize = 36;
@@ -154,16 +154,9 @@ impl IPage {
         d[7] = 0;
         d[8..16].copy_from_slice(&ts.to_le_bytes());
         d[16..20].copy_from_slice(&ttl.to_le_bytes());
-        // NOTE: generation is part of the ipage entry but not used during
-        // normal reads (the index carries it). Store it after ttl.
-        // Extend entry header to 24 bytes: shift to fit generation.
-        // Actually ENTRY_HEADER_SIZE=20, so gen goes at [20..24] – but that
-        // overlaps the key.  Store gen inside flags area instead: expand
-        // entry header to 24 bytes.
-        // This is a design inconsistency; simplest fix: skip storing gen in
-        // ipage (it's in the index), and keep ENTRY_HEADER_SIZE=20.
-        d[20..20 + key.len()].copy_from_slice(key);
-        d[20 + key.len()..entry_len].copy_from_slice(value);
+        d[20..24].copy_from_slice(&generation.to_le_bytes());
+        d[24..24 + key.len()].copy_from_slice(key);
+        d[24 + key.len()..entry_len].copy_from_slice(value);
 
         // Write slot (data_offset: u16, entry_len: u16)
         self.data[slot_off..slot_off + 2].copy_from_slice(&(new_data_start as u16).to_le_bytes());
@@ -186,19 +179,19 @@ impl IPage {
         if data_off + entry_len > PAGE_SIZE { return None; }
 
         let e = &self.data[data_off..data_off + entry_len];
-        let key_len  = u16::from_le_bytes(e[0..2].try_into().unwrap()) as usize;
-        let val_len  = u32::from_le_bytes(e[2..6].try_into().unwrap()) as usize;
-        let flags    = e[6];
-        let ts       = u64::from_le_bytes(e[8..16].try_into().unwrap());
-        let ttl      = u32::from_le_bytes(e[16..20].try_into().unwrap());
+        let key_len    = u16::from_le_bytes(e[0..2].try_into().unwrap()) as usize;
+        let val_len    = u32::from_le_bytes(e[2..6].try_into().unwrap()) as usize;
+        let flags      = e[6];
+        let ts         = u64::from_le_bytes(e[8..16].try_into().unwrap());
+        let ttl        = u32::from_le_bytes(e[16..20].try_into().unwrap());
+        let generation = u32::from_le_bytes(e[20..24].try_into().unwrap());
 
-        if 20 + key_len + val_len > entry_len { return None; }
-        let key   = e[20..20 + key_len].to_vec();
-        let value = e[20 + key_len..20 + key_len + val_len].to_vec();
+        if 24 + key_len + val_len > entry_len { return None; }
+        let key   = e[24..24 + key_len].to_vec();
+        let value = e[24 + key_len..24 + key_len + val_len].to_vec();
 
         Some(PageEntry {
-            key, value, ts, ttl,
-            generation: 0, // not stored in ipage; caller fills from index
+            key, value, ts, ttl, generation,
             is_deleted: flags & FLAG_DELETED != 0,
         })
     }

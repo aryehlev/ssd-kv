@@ -1,18 +1,13 @@
-//! Engine layer: index and recovery.
+//! SIndex engine — trillion-scale SSD-based KV indexing with deterministic latency.
 //!
-//! This module provides multiple index implementations:
-//! - **Index**: Original sharded RwLock-based index
-//! - **LockFreeIndex**: Lock-free hash table with open addressing (Aerospike SPRIGS-inspired)
-//! - **ShardPerCoreEngine**: Shard-per-core architecture (ScyllaDB-inspired)
+//! Implements: "The Design of Trillion-scale SSD-based Indexing with Deterministic
+//! Latency for Cloud Block Storage", ACM TOS 2024, DOI 10.1145/3789205.
 
-pub mod index;
-pub mod index_entry;
-pub mod recovery;
-pub mod lockfree_index;
-pub mod shard_per_core;
+pub mod btree;
+pub mod ipage;
+pub mod kv_engine;
+pub mod segment;
+pub mod value_log;
+pub mod wsbcache;
 
-pub use index::{Index, IndexStats, NUM_SHARDS};
-pub use index_entry::{hash_key, IndexEntry, KeyStorage, MAX_INLINE_KEY_SIZE};
-pub use recovery::{recover_index, recover_with_wal, RecoveryStats};
-pub use lockfree_index::{LockFreeIndex, Bucket, compare_keys_simd};
-pub use shard_per_core::{ShardPerCoreEngine, Shard, ShardMessage, ShardStats, SwmrCell};
+pub use kv_engine::KvEngine;

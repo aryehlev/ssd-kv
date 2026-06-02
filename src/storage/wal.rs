@@ -715,14 +715,20 @@ impl WriteAheadLog {
                         continue;
                     }
 
-                    // Sleep on the wake condvar. On idle load, writers
-                    // notify us the instant they stage the first byte so
-                    // we don't sit out the full `interval`. Under active
-                    // load, we get here only briefly between commit
-                    // cycles and the timeout caps how long we can miss
-                    // a notify.
-                    let remaining = interval.saturating_sub(elapsed)
-                        .max(Duration::from_micros(10));
+                    // Sleep on the wake condvar. Writers call notify_one()
+                    // the moment they stage data, so long idle sleeps don't
+                    // add write latency. Under active load we wake
+                    // frequently via notify; the timeout just guards against
+                    // a missed notify mid-batch.
+                    let remaining = if new_work {
+                        // Work is staged but batching window hasn't elapsed:
+                        // wait out the remainder (100µs floor to avoid spin).
+                        interval.saturating_sub(elapsed).max(Duration::from_micros(100))
+                    } else {
+                        // Truly idle: sleep for 5ms to save CPU. Writers will
+                        // wake us immediately via notify_one() when work arrives.
+                        Duration::from_millis(5)
+                    };
                     let mut guard = gc.wake_lock.lock();
                     // Re-check under lock to avoid lost-wake.
                     let written2 = gc.written_pos.load(Ordering::Acquire);
@@ -734,6 +740,11 @@ impl WriteAheadLog {
                         gc.commit_sleeping.store(true, Ordering::Release);
                         let _ = gc.wake_cond.wait_for(&mut guard, remaining);
                         gc.commit_sleeping.store(false, Ordering::Release);
+                        // Reset after sleeping so the next idle cycle starts
+                        // a fresh interval. Without this, elapsed stays >=
+                        // interval after a timeout and remaining hits the
+                        // floor, causing 100K wakeups/sec per shard.
+                        last_tick = Instant::now();
                     }
                 }
             })

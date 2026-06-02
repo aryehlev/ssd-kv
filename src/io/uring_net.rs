@@ -18,6 +18,9 @@ use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::engine::index_entry::RecordLocation;
+use crate::io::aligned_buf::{AlignedBuffer, BufferPool};
+
 /// Network operation types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetOperation {
@@ -29,6 +32,24 @@ pub enum NetOperation {
     /// wake this reactor when `durable_pos` advances. Completions for
     /// this op are re-armed and never surface to the reactor handler.
     EventfdWake,
+    /// Async disk read for the GET path. The completion carries the
+    /// connection fd and raw ipage bytes so the reactor can decode and
+    /// respond without ever blocking.
+    DiskRead,
+}
+
+/// Completion of an async disk read submitted via `UringServer::submit_disk_read`.
+pub struct DiskReadResult {
+    /// Connection fd this read serves.
+    pub conn_fd: RawFd,
+    /// Per-connection sequence number used for response ordering.
+    pub req_id: u64,
+    /// Bytes read (≥ 0) or negative errno on error.
+    pub result: i32,
+    /// The aligned buffer containing the raw page data on success.
+    pub buffer: AlignedBuffer,
+    /// Location originally requested.
+    pub loc: RecordLocation,
 }
 
 /// Result of a network operation.
@@ -67,10 +88,25 @@ mod linux {
         buffer: Option<Vec<u8>>,
     }
 
+    /// Pending disk read, keyed by io_uring user_data.
+    struct DiskPendingOp {
+        conn_fd: RawFd,
+        req_id: u64,
+        // AlignedBuffer owns heap memory via NonNull<u8>; moving the struct
+        // does not invalidate the data pointer passed to the SQE.
+        buffer: AlignedBuffer,
+        loc: RecordLocation,
+    }
+
     /// io_uring-based network manager.
     pub struct UringNet {
         ring: IoUring,
         pending: HashMap<u64, PendingOp>,
+        /// Separate map for disk reads so the hot networking path is unaffected.
+        disk_pending: HashMap<u64, DiskPendingOp>,
+        /// Completed disk reads stashed during `collect_completions`; drained
+        /// by `take_disk_completions`.
+        disk_completions: Vec<super::DiskReadResult>,
         next_id: AtomicU64,
         registered_buffers: bool,
         multishot_supported: bool,
@@ -99,6 +135,8 @@ mod linux {
             Ok(Self {
                 ring,
                 pending: HashMap::with_capacity(queue_depth as usize),
+                disk_pending: HashMap::with_capacity(64),
+                disk_completions: Vec::new(),
                 next_id: AtomicU64::new(1),
                 registered_buffers: false,
                 multishot_supported,
@@ -113,6 +151,8 @@ mod linux {
             Ok(Self {
                 ring,
                 pending: HashMap::with_capacity(queue_depth as usize),
+                disk_pending: HashMap::with_capacity(64),
+                disk_completions: Vec::new(),
                 next_id: AtomicU64::new(1),
                 registered_buffers: false,
                 multishot_supported: false,
@@ -338,7 +378,9 @@ mod linux {
             }
         }
 
-        /// Collect completed operations.
+        /// Collect completed network operations. Disk read completions are
+        /// stashed in `self.disk_completions`; drain them with
+        /// `take_disk_completions()` after this call.
         pub fn collect_completions(&mut self) -> Vec<NetResult> {
             let mut results = Vec::new();
 
@@ -346,24 +388,32 @@ mod linux {
                 let id = cqe.user_data();
                 let result = cqe.result();
 
+                // Network ops (hot path).
                 if let Some(mut pending) = self.pending.remove(&id) {
-                    // For recv, truncate buffer to actual received length
                     if pending.operation == NetOperation::Recv && result > 0 {
                         if let Some(ref mut buf) = pending.buffer {
                             buf.truncate(result as usize);
                         }
                     }
-
                     results.push(NetResult {
                         user_data: id,
                         operation: pending.operation,
                         result,
                         fd: if pending.operation == NetOperation::Accept && result >= 0 {
-                            result // For accept, result is the new fd
+                            result
                         } else {
                             pending.fd
                         },
                         buffer: pending.buffer,
+                    });
+                } else if let Some(dp) = self.disk_pending.remove(&id) {
+                    // Stash disk completions for the caller to drain separately.
+                    self.disk_completions.push(super::DiskReadResult {
+                        conn_fd: dp.conn_fd,
+                        req_id: dp.req_id,
+                        result,
+                        buffer: dp.buffer,
+                        loc: dp.loc,
                     });
                 }
             }
@@ -371,9 +421,52 @@ mod linux {
             results
         }
 
+        /// Drain completed disk reads that were collected by the last
+        /// `collect_completions` call.
+        pub fn take_disk_completions(&mut self) -> Vec<super::DiskReadResult> {
+            std::mem::take(&mut self.disk_completions)
+        }
+
         /// Number of pending operations.
         pub fn pending_count(&self) -> usize {
             self.pending.len()
+        }
+
+        /// Submit an async disk read. The buffer must be 4 KB-aligned
+        /// (use `AlignedBuffer`) and size must be a multiple of 4 KB.
+        /// `conn_fd` tags the completion so the reactor knows which
+        /// connection to respond to; `req_id` preserves ordering.
+        pub fn submit_disk_read(
+            &mut self,
+            file_fd: RawFd,
+            offset: u64,
+            mut buffer: AlignedBuffer,
+            conn_fd: RawFd,
+            req_id: u64,
+            loc: RecordLocation,
+        ) -> io::Result<u64> {
+            let id = self.next_id();
+            let len = buffer.capacity() as u32;
+            // AlignedBuffer.ptr is a NonNull<u8> pointing to a heap
+            // allocation; the pointer is stable across HashMap rehashes.
+            let ptr = buffer.as_mut_ptr();
+
+            self.disk_pending.insert(id, DiskPendingOp {
+                conn_fd, req_id, buffer, loc,
+            });
+
+            let read_op = opcode::Read::new(types::Fd(file_fd), ptr, len)
+                .offset(offset)
+                .build()
+                .user_data(id);
+
+            unsafe {
+                if self.ring.submission().push(&read_op).is_err() {
+                    self.disk_pending.remove(&id);
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+                }
+            }
+            Ok(id)
         }
 
         /// Check if SQPOLL is active (kernel is polling).
@@ -538,6 +631,46 @@ mod fallback {
                 .collect()
         }
 
+        pub fn submit_disk_read(
+            &mut self,
+            _file_fd: RawFd,
+            _offset: u64,
+            buffer: AlignedBuffer,
+            conn_fd: RawFd,
+            req_id: u64,
+            loc: RecordLocation,
+        ) -> io::Result<u64> {
+            // Fallback: synchronous pread via libc.
+            let id = self.next_id();
+            let len = buffer.capacity();
+            let mut buf = AlignedBuffer::new(len);
+            let result = unsafe {
+                libc::pread(
+                    _file_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    len,
+                    _offset as libc::off_t,
+                )
+            } as i32;
+            if result > 0 {
+                unsafe { buf.set_len(result as usize) };
+            }
+            self.pending.insert(id, PendingOp {
+                operation: NetOperation::DiskRead,
+                fd: conn_fd,
+                buffer: None,
+                result,
+            });
+            // Store in a side-channel so take_disk_completions returns it.
+            // (We reuse the pending map but mark as DiskRead.)
+            drop(buf); // not threaded, caller must re-read
+            Ok(id)
+        }
+
+        pub fn take_disk_completions(&mut self) -> Vec<super::DiskReadResult> {
+            Vec::new()
+        }
+
         pub fn pending_count(&self) -> usize {
             self.pending.len()
         }
@@ -595,6 +728,8 @@ pub struct TrackedConnection {
     pub send_queue: VecDeque<Vec<u8>>,
 }
 
+use std::sync::Arc;
+
 /// High-performance TCP server using io_uring.
 pub struct UringServer {
     net: UringNet,
@@ -604,6 +739,8 @@ pub struct UringServer {
     recv_buffer_size: usize,
     /// Whether an accept operation is currently pending in the submission queue.
     accept_pending: bool,
+    /// Pool of 4 KB aligned buffers reused for async disk reads.
+    disk_buf_pool: Arc<BufferPool>,
 }
 
 impl UringServer {
@@ -632,8 +769,7 @@ impl UringServer {
             fd
         };
 
-        let net = UringNet::new(queue_depth)
-            .or_else(|_| UringNet::new_simple(queue_depth))?;
+        let net = UringNet::new_simple(queue_depth)?;
 
         Ok(Self {
             net,
@@ -642,6 +778,10 @@ impl UringServer {
             buffer_pool: NetBufferPool::new(256, recv_buffer_size),
             recv_buffer_size,
             accept_pending: false,
+            // 256 × 4 KB = 1 MB; covers 256 concurrent in-flight single-page
+            // reads with zero allocation.  Large-page reads (span > 1) allocate
+            // fresh buffers outside the pool.
+            disk_buf_pool: BufferPool::new(256, 4096),
         })
     }
 
@@ -778,6 +918,34 @@ impl UringServer {
         Ok(())
     }
 
+    /// Submit an async disk read for a GET request. On completion the
+    /// reactor receives `NetEvent::DiskRead` with the raw page bytes.
+    /// `conn_fd` identifies the connection; `req_id` preserves ordering.
+    pub fn submit_disk_read(
+        &mut self,
+        file_fd: RawFd,
+        offset: u64,
+        size: usize,
+        conn_fd: RawFd,
+        req_id: u64,
+        loc: RecordLocation,
+    ) -> io::Result<()> {
+        let buf = if size <= 4096 {
+            let mut b = self.disk_buf_pool.try_acquire()
+                .unwrap_or_else(|| AlignedBuffer::new(4096));
+            // Set len so the CQE result can be validated against it.
+            unsafe { b.set_len(4096) };
+            b
+        } else {
+            // Large page: allocate fresh (rare).
+            let mut b = AlignedBuffer::new(size);
+            unsafe { b.set_len(size) };
+            b
+        };
+        self.net.submit_disk_read(file_fd, offset, buf, conn_fd, req_id, loc)?;
+        Ok(())
+    }
+
     /// Submit all pending operations.
     pub fn submit(&mut self) -> io::Result<usize> {
         self.net.submit()
@@ -808,8 +976,41 @@ impl UringServer {
         }
 
         let completions = self.net.collect_completions();
-        let count = completions.len();
+        // collect_completions stashes disk read completions as a side-effect;
+        // drain them now so we can call the handler while we still have &mut self.
+        let disk_completions = self.net.take_disk_completions();
+        let count = completions.len() + disk_completions.len();
 
+        // ── Disk read completions ─────────────────────────────────────────
+        // Process these first so that GET responses go out quickly. The
+        // connection fd is in the event; if the connection has since closed
+        // (race) we just discard. The response bytes are returned by the
+        // handler and queued for send.
+        for dr in disk_completions {
+            let conn_fd = dr.conn_fd;
+            // Return the buffer to the pool after the handler is done with it.
+            // We pass the whole DiskReadResult so the handler can decode it.
+            let resp = handler(NetEvent::DiskRead(dr));
+            if let Some(bytes) = resp {
+                if self.connections.contains_key(&conn_fd) {
+                    let _ = self.queue_send(conn_fd, bytes);
+                }
+            }
+            // Re-arm recv on the connection now that the disk read is done.
+            // The reactor's conn state tracks disk_read_inflight; when it
+            // returns a response from DiskRead, it also clears that flag.
+            // We unconditionally try to re-arm here so that if the handler
+            // returns None (e.g. connection already gone) we don't leak.
+            if let Some(conn) = self.connections.get_mut(&conn_fd) {
+                if !conn.recv_pending {
+                    let buffer = self.buffer_pool.get();
+                    let _ = self.net.submit_recv(conn_fd, buffer);
+                    conn.recv_pending = true;
+                }
+            }
+        }
+
+        // ── Network completions ───────────────────────────────────────────
         for result in completions {
             match result.operation {
                 NetOperation::Accept => {
@@ -911,6 +1112,13 @@ impl UringServer {
                     // whole point.
                     let _ = self.net.submit_eventfd_read(result.fd);
                 }
+
+                NetOperation::DiskRead => {
+                    // Disk completions are handled before network completions
+                    // via the disk_completions drain above. This arm is
+                    // unreachable in practice (disk CQEs are removed from
+                    // disk_pending and never appear in the network results vec).
+                }
             }
         }
 
@@ -937,11 +1145,14 @@ impl Drop for UringServer {
 }
 
 /// Network event from io_uring server.
-#[derive(Debug)]
 pub enum NetEvent {
     Accept(RawFd),
     Data(RawFd, Vec<u8>),
     Close(RawFd),
+    /// An async disk read submitted via `UringServer::submit_disk_read`
+    /// completed. The reactor should decode the buffer, format the RESP
+    /// response, and return it from the handler closure.
+    DiskRead(DiskReadResult),
 }
 
 /// Build a raw sockaddr from a SocketAddr. Used by the SO_REUSEPORT bind

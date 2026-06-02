@@ -201,13 +201,15 @@ pub struct Config {
     /// Number of io_uring workers (one kernel polling thread each in SQPOLL
     /// mode) that service cache-miss disk reads. Falls back to blocking
     /// pread if io_uring is unavailable.
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "0")]
     pub io_workers: usize,
 
     /// Number of RESP reactor threads. Each reactor owns its own io_uring
     /// ring; when >1 they share the listen port via SO_REUSEPORT so the
-    /// kernel load-balances connections across them. Default 1.
-    #[arg(long, default_value = "1")]
+    /// kernel load-balances connections across them.
+    /// Default: 1 (single-threaded, best GET latency). Increase for SET-heavy
+    /// workloads where parallel WAL shards improve write throughput.
+    #[arg(long, default_value = "0")]
     pub reactor_threads: usize,
 
     // --- WAL trim ---
@@ -359,8 +361,8 @@ impl Default for Config {
             fsync_batch: 256,
             wal_dirs: Vec::new(),
             wal_mode: WalModeArg::Odirect,
-            io_workers: 2,
-            reactor_threads: 1,
+            io_workers: 0,
+            reactor_threads: 0,
             wal_trim_interval_secs: 30,
         }
     }

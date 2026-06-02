@@ -753,6 +753,13 @@ impl RedisHandler {
         self.db_manager.db(self.current_db.get()).unwrap()
     }
 
+    /// If the current database is SSD-backed, returns its `Handler`.
+    /// Used by the reactor to call `try_get_async` for the GET fast path.
+    #[inline]
+    pub fn current_handler_ssd(&self) -> Option<&Arc<Handler>> {
+        self.current_handler().as_ssd()
+    }
+
     /// PUT via the non-blocking path, tracking the WAL position so the
     /// reactor knows when the response is safe to send. A thin wrapper
     /// callers use instead of `current_handler().put_sync(…)`. Routes
@@ -795,6 +802,14 @@ impl RedisHandler {
     #[inline]
     pub fn take_wal_position(&self) -> u64 {
         self.last_wal_position.replace(0)
+    }
+
+    /// Returns the current database index selected by this connection.
+    /// Used by the reactor to look up the right WAL when tracking which
+    /// WAL a pending response is waiting on.
+    #[inline]
+    pub fn current_db(&self) -> usize {
+        self.current_db.get() as usize
     }
 
     /// Handles a Redis command and writes response to buffer
@@ -1393,17 +1408,8 @@ impl RedisHandler {
         let memory_section = if let Some(h) = self.current_handler().as_ssd() {
             let idx = h.index();
             let total_bytes = idx.total_data_bytes();
-            let live_entries = idx.len();
-            let cache_line = h.wblock_cache().map(|c| {
-                let s = c.stats();
-                format!(
-                    "wblock_cache_hits:{}\r\n\
-                     wblock_cache_misses:{}\r\n\
-                     wblock_cache_inserts:{}\r\n\
-                     wblock_cache_hit_ratio:{:.4}\r\n",
-                    s.hits, s.misses, s.inserts, s.hit_ratio()
-                )
-            }).unwrap_or_default();
+            let live_entries = idx.stats().live_entries;
+            let cache_line = String::new();
             format!(
                 "# Memory\r\n\
                  used_memory:{}\r\n\

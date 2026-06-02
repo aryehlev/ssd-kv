@@ -11,7 +11,7 @@
 //! - **Huge Pages**: Reduce TLB misses for large allocations
 //! - **SIMD**: Vectorized batch operations (AVX2/NEON) for 2-4x throughput
 
-pub mod batch_writer;
+// batch_writer removed (depends on old WBlock storage layer)
 pub mod prefetch;
 pub mod numa;
 pub mod xdp;
@@ -22,7 +22,7 @@ pub mod object_pool;
 pub mod simd;
 pub mod latency_hist;
 
-pub use batch_writer::{BatchWriter, BatchWriterStats, WriteRequest};
+// BatchWriter removed
 pub use prefetch::{prefetch_read, prefetch_write, prefetch_range, BloomFilter, LockFreeBloomFilter, ReadAhead};
 pub use numa::{CpuTopology, NumaThreadPool, pin_to_cpu, pin_to_numa_node, numa_alloc, numa_free};
 pub use xdp::{XdpAccelerator, XdpConfig, XdpStats};

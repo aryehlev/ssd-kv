@@ -31,13 +31,12 @@ use perf::PerfTuning;
 use server::{
     Handler, DatabaseManager, DbHandler, start_reactor_multi, ServerTuning,
 };
-use storage::compaction::{start_compaction_thread, CompactionConfig};
 use storage::eviction::{start_eviction_thread, EvictionConfig, EvictionPolicy};
-use storage::file_manager::FileManager;
+use storage::gc::{start_gc_thread, GcConfig};
 use storage::memory_store::MemoryStore;
 use storage::wal::{WalConfig, WriteAheadLog};
-use storage::wblock_cache::WblockCache;
 use storage::write_buffer::WriteBuffer;
+use storage::FileManager;
 
 /// Use mimalloc as the global allocator for better performance.
 #[global_allocator]
@@ -46,7 +45,16 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
-    let config = Config::parse();
+    let mut config = Config::parse();
+
+    // Auto-detect reactor thread count: default 0 means half the hardware
+    // Default to 1 reactor (single-threaded like Redis/Valkey). This gives
+    // the best GET latency/throughput because all index lookups are on one
+    // core (hot cache, no cross-core synchronization). Use --reactor-threads
+    // to increase for SET-heavy workloads where parallel WAL shards help.
+    if config.reactor_threads == 0 {
+        config.reactor_threads = 1;
+    }
 
     // Validate configuration
     config.validate()?;
@@ -90,15 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let eviction_policy = EvictionPolicy::from_str(&config.eviction_policy);
 
-    // Optional wblock read cache, shared across SSD-backed DBs. 0 disables it;
-    // without the cache every GET does a 1 MiB SSD pread.
-    let wblock_cache = if config.wblock_cache_mb > 0 {
-        let c = WblockCache::new(config.wblock_cache_mb);
-        info!("Wblock cache enabled: {} MiB", config.wblock_cache_mb);
-        Some(c)
-    } else {
-        None
-    };
+    // ipage cache is embedded in SegmentManager; no separate wblock_cache object.
+    let _wblock_cache_mb = config.wblock_cache_mb; // retained for config compat
 
     // Shared io_uring reader for cache-miss reads. One pool shared across
     // all SSD-backed DBs keeps the total number of kernel polling threads
@@ -154,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let fm = Arc::new(FileManager::new(&db_data_dir)?);
             let idx = Arc::new(Index::new());
-            let wb = Arc::new(WriteBuffer::new(fm.file_count() as u32, config.wblocks_per_file));
+            let wb = Arc::new(WriteBuffer::new(0u32, 0usize));
 
             // Group-commit WAL shards for this DB. One shard per
             // reactor thread, so each reactor has its own fsync
@@ -212,22 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fm.create_file()?;
             }
 
-            // Start compaction thread for this DB
-            if !config.no_compaction {
-                let compaction_config = CompactionConfig {
-                    utilization_threshold: config.compaction_threshold,
-                    check_interval_secs: config.compaction_interval,
-                    ..Default::default()
-                };
-                let (_compactor, stop) = start_compaction_thread(
-                    compaction_config,
-                    Arc::clone(&idx),
-                    Arc::clone(&fm),
-                    Arc::clone(&wb),
-                    wblock_cache.as_ref().map(Arc::clone),
-                );
-                compaction_stops.push(stop);
-            }
+            // GC is handled by SegmentManager; no separate compaction thread.
 
             let mut handler_inner = Handler::new(
                 Arc::clone(&idx),
@@ -235,9 +221,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&wb),
             );
             handler_inner.set_eviction_config(eviction_policy, config.max_entries, config.max_data_mb);
-            if let Some(cache) = &wblock_cache {
-                handler_inner.set_wblock_cache(Arc::clone(cache));
-            }
             if let Some(reader) = &async_reader {
                 handler_inner.set_async_reader(Arc::clone(reader));
             }
@@ -285,6 +268,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let handler = Arc::new(handler_inner);
+
+            // Start GC thread for this SSD DB. Runs at throttled IOPS so
+            // background compaction never causes foreground latency spikes.
+            let _gc_handle = start_gc_thread(
+                Arc::clone(&idx),
+                Arc::clone(&fm),
+                GcConfig {
+                    check_interval_secs: 30,
+                    gc_threshold: config.compaction_threshold,
+                    max_writes_per_sec: 1000,
+                },
+            );
 
             // Start eviction thread for this SSD DB
             if config.eviction_policy != "noeviction"

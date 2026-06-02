@@ -693,17 +693,17 @@ mod tests {
     #[test]
     fn test_batch_index_lookup() {
         use crate::engine::index::Index;
-        use crate::storage::write_buffer::DiskLocation;
+        use crate::engine::index_entry::RecordLocation;
 
         let index = Index::new();
         let bloom = LockFreeBloomFilter::new(10000, 0.01);
 
         // Insert some keys
-        for i in 0..10 {
+        for i in 0..10u32 {
             let key = format!("key_{}", i);
             let key_bytes = key.as_bytes();
             let hash = xxhash_rust::xxh3::xxh3_64(key_bytes);
-            index.insert(key_bytes, DiskLocation::new(0, 0, i), i, 100);
+            index.insert(key_bytes, RecordLocation::ipage(0, i, 0), i, 100);
             bloom.add(hash);
         }
 

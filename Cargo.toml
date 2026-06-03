@@ -35,11 +35,6 @@ codegen-units = 1
 [dev-dependencies]
 tempfile = "3.10"
 criterion = "0.5"
-#
-#[[bench]]
-#name = "throughput"
-#harness = false
-#
-#[[bin]]
-#name = "redis_vs_aerospike"
-#path = "benchmark/redis_vs_aerospike.rs"
+[[bench]]
+name = "throughput"
+harness = false

@@ -18,6 +18,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
 use crate::engine::ipage::IPAGE_SIZE;
@@ -80,6 +81,7 @@ impl SegmentHeader {
 /// A segment file managing the B-Tree pages for one partition.
 pub struct SegmentFile {
     file: File,
+    fd: RawFd,
     pub header: SegmentHeader,
 }
 
@@ -87,11 +89,12 @@ impl SegmentFile {
     /// Open an existing segment file.
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let fd = file.as_raw_fd();
         let mut page = [0u8; IPAGE_SIZE];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut page)?;
         let header = SegmentHeader::read_from(&page)?;
-        Ok(SegmentFile { file, header })
+        Ok(SegmentFile { file, fd, header })
     }
 
     /// Create a new segment file for `partition_id`.
@@ -101,11 +104,12 @@ impl SegmentFile {
             .write(true)
             .create_new(true)
             .open(path)?;
+        let fd = file.as_raw_fd();
 
         let header = SegmentHeader {
             partition_id,
             root_page: 0,
-            next_free: 1, // page 0 is the header
+            next_free: 1,
             live_entries: 0,
             version: 1,
         };
@@ -113,10 +117,33 @@ impl SegmentFile {
         header.write_to(&mut page);
         file.write_all(&page)?;
         file.flush()?;
-        Ok(SegmentFile { file, header })
+        Ok(SegmentFile { file, fd, header })
     }
 
-    /// Read page `idx` into `buf`.
+    /// Read page `idx` into `buf` using `pread` — does not move the file
+    /// position, so it is safe to call concurrently while holding a shared
+    /// (`&self`) reference.
+    pub fn read_page_ro(&self, idx: u32, buf: &mut [u8; IPAGE_SIZE]) -> io::Result<()> {
+        let offset = (idx as i64) * (IPAGE_SIZE as i64);
+        let n = unsafe {
+            libc::pread(
+                self.fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                IPAGE_SIZE,
+                offset,
+            )
+        };
+        if n == IPAGE_SIZE as isize {
+            Ok(())
+        } else if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short pread"))
+        }
+    }
+
+    /// Read page `idx` into `buf` (requires mutable access for seek).
+    /// Prefer `read_page_ro` for concurrent read paths.
     pub fn read_page(&mut self, idx: u32, buf: &mut [u8; IPAGE_SIZE]) -> io::Result<()> {
         let offset = (idx as u64) * (IPAGE_SIZE as u64);
         self.file.seek(SeekFrom::Start(offset))?;
@@ -124,59 +151,34 @@ impl SegmentFile {
         Ok(())
     }
 
-    /// Read page `idx` via O_DIRECT (bypasses OS page cache).
-    ///
-    /// Uses an aligned heap buffer internally; copies into `buf` on success.
-    /// Falls back to normal `read_page` if the platform doesn't support O_DIRECT.
-    #[cfg(target_os = "linux")]
-    pub fn read_page_direct(&self, path: &Path, idx: u32, buf: &mut [u8; IPAGE_SIZE]) -> io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_DIRECT = 0o40000 on Linux
-        let f = OpenOptions::new().read(true).custom_flags(0o40000).open(path);
-        let f = match f {
-            Ok(f) => f,
-            Err(_) => return self.clone_read_page(idx, buf), // fallback
-        };
-        // Allocate a 4096-byte aligned buffer via heap (Vec guarantees >= pointer alignment)
-        let layout = std::alloc::Layout::from_size_align(IPAGE_SIZE, IPAGE_SIZE).unwrap();
-        let aligned = unsafe { std::alloc::alloc(layout) };
-        if aligned.is_null() {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "alloc failed"));
-        }
+    /// Write `buf` to page `idx` using `pwrite` — does not move the file
+    /// position.
+    pub fn write_page_pwrite(&self, idx: u32, buf: &[u8; IPAGE_SIZE]) -> io::Result<()> {
         let offset = (idx as i64) * (IPAGE_SIZE as i64);
-        let n = unsafe { libc::pread(std::os::unix::io::AsRawFd::as_raw_fd(&f), aligned as *mut libc::c_void, IPAGE_SIZE, offset) };
-        let result = if n == IPAGE_SIZE as isize {
-            unsafe { buf.as_mut_ptr().copy_from_nonoverlapping(aligned, IPAGE_SIZE) };
+        let n = unsafe {
+            libc::pwrite(
+                self.fd,
+                buf.as_ptr() as *const libc::c_void,
+                IPAGE_SIZE,
+                offset,
+            )
+        };
+        if n == IPAGE_SIZE as isize {
             Ok(())
         } else if n < 0 {
             Err(io::Error::last_os_error())
         } else {
-            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"))
-        };
-        unsafe { std::alloc::dealloc(aligned, layout) };
-        result
-    }
-
-    // Shared fallback when O_DIRECT isn't available.
-    fn clone_read_page(&self, idx: u32, buf: &mut [u8; IPAGE_SIZE]) -> io::Result<()> {
-        use std::os::unix::io::AsRawFd;
-        let offset = (idx as i64) * (IPAGE_SIZE as i64);
-        let n = unsafe { libc::pread(self.file.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, IPAGE_SIZE, offset) };
-        if n == IPAGE_SIZE as isize { Ok(()) }
-        else if n < 0 { Err(io::Error::last_os_error()) }
-        else { Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")) }
+            Err(io::Error::new(io::ErrorKind::WriteZero, "short pwrite"))
+        }
     }
 
     /// Write `buf` to page `idx`.
     pub fn write_page(&mut self, idx: u32, buf: &[u8; IPAGE_SIZE]) -> io::Result<()> {
-        let offset = (idx as u64) * (IPAGE_SIZE as u64);
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(buf)?;
-        Ok(())
+        self.write_page_pwrite(idx, buf)
     }
 
     /// Allocate a new page, returning its index. Updates the header in memory
-    /// but does NOT persist — call `flush_header()` when appropriate.
+    /// but does NOT persist — call `flush_header()` / `sync()` when appropriate.
     pub fn alloc_page(&mut self) -> u32 {
         let idx = self.header.next_free;
         self.header.next_free += 1;
@@ -184,21 +186,30 @@ impl SegmentFile {
     }
 
     /// Persist the in-memory header to page 0.
-    pub fn flush_header(&mut self) -> io::Result<()> {
+    pub fn flush_header(&self) -> io::Result<()> {
         let mut page = [0u8; IPAGE_SIZE];
         self.header.write_to(&mut page);
-        self.write_page(0, &page)
+        self.write_page_pwrite(0, &page)
     }
 
     /// Flush and fsync the segment file for durability.
-    pub fn sync(&mut self) -> io::Result<()> {
+    pub fn sync(&self) -> io::Result<()> {
         self.flush_header()?;
-        self.file.flush()?;
-        self.file.sync_data()
+        unsafe {
+            if libc::fdatasync(self.fd) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw fd (for callers that need it for diagnostics).
+    pub fn fd(&self) -> RawFd {
+        self.fd
     }
 }
 
-// ─── Little-endian helpers (duplicate here to avoid cross-module dep) ────────
+// ─── Little-endian helpers ────────────────────────────────────────────────────
 
 #[inline]
 fn read_u32(b: &[u8], off: usize) -> u32 {
@@ -234,7 +245,6 @@ mod tests {
             assert_eq!(seg.header.partition_id, 7);
             assert_eq!(seg.header.root_page, 0);
             assert_eq!(seg.header.next_free, 1);
-            // allocate some pages
             assert_eq!(seg.alloc_page(), 1);
             assert_eq!(seg.alloc_page(), 2);
             seg.sync().unwrap();
@@ -258,8 +268,36 @@ mod tests {
         seg.write_page(idx, &wb).unwrap();
 
         let mut rb = [0u8; IPAGE_SIZE];
-        seg.read_page(idx, &mut rb).unwrap();
+        seg.read_page_ro(idx, &mut rb).unwrap();
         assert_eq!(rb[0], 0xDE);
         assert_eq!(rb[4095], 0xAD);
+    }
+
+    #[test]
+    fn concurrent_reads_via_pread() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("conc.seg");
+        {
+            let mut seg = SegmentFile::create(&path, 42).unwrap();
+            let idx = seg.alloc_page();
+            let mut pg = [0u8; IPAGE_SIZE];
+            pg[0] = 0xFF;
+            seg.write_page(idx, &pg).unwrap();
+            seg.sync().unwrap();
+        }
+        let seg = Arc::new(SegmentFile::open(&path).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = Arc::clone(&seg);
+            handles.push(std::thread::spawn(move || {
+                let mut buf = [0u8; IPAGE_SIZE];
+                s.read_page_ro(1, &mut buf).unwrap();
+                assert_eq!(buf[0], 0xFF);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

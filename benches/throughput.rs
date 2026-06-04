@@ -1,18 +1,37 @@
 //! Criterion benchmarks for the SIndex KV engine.
 //!
-//! Measures single-key latency, sequential PUT/GET throughput, mixed workloads,
-//! variable value sizes, and multi-thread scaling.
+//! ## Benchmark categories
 //!
-//! Key count is capped at 1500 per engine to stay under the process fd limit
-//! (ulimit -n 4096) given the one-file-per-partition design (65536 partitions;
-//! 1500 keys → ~1480 unique segment files).
+//! **latency/** — per-operation µs showing B-Tree traversal + I/O cost
+//!   - `warm_get`  : read from OS page cache (DRAM-speed, hot-path)
+//!   - `cold_get`  : drop OS page cache before each op → true SSD read latency
+//!   - `put`       : value-log append + B-Tree insert + 2× fdatasync
+//!   - `delete`    : B-Tree remove + fdatasync
+//!
+//! **throughput/** — ops/s across warm (cached) and cold (disk) paths
+//!   - `get_warm_*`, `get_cold_*`, `mixed_*`, `put_seq_*`, `put_value_size_*`
+//!
+//! **concurrent/** — multi-thread scaling
+//!
+//! ## What "warm" vs "cold" means
+//! `warm` benchmarks read from the OS page cache (data already in DRAM after the
+//! first read). `cold` benchmarks call `drop_page_cache()` before each timed
+//! section, forcing every read to reach the SSD — this is the honest measure of
+//! SSD-based indexing performance.
+//!
+//! On bare-metal NVMe: cold ~50-150 µs/op. On this ext4/vda VM the number
+//! includes virtualisation overhead but still shows the storage round-trip.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
 use ssd_kv::engine::KvEngine;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-const MAX_KEYS: usize = 1_500; // keeps open files well under 4096
+/// Maximum unique keys. With 65536 partitions we open one fd per partition;
+/// keep well under the 4096 fd limit.
+const MAX_KEYS: usize = 1_200;
 
 fn make_engine() -> (TempDir, Arc<KvEngine>) {
     let dir = TempDir::new().unwrap();
@@ -28,79 +47,100 @@ fn val(i: usize) -> Vec<u8> {
     format!("v:{:020}", i).into_bytes()
 }
 
-fn populated(n: usize) -> (TempDir, Arc<KvEngine>) {
-    assert!(n <= MAX_KEYS, "n={n} would open too many segment files");
+/// Populate `n` keys, close the engine (clears in-process dirty cache),
+/// reopen so that subsequent reads must come from disk (or OS page cache).
+fn populated_cold(n: usize) -> (TempDir, Arc<KvEngine>) {
+    assert!(n <= MAX_KEYS);
     let (dir, engine) = make_engine();
     for i in 0..n {
         engine.put(&key(i), &val(i)).unwrap();
     }
+    engine.flush().unwrap();
+    drop(engine);
+    let engine = KvEngine::open(dir.path()).unwrap();
     (dir, engine)
 }
 
-// ─── Benchmarks ──────────────────────────────────────────────────────────────
+/// Drop the OS page cache so reads must go to storage.
+/// Requires Linux + CAP_SYS_ADMIN (we run as root in this environment).
+fn drop_page_cache() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/sys/vm/drop_caches")
+        {
+            let _ = f.write_all(b"3\n");
+        }
+    }
+}
 
-/// Single-operation latency: the paper's core claim is ≤ BTREE_MAX_HEIGHT
-/// SSD reads per GET, giving deterministic latency.
+// ─── latency ─────────────────────────────────────────────────────────────────
+
 fn bench_latency(c: &mut Criterion) {
-    let n = 1_000usize;
-    let (_dir, engine) = populated(n);
+    let n = 800usize;
+    let (_dir, engine) = populated_cold(n);
 
     let mut group = c.benchmark_group("latency");
-    group.bench_function("single_get", |b| {
+    // Fewer samples for cold measurements so drop_caches overhead is bounded.
+    group.sample_size(20);
+
+    // Warm GET: OS page cache (DRAM-speed). Realistic for a hot working set.
+    group.bench_function("warm_get", |b| {
         let mut i = 0usize;
         b.iter(|| {
             let _ = engine.get(black_box(&key(i % n))).unwrap();
             i += 1;
         });
     });
-    group.bench_function("single_put_update", |b| {
-        // Updates existing keys → no new partition files opened.
+
+    // Cold GET: drop OS page cache before each measurement → true SSD latency.
+    // This is the honest number for an "SSD-based index".
+    group.bench_function("cold_get", |b| {
         let mut i = 0usize;
+        b.iter_batched(
+            || drop_page_cache(),
+            |_| {
+                let r = engine.get(black_box(&key(i % n)));
+                i += 1;
+                r
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // PUT: value-log append + B-Tree insert + 2× fdatasync.
+    group.bench_function("put", |b| {
+        let mut i = n;
         b.iter(|| {
-            engine.put(black_box(&key(i % n)), black_box(&val(i))).unwrap();
+            engine
+                .put(black_box(&key(i % n)), black_box(&val(i)))
+                .unwrap();
             i += 1;
         });
     });
-    group.bench_function("single_delete", |b| {
-        let n2 = 500usize;
-        let (_d2, e2) = populated(n2);
+
+    // DELETE: B-Tree remove + fdatasync.
+    group.bench_function("delete", |b| {
+        let n2 = 400usize;
+        let (_d2, e2) = populated_cold(n2);
         let mut i = 0usize;
         b.iter(|| {
             let _ = e2.delete(black_box(&key(i % n2))).unwrap();
             i += 1;
         });
     });
+
     group.finish();
 }
 
-/// Sequential PUT throughput (steady-state, engine pre-warmed).
-/// Keys cycle over MAX_KEYS so we never open more segment files than exist.
-fn bench_put_seq(c: &mut Criterion) {
-    let mut group = c.benchmark_group("put_seq");
-    for &batch in &[10usize, 50, 200] {
-        group.throughput(Throughput::Elements(batch as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch| {
-            let n = MAX_KEYS;
-            let (_dir, engine) = populated(n);
-            let mut base = 0usize;
-            b.iter(|| {
-                for i in 0..batch {
-                    // Wrap within pre-existing keys: this measures PUT with a
-                    // mix of tree traversal + value log append + fsync.
-                    engine.put(black_box(&key((base + i) % n)), black_box(&val(i))).unwrap();
-                }
-                base += batch;
-            });
-        });
-    }
-    group.finish();
-}
+// ─── throughput (warm = OS page cache) ───────────────────────────────────────
 
-/// GET throughput — 100% hit rate.
-fn bench_get_hit(c: &mut Criterion) {
-    let mut group = c.benchmark_group("get_hit");
+fn bench_get_warm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get_warm");
     for &n in &[100usize, 500, 1_000] {
-        let (_dir, engine) = populated(n);
+        let (_dir, engine) = populated_cold(n);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
@@ -113,11 +153,59 @@ fn bench_get_hit(c: &mut Criterion) {
     group.finish();
 }
 
-/// GET throughput — 0% hit rate (all misses).
+// ─── throughput (cold = drop page cache before each batch) ───────────────────
+
+fn bench_get_cold(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get_cold");
+    // Reduce sample count: each setup call drops all page caches (~1 ms).
+    group.sample_size(15);
+    for &n in &[100usize, 500, 1_000] {
+        let (_dir, engine) = populated_cold(n);
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_batched(
+                || drop_page_cache(),
+                |_| {
+                    for i in 0..n {
+                        let _ = engine.get(black_box(&key(i))).unwrap();
+                    }
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+// ─── put throughput ──────────────────────────────────────────────────────────
+
+fn bench_put_seq(c: &mut Criterion) {
+    let mut group = c.benchmark_group("put_seq");
+    for &batch in &[10usize, 50, 200] {
+        group.throughput(Throughput::Elements(batch as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch| {
+            let n = MAX_KEYS;
+            let (_dir, engine) = populated_cold(n);
+            let mut base = 0usize;
+            b.iter(|| {
+                for i in 0..batch {
+                    engine
+                        .put(black_box(&key((base + i) % n)), black_box(&val(i)))
+                        .unwrap();
+                }
+                base += batch;
+            });
+        });
+    }
+    group.finish();
+}
+
+// ─── miss benchmark ──────────────────────────────────────────────────────────
+
 fn bench_get_miss(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_miss");
     for &n in &[200usize, 1_000] {
-        let (_dir, engine) = populated(n);
+        let (_dir, engine) = populated_cold(n);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
@@ -130,17 +218,20 @@ fn bench_get_miss(c: &mut Criterion) {
     group.finish();
 }
 
-/// Mixed 80% read / 20% write.
-fn bench_mixed(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mixed_80r_20w");
-    for &n in &[200usize, 1_000] {
-        let (_dir, engine) = populated(n);
+// ─── mixed workload ──────────────────────────────────────────────────────────
+
+fn bench_mixed_warm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mixed_80r_20w_warm");
+    for &n in &[200usize, 800] {
+        let (_dir, engine) = populated_cold(n);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
                 for i in 0..n {
                     if i % 5 == 0 {
-                        engine.put(black_box(&key(i)), black_box(&val(i + 1))).unwrap();
+                        engine
+                            .put(black_box(&key(i % n)), black_box(&val(i + 1)))
+                            .unwrap();
                     } else {
                         let _ = engine.get(black_box(&key(i))).unwrap();
                     }
@@ -151,7 +242,35 @@ fn bench_mixed(c: &mut Criterion) {
     group.finish();
 }
 
-/// PUT latency vs value byte size — shows value-log append cost.
+fn bench_mixed_cold(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mixed_80r_20w_cold");
+    group.sample_size(15);
+    for &n in &[200usize, 800] {
+        let (_dir, engine) = populated_cold(n);
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_batched(
+                || drop_page_cache(),
+                |_| {
+                    for i in 0..n {
+                        if i % 5 == 0 {
+                            engine
+                                .put(black_box(&key(i % n)), black_box(&val(i + 1)))
+                                .unwrap();
+                        } else {
+                            let _ = engine.get(black_box(&key(i))).unwrap();
+                        }
+                    }
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+// ─── value size sweep ────────────────────────────────────────────────────────
+
 fn bench_value_size(c: &mut Criterion) {
     let sizes: &[usize] = &[16, 256, 4_096, 65_536];
     let mut group = c.benchmark_group("put_value_size");
@@ -159,12 +278,13 @@ fn bench_value_size(c: &mut Criterion) {
         let v = vec![0x42u8; sz];
         group.throughput(Throughput::Bytes(sz as u64));
         group.bench_with_input(BenchmarkId::from_parameter(sz), &sz, |b, _| {
-            // Pre-warm 200 keys; cycle puts over them so no new files open.
             let n = 200usize;
-            let (_dir, engine) = populated(n);
+            let (_dir, engine) = populated_cold(n);
             let mut i = 0usize;
             b.iter(|| {
-                engine.put(black_box(&key(i % n)), black_box(&v)).unwrap();
+                engine
+                    .put(black_box(&key(i % n)), black_box(&v))
+                    .unwrap();
                 i += 1;
             });
         });
@@ -172,15 +292,15 @@ fn bench_value_size(c: &mut Criterion) {
     group.finish();
 }
 
-/// Multi-thread PUT+GET. Each thread gets its own key shard so no partition
-/// is shared between threads; shows DashMap + per-partition RwLock scaling.
+// ─── concurrent ──────────────────────────────────────────────────────────────
+
 fn bench_concurrent(c: &mut Criterion) {
-    let keys_per_thread = 100usize; // 4 threads × 100 = 400 unique keys → safe
+    let keys_per_thread = 80usize;
     let mut group = c.benchmark_group("concurrent_put_get");
 
     for &threads in &[1usize, 2, 4] {
         let n = threads * keys_per_thread;
-        let (_dir, engine) = populated(n);
+        let (_dir, engine) = populated_cold(n);
         let engine = Arc::clone(&engine);
 
         group.throughput(Throughput::Elements(n as u64));
@@ -215,10 +335,12 @@ fn bench_concurrent(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_latency,
+    bench_get_warm,
+    bench_get_cold,
     bench_put_seq,
-    bench_get_hit,
     bench_get_miss,
-    bench_mixed,
+    bench_mixed_warm,
+    bench_mixed_cold,
     bench_value_size,
     bench_concurrent,
 );

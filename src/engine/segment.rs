@@ -124,6 +124,49 @@ impl SegmentFile {
         Ok(())
     }
 
+    /// Read page `idx` via O_DIRECT (bypasses OS page cache).
+    ///
+    /// Uses an aligned heap buffer internally; copies into `buf` on success.
+    /// Falls back to normal `read_page` if the platform doesn't support O_DIRECT.
+    #[cfg(target_os = "linux")]
+    pub fn read_page_direct(&self, path: &Path, idx: u32, buf: &mut [u8; IPAGE_SIZE]) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_DIRECT = 0o40000 on Linux
+        let f = OpenOptions::new().read(true).custom_flags(0o40000).open(path);
+        let f = match f {
+            Ok(f) => f,
+            Err(_) => return self.clone_read_page(idx, buf), // fallback
+        };
+        // Allocate a 4096-byte aligned buffer via heap (Vec guarantees >= pointer alignment)
+        let layout = std::alloc::Layout::from_size_align(IPAGE_SIZE, IPAGE_SIZE).unwrap();
+        let aligned = unsafe { std::alloc::alloc(layout) };
+        if aligned.is_null() {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "alloc failed"));
+        }
+        let offset = (idx as i64) * (IPAGE_SIZE as i64);
+        let n = unsafe { libc::pread(std::os::unix::io::AsRawFd::as_raw_fd(&f), aligned as *mut libc::c_void, IPAGE_SIZE, offset) };
+        let result = if n == IPAGE_SIZE as isize {
+            unsafe { buf.as_mut_ptr().copy_from_nonoverlapping(aligned, IPAGE_SIZE) };
+            Ok(())
+        } else if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"))
+        };
+        unsafe { std::alloc::dealloc(aligned, layout) };
+        result
+    }
+
+    // Shared fallback when O_DIRECT isn't available.
+    fn clone_read_page(&self, idx: u32, buf: &mut [u8; IPAGE_SIZE]) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let offset = (idx as i64) * (IPAGE_SIZE as i64);
+        let n = unsafe { libc::pread(self.file.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, IPAGE_SIZE, offset) };
+        if n == IPAGE_SIZE as isize { Ok(()) }
+        else if n < 0 { Err(io::Error::last_os_error()) }
+        else { Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")) }
+    }
+
     /// Write `buf` to page `idx`.
     pub fn write_page(&mut self, idx: u32, buf: &[u8; IPAGE_SIZE]) -> io::Result<()> {
         let offset = (idx as u64) * (IPAGE_SIZE as u64);

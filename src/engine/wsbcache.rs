@@ -139,8 +139,13 @@ impl WsbCache {
                 if cp.acc_count == 0 {
                     let cp = inner.pages.remove(&key).unwrap();
                     inner.clock_order.swap_remove(pos);
-                    if inner.clock_pos > 0 {
-                        inner.clock_pos = inner.clock_pos.saturating_sub(1);
+                    // swap_remove moves the last element to `pos`.
+                    // If clock_pos is past the new end, clamp it; otherwise
+                    // leave it unchanged — elements before clock_pos are
+                    // unaffected by a swap at an index >= clock_pos.
+                    let new_len = inner.clock_order.len();
+                    if inner.clock_pos >= new_len && new_len > 0 {
+                        inner.clock_pos = new_len - 1;
                     }
                     return Some((key, cp.data, cp.dirty));
                 }

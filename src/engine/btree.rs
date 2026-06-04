@@ -20,10 +20,10 @@ use std::collections::HashMap;
 use std::io;
 
 use crate::engine::ipage::{
-    init_internal, init_leaf, internal_child, internal_count, internal_find_child,
+    init_internal, init_leaf, internal_child, internal_count, internal_find_child, internal_set_child,
     internal_height, internal_insert, internal_key, internal_split, leaf_count, leaf_entry_at,
     leaf_insert, leaf_lower_bound, leaf_next, leaf_remove, leaf_set_next, leaf_split,
-    leaf_write_entry, page_node_type, write_u32, LeafEntry, IPAGE_SIZE, NODE_INTERNAL, NODE_LEAF,
+    leaf_write_entry, page_node_type, LeafEntry, IPAGE_SIZE, NODE_INTERNAL, NODE_LEAF,
 };
 use crate::engine::segment::SegmentFile;
 
@@ -174,11 +174,7 @@ impl BTree {
                 let mut new_root = [0u8; IPAGE_SIZE];
                 init_internal(&mut new_root, height);
                 // children[0] = old root, children[1] = right_child
-                write_u32(
-                    &mut new_root,
-                    2056, // INT_CHILDREN_START + 0*4
-                    root,
-                );
+                internal_set_child(&mut new_root, 0, root);
                 internal_insert(&mut new_root, 0, sep_key, right_child);
                 self.mark_dirty(new_root_idx, new_root);
                 seg.header.root_page = new_root_idx;
@@ -402,8 +398,8 @@ impl BTree {
             if page_node_type(&page) == NODE_LEAF {
                 break;
             }
-            // Go to leftmost child (children[0] at INT_CHILDREN_START offset)
-            cur_idx = crate::engine::ipage::read_u32(&page, 2056);
+            // Go to leftmost child (children[0]).
+            cur_idx = internal_child(&page, 0);
         }
 
         // Follow leaf chain

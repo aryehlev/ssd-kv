@@ -201,6 +201,19 @@ impl ValueLog {
     pub fn size(&self) -> u64 {
         self.inner.lock().unwrap().write_pos
     }
+
+    /// Truncate the value log to empty, resetting the write position.
+    /// The caller must have already cleared the B-Tree index so no
+    /// dangling value_ptr references remain.
+    pub fn truncate(&self) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.write_file.flush()?;
+        inner.write_file.get_ref().set_len(0)?;
+        inner.write_file.seek(SeekFrom::Start(0))?;
+        inner.read_file.seek(SeekFrom::Start(0))?;
+        inner.write_pos = 0;
+        Ok(())
+    }
 }
 
 // ─── Little-endian helpers ───────────────────────────────────────────────────

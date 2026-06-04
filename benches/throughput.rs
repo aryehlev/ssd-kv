@@ -63,16 +63,23 @@ fn populated_cold(n: usize) -> (TempDir, Arc<KvEngine>) {
 
 /// Drop the OS page cache so reads must go to storage.
 /// Requires Linux + CAP_SYS_ADMIN (we run as root in this environment).
-fn drop_page_cache() {
+/// Returns an error if the write fails so callers can fail fast.
+fn drop_page_cache() -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .open("/proc/sys/vm/drop_caches")
-        {
-            let _ = f.write_all(b"3\n");
-        }
+            .open("/proc/sys/vm/drop_caches")?;
+        f.write_all(b"3\n")?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "cold benchmarks require Linux",
+        ))
     }
 }
 
@@ -100,11 +107,10 @@ fn bench_latency(c: &mut Criterion) {
     group.bench_function("cold_get", |b| {
         let mut i = 0usize;
         b.iter_batched(
-            || drop_page_cache(),
+            || drop_page_cache().expect("failed to drop page cache; cold benchmark invalid"),
             |_| {
-                let r = engine.get(black_box(&key(i % n)));
+                let _ = engine.get(black_box(&key(i % n))).unwrap();
                 i += 1;
-                r
             },
             BatchSize::PerIteration,
         );
@@ -122,11 +128,13 @@ fn bench_latency(c: &mut Criterion) {
     });
 
     // DELETE: B-Tree remove + fdatasync.
+    // Re-insert before each delete so every measured operation hits an existing key.
     group.bench_function("delete", |b| {
         let n2 = 400usize;
         let (_d2, e2) = populated_cold(n2);
         let mut i = 0usize;
         b.iter(|| {
+            e2.put(black_box(&key(i % n2)), black_box(&val(i))).unwrap();
             let _ = e2.delete(black_box(&key(i % n2))).unwrap();
             i += 1;
         });
@@ -164,7 +172,7 @@ fn bench_get_cold(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
-                || drop_page_cache(),
+                || drop_page_cache().expect("failed to drop page cache; cold benchmark invalid"),
                 |_| {
                     for i in 0..n {
                         let _ = engine.get(black_box(&key(i))).unwrap();
@@ -250,7 +258,7 @@ fn bench_mixed_cold(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
-                || drop_page_cache(),
+                || drop_page_cache().expect("failed to drop page cache; cold benchmark invalid"),
                 |_| {
                     for i in 0..n {
                         if i % 5 == 0 {

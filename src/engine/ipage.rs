@@ -296,7 +296,7 @@ fn internal_set_key(page: &mut [u8], i: usize, k: u64) {
 }
 
 #[inline]
-fn internal_set_child(page: &mut [u8], i: usize, c: u32) {
+pub fn internal_set_child(page: &mut [u8], i: usize, c: u32) {
     write_u32(page, INT_CHILDREN_START + i * 4, c);
 }
 

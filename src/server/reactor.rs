@@ -191,7 +191,7 @@ pub fn start_reactor_multi(
             let t = tuning;
             std::thread::spawn(move || {
                 let reactor = ReactorServer::new_with_reactor_id(a, dm, t, i);
-                if let Err(e) = reactor.run_with_reuseport(i > 0) {
+                if let Err(e) = reactor.run_with_reuseport(true) {
                     error!("reactor {} error: {}", i, e);
                 }
             })

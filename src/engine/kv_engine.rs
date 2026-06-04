@@ -38,7 +38,6 @@ use crate::engine::btree::BTree;
 use crate::engine::ipage::{FLAG_ALIVE, FLAG_DELETED};
 use crate::engine::segment::SegmentFile;
 use crate::engine::value_log::ValueLog;
-use crate::engine::wsbcache::WsbCache;
 
 /// Number of top-bits used to derive the partition ID.
 /// 16 bits → 65 536 partitions. Keeps the segment-table size tiny
@@ -74,8 +73,6 @@ pub struct KvEngine {
     partitions: DashMap<u32, Arc<RwLock<Partition>>>,
     /// Shared value log for all partitions.
     value_log: Arc<ValueLog>,
-    /// Write-staging buffer cache (WSBCache).
-    wsbcache: Arc<WsbCache>,
 }
 
 impl KvEngine {
@@ -86,13 +83,11 @@ impl KvEngine {
         std::fs::create_dir_all(&seg_dir)?;
 
         let value_log = ValueLog::open(&data_dir.join("value.log"))?;
-        let wsbcache = WsbCache::new(4096); // 4096 pages ≈ 16 MB
 
         let engine = Arc::new(KvEngine {
             data_dir: data_dir.to_path_buf(),
             partitions: DashMap::new(),
             value_log,
-            wsbcache,
         });
 
         // Pre-open any existing segment files (so we don't lose data on restart)
@@ -308,41 +303,35 @@ impl KvEngine {
         // and paginate. This can be optimized with a proper cursor later.
         let all_keys = self.scan_keys()?;
 
-        let start = cursor as usize;
-        let end = (start + count).min(all_keys.len());
-        let chunk: Vec<Vec<u8>> = all_keys[start..end]
+        // Filter first, then paginate — slicing before filtering would skip
+        // matched keys and under-fill pages when a pattern is active.
+        let filtered: Vec<&Vec<u8>> = all_keys
             .iter()
-            .filter(|k| {
-                if let Some(pat) = pattern {
-                    glob_match(pat, k)
-                } else {
-                    true
-                }
-            })
-            .cloned()
+            .filter(|k| pattern.map_or(true, |pat| glob_match(pat, k)))
             .collect();
 
-        let next_cursor = if end >= all_keys.len() { 0 } else { end as u64 };
+        let start = cursor as usize;
+        let end = (start + count).min(filtered.len());
+        let chunk: Vec<Vec<u8>> = filtered[start..end].iter().map(|k| (*k).clone()).collect();
+
+        let next_cursor = if end >= filtered.len() { 0 } else { end as u64 };
         Ok((next_cursor, chunk))
     }
 
     /// Remove all entries (FLUSHDB equivalent).
     pub fn clear(&self) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
+        // Clear the index first so no dangling value_ptr references remain.
         self.partitions.clear();
-        // Remove segment files
+        // Remove segment files.
         let seg_dir = data_dir.join("segments");
         if seg_dir.exists() {
             for entry in std::fs::read_dir(&seg_dir)?.flatten() {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-        // Truncate value log
-        let vlog_path = data_dir.join("value.log");
-        let _ = std::fs::remove_file(&vlog_path);
-        // Reinitialize value log
-        // (this is safe because we cleared the index above)
-        Ok(())
+        // Truncate the value log in-place so self.value_log remains valid.
+        self.value_log.truncate()
     }
 }
 

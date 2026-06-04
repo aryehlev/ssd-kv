@@ -1,27 +1,33 @@
 //! Append-only value log — stores variable-size (key, value) pairs.
 //!
-//! The value log is an extension of the SIndex paper design to support
-//! variable-length values (the original paper targets fixed-size block
-//! storage mappings). Each leaf B-Tree entry stores only a `value_ptr`
-//! (byte offset into this file) plus `key_len` and `value_len`; the
-//! actual bytes live here.
+//! ## Concurrency model
+//! Writes are serialized through `Mutex<WriteInner>`. Reads use `pread` on a
+//! stable file descriptor and do NOT hold the write mutex, so concurrent
+//! readers never block writers and concurrent writers never block readers.
+//!
+//! ## Durability
+//! `append()` writes into a `BufWriter` without syncing. Call
+//! `flush_and_sync()` (or use `GroupCommit`) to make data durable. This
+//! enables group-commit batching: N concurrent writers pay for one `fdatasync`
+//! instead of N.
 //!
 //! ## Entry format
 //! ```text
-//! [0..4]  magic      u32 = VLOG_MAGIC
-//! [4..6]  key_len    u16
-//! [6..10] value_len  u32
-//! [10]    flags      u8   (FLAG_ALIVE | FLAG_DELETED)
-//! [11]    _pad       u8
-//! [12..16] checksum  u32  (crc32 over [key][value])
-//! [16..]  key        [u8; key_len]
+//! [0..4]   magic      u32 = VLOG_MAGIC
+//! [4..6]   key_len    u16
+//! [6..10]  value_len  u32
+//! [10]     flags      u8   (VFLAG_ALIVE | VFLAG_DELETED)
+//! [11]     _pad       u8
+//! [12..16] checksum   u32  (crc32 over [key][value])
+//! [16..]   key        [u8; key_len]
 //! [16+key_len..] value [u8; value_len]
 //! ```
-//! Entries are NOT padded — they are read by absolute offset + lengths.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
@@ -30,41 +36,60 @@ pub const VLOG_HEADER_SIZE: usize = 16;
 pub const VFLAG_ALIVE: u8 = 1;
 pub const VFLAG_DELETED: u8 = 2;
 
-/// Thread-safe append-only value log.
-pub struct ValueLog {
-    inner: Mutex<ValueLogInner>,
+/// Threshold at which compaction is suggested: dead / total > 50%.
+const COMPACTION_DEAD_RATIO: f64 = 0.5;
+
+struct WriteInner {
+    file: BufWriter<File>,
+    write_pos: u64,
+    /// Kept alive so that `read_fd` remains valid.
+    _read_file: File,
 }
 
-struct ValueLogInner {
-    write_file: BufWriter<File>,
-    read_file: File,
-    /// Current write position (= end of the log).
-    write_pos: u64,
+/// Thread-safe append-only value log with lock-free reads.
+pub struct ValueLog {
+    inner: Mutex<WriteInner>,
+    /// Stable fd used by all readers via `pread` — never closed while `self`
+    /// is alive because `_read_file` inside the mutex owns it.
+    read_fd: RawFd,
+    /// Total bytes ever appended (monotonically increasing).
+    total_bytes: AtomicU64,
+    /// Bytes from overwritten or deleted entries (dead space).
+    dead_bytes: AtomicU64,
+    /// Highest write position that has been durably persisted via fdatasync.
+    /// Updated by `flush_and_sync()`. Used by `GroupCommit` to avoid
+    /// redundant fsyncs when multiple writers share one flush.
+    fsynced_through: AtomicU64,
 }
 
 impl ValueLog {
-    /// Open an existing value log (or create one if the file does not exist).
+    /// Open (or create) the value log at `path`.
     pub fn open(path: &Path) -> io::Result<Arc<Self>> {
         let write_f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
+            .read(true).write(true).create(true)
             .open(path)?;
         let read_f = OpenOptions::new().read(true).open(path)?;
         let write_pos = write_f.metadata()?.len();
+        let read_fd = read_f.as_raw_fd();
+
         Ok(Arc::new(ValueLog {
-            inner: Mutex::new(ValueLogInner {
-                write_file: BufWriter::new(write_f),
-                read_file: read_f,
+            inner: Mutex::new(WriteInner {
+                file: BufWriter::new(write_f),
                 write_pos,
+                _read_file: read_f,
             }),
+            read_fd,
+            total_bytes: AtomicU64::new(write_pos),
+            dead_bytes: AtomicU64::new(0),
+            // Existing file data is already durable from a prior run.
+            fsynced_through: AtomicU64::new(write_pos),
         }))
     }
 
-    /// Append `(key, value)` and return the byte offset where the entry starts.
-    ///
-    /// The returned offset is stored in the B-Tree leaf entry so that the
-    /// value can be retrieved later via `read()`.
+    // ─── Write path ───────────────────────────────────────────────────────────
+
+    /// Append `(key, value)` to the log and return the byte offset of the new
+    /// entry.  Does NOT fsync — call `flush_and_sync()` for durability.
     pub fn append(&self, key: &[u8], value: &[u8]) -> io::Result<u64> {
         assert!(key.len() <= u16::MAX as usize, "key too long");
         assert!(value.len() <= u32::MAX as usize, "value too long");
@@ -87,146 +112,147 @@ impl ValueLog {
         hdr[11] = 0;
         write_u32(&mut hdr, 12, crc);
 
-        inner.write_file.write_all(&hdr)?;
-        inner.write_file.write_all(key)?;
-        inner.write_file.write_all(value)?;
-        inner.write_file.flush()?;
+        inner.file.write_all(&hdr)?;
+        inner.file.write_all(key)?;
+        inner.file.write_all(value)?;
+        // No sync — caller uses flush_and_sync() / GroupCommit.
 
-        inner.write_pos += (VLOG_HEADER_SIZE + key.len() + value.len()) as u64;
+        let entry_size = (VLOG_HEADER_SIZE + key.len() + value.len()) as u64;
+        inner.write_pos += entry_size;
+        self.total_bytes.fetch_add(entry_size, Ordering::Relaxed);
+
         Ok(offset)
     }
 
-    /// Read the key and value stored at `offset`.
+    /// Flush the write buffer to the kernel and call `fdatasync`.
     ///
-    /// `key_len` and `value_len` come from the B-Tree leaf entry and serve
-    /// as a fast path; the header is still read and validated for safety.
-    pub fn read(
-        &self,
-        offset: u64,
-        key_len: u16,
-        value_len: u32,
-    ) -> io::Result<(Vec<u8>, Vec<u8>)> {
-        let mut inner = self.inner.lock().unwrap();
-
-        inner.read_file.seek(SeekFrom::Start(offset))?;
-
-        let mut hdr = [0u8; VLOG_HEADER_SIZE];
-        inner.read_file.read_exact(&mut hdr)?;
-
-        let magic = read_u32(&hdr, 0);
-        if magic != VLOG_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad value log magic at offset {}: 0x{:08x}", offset, magic),
-            ));
-        }
-
-        let stored_key_len = read_u16(&hdr, 4);
-        let stored_val_len = read_u32(&hdr, 6);
-        let flags = hdr[10];
-        let stored_crc = read_u32(&hdr, 12);
-
-        // Use lengths from the header; caller's hints are sanity-checked.
-        if stored_key_len != key_len || stored_val_len != value_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "value log length mismatch at {}: expected key={} val={}, got key={} val={}",
-                    offset, key_len, value_len, stored_key_len, stored_val_len
-                ),
-            ));
-        }
-
-        if flags == VFLAG_DELETED {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "value log entry is deleted",
-            ));
-        }
-
-        let mut key_buf = vec![0u8; key_len as usize];
-        let mut val_buf = vec![0u8; value_len as usize];
-        inner.read_file.read_exact(&mut key_buf)?;
-        inner.read_file.read_exact(&mut val_buf)?;
-
-        // Verify checksum
-        let actual_crc = {
-            let mut h = crc32fast::Hasher::new();
-            h.update(&key_buf);
-            h.update(&val_buf);
-            h.finalize()
+    /// Releases the inner lock *before* calling `fdatasync` so that concurrent
+    /// `append()` calls are not blocked for the full duration of the sync.
+    /// After `fdatasync` returns, `fsynced_through` is updated to the captured
+    /// write position, which `GroupCommit` uses to skip redundant fsyncs.
+    pub fn flush_and_sync(&self) -> io::Result<()> {
+        let (fd, captured_pos) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.file.flush()?;
+            let pos = inner.write_pos;
+            let fd = inner.file.get_ref().as_raw_fd();
+            (fd, pos)
+            // inner lock released here
         };
-        if actual_crc != stored_crc {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "value log checksum mismatch",
-            ));
+        unsafe {
+            if libc::fdatasync(fd) != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
-
-        Ok((key_buf, val_buf))
+        // Use Release so that readers of fsynced_through (using Acquire) see
+        // all the data that was written before this store.
+        self.fsynced_through.fetch_max(captured_pos, Ordering::Release);
+        Ok(())
     }
 
-    /// Read only the value (not the key) stored at `offset`.
+    /// The highest write position that has been durably persisted on disk.
+    /// Used by `GroupCommit` to avoid redundant fsyncs.
+    #[inline]
+    pub fn fsynced_through(&self) -> u64 {
+        self.fsynced_through.load(Ordering::Acquire)
+    }
+
+    /// Current dead-byte count (for compaction decisions).
+    #[inline]
+    pub fn dead_bytes_count(&self) -> u64 {
+        self.dead_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Account for `bytes` of dead space (overwritten / deleted entry).
+    pub fn mark_dead(&self, key_len: u16, value_len: u32) {
+        let dead = (VLOG_HEADER_SIZE as u64) + key_len as u64 + value_len as u64;
+        self.dead_bytes.fetch_add(dead, Ordering::Relaxed);
+    }
+
+    // ─── Read path (lock-free via pread) ─────────────────────────────────────
+
+    /// Read the value stored at `offset` without holding the write lock.
     pub fn read_value(&self, offset: u64, key_len: u16, value_len: u32) -> io::Result<Vec<u8>> {
-        let mut inner = self.inner.lock().unwrap();
-
-        inner
-            .read_file
-            .seek(SeekFrom::Start(offset + VLOG_HEADER_SIZE as u64 + key_len as u64))?;
-        let mut val_buf = vec![0u8; value_len as usize];
-        inner.read_file.read_exact(&mut val_buf)?;
-        Ok(val_buf)
+        let pos = (offset + VLOG_HEADER_SIZE as u64 + key_len as u64) as i64;
+        let mut buf = vec![0u8; value_len as usize];
+        pread_exact(self.read_fd, &mut buf, pos)?;
+        Ok(buf)
     }
 
-    /// Read only the key stored at `offset` (for collision detection).
+    /// Read only the key stored at `offset` (for hash-collision detection).
     pub fn read_key(&self, offset: u64, key_len: u16) -> io::Result<Vec<u8>> {
-        let mut inner = self.inner.lock().unwrap();
-
-        inner
-            .read_file
-            .seek(SeekFrom::Start(offset + VLOG_HEADER_SIZE as u64))?;
-        let mut key_buf = vec![0u8; key_len as usize];
-        inner.read_file.read_exact(&mut key_buf)?;
-        Ok(key_buf)
+        let pos = (offset + VLOG_HEADER_SIZE as u64) as i64;
+        let mut buf = vec![0u8; key_len as usize];
+        pread_exact(self.read_fd, &mut buf, pos)?;
+        Ok(buf)
     }
 
-    /// Flush buffered writes to the OS.
-    pub fn flush(&self) -> io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.write_file.flush()?;
-        inner.write_file.get_ref().sync_data()
+    /// Read the key and value stored at `offset`.
+    pub fn read(&self, offset: u64, key_len: u16, value_len: u32) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let pos = (offset + VLOG_HEADER_SIZE as u64) as i64;
+        let total = key_len as usize + value_len as usize;
+        let mut buf = vec![0u8; total];
+        pread_exact(self.read_fd, &mut buf, pos)?;
+        let (k, v) = buf.split_at(key_len as usize);
+        Ok((k.to_vec(), v.to_vec()))
     }
 
-    /// Current end-of-log position.
+    // ─── Compaction support ───────────────────────────────────────────────────
+
+    /// Return true when dead space exceeds the compaction threshold.
+    pub fn compaction_needed(&self) -> bool {
+        let dead = self.dead_bytes.load(Ordering::Relaxed);
+        let total = self.total_bytes.load(Ordering::Relaxed);
+        total > 0 && (dead as f64 / total as f64) > COMPACTION_DEAD_RATIO
+    }
+
+    /// Current write position (= total bytes written including header).
     pub fn size(&self) -> u64 {
         self.inner.lock().unwrap().write_pos
     }
 
-    /// Truncate the value log to empty, resetting the write position.
-    /// The caller must have already cleared the B-Tree index so no
-    /// dangling value_ptr references remain.
+    /// Reset dead-byte counter after a successful compaction.
+    pub fn reset_dead_bytes(&self) {
+        self.dead_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Flush and truncate to zero (FLUSHDB / FLUSHALL).  The caller must have
+    /// already cleared all B-Tree references so no dangling `value_ptr`s remain.
     pub fn truncate(&self) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner.write_file.flush()?;
-        inner.write_file.get_ref().set_len(0)?;
-        inner.write_file.seek(SeekFrom::Start(0))?;
-        inner.read_file.seek(SeekFrom::Start(0))?;
+        inner.file.flush()?;
+        inner.file.get_ref().set_len(0)?;
+        // Re-seek the write file to position 0
+        use std::io::Seek;
+        inner.file.seek(std::io::SeekFrom::Start(0))?;
         inner.write_pos = 0;
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.dead_bytes.store(0, Ordering::Relaxed);
+        self.fsynced_through.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub fn flush(&self) -> io::Result<()> {
+        self.flush_and_sync()
     }
 }
 
-// ─── Little-endian helpers ───────────────────────────────────────────────────
+// ─── pread helper ─────────────────────────────────────────────────────────────
 
-#[inline]
-fn read_u16(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
+fn pread_exact(fd: RawFd, buf: &mut [u8], offset: i64) -> io::Result<()> {
+    let n = unsafe {
+        libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), offset)
+    };
+    if n == buf.len() as isize {
+        Ok(())
+    } else if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short pread on value log"))
+    }
 }
 
-#[inline]
-fn read_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
-}
+// ─── Little-endian helpers ────────────────────────────────────────────────────
 
 #[inline]
 fn write_u16(b: &mut [u8], off: usize, v: u16) {
@@ -247,45 +273,64 @@ mod tests {
     fn append_and_read() {
         let dir = tempdir().unwrap();
         let vlog = ValueLog::open(&dir.path().join("v.log")).unwrap();
-
         let offset = vlog.append(b"hello", b"world").unwrap();
+        vlog.flush_and_sync().unwrap();
         let (k, v) = vlog.read(offset, 5, 5).unwrap();
         assert_eq!(k, b"hello");
         assert_eq!(v, b"world");
     }
 
     #[test]
-    fn multiple_entries() {
+    fn concurrent_reads() {
+        use std::sync::Arc;
         let dir = tempdir().unwrap();
         let vlog = ValueLog::open(&dir.path().join("v.log")).unwrap();
-
         let mut offsets = Vec::new();
-        for i in 0u64..100 {
-            let key = format!("key_{}", i);
-            let val = format!("val_{}_longer", i);
-            offsets.push((
-                vlog.append(key.as_bytes(), val.as_bytes()).unwrap(),
-                key.len() as u16,
-                val.len() as u32,
-                val,
-            ));
+        for i in 0u32..100 {
+            let key = format!("key{}", i);
+            let val = format!("val{}", i);
+            let off = vlog.append(key.as_bytes(), val.as_bytes()).unwrap();
+            offsets.push((off, key.len() as u16, val.len() as u32, val));
         }
+        vlog.flush_and_sync().unwrap();
 
-        for (offset, kl, vl, expected_val) in offsets {
-            let v = vlog.read_value(offset, kl, vl).unwrap();
-            assert_eq!(v, expected_val.as_bytes());
+        let vlog = Arc::new(vlog);
+        let offsets = Arc::new(offsets);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let vl = Arc::clone(&vlog);
+            let offs = Arc::clone(&offsets);
+            handles.push(std::thread::spawn(move || {
+                for (off, kl, vl_len, expected) in offs.iter() {
+                    let v = vl.read_value(*off, *kl, *vl_len).unwrap();
+                    assert_eq!(v, expected.as_bytes());
+                }
+            }));
         }
+        for h in handles { h.join().unwrap(); }
     }
 
     #[test]
     fn large_value() {
         let dir = tempdir().unwrap();
         let vlog = ValueLog::open(&dir.path().join("v.log")).unwrap();
-
         let key = b"bigkey";
-        let value = vec![0xABu8; 1024 * 1024]; // 1 MB value
+        let value = vec![0xABu8; 1024 * 1024]; // 1 MB
         let offset = vlog.append(key, &value).unwrap();
+        vlog.flush_and_sync().unwrap();
         let v = vlog.read_value(offset, key.len() as u16, value.len() as u32).unwrap();
         assert_eq!(v, value);
+    }
+
+    #[test]
+    fn dead_bytes_tracking() {
+        let dir = tempdir().unwrap();
+        let vlog = ValueLog::open(&dir.path().join("v.log")).unwrap();
+        vlog.append(b"k", b"old").unwrap();
+        assert!(!vlog.compaction_needed());
+        // Mark old value as dead
+        vlog.mark_dead(1, 3);
+        // total = 16+1+3=20, dead = 20, ratio = 1.0 > 0.5 → needed
+        assert!(vlog.compaction_needed());
     }
 }

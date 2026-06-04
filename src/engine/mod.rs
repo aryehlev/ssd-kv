@@ -4,6 +4,7 @@
 //! Latency for Cloud Block Storage", ACM TOS 2024, DOI 10.1145/3789205.
 
 pub mod btree;
+pub mod group_commit;
 pub mod ipage;
 pub mod kv_engine;
 pub mod segment;

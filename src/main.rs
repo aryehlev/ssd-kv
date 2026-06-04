@@ -6,6 +6,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod cluster;
 mod config;
 mod engine;
 mod io;
@@ -15,6 +16,7 @@ use config::Config;
 use engine::KvEngine;
 use server::reactor::{start_reactor_multi, start_reactor_server};
 use server::{DatabaseManager, DbHandler, Handler, ServerTuning};
+use std::time::Duration;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -41,6 +43,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all(&config.data_dir)?;
 
+    // Cluster: start the ready-protocol manager before accepting client traffic.
+    let cluster_mgr = if config.cluster_mode {
+        info!(
+            "cluster mode: node_id={} total_nodes={} cluster_port={} peers={}",
+            config.node_id.unwrap(),
+            config.total_nodes.unwrap(),
+            config.cluster_port,
+            config.cluster_peers,
+        );
+        Some(cluster::ClusterManager::start(&config))
+    } else {
+        None
+    };
+
     // Create one KvEngine per database (SELECT 0..num_dbs-1).
     let mut dbs: Vec<DbHandler> = Vec::with_capacity(config.num_dbs as usize);
     for db_idx in 0..config.num_dbs {
@@ -60,6 +76,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.reactor_threads <= 1 {
         info!("starting single reactor on {}", config.bind);
         let handle = start_reactor_server(config.bind, Arc::clone(&db_manager), tuning);
+
+        // Wait for cluster quorum (reactor is already accepting, so the TCP
+        // readiness probe succeeds during negotiation).
+        if let Some(ref mgr) = cluster_mgr {
+            if !mgr.wait_for_quorum(Duration::from_secs(60)) {
+                tracing::warn!("cluster quorum not reached within timeout; proceeding anyway");
+            }
+        }
+
         handle.join().ok();
     } else {
         info!(
@@ -72,6 +97,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tuning,
             config.reactor_threads,
         );
+
+        if let Some(ref mgr) = cluster_mgr {
+            if !mgr.wait_for_quorum(Duration::from_secs(60)) {
+                tracing::warn!("cluster quorum not reached within timeout; proceeding anyway");
+            }
+        }
+
         for h in handles {
             h.join().ok();
         }

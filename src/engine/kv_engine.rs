@@ -15,17 +15,17 @@
 //!   │   ├── BTree — per-partition B+ tree (bounded height → deterministic latency)
 //!   │   └── SegmentFile — 4 KB ipage backing store on SSD
 //!   │
-//!   └── ValueLog (shared) — append-only variable-size (key, value) store
+//!   ├── ValueLog (shared) — append-only variable-size (key, value) store
+//!   ├── GroupCommit    — batches value-log fdatasyncs across concurrent writers
+//!   └── WsbCache       — clock-eviction page cache for hot ipages
 //! ```
 //!
-//! ## Deterministic Latency Guarantee
-//! A `get` touches at most `BTREE_MAX_HEIGHT` ipage reads (the B-Tree traversal)
-//! plus one value log read — a fixed upper bound independent of data volume.
-//!
-//! ## Variable Value Support
-//! Unlike the paper's original fixed-size block mappings, `KvEngine` stores
-//! arbitrary byte slices by writing them to the value log and recording only
-//! (value_ptr, value_len, key_len) in the B-Tree leaf entry.
+//! ## Concurrency
+//! * GET / EXISTS / SCAN use `RwLock::read()` so concurrent readers never
+//!   block each other.  The B-Tree read path uses `pread`, which is safe under
+//!   a shared lock.
+//! * PUT / DELETE use `RwLock::write()` for the partition they modify.
+//! * Value-log reads are always lock-free (`pread` on a stable fd).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,16 +35,20 @@ use dashmap::DashMap;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::btree::BTree;
-use crate::engine::ipage::{FLAG_ALIVE, FLAG_DELETED};
+use crate::engine::group_commit::GroupCommit;
+use crate::engine::ipage::{FLAG_ALIVE, LeafEntry};
 use crate::engine::segment::SegmentFile;
-use crate::engine::value_log::ValueLog;
+use crate::engine::value_log::{ValueLog, VLOG_HEADER_SIZE};
+use crate::engine::wsbcache::WsbCache;
 
 /// Number of top-bits used to derive the partition ID.
-/// 16 bits → 65 536 partitions. Keeps the segment-table size tiny
-/// (< 1 MB in RAM) even at trillion-entry scale.
+/// 16 bits → 65 536 partitions.
 pub const NUM_PARTITION_BITS: u32 = 16;
 /// Total number of partitions.
 pub const NUM_PARTITIONS: u32 = 1 << NUM_PARTITION_BITS;
+
+/// WSBCache capacity: 8 192 ipages ≈ 32 MB.
+const WSB_CACHE_CAPACITY: usize = 8 * 1024;
 
 struct Partition {
     btree: BTree,
@@ -69,10 +73,13 @@ impl Partition {
 pub struct KvEngine {
     data_dir: PathBuf,
     /// Segment table (MLI Level-1): partition_id → Partition.
-    /// Keys are created lazily on first write.
     partitions: DashMap<u32, Arc<RwLock<Partition>>>,
     /// Shared value log for all partitions.
     value_log: Arc<ValueLog>,
+    /// Batches concurrent value-log fdatasyncs (group commit).
+    group_commit: GroupCommit,
+    /// Write-staging buffer cache: hot ipages served from RAM.
+    wsb_cache: Arc<WsbCache>,
 }
 
 impl KvEngine {
@@ -83,11 +90,15 @@ impl KvEngine {
         std::fs::create_dir_all(&seg_dir)?;
 
         let value_log = ValueLog::open(&data_dir.join("value.log"))?;
+        let group_commit = GroupCommit::new(Arc::clone(&value_log));
+        let wsb_cache = WsbCache::new(WSB_CACHE_CAPACITY);
 
         let engine = Arc::new(KvEngine {
             data_dir: data_dir.to_path_buf(),
             partitions: DashMap::new(),
             value_log,
+            group_commit,
+            wsb_cache,
         });
 
         // Pre-open any existing segment files (so we don't lose data on restart)
@@ -110,23 +121,11 @@ impl KvEngine {
         Ok(engine)
     }
 
-    /// Compute the partition ID from a key.
-    #[inline]
-    fn partition_id(key: &[u8]) -> u32 {
-        let h = xxh3_64(key);
-        // Use the top NUM_PARTITION_BITS bits
-        (h >> (64 - NUM_PARTITION_BITS)) as u32
-    }
-
-    /// Get or create the `Partition` for `partition_id`.
-    fn get_or_create_partition(
-        &self,
-        pid: u32,
-    ) -> io::Result<Arc<RwLock<Partition>>> {
+    /// Get or create the `Partition` for `pid`.
+    fn get_or_create_partition(&self, pid: u32) -> io::Result<Arc<RwLock<Partition>>> {
         if let Some(p) = self.partitions.get(&pid) {
             return Ok(Arc::clone(p.value()));
         }
-        // Create new partition — serialize creation to avoid race
         let entry = self.partitions.entry(pid).or_try_insert_with(|| {
             let path = self.seg_path(pid);
             Partition::open_or_create(&path, pid).map(|p| Arc::new(RwLock::new(p)))
@@ -144,7 +143,8 @@ impl KvEngine {
 
     /// Get the value for `key`. Returns `None` if the key does not exist.
     ///
-    /// At most `BTREE_MAX_HEIGHT` + 1 storage reads (deterministic latency).
+    /// Uses a shared (`RwLock::read`) partition lock so concurrent GETs on
+    /// the same partition never block each other.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
@@ -155,9 +155,8 @@ impl KvEngine {
         };
 
         let entry = {
-            let mut guard = part_arc.write().unwrap();
-            let part = &mut *guard;
-            part.btree.get(&mut part.seg, h)?
+            let guard = part_arc.read().unwrap();
+            guard.btree.get(&guard.seg, h, Some((&*self.wsb_cache, pid)))?
         };
 
         let entry = match entry {
@@ -165,12 +164,9 @@ impl KvEngine {
             None => return Ok(None),
         };
 
-        // Verify the actual key (guards against hash collisions).
-        let stored_key = self
-            .value_log
-            .read_key(entry.value_ptr, entry.key_len)?;
+        // Verify the actual key (hash-collision guard).
+        let stored_key = self.value_log.read_key(entry.value_ptr, entry.key_len)?;
         if stored_key != key {
-            // Hash collision — key not found
             return Ok(None);
         }
 
@@ -181,19 +177,38 @@ impl KvEngine {
     }
 
     /// Insert or update `(key, value)`.
+    ///
+    /// Write order for crash consistency:
+    /// 1. Append to value log (BufWriter, not yet durable).
+    /// 2. Group-commit sync: flush BufWriter + fdatasync value log.
+    /// 3. Update B-Tree + flush segment (fdatasync segment).
+    ///
+    /// On crash between 2 and 3 the value is durable but the index has no
+    /// pointer — the entry is orphaned dead space, never corrupt.
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
 
-        // Step 1: append to value log (write-ahead)
+        // Step 1: append to value log (no sync).
         let value_ptr = self.value_log.append(key, value)?;
+        let my_end =
+            value_ptr + VLOG_HEADER_SIZE as u64 + key.len() as u64 + value.len() as u64;
 
-        // Step 2: update the B-Tree index
+        // Step 2: make value durable via group commit BEFORE updating the index.
+        self.group_commit.sync_vlog(my_end)?;
+
+        // Step 3: update B-Tree and flush segment.
         let part_arc = self.get_or_create_partition(pid)?;
-        let mut guard = part_arc.write().unwrap();
         {
+            let mut guard = part_arc.write().unwrap();
             let part = &mut *guard;
-            use crate::engine::ipage::LeafEntry;
+            let cache = Some((&*self.wsb_cache, pid));
+
+            // Track dead bytes for any overwritten entry.
+            if let Ok(Some(old)) = part.btree.get(&part.seg, h, cache) {
+                self.value_log.mark_dead(old.key_len, old.value_len);
+            }
+
             let leaf_entry = LeafEntry {
                 key_hash: h,
                 value_ptr,
@@ -201,8 +216,8 @@ impl KvEngine {
                 key_len: key.len() as u16,
                 flags: FLAG_ALIVE,
             };
-            part.btree.insert(&mut part.seg, leaf_entry)?;
-            part.btree.flush(&mut part.seg)?;
+            part.btree.insert(&mut part.seg, leaf_entry, cache)?;
+            part.btree.flush(&mut part.seg, cache)?;
         }
         Ok(())
     }
@@ -219,14 +234,24 @@ impl KvEngine {
 
         let mut guard = part_arc.write().unwrap();
         let part = &mut *guard;
-        let found = part.btree.delete(&mut part.seg, h)?;
+        let cache = Some((&*self.wsb_cache, pid));
+
+        // Look up first so we can record dead bytes.
+        let old_entry = part.btree.get(&part.seg, h, cache)?;
+
+        let found = part.btree.delete(&mut part.seg, h, cache)?;
         if found {
-            part.btree.flush(&mut part.seg)?;
+            if let Some(e) = old_entry {
+                self.value_log.mark_dead(e.key_len, e.value_len);
+            }
+            part.btree.flush(&mut part.seg, cache)?;
         }
         Ok(found)
     }
 
     /// Check if `key` exists without fetching the value.
+    ///
+    /// Uses a shared partition lock (same as `get`).
     pub fn exists(&self, key: &[u8]) -> io::Result<bool> {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
@@ -237,15 +262,13 @@ impl KvEngine {
         };
 
         let entry = {
-            let mut guard = part_arc.write().unwrap();
-            let part = &mut *guard;
-            part.btree.get(&mut part.seg, h)?
+            let guard = part_arc.read().unwrap();
+            guard.btree.get(&guard.seg, h, Some((&*self.wsb_cache, pid)))?
         };
 
         match entry {
             None => Ok(false),
             Some(e) => {
-                // Verify key to guard against hash collisions
                 let stored_key = self.value_log.read_key(e.value_ptr, e.key_len)?;
                 Ok(stored_key == key)
             }
@@ -254,11 +277,12 @@ impl KvEngine {
 
     /// Flush all dirty state to disk.
     pub fn flush(&self) -> io::Result<()> {
-        self.value_log.flush()?;
+        self.value_log.flush_and_sync()?;
         for entry in self.partitions.iter() {
+            let pid = *entry.key();
             let mut guard = entry.value().write().unwrap();
             let part = &mut *guard;
-            part.btree.flush(&mut part.seg)?;
+            part.btree.flush(&mut part.seg, Some((&*self.wsb_cache, pid)))?;
         }
         Ok(())
     }
@@ -278,9 +302,9 @@ impl KvEngine {
     pub fn scan_keys(&self) -> io::Result<Vec<Vec<u8>>> {
         let mut result = Vec::new();
         for entry in self.partitions.iter() {
-            let mut guard = entry.value().write().unwrap();
-            let part = &mut *guard;
-            let entries = part.btree.iter_entries(&mut part.seg)?;
+            let pid = *entry.key();
+            let guard = entry.value().read().unwrap();
+            let entries = guard.btree.iter_entries(&guard.seg, Some((&*self.wsb_cache, pid)))?;
             for e in entries {
                 if let Ok(key) = self.value_log.read_key(e.value_ptr, e.key_len) {
                     result.push(key);
@@ -298,13 +322,8 @@ impl KvEngine {
         count: usize,
         pattern: Option<&[u8]>,
     ) -> io::Result<(u64, Vec<Vec<u8>>)> {
-        // We partition-scan: cursor encodes (partition_idx, entry_offset)
-        // For simplicity, collect all alive B-Tree entries across all partitions
-        // and paginate. This can be optimized with a proper cursor later.
         let all_keys = self.scan_keys()?;
 
-        // Filter first, then paginate — slicing before filtering would skip
-        // matched keys and under-fill pages when a pattern is active.
         let filtered: Vec<&Vec<u8>> = all_keys
             .iter()
             .filter(|k| pattern.map_or(true, |pat| glob_match(pat, k)))
@@ -321,17 +340,20 @@ impl KvEngine {
     /// Remove all entries (FLUSHDB equivalent).
     pub fn clear(&self) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
-        // Clear the index first so no dangling value_ptr references remain.
         self.partitions.clear();
-        // Remove segment files.
+        self.wsb_cache.drain_dirty(); // evict stale cache entries
         let seg_dir = data_dir.join("segments");
         if seg_dir.exists() {
             for entry in std::fs::read_dir(&seg_dir)?.flatten() {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-        // Truncate the value log in-place so self.value_log remains valid.
         self.value_log.truncate()
+    }
+
+    /// Returns `true` when value-log dead space exceeds the compaction threshold.
+    pub fn compaction_needed(&self) -> bool {
+        self.value_log.compaction_needed()
     }
 }
 
@@ -392,9 +414,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let engine = KvEngine::open(dir.path()).unwrap();
 
-        // Small value
         engine.put(b"s", b"x").unwrap();
-        // Large value (1 MB)
         let big = vec![0x42u8; 1024 * 1024];
         engine.put(b"big", &big).unwrap();
 
@@ -460,8 +480,23 @@ mod tests {
         }
 
         let (cursor, keys) = engine.scan(0, 200, None).unwrap();
-        assert_eq!(cursor, 0); // all done in one page
+        assert_eq!(cursor, 0);
         assert_eq!(keys.len(), 100);
+    }
+
+    #[test]
+    fn dead_bytes_tracked_on_overwrite_and_delete() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(dir.path()).unwrap();
+
+        engine.put(b"key", b"old_value").unwrap();
+        assert!(!engine.compaction_needed());
+
+        // Overwrite: old entry becomes dead.
+        engine.put(b"key", b"new_value").unwrap();
+
+        // Delete: entry becomes dead.
+        engine.delete(b"key").unwrap();
     }
 
     #[test]

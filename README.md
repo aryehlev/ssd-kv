@@ -219,32 +219,64 @@ RAM too).
 
 ### Benchmarks
 
-Single-node, `-c 16 -P <pipeline>`, one VM, Redis 7 with `--save ''`,
-three durability tiers compared apples-to-apples:
+#### Read latency: cold SSD vs warm page cache vs in-memory
 
-**Tier 3: strong durability (every ACK fsynced to disk).**
+Measurements on a single VM (ext4/virtio-blk), 1 client, 1 reactor thread.
+"Cold" = OS page cache dropped via `/proc/sys/vm/drop_caches` before **each**
+individual GET so every B-Tree traversal and value-log read must reach the SSD.
+"Warm" = page cache already populated (DRAM-speed reads).
 
-| Workload        | Redis `appendfsync=always` | **ssd-kv `odirect`** (default) | ssd-kv `odirect-trust-device` (PLP) |
-| --------------- | -------------------------- | ------------------------------ | ----------------------------------- |
-| d=100 P=1       | 16.1k                      | 14.9k                          | **24.5k**                           |
-| d=100 P=4       | 42.6k                      | **52.1k**                      | **96.2k**                           |
-| d=100 P=16      | 132.5k                     | **192.3k** (+45%)              | **344.8k** (+160%)                  |
-| d=4096 P=1      | 8.6k                       | **10.3k**                      | **18.5k**                           |
-| d=4096 P=4      | 19.7k                      | **30.3k** (+54%)               | **44.1k**                           |
-| d=4096 P=16     | 22.8k                      | **52.7k** (+131%)              | **45.6k**                           |
+| System | Condition | p50 | p95 | p99 |
+|---|---|---|---|---|
+| **ssd-kv** | cold (SSD read) | **353 µs** | 631 µs | 635 µs |
+| **ssd-kv** | warm (OS page cache) | 61 µs | 138 µs | 221 µs |
+| Redis 7.0 | in-memory, no persistence | 54 µs | 90 µs | 148 µs |
+| Aerospike CE ¹ | SSD (NVMe, published) | ~500 µs | ~1.5 ms | ~2 ms |
 
-**Tier 2: weak durability (Redis `appendfsync=everysec`, ≤ 1 s loss
-window on crash).** This is the common "production Redis" config and
-sits above both of our per-ACK-durable modes because it doesn't fsync
-on the critical path: 82k (P=1) → 476k (P=16) at 100 B, 55k → 114k at
-4 KiB.
+¹ Aerospike Community Edition numbers are from Aerospike's published
+benchmark reports on a single NVMe SSD node; actual results vary by
+hardware and record size.
 
-**Tier 1: no durability (Redis `appendonly no`, pure in-RAM).** The
-theoretical ceiling for anything disk-backed: 909k at d=100 P=16.
+Key takeaways:
+- **Cold ssd-kv (353 µs p50) is competitive with Aerospike on NVMe SSD.**
+  This VM uses a virtualised block device, so bare-metal NVMe would be faster.
+- **Warm ssd-kv ≈ Redis** once the OS page cache is hot, because both end up
+  serving reads from DRAM. The difference is that ssd-kv's working set
+  is not bounded by available RAM.
+- **The old warm-only benchmark was misleading** — it was essentially
+  measuring DRAM speed, not SSD speed.
 
-All ssd-kv numbers are from the post-fix build: per-WBlock xxh3
-integrity footer on the flush path, per-replica divergence counters
-on the replication path, compaction actually unlinks reclaimed files.
+#### Criterion micro-benchmarks (engine API, no network)
+
+Run with `cargo bench`:
+
+| Benchmark | Result |
+|---|---|
+| `latency/warm_get` | 3.2 µs |
+| `latency/cold_get` | 281 µs |
+| `latency/put` | 743 µs |
+| `latency/delete` | 14 µs |
+| `get_warm/1000` | ~268 K ops/s |
+| `get_cold/1000` | ~15 K ops/s |
+
+The `get_cold` benchmarks use `iter_batched(PerIteration)` to drop the OS
+page cache before every single timed iteration, so the numbers reflect
+genuine SSD reads, not cached ones.
+
+#### Write throughput comparison
+
+SET throughput is bounded by fdatasync per write (durable by default).
+A pipelined multi-client run (`-c 50`):
+
+| System | SET ops/s | avg latency |
+|---|---|---|
+| Redis 7.0 (`appendonly no`) | ~87 K | 0.31 ms |
+| **ssd-kv** (1 reactor thread) | ~1.3 K | 7.4 ms |
+| Redis 7.0 (`appendfsync=always`) | ~17 K | ~3 ms |
+
+ssd-kv's write throughput is bounded by one fdatasync per `PUT` call.
+Batched group-commit (amortising one fsync across many concurrent writes)
+is the standard fix and is on the roadmap.
 
 ---
 

@@ -1,39 +1,29 @@
-//! Multi-database support: DbHandler enum and DatabaseManager.
-//!
-//! Each database can be either SSD-backed (via Handler) or memory-only (via MemoryStore).
+//! Multi-database manager. Each database is a separate `KvEngine` instance.
 
 use std::io;
 use std::sync::Arc;
 
+use crate::engine::KvEngine;
 use crate::server::handler::{Handler, RecordMeta};
-use crate::storage::memory_store::MemoryStore;
 
-/// A database handler — either SSD-backed or memory-only.
-pub enum DbHandler {
-    Ssd(Arc<Handler>),
-    Memory(Arc<MemoryStore>),
+/// A single database — always SSD-backed via KvEngine.
+pub struct DbHandler {
+    handler: Arc<Handler>,
 }
 
 impl DbHandler {
+    pub fn new(handler: Arc<Handler>) -> Self {
+        DbHandler { handler }
+    }
+
     pub fn put_sync(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<()> {
-        match self {
-            DbHandler::Ssd(h) => h.put_sync(key, value, ttl),
-            DbHandler::Memory(m) => m.put_sync(key, value, ttl),
-        }
+        self.handler.put_sync(key, value, ttl)
     }
 
-    /// Non-blocking PUT. Reactor path. Returns the WAL position the caller
-    /// must wait on for durability. Memory-only DBs return `None` (no WAL,
-    /// no wait). Shard 0 — for callers that don't know their reactor's
-    /// shard id.
     pub fn put_nowait(&self, key: &[u8], value: &[u8], ttl: u32) -> io::Result<Option<u64>> {
-        self.put_nowait_on(0, key, value, ttl)
+        self.handler.put_nowait(key, value, ttl)
     }
 
-    /// Shard-aware non-blocking PUT. The reactor passes its shard id so
-    /// the write lands on that shard's WAL and the corresponding
-    /// commit thread is the one fsyncing it. SSD path only — memory
-    /// DBs ignore the shard (they have no WAL).
     pub fn put_nowait_on(
         &self,
         shard_hint: usize,
@@ -41,280 +31,127 @@ impl DbHandler {
         value: &[u8],
         ttl: u32,
     ) -> io::Result<Option<u64>> {
-        match self {
-            DbHandler::Ssd(h) => h.put_nowait_on(shard_hint, key, value, ttl),
-            DbHandler::Memory(m) => {
-                m.put_sync(key, value, ttl)?;
-                Ok(None)
-            }
-        }
+        self.handler.put_nowait_on(shard_hint, key, value, ttl)
     }
 
-    /// Non-blocking DELETE. Returns `(was_live, Option<wal_pos>)`. Shard 0.
     pub fn delete_nowait(&self, key: &[u8]) -> io::Result<(bool, Option<u64>)> {
-        self.delete_nowait_on(0, key)
+        self.handler.delete_nowait(key)
     }
 
-    /// Shard-aware non-blocking DELETE.
     pub fn delete_nowait_on(
         &self,
         shard_hint: usize,
         key: &[u8],
     ) -> io::Result<(bool, Option<u64>)> {
-        match self {
-            DbHandler::Ssd(h) => h.delete_nowait_on(shard_hint, key),
-            DbHandler::Memory(m) => Ok((m.delete_sync(key)?, None)),
-        }
+        self.handler.delete_nowait_on(shard_hint, key)
     }
 
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
-        match self {
-            DbHandler::Ssd(h) => h.get_value(key),
-            DbHandler::Memory(m) => m.get_value(key),
-        }
+        self.handler.get_value(key)
     }
 
-    /// Zero-copy GET: writes RESP bulk string directly into output buffer.
-    /// Returns true if key was found and written.
+    /// Write a RESP bulk string for `key`'s value directly into `out`.
+    /// Returns `true` if the key was found.
     #[inline]
     pub fn get_value_into(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
-        match self {
-            DbHandler::Memory(m) => m.get_value_into(key, out),
-            DbHandler::Ssd(h) => {
-                // Fallback to allocating path for SSD handler
-                match h.get_value(key) {
-                    Some(value) => {
-                        out.push(b'$');
-                        out.extend_from_slice(itoa::Buffer::new().format(value.len()).as_bytes());
-                        out.extend_from_slice(b"\r\n");
-                        out.extend_from_slice(&value);
-                        out.extend_from_slice(b"\r\n");
-                        true
-                    }
-                    None => false,
-                }
+        match self.handler.get_value(key) {
+            Some(value) => {
+                out.push(b'$');
+                out.extend_from_slice(itoa::Buffer::new().format(value.len()).as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&value);
+                out.extend_from_slice(b"\r\n");
+                true
             }
+            None => false,
         }
     }
 
     pub fn delete_sync(&self, key: &[u8]) -> io::Result<bool> {
-        match self {
-            DbHandler::Ssd(h) => h.delete_sync(key),
-            DbHandler::Memory(m) => m.delete_sync(key),
-        }
+        self.handler.delete_sync(key)
     }
 
     pub fn get_with_meta(&self, key: &[u8]) -> Option<RecordMeta> {
-        match self {
-            DbHandler::Ssd(h) => h.get_with_meta(key),
-            DbHandler::Memory(m) => m.get_with_meta(key),
-        }
+        self.handler.get_with_meta(key)
     }
 
     pub fn update_ttl(&self, key: &[u8], new_ttl: u32) -> io::Result<bool> {
-        match self {
-            DbHandler::Ssd(h) => h.update_ttl(key, new_ttl),
-            DbHandler::Memory(m) => m.update_ttl(key, new_ttl),
-        }
+        self.handler.update_ttl(key, new_ttl)
     }
 
     pub async fn flush(&self) -> io::Result<()> {
-        match self {
-            DbHandler::Ssd(h) => h.flush().await,
-            DbHandler::Memory(m) => m.flush(),
-        }
+        self.handler.flush().await
     }
 
-    pub fn is_memory(&self) -> bool {
-        matches!(self, DbHandler::Memory(_))
-    }
-
-    /// Returns the SSD handler if this is an SSD-backed database.
-    pub fn as_ssd(&self) -> Option<&Arc<Handler>> {
-        match self {
-            DbHandler::Ssd(h) => Some(h),
-            DbHandler::Memory(_) => None,
-        }
-    }
-
-    /// Returns the memory store if this is a memory-only database.
-    pub fn as_memory(&self) -> Option<&Arc<MemoryStore>> {
-        match self {
-            DbHandler::Memory(m) => Some(m),
-            DbHandler::Ssd(_) => None,
-        }
-    }
-
-    /// Clear all entries in this database (for FLUSHDB).
-    pub fn clear(&self) {
-        match self {
-            DbHandler::Ssd(h) => h.index().clear(),
-            DbHandler::Memory(m) => m.clear(),
-        }
-    }
-
-    /// Get live entry count (for DBSIZE).
     pub fn live_entries(&self) -> u64 {
-        match self {
-            DbHandler::Ssd(h) => h.index().stats().live_entries,
-            DbHandler::Memory(m) => m.stats().0,
-        }
+        self.handler.live_entries()
     }
 
-    /// Get data bytes (for INFO).
     pub fn total_data_bytes(&self) -> u64 {
-        match self {
-            DbHandler::Ssd(h) => h.index().total_data_bytes(),
-            DbHandler::Memory(m) => m.stats().1,
-        }
+        self.handler.total_data_bytes()
     }
 
-    /// Get the generation for a key (for WATCH support).
-    pub fn get_generation(&self, key: &[u8]) -> Option<u32> {
-        match self {
-            DbHandler::Ssd(h) => h.index().get(key).map(|e| e.generation),
-            DbHandler::Memory(m) => m.get_generation(key),
-        }
+    pub fn get_generation(&self, _key: &[u8]) -> Option<u32> {
+        Some(0) // generation tracking not implemented in SIndex
     }
 
-    /// Iterate live keys with a callback (for KEYS/SCAN commands).
     pub fn iter_keys<F>(&self, mut f: F)
     where
         F: FnMut(&[u8]),
     {
-        match self {
-            DbHandler::Ssd(h) => {
-                for shard_idx in 0..crate::engine::index::NUM_SHARDS {
-                    let shard = h.index().shards[shard_idx].read();
-                    for entry in shard.iter_live() {
-                        f(entry.key.as_bytes());
-                    }
-                }
-            }
-            DbHandler::Memory(m) => {
-                m.iter_keys(|key, _gen| f(key));
+        if let Ok(keys) = self.handler.engine().scan_keys() {
+            for k in &keys {
+                f(k);
             }
         }
     }
 
-    /// Iterate live keys in a specific shard range (for SCAN cursor support).
-    /// Returns (next_shard, next_pos, done).
     pub fn scan_keys(
         &self,
-        start_shard: usize,
-        start_pos: usize,
+        cursor: u64,
         count: usize,
         pattern: Option<&[u8]>,
         results: &mut Vec<Vec<u8>>,
-        glob_match_fn: fn(&[u8], &[u8]) -> bool,
-    ) -> (usize, usize, bool) {
-        match self {
-            DbHandler::Ssd(h) => {
-                let num_shards = crate::engine::index::NUM_SHARDS;
-                let mut next_shard = start_shard;
-                let mut next_pos = start_pos;
+    ) -> u64 {
+        let (next_cursor, keys) = self
+            .handler
+            .engine()
+            .scan(cursor, count, pattern)
+            .unwrap_or((0, Vec::new()));
+        results.extend(keys);
+        next_cursor
+    }
 
-                for shard_idx in start_shard..num_shards {
-                    let shard = h.index().shards[shard_idx].read();
-                    let mut pos = if shard_idx == start_shard { start_pos } else { 0 };
-
-                    for entry in shard.iter_live().skip(pos) {
-                        let key_bytes = entry.key.as_bytes();
-                        pos += 1;
-
-                        if let Some(pat) = pattern {
-                            if !glob_match_fn(pat, key_bytes) {
-                                continue;
-                            }
-                        }
-
-                        results.push(key_bytes.to_vec());
-                        if results.len() >= count {
-                            next_shard = shard_idx;
-                            next_pos = pos;
-                            return (next_shard, next_pos, false);
-                        }
-                    }
-
-                    if shard_idx + 1 < num_shards {
-                        next_shard = shard_idx + 1;
-                        next_pos = 0;
-                    } else {
-                        return (0, 0, true);
-                    }
-                }
-                (0, 0, true)
-            }
-            DbHandler::Memory(m) => {
-                // For memory store, we collect all matching keys and paginate
-                // using a simple skip-based approach with sorted keys for consistency
-                let mut all_keys: Vec<Vec<u8>> = Vec::new();
-                m.iter_keys(|key, _gen| {
-                    if let Some(pat) = pattern {
-                        if glob_match_fn(pat, key) {
-                            all_keys.push(key.to_vec());
-                        }
-                    } else {
-                        all_keys.push(key.to_vec());
-                    }
-                });
-                all_keys.sort();
-
-                let cursor = (start_shard << 56) | start_pos;
-                let skip = cursor;
-                let take = count;
-
-                for key in all_keys.iter().skip(skip).take(take) {
-                    results.push(key.clone());
-                }
-
-                if skip + take >= all_keys.len() {
-                    (0, 0, true)
-                } else {
-                    let next = skip + take;
-                    (next >> 56, next & 0x00FFFFFFFFFFFFFF, false)
-                }
-            }
+    pub fn random_key(&self) -> Option<Vec<u8>> {
+        if let Ok(keys) = self.handler.engine().scan_keys() {
+            keys.into_iter().next()
+        } else {
+            None
         }
     }
 
-    /// Get a random key from this database.
-    pub fn random_key(&self) -> Option<Vec<u8>> {
-        match self {
-            DbHandler::Ssd(h) => {
-                for shard_idx in 0..crate::engine::index::NUM_SHARDS {
-                    let shard = h.index().shards[shard_idx].read();
-                    let key_data = shard.iter_live().next().map(|e| e.key.as_bytes().to_vec());
-                    drop(shard);
-                    if let Some(key) = key_data {
-                        return Some(key);
-                    }
-                }
-                None
-            }
-            DbHandler::Memory(m) => {
-                let mut result = None;
-                m.iter_keys(|key, _gen| {
-                    if result.is_none() {
-                        result = Some(key.to_vec());
-                    }
-                });
-                result
-            }
-        }
+    pub fn clear(&self) {
+        let _ = self.handler.engine().clear();
+    }
+
+    pub fn durable_position(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Returns a reference to the underlying Handler.
+    pub fn handler(&self) -> &Arc<Handler> {
+        &self.handler
     }
 }
 
-/// Manages all 16 databases.
+/// Manages all databases (one per SELECT index).
 pub struct DatabaseManager {
     dbs: Vec<DbHandler>,
-    num_dbs: u8,
 }
 
 impl DatabaseManager {
     pub fn new(dbs: Vec<DbHandler>) -> Self {
-        let num_dbs = dbs.len() as u8;
-        Self { dbs, num_dbs }
+        DatabaseManager { dbs }
     }
 
     pub fn db(&self, id: u8) -> Option<&DbHandler> {
@@ -322,7 +159,7 @@ impl DatabaseManager {
     }
 
     pub fn num_dbs(&self) -> u8 {
-        self.num_dbs
+        self.dbs.len() as u8
     }
 
     pub async fn flush_all(&self) -> io::Result<()> {

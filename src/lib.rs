@@ -1,17 +1,16 @@
-//! SSD-KV: High-Performance Key-Value Store
+//! SIndex KV: Trillion-scale SSD-based indexing with deterministic latency.
 //!
-//! - Index in RAM for fast lookups
-//! - Data on SSD with O_DIRECT for consistent latency
-//! - io_uring for async I/O (Linux)
-//! - Sharded hashmap index with 256 shards
-//! - Lock-free hot cache for frequently accessed keys
-//! - Bloom filter for fast negative lookups
-//! - CPU prefetching and NUMA awareness
+//! Implements: "The Design of Trillion-scale SSD-based Indexing with
+//! Deterministic Latency for Cloud Block Storage", ACM TOS 2024.
+//!
+//! ## Key design points
+//! - Multi-Level Index (MLI): partition hash table + per-partition B+ trees
+//! - Segments: per-partition 4 KB ipage files on SSD
+//! - Variable-value support via a shared append-only value log
+//! - Bounded B-Tree height → at most BTREE_MAX_HEIGHT + 1 SSD reads per GET
+//! - io_uring for high-throughput network I/O
 
-pub mod cluster;
 pub mod config;
 pub mod engine;
 pub mod io;
-pub mod perf;
 pub mod server;
-pub mod storage;

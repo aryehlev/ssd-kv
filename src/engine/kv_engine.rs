@@ -315,22 +315,54 @@ impl KvEngine {
         self.value_log.flush()?;
 
         // Stage 2: write staged ipages per partition, fsync each segment.
+        //
+        // Three-phase per partition — the paper's key latency guarantee is
+        // that reads are never stalled by the sync cycle's I/O:
+        //
+        // 2a. Write dirty pages under a *read* lock: `write_page` is a
+        //     positional pwrite (&self) so GET operations can proceed
+        //     concurrently on the same partition.
+        //
+        // 2b. Flush the segment header under a brief *write* lock (one 4 KB
+        //     pwrite to page 0 — microseconds). Clone the file descriptor so
+        //     we can fsync after releasing the lock.
+        //
+        // 2c. fdatasync with *no partition lock* held. GET readers hitting
+        //     WSBCache never contend with this.
         let mut by_pid: HashMap<u32, Vec<usize>> = HashMap::new();
         for (i, ((pid, _), _, _)) in dirty.iter().enumerate() {
             by_pid.entry(*pid).or_default().push(i);
         }
+        let mut seg_fds: Vec<std::fs::File> = Vec::with_capacity(by_pid.len());
         for (pid, idxs) in &by_pid {
             let part_arc = match self.partitions.get(pid) {
                 Some(p) => Arc::clone(&p),
                 None => continue, // partition cleared meanwhile
             };
-            let guard = part_arc.write().unwrap();
-            for &i in idxs {
-                let ((_, page_idx), _, page) = &mut dirty[i];
-                ipage::seal(page);
-                guard.seg.write_page(*page_idx, page)?;
+
+            // 2a: write dirty page data — read lock (concurrent GETs unblocked)
+            {
+                let guard = part_arc.read().unwrap();
+                for &i in idxs {
+                    let ((_, page_idx), _, page) = &mut dirty[i];
+                    ipage::seal(page);
+                    guard.seg.write_page(*page_idx, page)?;
+                }
             }
-            guard.seg.sync()?;
+
+            // 2b: flush segment header — brief write lock, then clone fd
+            let fd = {
+                let guard = part_arc.write().unwrap();
+                let fd = guard.seg.try_clone_file()?;
+                guard.seg.flush_header()?;
+                fd
+            };
+            seg_fds.push(fd);
+        }
+
+        // 2c: fdatasync all affected segments — no partition lock held
+        for fd in seg_fds {
+            fd.sync_data()?;
         }
 
         // Checkpoint: everything below `p` is now durable in the index.

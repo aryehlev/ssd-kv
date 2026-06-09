@@ -150,6 +150,14 @@ impl SegmentFile {
         self.flush_header()?;
         self.file.sync_data()
     }
+
+    /// Clone the file descriptor so the caller can issue `sync_data()` on
+    /// the segment without holding the containing partition lock. The clone
+    /// shares the same inode; an `fdatasync` on either descriptor flushes
+    /// all dirty pages for the file.
+    pub fn try_clone_file(&self) -> io::Result<std::fs::File> {
+        self.file.try_clone()
+    }
 }
 
 // ─── Little-endian helpers (duplicate here to avoid cross-module dep) ────────

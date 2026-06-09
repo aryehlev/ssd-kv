@@ -1,22 +1,33 @@
-//! Write-staging buffer cache (WSBCache) — paper §5.2.
+//! Write-staging buffer cache (WSBCache) — SIndex paper §4.3.
 //!
-//! From "The Design of Trillion-scale SSD-based Indexing with Deterministic
-//! Latency for Cloud Block Storage" (ACM TOS 2024):
+//! From "SIndex: An SSD-based Large-scale Indexing with Deterministic
+//! Latency for Cloud Block Storage" (ICPP '24; extended in ACM TOS 2026):
 //!
-//! > The WSBCache absorbs hot ipage accesses in memory and separates write
-//! > timing from the user request path using a Two-Stage Sync (TSS): Stage 1
-//! > writes dirty ipages to the VL-SSD asynchronously; Stage 2 keeps recently
-//! > evicted ipages in a staging area so read-after-write requests are served
-//! > without hitting the still-variable-latency write SSD.
+//! > WSBCache employs multiple clock lists (i.e., 16 in default) organized
+//! > as linked-list to collaboratively manage [pointers] corresponding to
+//! > cached ipages. [...] WSBCache proposes a two-stage sync mechanism
+//! > (TSS) that strategically buffers the evicted ipages in memory to
+//! > provide stable latency of read-after-write operations.
 //!
 //! ## This implementation
-//! We implement the clock-based eviction policy with AccCount and a background
-//! sync thread (TSS Stage 1). The Stage-2 staging area is simplified to a
-//! recent-eviction buffer.
-//!
-//! The cache is keyed by `(partition_id, page_index)`. On a cache miss the
-//! caller loads the page from the segment file and inserts it. On an eviction
-//! the background thread writes dirty pages to the segment file.
+//! - 16 independently-locked shards, each with its own clock list — the
+//!   paper's contention-avoidance structure. (Deviation: pages map to a
+//!   shard by key hash rather than "shortest list" insertion, because we
+//!   look pages up by key rather than through swizzled pointers; eviction
+//!   runs inline on insert rather than on 16 dedicated threads.)
+//! - Per-page `AccCount` decremented by the clock sweep, exactly as in
+//!   the paper's Algorithm 1.
+//! - **Dirty pages are never evicted** — they are staged in memory until
+//!   the TSS sync cycle writes them to their segment file and marks them
+//!   clean (paper ipage states: cached → dirty → buffered → released).
+//!   Flushed pages *stay cached* so read-after-write is served from
+//!   memory, which is the entire point of the staging design. If every
+//!   page in a shard is dirty the shard temporarily overflows capacity
+//!   and the sync trigger is notified (back-pressure to the sync thread).
+//! - Each page carries a `gen` counter bumped on every dirty insert, so
+//!   the sync cycle can snapshot dirty pages, write them without holding
+//!   shard locks, and afterwards mark clean *only* pages that were not
+//!   re-dirtied concurrently (paper state ❺: re-updated during TSS).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,210 +35,240 @@ use std::time::Duration;
 
 use crate::engine::ipage::IPAGE_SIZE;
 
+/// Number of independently-locked clock lists (paper default: 16).
+const NUM_SHARDS: usize = 16;
+
 /// A cached ipage together with metadata.
 struct CachedPage {
     data: Box<[u8; IPAGE_SIZE]>,
     /// Dirty flag: page has been modified and not yet flushed to SSD.
     dirty: bool,
-    /// Access count, decremented by the clock eviction thread.
+    /// Bumped on every dirty insert; used to detect re-dirtying races.
+    gen: u64,
+    /// Access count, decremented by the clock eviction sweep (paper AccCount).
     acc_count: u32,
 }
 
-type PageKey = (u32, u32); // (partition_id, page_index)
+pub type PageKey = (u32, u32); // (partition_id, page_index)
 
-struct CacheInner {
+struct Shard {
     pages: HashMap<PageKey, CachedPage>,
-    /// Clock hand position for the eviction clock algorithm.
+    /// Clock list for this shard.
     clock_order: Vec<PageKey>,
     clock_pos: usize,
     capacity: usize,
 }
 
-/// Write-staging buffer cache.
-///
-/// Cheap to clone (Arc-wrapped). The background sync thread calls
-/// `flush_dirty()` periodically; callers may also call it explicitly.
-pub struct WsbCache {
-    inner: Arc<Mutex<CacheInner>>,
-    /// Notified when dirty pages exceed a threshold to wake the sync thread.
-    sync_trigger: Arc<Condvar>,
-}
-
-impl WsbCache {
-    /// Create a cache with `capacity` entries.
-    pub fn new(capacity: usize) -> Arc<Self> {
-        Arc::new(WsbCache {
-            inner: Arc::new(Mutex::new(CacheInner {
-                pages: HashMap::with_capacity(capacity),
-                clock_order: Vec::with_capacity(capacity),
-                clock_pos: 0,
-                capacity,
-            })),
-            sync_trigger: Arc::new(Condvar::new()),
-        })
-    }
-
-    /// Look up a page. Returns `None` on a cache miss.
-    pub fn get(&self, key: PageKey) -> Option<Box<[u8; IPAGE_SIZE]>> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(cp) = inner.pages.get_mut(&key) {
-            cp.acc_count = cp.acc_count.saturating_add(1);
-            return Some((*cp.data).clone().into());
-        }
-        None
-    }
-
-    /// Insert or update a page in the cache, marking it dirty if `dirty=true`.
-    ///
-    /// If the cache is at capacity, one clean page (or the LRU dirty page) is
-    /// evicted using the clock algorithm.
-    pub fn insert(
-        &self,
-        key: PageKey,
-        data: Box<[u8; IPAGE_SIZE]>,
-        dirty: bool,
-    ) -> Option<(PageKey, Box<[u8; IPAGE_SIZE]>, bool)> {
-        let mut inner = self.inner.lock().unwrap();
-
-        if let Some(cp) = inner.pages.get_mut(&key) {
-            if dirty {
-                cp.dirty = true;
-            }
-            cp.data = data;
-            cp.acc_count = 1;
-            return None;
-        }
-
-        // Evict if at capacity
-        let evicted = if inner.pages.len() >= inner.capacity {
-            Self::evict(&mut inner)
-        } else {
-            None
-        };
-
-        inner.pages.insert(
-            key,
-            CachedPage {
-                data,
-                dirty,
-                acc_count: 1,
-            },
-        );
-        inner.clock_order.push(key);
-
-        if dirty {
-            drop(inner);
-            self.sync_trigger.notify_one();
-        }
-
-        evicted
-    }
-
-    /// Clock eviction: sweep until a page with acc_count == 0 is found.
-    /// Returns the evicted page's key, data, and dirty flag.
-    fn evict(inner: &mut CacheInner) -> Option<(PageKey, Box<[u8; IPAGE_SIZE]>, bool)> {
-        let len = inner.clock_order.len();
+impl Shard {
+    /// Clock eviction sweep over clean pages only (dirty pages are staged).
+    fn evict_one_clean(&mut self) -> Option<PageKey> {
+        let len = self.clock_order.len();
         if len == 0 {
             return None;
         }
-        let start = inner.clock_pos;
+        // Up to two full sweeps: the first pass decrements access counts,
+        // the second finds a zero-count clean victim.
         for _ in 0..len * 2 {
-            let pos = inner.clock_pos % len;
-            inner.clock_pos = (inner.clock_pos + 1) % len.max(1);
-            let key = inner.clock_order[pos];
-            if let Some(cp) = inner.pages.get_mut(&key) {
+            let pos = self.clock_pos % len;
+            self.clock_pos = (pos + 1) % len;
+            let key = self.clock_order[pos];
+            if let Some(cp) = self.pages.get_mut(&key) {
+                if cp.dirty {
+                    continue; // staged — never evict
+                }
                 if cp.acc_count == 0 {
-                    let cp = inner.pages.remove(&key).unwrap();
-                    inner.clock_order.swap_remove(pos);
-                    // swap_remove moves the last element to `pos`.
-                    // If clock_pos is past the new end, clamp it; otherwise
-                    // leave it unchanged — elements before clock_pos are
-                    // unaffected by a swap at an index >= clock_pos.
-                    let new_len = inner.clock_order.len();
-                    if inner.clock_pos >= new_len && new_len > 0 {
-                        inner.clock_pos = new_len - 1;
+                    self.pages.remove(&key);
+                    self.clock_order.swap_remove(pos);
+                    let new_len = self.clock_order.len();
+                    if self.clock_pos >= new_len && new_len > 0 {
+                        self.clock_pos = new_len - 1;
                     }
-                    return Some((key, cp.data, cp.dirty));
+                    return Some(key);
                 }
                 cp.acc_count = cp.acc_count.saturating_sub(1);
             }
-            if inner.clock_pos == start {
-                break;
-            }
         }
-        // Fallback: evict the first entry
-        if let Some(&first_key) = inner.clock_order.first() {
-            let cp = inner.pages.remove(&first_key).unwrap();
-            inner.clock_order.swap_remove(0);
-            inner.clock_pos = 0;
-            return Some((first_key, cp.data, cp.dirty));
+        None
+    }
+}
+
+/// Write-staging buffer cache.
+pub struct WsbCache {
+    shards: Vec<Mutex<Shard>>,
+    /// Paired with `trigger_lock`; notified when dirty pages pile up to
+    /// wake the TSS sync thread early.
+    sync_trigger: Condvar,
+    trigger_lock: Mutex<()>,
+}
+
+impl WsbCache {
+    /// Create a cache with `capacity` total page entries.
+    pub fn new(capacity: usize) -> Arc<Self> {
+        let per_shard = (capacity / NUM_SHARDS).max(1);
+        let shards = (0..NUM_SHARDS)
+            .map(|_| {
+                Mutex::new(Shard {
+                    pages: HashMap::with_capacity(per_shard),
+                    clock_order: Vec::with_capacity(per_shard),
+                    clock_pos: 0,
+                    capacity: per_shard,
+                })
+            })
+            .collect();
+        Arc::new(WsbCache {
+            shards,
+            sync_trigger: Condvar::new(),
+            trigger_lock: Mutex::new(()),
+        })
+    }
+
+    #[inline]
+    fn shard_for(&self, key: PageKey) -> &Mutex<Shard> {
+        // Cheap mix of partition id and page index.
+        let h = (key.0 as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (key.1 as u64);
+        &self.shards[(h as usize) % NUM_SHARDS]
+    }
+
+    /// Look up a page. Returns a copy on hit, `None` on a miss.
+    pub fn get(&self, key: PageKey) -> Option<[u8; IPAGE_SIZE]> {
+        let mut shard = self.shard_for(key).lock().unwrap();
+        if let Some(cp) = shard.pages.get_mut(&key) {
+            cp.acc_count = cp.acc_count.saturating_add(1);
+            return Some(*cp.data);
         }
         None
     }
 
-    /// Drain all dirty pages from the cache.
+    /// Insert or update a page, marking it dirty if `dirty=true`.
     ///
-    /// Returns a Vec of `(partition_id, page_index, page_data)` for the caller
-    /// to write to the corresponding segment files.
-    pub fn drain_dirty(&self) -> Vec<(u32, u32, Box<[u8; IPAGE_SIZE]>)> {
-        let mut inner = self.inner.lock().unwrap();
-        let dirty_keys: Vec<PageKey> = inner
-            .pages
-            .iter()
-            .filter(|(_, cp)| cp.dirty)
-            .map(|(k, _)| *k)
-            .collect();
+    /// At capacity a *clean* page is evicted via the clock sweep (evicted
+    /// clean pages need no writeback and are simply dropped). Dirty pages
+    /// are never evicted; the shard overflows instead and the sync thread
+    /// is poked.
+    pub fn insert(&self, key: PageKey, data: Box<[u8; IPAGE_SIZE]>, dirty: bool) {
+        let mut overflowed = false;
+        {
+            let mut shard = self.shard_for(key).lock().unwrap();
 
-        let mut result = Vec::with_capacity(dirty_keys.len());
-        for key in dirty_keys {
-            if let Some(cp) = inner.pages.get_mut(&key) {
-                cp.dirty = false;
-                result.push((key.0, key.1, (*cp.data).clone().into()));
+            if let Some(cp) = shard.pages.get_mut(&key) {
+                cp.data = data;
+                cp.acc_count = cp.acc_count.saturating_add(1);
+                if dirty {
+                    cp.dirty = true;
+                    cp.gen += 1;
+                }
+                return;
+            }
+
+            if shard.pages.len() >= shard.capacity && shard.evict_one_clean().is_none() {
+                overflowed = true; // all dirty: stage anyway
+            }
+
+            shard.pages.insert(
+                key,
+                CachedPage {
+                    data,
+                    dirty,
+                    gen: 1,
+                    acc_count: 1,
+                },
+            );
+            shard.clock_order.push(key);
+        }
+        if dirty || overflowed {
+            self.sync_trigger.notify_one();
+        }
+    }
+
+    /// Snapshot all dirty pages **without** clearing the dirty flag.
+    ///
+    /// Returns `(key, gen, data)` tuples. After writing the pages to their
+    /// segment files (and fsyncing), call [`mark_clean`](Self::mark_clean)
+    /// with the same `(key, gen)` pairs — pages re-dirtied in the interim
+    /// keep their dirty flag thanks to the generation check.
+    pub fn collect_dirty(&self) -> Vec<(PageKey, u64, Box<[u8; IPAGE_SIZE]>)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.lock().unwrap();
+            out.extend(
+                shard
+                    .pages
+                    .iter()
+                    .filter(|(_, cp)| cp.dirty)
+                    .map(|(k, cp)| (*k, cp.gen, cp.data.clone())),
+            );
+        }
+        out
+    }
+
+    /// Snapshot dirty pages belonging to one partition (for targeted flush).
+    pub fn collect_dirty_for(&self, pid: u32) -> Vec<(PageKey, u64, Box<[u8; IPAGE_SIZE]>)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.lock().unwrap();
+            out.extend(
+                shard
+                    .pages
+                    .iter()
+                    .filter(|(k, cp)| k.0 == pid && cp.dirty)
+                    .map(|(k, cp)| (*k, cp.gen, cp.data.clone())),
+            );
+        }
+        out
+    }
+
+    /// Clear the dirty flag for pages whose generation is unchanged since
+    /// the matching `collect_dirty` snapshot. The pages stay cached
+    /// (paper "buffered" state) so read-after-write hits memory.
+    pub fn mark_clean(&self, written: &[(PageKey, u64)]) {
+        for &(key, gen) in written {
+            let mut shard = self.shard_for(key).lock().unwrap();
+            if let Some(cp) = shard.pages.get_mut(&key) {
+                if cp.gen == gen {
+                    cp.dirty = false;
+                }
             }
         }
-        result
     }
 
     /// Remove all entries for a given partition (on partition destruction).
     pub fn evict_partition(&self, partition_id: u32) {
-        let mut inner = self.inner.lock().unwrap();
-        inner
-            .pages
-            .retain(|k, _| k.0 != partition_id);
-        inner
-            .clock_order
-            .retain(|k| k.0 != partition_id);
+        for shard in &self.shards {
+            let mut shard = shard.lock().unwrap();
+            shard.pages.retain(|k, _| k.0 != partition_id);
+            shard.clock_order.retain(|k| k.0 != partition_id);
+            shard.clock_pos = 0;
+        }
+    }
+
+    /// Drop every cached page (FLUSHDB path).
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            let mut shard = shard.lock().unwrap();
+            shard.pages.clear();
+            shard.clock_order.clear();
+            shard.clock_pos = 0;
+        }
     }
 
     /// Number of pages currently in the cache.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().pages.len()
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap().pages.len())
+            .sum()
     }
 
-    /// Start a background TSS (Two-Stage Sync) thread that calls `flush_cb`
-    /// with dirty pages every `interval`. The callback receives batches of
-    /// `(partition_id, page_idx, page_data)`.
-    pub fn start_background_sync<F>(
-        cache: Arc<Self>,
-        interval: Duration,
-        mut flush_cb: F,
-    ) -> std::thread::JoinHandle<()>
-    where
-        F: FnMut(Vec<(u32, u32, Box<[u8; IPAGE_SIZE]>)>) + Send + 'static,
-    {
-        std::thread::spawn(move || {
-            loop {
-                // Wait for interval or a trigger notification
-                {
-                    let inner = cache.inner.lock().unwrap();
-                    let _ = cache.sync_trigger.wait_timeout(inner, interval);
-                }
-                let dirty = cache.drain_dirty();
-                if !dirty.is_empty() {
-                    flush_cb(dirty);
-                }
-            }
-        })
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Block until either `interval` elapses or a dirty insert pokes the
+    /// sync trigger. Used by the TSS background thread between cycles.
+    pub fn wait_for_work(&self, interval: Duration) {
+        let guard = self.trigger_lock.lock().unwrap();
+        let _ = self.sync_trigger.wait_timeout(guard, interval);
     }
 }
 
@@ -243,7 +284,7 @@ mod tests {
 
     #[test]
     fn basic_insert_and_get() {
-        let cache = WsbCache::new(10);
+        let cache = WsbCache::new(160);
         let key = (0u32, 1u32);
         cache.insert(key, make_page(42), false);
         let got = cache.get(key).unwrap();
@@ -252,25 +293,61 @@ mod tests {
     }
 
     #[test]
-    fn eviction_on_capacity() {
-        let cache = WsbCache::new(4);
-        for i in 0u32..5 {
+    fn eviction_on_capacity_spares_dirty() {
+        // Tiny cache: 16 shards of 1 page each.
+        let cache = WsbCache::new(16);
+        cache.insert((0, 0), make_page(0), true);
+        cache.insert((0, 1), make_page(1), true);
+        for i in 2u32..40 {
             cache.insert((0, i), make_page(i as u8), false);
         }
-        // After 5 inserts into capacity-4 cache, some page was evicted
-        assert!(cache.len() <= 4);
+        assert!(cache.get((0, 0)).is_some(), "dirty page was evicted");
+        assert!(cache.get((0, 1)).is_some(), "dirty page was evicted");
+        assert_eq!(cache.collect_dirty().len(), 2);
     }
 
     #[test]
-    fn drain_dirty_marks_clean() {
-        let cache = WsbCache::new(100);
+    fn collect_and_mark_clean_with_generation_race() {
+        let cache = WsbCache::new(1600);
         cache.insert((0, 1), make_page(1), true);
-        cache.insert((0, 2), make_page(2), false);
-        cache.insert((0, 3), make_page(3), true);
+        cache.insert((0, 2), make_page(2), true);
 
-        let dirty = cache.drain_dirty();
-        assert_eq!(dirty.len(), 2);
-        // After drain, no more dirty pages
-        assert!(cache.drain_dirty().is_empty());
+        let snap = cache.collect_dirty();
+        assert_eq!(snap.len(), 2);
+
+        // Page (0,1) gets re-dirtied between snapshot and mark_clean.
+        cache.insert((0, 1), make_page(9), true);
+
+        let written: Vec<(PageKey, u64)> = snap.iter().map(|(k, g, _)| (*k, *g)).collect();
+        cache.mark_clean(&written);
+
+        // (0,1) must remain dirty (newer gen); (0,2) is clean now.
+        let still_dirty = cache.collect_dirty();
+        assert_eq!(still_dirty.len(), 1);
+        assert_eq!(still_dirty[0].0, (0, 1));
+        assert_eq!(still_dirty[0].2[0], 9);
+    }
+
+    #[test]
+    fn all_dirty_overflows_capacity() {
+        let cache = WsbCache::new(16); // 1 page per shard
+        for i in 0u32..80 {
+            cache.insert((0, i), make_page(i as u8), true);
+        }
+        // Nothing evictable: cache stages all 80 dirty pages.
+        assert_eq!(cache.len(), 80);
+        assert_eq!(cache.collect_dirty().len(), 80);
+    }
+
+    #[test]
+    fn flushed_pages_stay_cached_for_read_after_write() {
+        let cache = WsbCache::new(160);
+        cache.insert((3, 7), make_page(0xAB), true);
+        let snap = cache.collect_dirty();
+        let written: Vec<(PageKey, u64)> = snap.iter().map(|(k, g, _)| (*k, *g)).collect();
+        cache.mark_clean(&written);
+        // Paper "buffered" state: the page is clean but still in memory.
+        assert_eq!(cache.get((3, 7)).unwrap()[0], 0xAB);
+        assert!(cache.collect_dirty().is_empty());
     }
 }

@@ -1,79 +1,97 @@
 //! Per-partition B+ tree stored as ipages in a segment file.
 //!
-//! This implements the per-partition index structure from SIndex (ACM TOS 2024).
-//! Keys are 64-bit hashes of the actual keys; values are (value_ptr, value_len,
-//! key_len) tuples pointing into the value log. All data is in leaf nodes;
-//! internal nodes only hold separator keys for routing.
+//! This implements the per-partition index structure from SIndex (ICPP '24 /
+//! ACM TOS 2026). Keys are 64-bit hashes of the actual keys; values are
+//! (value_ptr, value_len, key_len) tuples pointing into the value log. All
+//! data is in leaf nodes; internal nodes only hold separator keys for routing.
 //!
 //! ## Deterministic latency
 //! Tree height is bounded by `BTREE_MAX_HEIGHT`. A lookup reads at most
 //! `BTREE_MAX_HEIGHT` ipage pages from the segment (SSD reads), guaranteeing
 //! deterministic latency per the paper.
 //!
-//! ## Page cache
-//! Modified pages are held in a `HashMap<u32, [u8; IPAGE_SIZE]>` (the
-//! "dirty page cache"). On `flush()` they are written to the segment file in
-//! batch. This corresponds to the paper's WSBCache (write-staging buffer),
-//! though without the full clock-eviction / TSS mechanism.
+//! ## Page access via WSBCache
+//! Every page read/write goes through the engine-global write-staging
+//! buffer cache. Reads check the cache first (hot ipages are served from
+//! memory); modified pages are inserted dirty and stay staged until the
+//! TSS sync cycle writes them to the segment file. The tree itself holds
+//! no mutable state — read operations take `&self` + `&SegmentFile` and
+//! can run under a shared partition lock.
 
-use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 
 use crate::engine::ipage::{
-    init_internal, init_leaf, internal_child, internal_count, internal_find_child, internal_set_child,
-    internal_height, internal_insert, internal_key, internal_split, leaf_count, leaf_entry_at,
-    leaf_insert, leaf_lower_bound, leaf_next, leaf_remove, leaf_set_next, leaf_split,
-    leaf_write_entry, page_node_type, LeafEntry, IPAGE_SIZE, NODE_INTERNAL, NODE_LEAF,
+    init_internal, init_leaf, internal_child, internal_count, internal_find_child,
+    internal_height, internal_insert, internal_key, internal_set_child, internal_split,
+    leaf_count, leaf_entry_at, leaf_insert, leaf_lower_bound, leaf_next, leaf_remove,
+    leaf_set_next, leaf_split, leaf_write_entry, page_node_type, LeafEntry, IPAGE_SIZE,
+    NODE_INTERNAL, NODE_LEAF,
 };
 use crate::engine::segment::SegmentFile;
+use crate::engine::wsbcache::WsbCache;
 
-/// Maximum allowed B-Tree height. Bounds the number of SSD reads per lookup,
-/// providing the deterministic latency guarantee from the paper.
-pub const BTREE_MAX_HEIGHT: u8 = 4;
-
-/// B+ tree backed by a segment file.
+/// Maximum B-Tree height, matching the paper ("SIndex precisely tunes the
+/// capacity of internal B-Tree nodes to ensure the tree height does not
+/// exceed 3, achieving consistently short indexing path").
 ///
-/// All node pages are 4 KB ipages. Modified pages live in `dirty` until
-/// `flush()` writes them to the segment file.
+/// Capacity check: a height-3 tree holds 169 (leaf entries) × 254 × 254
+/// ≈ 10.9 M entries per partition; with 65 536 partitions the engine spans
+/// ~715 billion entries — the paper's "hundreds of billions" regime.
+pub const BTREE_MAX_HEIGHT: u8 = 3;
+
+/// B+ tree backed by a segment file, with all page traffic staged through
+/// the shared `WsbCache`.
 pub struct BTree {
-    /// Dirty pages not yet flushed to the segment file.
-    dirty: HashMap<u32, [u8; IPAGE_SIZE]>,
+    pid: u32,
+    cache: Arc<WsbCache>,
 }
 
 impl BTree {
-    pub fn new() -> Self {
-        BTree {
-            dirty: HashMap::new(),
-        }
+    pub fn new(pid: u32, cache: Arc<WsbCache>) -> Self {
+        BTree { pid, cache }
     }
 
-    /// Get a page: check dirty cache first, then read from segment.
-    /// Returns a copy of the 4 KB page (stack-allocated, safe for bounded recursion).
-    fn load_page(
-        &self,
-        seg: &mut SegmentFile,
-        idx: u32,
-    ) -> io::Result<[u8; IPAGE_SIZE]> {
-        if let Some(p) = self.dirty.get(&idx) {
-            return Ok(*p);
+    /// Get a page: check the WSBCache first, then read from the segment
+    /// (inserting the page clean so subsequent reads hit memory). Pages
+    /// coming from the SSD are CRC-verified (paper: per-ipage CRC check).
+    fn load_page(&self, seg: &SegmentFile, idx: u32) -> io::Result<[u8; IPAGE_SIZE]> {
+        if let Some(p) = self.cache.get((self.pid, idx)) {
+            return Ok(p);
         }
         let mut buf = [0u8; IPAGE_SIZE];
         seg.read_page(idx, &mut buf)?;
+        if !crate::engine::ipage::verify(&buf) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ipage CRC mismatch: partition {} page {}", self.pid, idx),
+            ));
+        }
+        self.cache.insert((self.pid, idx), Box::new(buf), false);
         Ok(buf)
     }
 
-    /// Mark a page as dirty (in-memory pending write).
-    fn mark_dirty(&mut self, idx: u32, page: [u8; IPAGE_SIZE]) {
-        self.dirty.insert(idx, page);
+    /// Stage a modified page in the WSBCache (write-staging, paper TSS).
+    fn mark_dirty(&self, idx: u32, page: [u8; IPAGE_SIZE]) {
+        self.cache.insert((self.pid, idx), Box::new(page), true);
     }
 
-    /// Write all dirty pages to the segment file and flush the header.
-    pub fn flush(&mut self, seg: &mut SegmentFile) -> io::Result<()> {
-        for (&idx, page) in &self.dirty {
-            seg.write_page(idx, page)?;
+    /// Write this partition's staged dirty pages to the segment file and
+    /// fsync. Used by the engine's sync cycle and on shutdown. Each page is
+    /// CRC-sealed before hitting the SSD.
+    pub fn flush(&self, seg: &mut SegmentFile) -> io::Result<()> {
+        let mut dirty = self.cache.collect_dirty_for(self.pid);
+        if dirty.is_empty() {
+            return Ok(());
         }
-        self.dirty.clear();
-        seg.sync()
+        for ((_, idx), _, page) in &mut dirty {
+            crate::engine::ipage::seal(page);
+            seg.write_page(*idx, page)?;
+        }
+        seg.sync()?;
+        let written: Vec<_> = dirty.iter().map(|(k, g, _)| (*k, *g)).collect();
+        self.cache.mark_clean(&written);
+        Ok(())
     }
 
     // ─── Search ─────────────────────────────────────────────────────────────
@@ -81,12 +99,9 @@ impl BTree {
     /// Look up `key_hash` in the tree.
     ///
     /// Returns the first `LeafEntry` with a matching `key_hash` and
-    /// `FLAG_ALIVE`, or `None`.
-    pub fn get(
-        &self,
-        seg: &mut SegmentFile,
-        key_hash: u64,
-    ) -> io::Result<Option<LeafEntry>> {
+    /// `FLAG_ALIVE`, or `None`. Takes `&self` + `&SegmentFile`: safe under a
+    /// shared (read) partition lock.
+    pub fn get(&self, seg: &SegmentFile, key_hash: u64) -> io::Result<Option<LeafEntry>> {
         let root = seg.header.root_page;
         if root == 0 {
             return Ok(None);
@@ -96,7 +111,7 @@ impl BTree {
 
     fn get_inner(
         &self,
-        seg: &mut SegmentFile,
+        seg: &SegmentFile,
         page_idx: u32,
         key_hash: u64,
     ) -> io::Result<Option<LeafEntry>> {
@@ -135,12 +150,9 @@ impl BTree {
     ///
     /// If an alive entry for `key_hash` already exists its `value_ptr` is
     /// updated in-place. Returns `true` if a new entry was created, `false`
-    /// if an existing one was updated.
-    pub fn insert(
-        &mut self,
-        seg: &mut SegmentFile,
-        entry: LeafEntry,
-    ) -> io::Result<bool> {
+    /// if an existing one was updated. Pages are staged dirty in the
+    /// WSBCache — nothing touches the SSD here.
+    pub fn insert(&self, seg: &mut SegmentFile, entry: LeafEntry) -> io::Result<bool> {
         let root = seg.header.root_page;
         if root == 0 {
             // Tree is empty — allocate the first leaf as root.
@@ -193,7 +205,7 @@ impl BTree {
     }
 
     fn insert_recursive(
-        &mut self,
+        &self,
         seg: &mut SegmentFile,
         page_idx: u32,
         entry: LeafEntry,
@@ -238,12 +250,7 @@ impl BTree {
                                 {
                                     rpos += 1;
                                 }
-                                internal_insert(
-                                    &mut right_page,
-                                    rpos,
-                                    sep_key,
-                                    right_child,
-                                );
+                                internal_insert(&mut right_page, rpos, sep_key, right_child);
                             }
 
                             self.mark_dirty(page_idx, page);
@@ -325,11 +332,7 @@ impl BTree {
     /// Mark the entry for `key_hash` as deleted.
     ///
     /// Returns `true` if an alive entry was found and marked deleted.
-    pub fn delete(
-        &mut self,
-        seg: &mut SegmentFile,
-        key_hash: u64,
-    ) -> io::Result<bool> {
+    pub fn delete(&self, seg: &mut SegmentFile, key_hash: u64) -> io::Result<bool> {
         let root = seg.header.root_page;
         if root == 0 {
             return Ok(false);
@@ -342,8 +345,8 @@ impl BTree {
     }
 
     fn delete_recursive(
-        &mut self,
-        seg: &mut SegmentFile,
+        &self,
+        seg: &SegmentFile,
         page_idx: u32,
         key_hash: u64,
     ) -> io::Result<bool> {
@@ -382,10 +385,7 @@ impl BTree {
     ///
     /// Starts from the leftmost leaf by traversing the tree, then follows
     /// `next_leaf` pointers. Used for SCAN and recovery.
-    pub fn iter_entries(
-        &self,
-        seg: &mut SegmentFile,
-    ) -> io::Result<Vec<LeafEntry>> {
+    pub fn iter_entries(&self, seg: &SegmentFile) -> io::Result<Vec<LeafEntry>> {
         let root = seg.header.root_page;
         if root == 0 {
             return Ok(Vec::new());
@@ -425,12 +425,6 @@ impl BTree {
     }
 }
 
-impl Default for BTree {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Result of a recursive insert — either done or a split bubbled up.
 enum InsertResult {
     Done { is_new: bool },
@@ -457,32 +451,31 @@ mod tests {
         }
     }
 
-    fn open_seg(path: &std::path::Path) -> SegmentFile {
-        SegmentFile::create(path, 0).unwrap()
+    fn open_tree(path: &std::path::Path) -> (BTree, SegmentFile) {
+        let seg = SegmentFile::create(path, 0).unwrap();
+        (BTree::new(0, WsbCache::new(100_000)), seg)
     }
 
     #[test]
     fn basic_insert_and_get() {
         let dir = tempdir().unwrap();
-        let mut seg = open_seg(&dir.path().join("p0.seg"));
-        let mut tree = BTree::new();
+        let (tree, mut seg) = open_tree(&dir.path().join("p0.seg"));
 
         for i in 0u64..100 {
             tree.insert(&mut seg, make_entry(i * 7, i * 100)).unwrap();
         }
 
         for i in 0u64..100 {
-            let e = tree.get(&mut seg, i * 7).unwrap().unwrap();
+            let e = tree.get(&seg, i * 7).unwrap().unwrap();
             assert_eq!(e.value_ptr, i * 100);
         }
-        assert!(tree.get(&mut seg, 9999).unwrap().is_none());
+        assert!(tree.get(&seg, 9999).unwrap().is_none());
     }
 
     #[test]
     fn insert_many_causes_splits() {
         let dir = tempdir().unwrap();
-        let mut seg = open_seg(&dir.path().join("p0.seg"));
-        let mut tree = BTree::new();
+        let (tree, mut seg) = open_tree(&dir.path().join("p0.seg"));
 
         // Insert enough keys to force multiple leaf splits
         let n = MAX_LEAF_ENTRIES * 10;
@@ -493,7 +486,7 @@ mod tests {
 
         // Verify all entries are findable
         for i in 0u64..n as u64 {
-            let e = tree.get(&mut seg, i).unwrap().unwrap();
+            let e = tree.get(&seg, i).unwrap().unwrap();
             assert_eq!(e.value_ptr, i * 10);
         }
     }
@@ -501,16 +494,15 @@ mod tests {
     #[test]
     fn delete_removes_entry() {
         let dir = tempdir().unwrap();
-        let mut seg = open_seg(&dir.path().join("p0.seg"));
-        let mut tree = BTree::new();
+        let (tree, mut seg) = open_tree(&dir.path().join("p0.seg"));
 
         for i in 0u64..50 {
             tree.insert(&mut seg, make_entry(i, i)).unwrap();
         }
 
         assert!(tree.delete(&mut seg, 25).unwrap());
-        assert!(tree.get(&mut seg, 25).unwrap().is_none());
-        assert!(tree.get(&mut seg, 24).unwrap().is_some());
+        assert!(tree.get(&seg, 25).unwrap().is_none());
+        assert!(tree.get(&seg, 24).unwrap().is_some());
         assert!(!tree.delete(&mut seg, 999).unwrap()); // non-existent
     }
 
@@ -520,18 +512,19 @@ mod tests {
         let path = dir.path().join("p0.seg");
         {
             let mut seg = SegmentFile::create(&path, 0).unwrap();
-            let mut tree = BTree::new();
+            let tree = BTree::new(0, WsbCache::new(100_000));
             for i in 0u64..50 {
                 tree.insert(&mut seg, make_entry(i, i * 10)).unwrap();
             }
             tree.flush(&mut seg).unwrap();
         }
         {
-            let mut seg = SegmentFile::open(&path).unwrap();
-            let tree = BTree::new();
+            // Fresh cache: everything must come from the segment file.
+            let seg = SegmentFile::open(&path).unwrap();
+            let tree = BTree::new(0, WsbCache::new(100_000));
             assert_eq!(seg.header.live_entries, 50);
             for i in 0u64..50 {
-                let e = tree.get(&mut seg, i).unwrap().unwrap();
+                let e = tree.get(&seg, i).unwrap().unwrap();
                 assert_eq!(e.value_ptr, i * 10);
             }
         }
@@ -540,15 +533,14 @@ mod tests {
     #[test]
     fn iter_entries_in_order() {
         let dir = tempdir().unwrap();
-        let mut seg = open_seg(&dir.path().join("p0.seg"));
-        let mut tree = BTree::new();
+        let (tree, mut seg) = open_tree(&dir.path().join("p0.seg"));
 
         let mut hashes: Vec<u64> = (0u64..200).map(|i| i * 3 + 1).collect();
         for &h in &hashes {
             tree.insert(&mut seg, make_entry(h, h * 2)).unwrap();
         }
 
-        let entries = tree.iter_entries(&mut seg).unwrap();
+        let entries = tree.iter_entries(&seg).unwrap();
         assert_eq!(entries.len(), hashes.len());
         hashes.sort();
         for (got, expected_h) in entries.iter().zip(hashes.iter()) {

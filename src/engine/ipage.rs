@@ -71,6 +71,28 @@ const LEAF_OFF_NEXT: usize = 8;
 const LEAF_ENTRIES_START: usize = 32;
 const LEAF_ENTRY_SIZE: usize = 24;
 
+/// Byte offset of the per-page CRC32 (paper: "A CRC check is incorporated
+/// to verify data integrity" per ipage). Lives in the padding region of
+/// both node layouts: leaf [12..32], internal [8..32].
+const PAGE_CRC_OFF: usize = 12;
+
+/// Stamp the page CRC. Called when a page is written to the segment file;
+/// the CRC field itself is zeroed during computation.
+pub fn seal(page: &mut [u8; IPAGE_SIZE]) {
+    write_u32(page, PAGE_CRC_OFF, 0);
+    let crc = crc32fast::hash(page);
+    write_u32(page, PAGE_CRC_OFF, crc);
+}
+
+/// Verify the page CRC stamped by [`seal`]. Called when a page is read from
+/// the segment file (not for cache hits — cached pages are trusted).
+pub fn verify(page: &[u8; IPAGE_SIZE]) -> bool {
+    let stored = read_u32(page, PAGE_CRC_OFF);
+    let mut copy = *page;
+    write_u32(&mut copy, PAGE_CRC_OFF, 0);
+    crc32fast::hash(&copy) == stored
+}
+
 /// Byte offsets within the internal node header.
 const INT_OFF_HEIGHT: usize = 5;
 const INT_OFF_COUNT: usize = 6;

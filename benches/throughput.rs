@@ -3,10 +3,11 @@
 //! ## Benchmark categories
 //!
 //! **latency/** — per-operation µs showing B-Tree traversal + I/O cost
-//!   - `warm_get`  : read from OS page cache (DRAM-speed, hot-path)
+//!   - `warm_get`  : WSBCache/OS-page-cache hit (DRAM-speed, hot-path)
 //!   - `cold_get`  : drop OS page cache before each op → true SSD read latency
-//!   - `put`       : value-log append + B-Tree insert + 2× fdatasync
-//!   - `delete`    : B-Tree remove + fdatasync
+//!   - `put`       : value-log append + staged B-Tree update (write-staging:
+//!                   no fsync on the request path; the TSS thread syncs)
+//!   - `delete`    : tombstone append + staged B-Tree remove
 //!
 //! **throughput/** — ops/s across warm (cached) and cold (disk) paths
 //!   - `get_warm_*`, `get_cold_*`, `mixed_*`, `put_seq_*`, `put_value_size_*`

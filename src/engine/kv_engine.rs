@@ -1,50 +1,91 @@
 //! Top-level KV engine implementing the SIndex paper design.
 //!
-//! "The Design of Trillion-scale SSD-based Indexing with Deterministic
-//! Latency for Cloud Block Storage", ACM TOS 2024 (DOI 10.1145/3789205).
+//! "SIndex: An SSD-based Large-scale Indexing with Deterministic Latency
+//! for Cloud Block Storage" (ICPP '24, DOI 10.1145/3673038.3673041;
+//! extended as ACM TOS 2026, DOI 10.1145/3789205).
 //!
 //! ## Architecture
 //!
 //! ```text
 //!   KvEngine
-//!   ├── PartitionTable (DashMap<partition_id → Arc<RwLock<Partition>>>)
-//!   │     One entry per active partition (created lazily on first write).
-//!   │     Partition ID = top NUM_PARTITION_BITS bits of xxh3(key).
+//!   ├── Segment table / MLI high level (DashMap<partition_id → Partition>)
+//!   │     The paper's concurrent hash table keyed by vplaneID; here the
+//!   │     partition ID = top NUM_PARTITION_BITS bits of xxh3(key).
 //!   │
-//!   ├── Each Partition:
-//!   │   ├── BTree — per-partition B+ tree (bounded height → deterministic latency)
+//!   ├── Each Partition (MLI low level):
+//!   │   ├── BTree — per-partition B+ tree, height ≤ BTREE_MAX_HEIGHT (= 3,
+//!   │   │   as in the paper) with a dedicated RwLock per partition
 //!   │   └── SegmentFile — 4 KB ipage backing store on SSD
 //!   │
-//!   └── ValueLog (shared) — append-only variable-size (key, value) store
+//!   ├── WSBCache (shared) — write-staging buffer cache, 16 clock lists;
+//!   │     all ipage traffic goes through it (§4.3 of the paper)
+//!   │
+//!   └── ValueLog (shared) — append-only (key, value) store + redo journal
 //! ```
 //!
-//! ## Deterministic Latency Guarantee
-//! A `get` touches at most `BTREE_MAX_HEIGHT` ipage reads (the B-Tree traversal)
-//! plus one value log read — a fixed upper bound independent of data volume.
+//! ## Write path (paper §4.3 write staging + §4.5 crash consistency)
+//! A `put` appends to the value log (the WAL: "recording all BM updates
+//! into the WAL before overwriting their related ipage") and updates the
+//! B-Tree **in memory only** — modified ipages are staged dirty in the
+//! WSBCache. No fsync happens on the request path. A background TSS
+//! thread runs the two-stage sync every `SYNC_INTERVAL`:
 //!
-//! ## Variable Value Support
-//! Unlike the paper's original fixed-size block mappings, `KvEngine` stores
-//! arbitrary byte slices by writing them to the value log and recording only
-//! (value_ptr, value_len, key_len) in the B-Tree leaf entry.
+//! 1. Under a brief exclusive epoch guard, snapshot the dirty page set and
+//!    the value-log high-water mark `P` (every entry below `P` is fully
+//!    applied to the in-memory index by then).
+//! 2. fsync the value log up to `P`, write + fsync the snapshot pages to
+//!    their segment files, then atomically advance the on-disk checkpoint
+//!    to `P`. Flushed pages stay cached (paper "buffered" state) so
+//!    read-after-write is served from memory.
+//!
+//! ## Recovery
+//! On open, the engine replays the value log from the last checkpoint:
+//! ALIVE entries are re-inserted, DELETED tombstones re-applied, and a
+//! torn tail (detected by magic/CRC) is truncated. Replay is idempotent —
+//! re-inserting an already-indexed entry just rewrites the same pointer.
+//!
+//! ## Deterministic Latency Guarantee
+//! A `get` touches at most `BTREE_MAX_HEIGHT` ipage reads (the B-Tree
+//! traversal, each a WSBCache hit or one SSD pread) plus one value-log
+//! pread — a fixed upper bound independent of data volume.
+//!
+//! ## Single-disk scope
+//! The paper's inter-SSD scheduling (RO-/WO-SSD separation, epoch state
+//! transition with Evading-flush Delay, dynamic read selection §4.4) needs
+//! multiple physical SSDs and is out of scope for this single-volume
+//! deployment; the staging/sync design here is what those mechanisms
+//! build upon.
 
-use std::io;
+use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, Weak};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::btree::BTree;
-use crate::engine::ipage::{FLAG_ALIVE, FLAG_DELETED};
+use crate::engine::ipage::{self, LeafEntry, FLAG_ALIVE};
 use crate::engine::segment::SegmentFile;
-use crate::engine::value_log::ValueLog;
+use crate::engine::value_log::{ValueLog, VFLAG_DELETED};
+use crate::engine::wsbcache::WsbCache;
 
 /// Number of top-bits used to derive the partition ID.
 /// 16 bits → 65 536 partitions. Keeps the segment-table size tiny
-/// (< 1 MB in RAM) even at trillion-entry scale.
+/// (< 1 MB in RAM) even at hundreds-of-billions scale.
 pub const NUM_PARTITION_BITS: u32 = 16;
 /// Total number of partitions.
 pub const NUM_PARTITIONS: u32 = 1 << NUM_PARTITION_BITS;
+
+/// WSBCache capacity in 4 KB pages (16 384 pages = 64 MB staged + hot set).
+const WSB_CACHE_PAGES: usize = 16_384;
+
+/// TSS sync interval. The paper defaults to 5 s epochs for multi-SSD state
+/// transitions; on a single volume we sync far more often to keep the
+/// post-crash replay window small.
+const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 
 struct Partition {
     btree: BTree,
@@ -52,14 +93,18 @@ struct Partition {
 }
 
 impl Partition {
-    fn open_or_create(path: &Path, partition_id: u32) -> io::Result<Self> {
+    fn open_or_create(
+        path: &Path,
+        partition_id: u32,
+        cache: Arc<WsbCache>,
+    ) -> io::Result<Self> {
         let seg = if path.exists() {
             SegmentFile::open(path)?
         } else {
             SegmentFile::create(path, partition_id)?
         };
         Ok(Partition {
-            btree: BTree::new(),
+            btree: BTree::new(partition_id, cache),
             seg,
         })
     }
@@ -68,68 +113,245 @@ impl Partition {
 /// The main KV engine.
 pub struct KvEngine {
     data_dir: PathBuf,
-    /// Segment table (MLI Level-1): partition_id → Partition.
-    /// Keys are created lazily on first write.
+    /// Segment table (MLI high level): partition_id → Partition.
+    /// Partitions are created lazily on first write.
     partitions: DashMap<u32, Arc<RwLock<Partition>>>,
-    /// Shared value log for all partitions.
+    /// Shared value log (data + redo journal) for all partitions.
     value_log: Arc<ValueLog>,
+    /// Write-staging buffer cache shared by every partition's B-Tree.
+    cache: Arc<WsbCache>,
+    /// Held shared by writers for the (vlog append → index update) section;
+    /// held exclusive by the sync cycle to snapshot a consistent cut.
+    epoch: RwLock<()>,
+    /// Serializes sync cycles (TSS thread vs explicit `flush()` calls):
+    /// checkpoints must advance monotonically and the tmp+rename pair must
+    /// not race itself.
+    sync_lock: std::sync::Mutex<()>,
+    /// Value-log offset below which the index is durable on disk.
+    checkpoint: AtomicU64,
+    /// Stops the TSS thread.
+    shutdown: AtomicBool,
+    /// When set, Drop skips the final flush (crash simulation in tests).
+    skip_final_flush: AtomicBool,
 }
 
 impl KvEngine {
-    /// Open (or create) a `KvEngine` rooted at `data_dir`.
+    /// Open (or create) a `KvEngine` rooted at `data_dir`, replaying any
+    /// value-log tail past the last checkpoint, and start the TSS sync
+    /// thread.
     pub fn open(data_dir: &Path) -> io::Result<Arc<Self>> {
         std::fs::create_dir_all(data_dir)?;
         let seg_dir = data_dir.join("segments");
         std::fs::create_dir_all(&seg_dir)?;
 
         let value_log = ValueLog::open(&data_dir.join("value.log"))?;
+        let cache = WsbCache::new(WSB_CACHE_PAGES);
 
         let engine = Arc::new(KvEngine {
             data_dir: data_dir.to_path_buf(),
             partitions: DashMap::new(),
             value_log,
+            cache,
+            epoch: RwLock::new(()),
+            sync_lock: std::sync::Mutex::new(()),
+            checkpoint: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+            skip_final_flush: AtomicBool::new(false),
         });
 
-        // Pre-open any existing segment files (so we don't lose data on restart)
+        // Pre-open existing segment files.
         if let Ok(rd) = std::fs::read_dir(&seg_dir) {
             for entry in rd.flatten() {
                 let p = entry.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("seg") {
                     if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                         if let Ok(pid) = stem.parse::<u32>() {
-                            let part = Partition::open_or_create(&p, pid)?;
-                            engine
-                                .partitions
-                                .insert(pid, Arc::new(RwLock::new(part)));
+                            let part = Partition::open_or_create(
+                                &p,
+                                pid,
+                                Arc::clone(&engine.cache),
+                            )?;
+                            engine.partitions.insert(pid, Arc::new(RwLock::new(part)));
                         }
                     }
                 }
             }
         }
 
+        engine.recover()?;
+
+        // TSS background thread. It waits on a cloned cache handle and only
+        // upgrades its Weak engine ref for the duration of a sync cycle, so
+        // dropping the last user Arc runs the engine's final-flush Drop
+        // promptly (not delayed by a sleeping thread).
+        let weak: Weak<KvEngine> = Arc::downgrade(&engine);
+        let wait_cache = Arc::clone(&engine.cache);
+        std::thread::Builder::new()
+            .name("sindex-tss".into())
+            .spawn(move || loop {
+                wait_cache.wait_for_work(SYNC_INTERVAL);
+                match weak.upgrade() {
+                    Some(engine) => {
+                        if engine.shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if let Err(e) = engine.sync_cycle() {
+                            eprintln!("sindex: TSS sync cycle failed: {}", e);
+                        }
+                    }
+                    None => break,
+                }
+            })
+            .expect("failed to spawn TSS thread");
+
         Ok(engine)
     }
 
-    /// Compute the partition ID from a key.
-    #[inline]
-    fn partition_id(key: &[u8]) -> u32 {
-        let h = xxh3_64(key);
-        // Use the top NUM_PARTITION_BITS bits
-        (h >> (64 - NUM_PARTITION_BITS)) as u32
+    // ─── Recovery (paper §4.5) ───────────────────────────────────────────────
+
+    fn checkpoint_path(&self) -> PathBuf {
+        self.data_dir.join("checkpoint")
     }
 
+    fn read_checkpoint(&self) -> u64 {
+        match std::fs::read(self.checkpoint_path()) {
+            Ok(bytes) if bytes.len() == 12 => {
+                let pos = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                if crc32fast::hash(&bytes[0..8]) == crc {
+                    pos
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn write_checkpoint(&self, pos: u64) -> io::Result<()> {
+        let mut bytes = Vec::with_capacity(12);
+        bytes.extend_from_slice(&pos.to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&pos.to_le_bytes()).to_le_bytes());
+        // Atomic via temp + rename.
+        let tmp = self.data_dir.join("checkpoint.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp, self.checkpoint_path())?;
+        self.checkpoint.store(pos, Ordering::Release);
+        Ok(())
+    }
+
+    /// Replay the value-log tail past the checkpoint into the index, then
+    /// truncate any torn tail and persist a fresh checkpoint.
+    fn recover(&self) -> io::Result<()> {
+        let ckpt = self.read_checkpoint().min(self.value_log.size());
+        self.checkpoint.store(ckpt, Ordering::Release);
+
+        let (valid_end, entries) = self.value_log.scan_from(ckpt)?;
+        if entries.is_empty() && valid_end == self.value_log.size() && ckpt == valid_end {
+            return Ok(());
+        }
+
+        for e in &entries {
+            let h = xxh3_64(&e.key);
+            let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
+            if e.flags == VFLAG_DELETED {
+                if let Some(part_arc) = self.partitions.get(&pid).map(|p| Arc::clone(&p)) {
+                    let mut guard = part_arc.write().unwrap();
+                    let part = &mut *guard;
+                    part.btree.delete(&mut part.seg, h)?;
+                }
+            } else {
+                let part_arc = self.get_or_create_partition(pid)?;
+                let mut guard = part_arc.write().unwrap();
+                let part = &mut *guard;
+                part.btree.insert(
+                    &mut part.seg,
+                    LeafEntry {
+                        key_hash: h,
+                        value_ptr: e.offset,
+                        value_len: e.value_len,
+                        key_len: e.key.len() as u16,
+                        flags: FLAG_ALIVE,
+                    },
+                )?;
+            }
+        }
+
+        // Drop a torn tail so future appends don't land after garbage.
+        if valid_end < self.value_log.size() {
+            self.value_log.truncate_to(valid_end)?;
+        }
+
+        // Persist the replayed state and advance the checkpoint.
+        self.flush()
+    }
+
+    // ─── TSS sync cycle (paper §4.3 two-stage sync) ──────────────────────────
+
+    /// One two-stage-sync cycle: snapshot a consistent cut, make the value
+    /// log durable, write staged ipages to their segments, advance the
+    /// checkpoint, and mark the written pages clean (they stay cached).
+    fn sync_cycle(&self) -> io::Result<()> {
+        let _sync = self.sync_lock.lock().unwrap();
+
+        // Stage 0: consistent cut. The exclusive epoch guard waits out all
+        // in-flight (append → index-update) sections, so every vlog entry
+        // below `p` is reflected in the staged pages we snapshot.
+        let (p, mut dirty) = {
+            let _g = self.epoch.write().unwrap();
+            (self.value_log.size(), self.cache.collect_dirty())
+        };
+
+        if dirty.is_empty() && p == self.checkpoint.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        // Stage 1: journal first — the index must never durably reference
+        // value-log bytes that aren't on disk.
+        self.value_log.flush()?;
+
+        // Stage 2: write staged ipages per partition, fsync each segment.
+        let mut by_pid: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, ((pid, _), _, _)) in dirty.iter().enumerate() {
+            by_pid.entry(*pid).or_default().push(i);
+        }
+        for (pid, idxs) in &by_pid {
+            let part_arc = match self.partitions.get(pid) {
+                Some(p) => Arc::clone(&p),
+                None => continue, // partition cleared meanwhile
+            };
+            let guard = part_arc.write().unwrap();
+            for &i in idxs {
+                let ((_, page_idx), _, page) = &mut dirty[i];
+                ipage::seal(page);
+                guard.seg.write_page(*page_idx, page)?;
+            }
+            guard.seg.sync()?;
+        }
+
+        // Checkpoint: everything below `p` is now durable in the index.
+        self.write_checkpoint(p)?;
+
+        let written: Vec<_> = dirty.iter().map(|(k, g, _)| (*k, *g)).collect();
+        self.cache.mark_clean(&written);
+        Ok(())
+    }
+
+    // ─── Partitioning ────────────────────────────────────────────────────────
+
     /// Get or create the `Partition` for `partition_id`.
-    fn get_or_create_partition(
-        &self,
-        pid: u32,
-    ) -> io::Result<Arc<RwLock<Partition>>> {
+    fn get_or_create_partition(&self, pid: u32) -> io::Result<Arc<RwLock<Partition>>> {
         if let Some(p) = self.partitions.get(&pid) {
             return Ok(Arc::clone(p.value()));
         }
-        // Create new partition — serialize creation to avoid race
+        let cache = Arc::clone(&self.cache);
         let entry = self.partitions.entry(pid).or_try_insert_with(|| {
             let path = self.seg_path(pid);
-            Partition::open_or_create(&path, pid).map(|p| Arc::new(RwLock::new(p)))
+            Partition::open_or_create(&path, pid, cache).map(|p| Arc::new(RwLock::new(p)))
         })?;
         Ok(Arc::clone(entry.value()))
     }
@@ -144,7 +366,8 @@ impl KvEngine {
 
     /// Get the value for `key`. Returns `None` if the key does not exist.
     ///
-    /// At most `BTREE_MAX_HEIGHT` + 1 storage reads (deterministic latency).
+    /// Takes only a shared partition lock: concurrent readers proceed in
+    /// parallel (B-Tree pages via WSBCache or `pread`, value via `pread`).
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
@@ -155,9 +378,8 @@ impl KvEngine {
         };
 
         let entry = {
-            let mut guard = part_arc.write().unwrap();
-            let part = &mut *guard;
-            part.btree.get(&mut part.seg, h)?
+            let guard = part_arc.read().unwrap();
+            guard.btree.get(&guard.seg, h)?
         };
 
         let entry = match entry {
@@ -165,49 +387,50 @@ impl KvEngine {
             None => return Ok(None),
         };
 
-        // Verify the actual key (guards against hash collisions).
-        let stored_key = self
-            .value_log
-            .read_key(entry.value_ptr, entry.key_len)?;
+        // One positional read for key + value; comparing the stored key
+        // guards against hash collisions.
+        let (stored_key, value) =
+            self.value_log
+                .read_key_value(entry.value_ptr, entry.key_len, entry.value_len)?;
         if stored_key != key {
-            // Hash collision — key not found
             return Ok(None);
         }
-
-        let value = self
-            .value_log
-            .read_value(entry.value_ptr, entry.key_len, entry.value_len)?;
         Ok(Some(value))
     }
 
     /// Insert or update `(key, value)`.
+    ///
+    /// Appends to the value log (journal) and stages the B-Tree update in
+    /// the WSBCache — no fsync on the request path (paper write staging).
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
 
-        // Step 1: append to value log (write-ahead)
-        let value_ptr = self.value_log.append(key, value)?;
+        let _epoch = self.epoch.read().unwrap();
 
-        // Step 2: update the B-Tree index
         let part_arc = self.get_or_create_partition(pid)?;
         let mut guard = part_arc.write().unwrap();
-        {
-            let part = &mut *guard;
-            use crate::engine::ipage::LeafEntry;
-            let leaf_entry = LeafEntry {
+
+        // Journal first (WAL before ipage update, paper §4.5).
+        let value_ptr = self.value_log.append(key, value)?;
+
+        let part = &mut *guard;
+        part.btree.insert(
+            &mut part.seg,
+            LeafEntry {
                 key_hash: h,
                 value_ptr,
                 value_len: value.len() as u32,
                 key_len: key.len() as u16,
                 flags: FLAG_ALIVE,
-            };
-            part.btree.insert(&mut part.seg, leaf_entry)?;
-            part.btree.flush(&mut part.seg)?;
-        }
+            },
+        )?;
         Ok(())
     }
 
     /// Delete `key`. Returns `true` if the key existed.
+    ///
+    /// Appends a tombstone to the value log so recovery replays the delete.
     pub fn delete(&self, key: &[u8]) -> io::Result<bool> {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
@@ -217,11 +440,12 @@ impl KvEngine {
             None => return Ok(false),
         };
 
+        let _epoch = self.epoch.read().unwrap();
         let mut guard = part_arc.write().unwrap();
         let part = &mut *guard;
         let found = part.btree.delete(&mut part.seg, h)?;
         if found {
-            part.btree.flush(&mut part.seg)?;
+            self.value_log.append_tombstone(key)?;
         }
         Ok(found)
     }
@@ -237,30 +461,22 @@ impl KvEngine {
         };
 
         let entry = {
-            let mut guard = part_arc.write().unwrap();
-            let part = &mut *guard;
-            part.btree.get(&mut part.seg, h)?
+            let guard = part_arc.read().unwrap();
+            guard.btree.get(&guard.seg, h)?
         };
 
         match entry {
             None => Ok(false),
             Some(e) => {
-                // Verify key to guard against hash collisions
                 let stored_key = self.value_log.read_key(e.value_ptr, e.key_len)?;
                 Ok(stored_key == key)
             }
         }
     }
 
-    /// Flush all dirty state to disk.
+    /// Flush all staged state to disk (full TSS cycle). Durable on return.
     pub fn flush(&self) -> io::Result<()> {
-        self.value_log.flush()?;
-        for entry in self.partitions.iter() {
-            let mut guard = entry.value().write().unwrap();
-            let part = &mut *guard;
-            part.btree.flush(&mut part.seg)?;
-        }
-        Ok(())
+        self.sync_cycle()
     }
 
     /// Number of live entries across all partitions.
@@ -278,9 +494,8 @@ impl KvEngine {
     pub fn scan_keys(&self) -> io::Result<Vec<Vec<u8>>> {
         let mut result = Vec::new();
         for entry in self.partitions.iter() {
-            let mut guard = entry.value().write().unwrap();
-            let part = &mut *guard;
-            let entries = part.btree.iter_entries(&mut part.seg)?;
+            let guard = entry.value().read().unwrap();
+            let entries = guard.btree.iter_entries(&guard.seg)?;
             for e in entries {
                 if let Ok(key) = self.value_log.read_key(e.value_ptr, e.key_len) {
                     result.push(key);
@@ -298,9 +513,6 @@ impl KvEngine {
         count: usize,
         pattern: Option<&[u8]>,
     ) -> io::Result<(u64, Vec<Vec<u8>>)> {
-        // We partition-scan: cursor encodes (partition_idx, entry_offset)
-        // For simplicity, collect all alive B-Tree entries across all partitions
-        // and paginate. This can be optimized with a proper cursor later.
         let all_keys = self.scan_keys()?;
 
         // Filter first, then paginate — slicing before filtering would skip
@@ -320,18 +532,36 @@ impl KvEngine {
 
     /// Remove all entries (FLUSHDB equivalent).
     pub fn clear(&self) -> io::Result<()> {
-        let data_dir = self.data_dir.clone();
-        // Clear the index first so no dangling value_ptr references remain.
+        let _g = self.epoch.write().unwrap(); // drain in-flight writers
         self.partitions.clear();
-        // Remove segment files.
-        let seg_dir = data_dir.join("segments");
+        self.cache.clear();
+        let seg_dir = self.data_dir.join("segments");
         if seg_dir.exists() {
             for entry in std::fs::read_dir(&seg_dir)?.flatten() {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
         // Truncate the value log in-place so self.value_log remains valid.
-        self.value_log.truncate()
+        self.value_log.truncate()?;
+        self.write_checkpoint(0)
+    }
+
+    /// Test hook: drop the engine *without* the final flush, as a crash
+    /// would. The TSS thread is stopped first so it can't flush either.
+    #[cfg(test)]
+    pub fn simulate_crash(self: Arc<Self>) {
+        self.shutdown.store(true, Ordering::Release);
+        self.skip_final_flush.store(true, Ordering::Release);
+        drop(self);
+    }
+}
+
+impl Drop for KvEngine {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if !self.skip_final_flush.load(Ordering::Acquire) {
+            let _ = self.sync_cycle();
+        }
     }
 }
 
@@ -430,6 +660,54 @@ mod tests {
     }
 
     #[test]
+    fn crash_recovery_replays_value_log() {
+        let dir = tempdir().unwrap();
+        {
+            let engine = KvEngine::open(dir.path()).unwrap();
+            for i in 0u64..30 {
+                let k = format!("key{}", i);
+                let v = format!("val{}", i);
+                engine.put(k.as_bytes(), v.as_bytes()).unwrap();
+            }
+            engine.delete(b"key7").unwrap();
+            // Crash: no flush, no TSS cycle, staged index pages are lost.
+            engine.simulate_crash();
+        }
+        {
+            // The value log survives; recovery must replay it.
+            let engine = KvEngine::open(dir.path()).unwrap();
+            for i in 0u64..30 {
+                let k = format!("key{}", i);
+                if i == 7 {
+                    assert_eq!(engine.get(k.as_bytes()).unwrap(), None, "tombstone lost");
+                } else {
+                    let v = format!("val{}", i);
+                    assert_eq!(
+                        engine.get(k.as_bytes()).unwrap(),
+                        Some(v.into_bytes()),
+                        "key{} lost after crash",
+                        i
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drop_without_explicit_flush_is_durable() {
+        let dir = tempdir().unwrap();
+        {
+            let engine = KvEngine::open(dir.path()).unwrap();
+            engine.put(b"k", b"v").unwrap();
+            // No explicit flush: Drop must run a final sync cycle.
+        }
+        {
+            let engine = KvEngine::open(dir.path()).unwrap();
+            assert_eq!(engine.get(b"k").unwrap(), Some(b"v".to_vec()));
+        }
+    }
+
+    #[test]
     fn many_keys_across_partitions() {
         let dir = tempdir().unwrap();
         let engine = KvEngine::open(dir.path()).unwrap();
@@ -450,6 +728,37 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_readers_and_writer() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(dir.path()).unwrap();
+        for i in 0..200 {
+            engine
+                .put(format!("k{:03}", i).as_bytes(), b"seed")
+                .unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let eng = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for round in 0..200 {
+                    let i = (t * 53 + round * 7) % 200;
+                    let k = format!("k{:03}", i);
+                    if t == 0 {
+                        eng.put(k.as_bytes(), format!("v{}", round).as_bytes())
+                            .unwrap();
+                    } else {
+                        let _ = eng.get(k.as_bytes()).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
     fn scan_returns_all_keys() {
         let dir = tempdir().unwrap();
         let engine = KvEngine::open(dir.path()).unwrap();
@@ -462,6 +771,17 @@ mod tests {
         let (cursor, keys) = engine.scan(0, 200, None).unwrap();
         assert_eq!(cursor, 0); // all done in one page
         assert_eq!(keys.len(), 100);
+    }
+
+    #[test]
+    fn clear_then_reuse() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(dir.path()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        engine.clear().unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), None);
+        engine.put(b"b", b"2").unwrap();
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
     }
 
     #[test]

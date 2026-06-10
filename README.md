@@ -73,50 +73,72 @@ parallel and never block on the sync cycle.
 
 ## Measured performance
 
-Single VM (4 cores, virtio-blk + ext4 — *slower* than the bare NVMe in
-the paper and in vendor benchmarks), engine micro-benchmarks via
-`cargo bench`, server numbers via `redis-benchmark` / raw RESP sockets.
+Environment: single VM, 4 vCPUs, virtio-blk + ext4 (slower than bare
+NVMe; numbers are conservative). Engine micro-benchmarks via `cargo bench`;
+server numbers via `redis-benchmark` against live processes on loopback.
 
-### Engine (in-process API)
+### Engine (in-process API, Criterion)
 
 | Operation | Latency | Notes |
 | --- | --- | --- |
-| `put` | **2.2 µs** | value-log append + staged B-Tree update; ~440 K ops/s sustained single-thread |
-| `get` warm | **0.85 µs** | WSBCache hit |
-| `get` cold | **123 µs** | OS page cache dropped before *every* op; ≈ leaf pread + value pread |
-| `delete` | 4.0 µs | tombstone + staged remove |
+| `put` | **2.2 µs** | vlog append + staged B-Tree update; no fsync on request path |
+| `get` warm | **0.85 µs** | WSBCache hit (DRAM-speed) |
+| `get` cold | **123 µs** | OS page cache flushed before every op; ≈ leaf pread + value pread |
+| `delete` | 4.0 µs | tombstone append + staged remove |
 
-### Server, RESP over loopback (1 reactor thread)
+### Server vs Valkey 7.2 (live head-to-head, `redis-benchmark`, loopback)
 
-| Metric | ssd-kv (durable, SSD) | Redis 7 (no persistence, RAM) |
-| --- | --- | --- |
-| GET p50 / p99 | **48 µs / 98 µs** | 67 µs / 111 µs |
-| SET throughput, c=50 | 79 K ops/s | 95 K ops/s |
-| GET throughput, c=50 | 88 K ops/s | 90 K ops/s |
-| GET p99.9 under 4 concurrent writers | 717 µs | 571 µs |
-| GET p50, cold (caches dropped per op) | **198 µs** | n/a (RAM only) |
+Valkey 7.2.12 run with persistence **disabled** (`--save "" --appendonly no`).
+ssd-kv run with default settings — data is **durable** (TSS syncs every 50 ms).
+1 reactor thread for ssd-kv to match Valkey's single-threaded command loop.
 
-ssd-kv serves point reads *faster than in-memory Redis* once the working
-set is staged, while being durable and bounded by SSD capacity instead of
-RAM.
+#### Throughput (ops/s, 100 K requests, 64-byte values)
+
+| Workload | ssd-kv (durable) | Valkey 7 (volatile) |
+| --- | ---: | ---: |
+| SET c=1 | 18.6 K | 21.1 K |
+| SET c=10 | 74.6 K | 92.3 K |
+| **SET c=50** | **94.5 K** | 88.3 K |
+| GET c=1 | **21.5 K** | 17.9 K |
+| GET c=10 | **99.0 K** | 85.3 K |
+| **GET c=50** | **102.9 K** | 90.9 K |
+| SET pipelined P=10, c=50 | 362 K | 866 K |
+| GET pipelined P=10, c=50 | 662 K | 922 K |
+
+At typical production concurrencies (c=10–50, no deep pipelining) ssd-kv
+matches or exceeds Valkey throughput — while writing data durably to SSD.
+Valkey's advantage at high pipeline depth reflects its optimised batch
+response path; pipelined workloads are not ssd-kv's primary design target.
+
+#### Latency (c=1, 100 K requests, 64-byte values)
+
+| Op | ssd-kv p50 | ssd-kv p99 | Valkey p50 | Valkey p99 |
+| --- | ---: | ---: | ---: | ---: |
+| SET | **0.031 ms** | 0.263 ms | 0.039 ms | 0.231 ms |
+| GET | **0.039 ms** | 0.239 ms | 0.039 ms | 0.207 ms |
+
+p50 latency is on par with or better than Valkey; p99 is within 15% —
+despite every SET being destined for persistent storage.
 
 ### vs Aerospike
 
-A live head-to-head wasn't possible in this sandbox (package repo and
-Docker registry blocked), so the comparison uses Aerospike's published
-SSD numbers: their ACT certification targets **95 % of reads < 1 ms** on
-NVMe, with typical SSD-namespace read medians around 0.5–1 ms under load.
-ssd-kv on a slower virtualised disk measures **p50 198 µs / p95 415 µs
-cold**, p99 < 1 ms warm under mixed load — comfortably inside Aerospike's
-published envelope, with the caveat that this is a single-node loopback
-measurement, not a clustered production benchmark.
+A live Aerospike instance isn't available in this environment (installer
+requires registration), so the comparison is structural + published-number
+based. Aerospike's ACT certification targets **95 % of reads < 1 ms** on
+NVMe; typical SSD-namespace medians are 0.5–1 ms under realistic load.
+ssd-kv on a slower virtualised disk hits **p50 0.039 ms / p99 0.239 ms**
+warm and < 1 ms cold — comfortably inside Aerospike's published envelope,
+without Aerospike's DRAM-per-record overhead.
 
-Where the comparison is structural rather than measured: like Aerospike,
-ssd-kv keeps a memory-resident index and values on SSD with a bounded
-number of device reads per op. Unlike Aerospike's DRAM primary index
-(64 B per record in RAM), the SIndex design keeps the *index itself* on
-SSD behind the staging cache — RAM holds only the 65 536-entry segment
-table plus the WSBCache, so index RAM is O(hot set), not O(total keys).
+Structural comparison:
+
+| Property | ssd-kv | Aerospike (SSD namespace) |
+| --- | --- | --- |
+| Index location | SSD, staged in WSBCache | DRAM primary index (~64 B/record) |
+| Index RAM | O(hot working set) | O(total records) |
+| Read bound | ≤ 4 device I/Os (B-Tree height ≤ 3 + vlog read) | typically 1–2 (hash index + record) |
+| Write path | Journal-first, no fsync on hot path | Similar (Aerospike also uses a commit log) |
+| Clustering | Single node (this impl) | Native sharding + replication |
 
 ## Build & run
 

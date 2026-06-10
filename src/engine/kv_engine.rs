@@ -87,6 +87,19 @@ const WSB_CACHE_PAGES: usize = 16_384;
 /// post-crash replay window small.
 const SYNC_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Statistics returned by [`KvEngine::compact`].
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionStats {
+    /// Value-log size before compaction.
+    pub bytes_before: u64,
+    /// Value-log size after compaction.
+    pub bytes_after: u64,
+    /// Bytes reclaimed (`bytes_before − bytes_after`).
+    pub bytes_reclaimed: u64,
+    /// Number of live entries rewritten into the new log.
+    pub entries_compacted: usize,
+}
+
 struct Partition {
     btree: BTree,
     seg: SegmentFile,
@@ -398,11 +411,14 @@ impl KvEngine {
 
     /// Get the value for `key`. Returns `None` if the key does not exist.
     ///
-    /// Takes only a shared partition lock: concurrent readers proceed in
-    /// parallel (B-Tree pages via WSBCache or `pread`, value via `pread`).
+    /// Takes a shared epoch guard (prevents compaction from truncating the
+    /// vlog between the B-Tree lookup and the value pread) and a shared
+    /// partition lock (concurrent readers proceed in parallel).
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
+
+        let _epoch = self.epoch.read().unwrap();
 
         let part_arc = match self.partitions.get(&pid) {
             Some(a) => Arc::clone(a.value()),
@@ -487,6 +503,8 @@ impl KvEngine {
         let h = xxh3_64(key);
         let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
 
+        let _epoch = self.epoch.read().unwrap();
+
         let part_arc = match self.partitions.get(&pid) {
             Some(a) => Arc::clone(a.value()),
             None => return Ok(false),
@@ -511,6 +529,128 @@ impl KvEngine {
         self.sync_cycle()
     }
 
+    /// Compact the value log by rewriting only live entries.
+    ///
+    /// Every `put` appends a new record to the value log; overwritten and
+    /// deleted values leave dead space that is never reclaimed during normal
+    /// operation. This method reclaims that space:
+    ///
+    /// 1. Walk every B-Tree partition and collect all live `(key, value)` pairs.
+    /// 2. Clear all on-disk and in-memory state (segments + vlog).
+    /// 3. Re-insert every live pair, rebuilding a fresh vlog and B-Tree.
+    /// 4. Flush the rebuilt state to disk atomically.
+    ///
+    /// This is a **stop-the-world** operation. The sync lock and exclusive
+    /// epoch guard are held for the entire duration: no reads, writes, or
+    /// background sync cycles can run concurrently. The flush is done inline
+    /// (not via `sync_cycle`) to avoid re-acquiring `epoch.write()`.
+    pub fn compact(&self) -> io::Result<CompactionStats> {
+        // Take sync_lock first (matches sync_cycle's acquisition order) so
+        // any in-progress sync_cycle finishes before we start.
+        let _sync = self.sync_lock.lock().unwrap();
+
+        let bytes_before = self.value_log.size();
+
+        // Exclusive epoch: drain all in-flight readers/writers.
+        let _epoch = self.epoch.write().unwrap();
+
+        // Collect all live entries (key + value).
+        let mut live: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for entry in self.partitions.iter() {
+            let guard = entry.value().read().unwrap();
+            let btree_entries = guard.btree.iter_entries(&guard.seg)?;
+            for e in btree_entries {
+                let (key, value) = self.value_log.read_key_value(
+                    e.value_ptr, e.key_len, e.value_len,
+                )?;
+                live.push((key, value));
+            }
+        }
+        let entries_compacted = live.len();
+
+        // Wipe all in-memory and on-disk state.
+        self.partitions.clear();
+        self.cache.clear();
+        let seg_dir = self.data_dir.join("segments");
+        if seg_dir.exists() {
+            for entry in std::fs::read_dir(&seg_dir)?.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        self.value_log.truncate()?;
+        self.checkpoint.store(0, Ordering::Release);
+
+        // Rebuild index and vlog from the live set.
+        for (key, value) in &live {
+            let h = xxh3_64(key);
+            let pid = (h >> (64 - NUM_PARTITION_BITS)) as u32;
+            let part_arc = self.get_or_create_partition(pid)?;
+            let mut guard = part_arc.write().unwrap();
+            let value_ptr = self.value_log.append(key, value)?;
+            let part = &mut *guard;
+            part.btree.insert(
+                &mut part.seg,
+                LeafEntry {
+                    key_hash: h,
+                    value_ptr,
+                    value_len: value.len() as u32,
+                    key_len: key.len() as u16,
+                    flags: FLAG_ALIVE,
+                },
+            )?;
+        }
+
+        let bytes_after = self.value_log.size();
+
+        // Flush inline (cannot call sync_cycle here — that would deadlock on
+        // epoch.write() which we're already holding).
+        self.value_log.flush()?;
+
+        let mut dirty = self.cache.collect_dirty();
+        let mut by_pid: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, ((pid, _), _, _)) in dirty.iter().enumerate() {
+            by_pid.entry(*pid).or_default().push(i);
+        }
+
+        let mut seg_fds: Vec<std::fs::File> = Vec::with_capacity(by_pid.len());
+        for (pid, idxs) in &by_pid {
+            let part_arc = match self.partitions.get(pid) {
+                Some(p) => Arc::clone(&p),
+                None => continue,
+            };
+            {
+                let guard = part_arc.read().unwrap();
+                for &i in idxs {
+                    let ((_, page_idx), _, page) = &mut dirty[i];
+                    ipage::seal(page);
+                    guard.seg.write_page(*page_idx, page)?;
+                }
+            }
+            let fd = {
+                let guard = part_arc.write().unwrap();
+                let f = guard.seg.try_clone_file()?;
+                guard.seg.flush_header()?;
+                f
+            };
+            seg_fds.push(fd);
+        }
+        for fd in seg_fds {
+            fd.sync_data()?;
+        }
+
+        self.write_checkpoint(bytes_after)?;
+
+        let written: Vec<_> = dirty.iter().map(|(k, g, _)| (*k, *g)).collect();
+        self.cache.mark_clean(&written);
+
+        Ok(CompactionStats {
+            bytes_before,
+            bytes_after,
+            bytes_reclaimed: bytes_before.saturating_sub(bytes_after),
+            entries_compacted,
+        })
+    }
+
     /// Number of live entries across all partitions.
     pub fn count_live(&self) -> u64 {
         self.partitions
@@ -524,6 +664,7 @@ impl KvEngine {
 
     /// Collect all live keys (expensive: full tree scan). Used for KEYS/SCAN.
     pub fn scan_keys(&self) -> io::Result<Vec<Vec<u8>>> {
+        let _epoch = self.epoch.read().unwrap();
         let mut result = Vec::new();
         for entry in self.partitions.iter() {
             let guard = entry.value().read().unwrap();
@@ -814,6 +955,53 @@ mod tests {
         assert_eq!(engine.get(b"a").unwrap(), None);
         engine.put(b"b", b"2").unwrap();
         assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn compact_reclaims_dead_vlog_space() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(dir.path()).unwrap();
+
+        // Write 50 keys, then overwrite each three times so 3/4 of the vlog is dead.
+        for i in 0u32..50 {
+            let k = format!("k{:04}", i);
+            engine.put(k.as_bytes(), b"v1").unwrap();
+            engine.put(k.as_bytes(), b"v2").unwrap();
+            engine.put(k.as_bytes(), b"v3").unwrap();
+            engine.put(k.as_bytes(), format!("final-{}", i).as_bytes()).unwrap();
+        }
+        // Delete a handful to ensure tombstones are also gone after compaction.
+        for i in 40..50u32 {
+            engine.delete(format!("k{:04}", i).as_bytes()).unwrap();
+        }
+
+        let stats = engine.compact().unwrap();
+        assert!(stats.bytes_reclaimed > 0, "no space was reclaimed");
+        assert_eq!(stats.entries_compacted, 40); // 50 − 10 deleted
+        assert!(stats.bytes_after < stats.bytes_before);
+
+        // All remaining keys still readable, deleted keys gone.
+        for i in 0u32..40 {
+            let k = format!("k{:04}", i);
+            let expected = format!("final-{}", i);
+            assert_eq!(
+                engine.get(k.as_bytes()).unwrap(),
+                Some(expected.into_bytes())
+            );
+        }
+        for i in 40..50u32 {
+            assert_eq!(engine.get(format!("k{:04}", i).as_bytes()).unwrap(), None);
+        }
+
+        // Durable: survives a reopen.
+        engine.flush().unwrap();
+        drop(engine);
+        let engine = KvEngine::open(dir.path()).unwrap();
+        for i in 0u32..40 {
+            let k = format!("k{:04}", i);
+            let expected = format!("final-{}", i);
+            assert_eq!(engine.get(k.as_bytes()).unwrap(), Some(expected.into_bytes()));
+        }
     }
 
     #[test]

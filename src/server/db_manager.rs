@@ -3,7 +3,6 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::engine::KvEngine;
 use crate::server::handler::{Handler, RecordMeta};
 
 /// A single database — always SSD-backed via KvEngine.
@@ -132,6 +131,10 @@ impl DbHandler {
 
     pub fn clear(&self) {
         let _ = self.handler.engine().clear();
+    }
+
+    pub fn compact(&self) -> io::Result<crate::engine::CompactionStats> {
+        self.handler.compact()
     }
 
     pub fn durable_position(&self) -> u64 {

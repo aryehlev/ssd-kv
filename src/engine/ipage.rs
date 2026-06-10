@@ -460,7 +460,7 @@ mod tests {
 
         // Insert several separator keys with right children
         for i in 0u64..10 {
-            let pos = internal_find_child(&page, i * 100 + 99);
+            let _pos = internal_find_child(&page, i * 100 + 99);
             let cnt = internal_count(&page) as usize;
             // Insert at position `cnt` (append)
             assert!(internal_insert(&mut page, cnt, i * 100 + 100, (i + 1) as u32 + 42));

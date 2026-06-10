@@ -137,6 +137,10 @@ impl Handler {
         self.engine.flush()
     }
 
+    pub fn compact(&self) -> io::Result<crate::engine::CompactionStats> {
+        self.engine.compact()
+    }
+
     pub fn live_entries(&self) -> u64 {
         self.engine.count_live()
     }

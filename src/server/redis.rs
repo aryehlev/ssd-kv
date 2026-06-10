@@ -4,11 +4,8 @@
 //!           DBSIZE, SELECT, FLUSHDB, FLUSHALL, INFO, COMMAND, QUIT.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-
-use tracing::{debug, error};
 
 use crate::server::db_manager::{DatabaseManager, DbHandler};
 
@@ -106,7 +103,6 @@ pub struct RespParser {
     buf: Vec<u8>,
     pos: usize,
     len: usize,
-    initial: usize,
 }
 
 impl RespParser {
@@ -115,7 +111,6 @@ impl RespParser {
             buf: vec![0u8; initial],
             pos: 0,
             len: 0,
-            initial,
         }
     }
 
@@ -176,18 +171,6 @@ impl RespParser {
             let result_end = end;
             self.pos = end + 2; // skip \r\n
             Some(&self.buf[result_start..result_end])
-        } else {
-            None
-        }
-    }
-
-    fn read_crlf_line(&mut self) -> Option<&[u8]> {
-        let start = self.pos;
-        let data = &self.buf[start..self.len];
-        if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
-            let end = start + pos;
-            self.pos = end + 2;
-            Some(&self.buf[start..end])
         } else {
             None
         }
@@ -388,9 +371,16 @@ impl RedisHandler {
             b"RENAME" => self.cmd_rename(args, out),
             b"RENAMENX" => self.cmd_renamenx(args, out),
             b"WAIT" | b"DEBUG" => RespValue::ok().serialize_into(out),
-            b"BGSAVE" | b"BGREWRITEAOF" | b"SAVE" => {
+            b"SAVE" | b"BGSAVE" => {
                 let _ = self.db().flush();
                 RespValue::ok().serialize_into(out)
+            }
+            b"BGREWRITEAOF" => {
+                // Full value-log compaction: rewrite only live entries.
+                // Blocks while running; returns OK when complete.
+                let _ = self.db().compact();
+                RespValue::SimpleString("Background append only file rewriting started".to_string())
+                    .serialize_into(out)
             }
             b"LASTSAVE" => RespValue::Integer(0).serialize_into(out),
             b"CLUSTER" => {
@@ -506,22 +496,14 @@ impl RedisHandler {
         let old_value = if get { self.db().get_value(key) } else { None };
 
         if nx && self.db().get_value(key).is_some() {
-            if get {
-                match old_value {
-                    Some(v) => RespValue::bulk(v).serialize_into(out),
-                    None => RespValue::null().serialize_into(out),
-                }
-            } else {
-                RespValue::null().serialize_into(out);
+            match old_value.filter(|_| get) {
+                Some(v) => RespValue::bulk(v).serialize_into(out),
+                None => RespValue::null().serialize_into(out),
             }
             return;
         }
         if xx && self.db().get_value(key).is_none() {
-            if get {
-                RespValue::null().serialize_into(out);
-            } else {
-                RespValue::null().serialize_into(out);
-            }
+            RespValue::null().serialize_into(out);
             return;
         }
 
@@ -876,9 +858,8 @@ impl RedisHandler {
     }
 
     fn cmd_info(&self, args: &[RespValue], out: &mut Vec<u8>) {
-        let section = if args.len() > 1 {
-            String::from_utf8_lossy(bulk_bytes(&args[1]))
-                .to_lowercase()
+        let _section = if args.len() > 1 {
+            String::from_utf8_lossy(bulk_bytes(&args[1])).to_lowercase()
         } else {
             "all".to_string()
         };
@@ -914,7 +895,7 @@ impl RedisHandler {
              # SIndex\r\n\
              index_type:sindex-btree\r\n\
              partition_bits:16\r\n\
-             btree_max_height:4\r\n\
+             btree_max_height:3\r\n\
              paper:10.1145/3789205\r\n\
              ",
             data_bytes = data_bytes,

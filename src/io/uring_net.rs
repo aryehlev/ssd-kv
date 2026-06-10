@@ -58,7 +58,6 @@ pub struct Connection {
 mod linux {
     use super::*;
     use io_uring::{opcode, types, IoUring, Probe};
-    use std::net::TcpListener;
 
     /// Pending operation tracking.
     struct PendingOp {
@@ -601,7 +600,6 @@ pub struct UringServer {
     listener_fd: RawFd,
     connections: HashMap<RawFd, TrackedConnection>,
     buffer_pool: NetBufferPool,
-    recv_buffer_size: usize,
     /// Whether an accept operation is currently pending in the submission queue.
     accept_pending: bool,
 }
@@ -640,7 +638,6 @@ impl UringServer {
             listener_fd,
             connections: HashMap::new(),
             buffer_pool: NetBufferPool::new(256, recv_buffer_size),
-            recv_buffer_size,
             accept_pending: false,
         })
     }

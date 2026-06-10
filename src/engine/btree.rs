@@ -270,7 +270,7 @@ impl BTree {
 
                 // Check if key already exists (update in place)
                 let pos = leaf_lower_bound(&page, entry.key_hash);
-                let mut i = pos;
+                let i = pos;
                 while i < count && leaf_entry_at(&page, i).key_hash == entry.key_hash {
                     let mut e = leaf_entry_at(&page, i);
                     if e.is_alive() {

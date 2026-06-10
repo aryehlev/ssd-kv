@@ -10,4 +10,4 @@ pub mod segment;
 pub mod value_log;
 pub mod wsbcache;
 
-pub use kv_engine::KvEngine;
+pub use kv_engine::{CompactionStats, KvEngine};

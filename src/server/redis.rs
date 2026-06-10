@@ -155,10 +155,7 @@ impl RespParser {
             b':' => self.parse_integer(),
             b'$' => self.parse_bulk_string(),
             b'*' => self.parse_array(),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected RESP type byte: 0x{:02x}", self.buf[self.pos]),
-            )),
+            _ => self.parse_inline(),
         }
     }
 
@@ -291,6 +288,27 @@ impl RespParser {
             }
         }
         Ok(Some(RespValue::Array(Some(items))))
+    }
+
+    // Inline command: `PING\r\n` or `PING message\r\n` — no RESP prefix byte.
+    fn parse_inline(&mut self) -> io::Result<Option<RespValue>> {
+        let save = self.pos;
+        let data = &self.buf[self.pos..self.len];
+        let Some(crlf) = data.windows(2).position(|w| w == b"\r\n") else {
+            return Ok(None); // incomplete
+        };
+        let line = &data[..crlf];
+        self.pos += crlf + 2;
+        let tokens: Vec<RespValue> = line
+            .split(|&b| b == b' ')
+            .filter(|t| !t.is_empty())
+            .map(|t| RespValue::BulkString(Some(t.to_vec())))
+            .collect();
+        if tokens.is_empty() {
+            self.pos = save;
+            return Ok(None);
+        }
+        Ok(Some(RespValue::Array(Some(tokens))))
     }
 }
 

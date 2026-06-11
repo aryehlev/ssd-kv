@@ -379,10 +379,13 @@ impl RedisHandler {
             b"DECR" => self.cmd_incr(args, out, -1),
             b"INCRBY" => self.cmd_incrby(args, out),
             b"DECRBY" => self.cmd_decrby(args, out),
-            b"TTL" | b"PTTL" => RespValue::Integer(-1).serialize_into(out),
-            b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PERSIST" => {
-                RespValue::Integer(0).serialize_into(out)
-            }
+            b"TTL" => self.cmd_ttl(args, out, false),
+            b"PTTL" => self.cmd_ttl(args, out, true),
+            b"EXPIRE" => self.cmd_expire(args, out, false, false),
+            b"PEXPIRE" => self.cmd_expire(args, out, true, false),
+            b"EXPIREAT" => self.cmd_expireat(args, out, false),
+            b"PEXPIREAT" => self.cmd_expireat(args, out, true),
+            b"PERSIST" => self.cmd_persist(args, out),
             b"TYPE" => self.cmd_type(args, out),
             b"OBJECT" => RespValue::null().serialize_into(out),
             b"RANDOMKEY" => self.cmd_randomkey(out),
@@ -462,8 +465,9 @@ impl RedisHandler {
         let key = bulk_bytes(&args[1]);
         let value = bulk_bytes(&args[2]);
 
-        // Parse optional SET options: EX, PX, NX, XX, GET
-        let mut ttl = 0u32;
+        // Parse optional SET options: EX, PX, EXAT, PXAT, NX, XX, GET, KEEPTTL
+        let mut ttl_secs: Option<u32> = None; // None = clear any existing TTL
+        let mut keepttl = false;
         let mut nx = false;
         let mut xx = false;
         let mut get = false;
@@ -472,20 +476,43 @@ impl RedisHandler {
             let opt = bulk_bytes_upper(&args[i]);
             match opt.as_slice() {
                 b"EX" if i + 1 < args.len() => {
-                    if let Ok(n) = std::str::from_utf8(bulk_bytes(&args[i + 1]))
-                        .unwrap_or("")
-                        .parse::<u32>()
-                    {
-                        ttl = n;
-                    }
+                    ttl_secs = std::str::from_utf8(bulk_bytes(&args[i + 1]))
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok());
                     i += 2;
                 }
                 b"PX" if i + 1 < args.len() => {
-                    if let Ok(n) = std::str::from_utf8(bulk_bytes(&args[i + 1]))
-                        .unwrap_or("")
-                        .parse::<u64>()
+                    ttl_secs = std::str::from_utf8(bulk_bytes(&args[i + 1]))
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(|ms| (ms / 1000).max(1) as u32);
+                    i += 2;
+                }
+                b"EXAT" if i + 1 < args.len() => {
+                    // Absolute Unix timestamp in seconds → convert to relative.
+                    if let Some(abs) = std::str::from_utf8(bulk_bytes(&args[i + 1]))
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
                     {
-                        ttl = (n / 1000) as u32;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        ttl_secs = Some(abs.saturating_sub(now) as u32);
+                    }
+                    i += 2;
+                }
+                b"PXAT" if i + 1 < args.len() => {
+                    // Absolute Unix timestamp in milliseconds → convert to relative.
+                    if let Some(abs_ms) = std::str::from_utf8(bulk_bytes(&args[i + 1]))
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        ttl_secs = Some((abs_ms.saturating_sub(now_ms) / 1000).max(1) as u32);
                     }
                     i += 2;
                 }
@@ -502,14 +529,23 @@ impl RedisHandler {
                     i += 1;
                 }
                 b"KEEPTTL" => {
+                    keepttl = true;
                     i += 1;
-                }
-                b"EXAT" | b"PXAT" => {
-                    i += 2; // skip value
                 }
                 _ => i += 1,
             }
         }
+        // Resolve final TTL: KEEPTTL means preserve existing; otherwise use
+        // the parsed value (None → 0 → clear expiry).
+        let ttl: u32 = if keepttl {
+            // Read current TTL and preserve it after the write.
+            match self.db().ttl_secs(key) {
+                n if n > 0 => n as u32,
+                _ => 0,
+            }
+        } else {
+            ttl_secs.unwrap_or(0)
+        };
 
         let old_value = if get { self.db().get_value(key) } else { None };
 
@@ -545,11 +581,22 @@ impl RedisHandler {
             RespValue::err("wrong number of arguments").serialize_into(out);
             return;
         }
+        let cmd_upper = bulk_bytes_upper(&args[0]);
         let key = bulk_bytes(&args[1]);
+        // SETEX key seconds value  / PSETEX key milliseconds value
+        let ttl_raw: u64 = std::str::from_utf8(bulk_bytes(&args[2]))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let ttl_secs: u32 = if cmd_upper == b"PSETEX" {
+            (ttl_raw / 1000).max(1) as u32
+        } else {
+            ttl_raw as u32
+        };
         let value = bulk_bytes(&args[3]);
         match self
             .db()
-            .put_nowait_on(self.shard_hint.get(), key, value, 0)
+            .put_nowait_on(self.shard_hint.get(), key, value, ttl_secs)
         {
             Ok(_) => RespValue::ok().serialize_into(out),
             Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
@@ -653,6 +700,67 @@ impl RedisHandler {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         self.cmd_incr(args, out, -delta);
+    }
+
+    fn cmd_ttl(&self, args: &[RespValue], out: &mut Vec<u8>, millis: bool) {
+        if args.len() < 2 {
+            RespValue::err("wrong number of arguments").serialize_into(out);
+            return;
+        }
+        let key = bulk_bytes(&args[1]);
+        let secs = self.db().ttl_secs(key);
+        let result = if millis && secs > 0 { secs * 1000 } else { secs };
+        RespValue::Integer(result).serialize_into(out);
+    }
+
+    fn cmd_expire(&self, args: &[RespValue], out: &mut Vec<u8>, millis: bool, _gt: bool) {
+        if args.len() < 3 {
+            RespValue::err("wrong number of arguments").serialize_into(out);
+            return;
+        }
+        let key = bulk_bytes(&args[1]);
+        let raw: u64 = std::str::from_utf8(bulk_bytes(&args[2]))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let ttl_secs: u32 = if millis {
+            (raw / 1000).max(1) as u32
+        } else {
+            raw as u32
+        };
+        match self.db().update_ttl(key, ttl_secs) {
+            Ok(found) => RespValue::Integer(found as i64).serialize_into(out),
+            Err(e) => RespValue::err(&e.to_string()).serialize_into(out),
+        }
+    }
+
+    fn cmd_expireat(&self, args: &[RespValue], out: &mut Vec<u8>, millis: bool) {
+        if args.len() < 3 {
+            RespValue::err("wrong number of arguments").serialize_into(out);
+            return;
+        }
+        let key = bulk_bytes(&args[1]);
+        let raw: u64 = std::str::from_utf8(bulk_bytes(&args[2]))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let abs_secs = if millis { raw / 1000 } else { raw };
+        // Check key exists first (expireat on missing key → 0).
+        if self.db().ttl_secs(key) == -2 {
+            RespValue::Integer(0).serialize_into(out);
+            return;
+        }
+        self.db().set_expiry_abs(key, abs_secs);
+        RespValue::Integer(1).serialize_into(out);
+    }
+
+    fn cmd_persist(&self, args: &[RespValue], out: &mut Vec<u8>) {
+        if args.len() < 2 {
+            RespValue::err("wrong number of arguments").serialize_into(out);
+            return;
+        }
+        let key = bulk_bytes(&args[1]);
+        RespValue::Integer(self.db().persist(key) as i64).serialize_into(out);
     }
 
     fn cmd_del(&self, args: &[RespValue], out: &mut Vec<u8>) {

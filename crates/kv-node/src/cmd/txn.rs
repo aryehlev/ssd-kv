@@ -160,7 +160,18 @@ pub fn runs_in_partition(id: CmdId) -> bool {
 fn inline_conn_cmd(id: CmdId) -> bool {
     matches!(
         id,
-        CmdId::Ping | CmdId::Echo | CmdId::Select | CmdId::Unwatch | CmdId::Time | CmdId::ClientId
+        CmdId::Ping
+            | CmdId::Echo
+            | CmdId::Select
+            | CmdId::Unwatch
+            | CmdId::Time
+            | CmdId::ClientId
+            | CmdId::Command
+            | CmdId::CommandCount
+            | CmdId::CommandInfo
+            | CmdId::CommandDocs
+            | CmdId::CommandList
+            | CmdId::CommandGetkeys
     )
 }
 
@@ -204,6 +215,13 @@ pub fn run_queued<S: Store>(
             CmdId::Unwatch => w.ok(),
             CmdId::Time => super::server::write_time(w),
             CmdId::ClientId => w.int(env.conn_id as i64),
+            // the command table is static
+            CmdId::Command => kv_cmd::write_command_all(w),
+            CmdId::CommandCount => w.int(kv_cmd::command_count() as i64),
+            CmdId::CommandInfo => kv_cmd::write_command_info_reply(&args.argv[2..], w),
+            CmdId::CommandDocs => kv_cmd::write_command_docs_reply(&args.argv[2..], w),
+            CmdId::CommandList => kv_cmd::write_command_list_reply(&args.argv[2..], w),
+            CmdId::CommandGetkeys => kv_cmd::write_command_getkeys(&args.argv[2..], w),
             id => match super::keyed::<S>(id) {
                 Some(f) => f(ks, &args, w, &env)?,
                 None => w.error(NOT_IN_TXN),
@@ -343,6 +361,7 @@ mod tests {
             owned("UNWATCH"),
             owned("CLIENT ID"),
             owned("DBSIZE"),
+            owned("COMMAND GETKEYS GET k"),
         ];
         let env = ExecEnv {
             proto: Proto::Resp2,
@@ -363,9 +382,9 @@ mod tests {
         assert_eq!(db, 3);
         assert_eq!(
             show(&out),
-            "*9\\r\\n+OK\\r\\n+OK\\r\\n+PONG\\r\\n-ERR wrong number of arguments for 'mset' command\\r\\n\
+            "*10\\r\\n+OK\\r\\n+OK\\r\\n+PONG\\r\\n-ERR wrong number of arguments for 'mset' command\\r\\n\
              -ERR value is not an integer or out of range\\r\\n$1\\r\\nv\\r\\n+OK\\r\\n:1\\r\\n\
-             -ERR command not supported inside a single-partition transaction\\r\\n"
+             -ERR command not supported inside a single-partition transaction\\r\\n*1\\r\\n$1\\r\\nk\\r\\n"
         );
         assert!(m.rec(3, b"k").is_some() && m.rec(0, b"k").is_none());
         let cmds = [owned("SELECT 16")];

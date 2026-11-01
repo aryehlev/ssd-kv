@@ -11,20 +11,43 @@
 pub use kv_common::Access;
 
 bitflags::bitflags! {
+    /// kvssd dispatch properties of a command. The Redis flags reported by COMMAND INFO are kept
+    /// separately (they are Redis's, verbatim); these are the ones the data node and the
+    /// coordinator act on.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct CmdFlags: u32 {
+        /// May modify the keyspace (Redis `write`).
         const WRITE = 1;
+        /// Reads the keyspace and never modifies it (Redis `readonly`).
         const READONLY = 2;
+        /// Administrative command (Redis `admin`).
         const ADMIN = 4;
+        /// O(1) or O(log n) command (Redis `fast`).
         const FAST = 8;
+        /// Allowed while the node is loading (Redis `loading`); others get `-LOADING`.
         const LOADING_OK = 16;
+        /// Refused inside MULTI (Redis `no_multi`).
         const NO_MULTI = 32;
+        /// Takes more than one key (MGET, MSET, MSETNX, DEL, UNLINK, EXISTS, TOUCH, RENAME,
+        /// RENAMENX, COPY, WATCH): subject to the same-slot rule in cluster mode (§23.14) and to
+        /// the per-partition split of §6.8.
         const MULTI_KEY = 64;
+        /// Has no key arguments.
         const KEYLESS = 128;
+        /// May delete a key, including through an expiry in the past (DEL, UNLINK, GETDEL,
+        /// GETEX, EXPIRE family, RENAME family, HDEL, FLUSHDB, FLUSHALL): the reply waits for
+        /// the durable-delete rule (§16.2).
         const DELETE = 256;
+        /// Connection or server command answered on the connection's home worker without a
+        /// partition request.
         const CONN = 512;
+        /// Valid only in cluster mode (CLUSTER, READONLY, READWRITE, ASKING); standalone nodes
+        /// answer `-ERR This instance has cluster support disabled` (§8.7).
         const CLUSTER_ONLY = 1024;
+        /// Answered by the coordinator itself (§23.5): protocol, connection and topology
+        /// commands. Keyed commands get MOVED there instead.
         const COORD_OK = 2048;
+        /// Allowed before authentication (Redis `no_auth`: AUTH, HELLO, QUIT, RESET).
         const NO_AUTH = 4096;
     }
 }
@@ -34,13 +57,14 @@ bitflags::bitflags! {
 pub enum KeySpec {
     None,
     /// Keys at `first, first + step, ...` up to `last` (negative: counted from the end, `-1` =
-    /// last argument).
+    /// last argument). This is the legacy `(first, last, step)` triple of COMMAND INFO.
     Range { first: u16, last: i16, step: u16 },
     /// Command-specific key extraction.
     Custom(fn(&[&[u8]]) -> smallvec::SmallVec<[u16; 4]>),
 }
 
-/// One command table entry.
+/// One command table entry. `name` is the Redis "full name": lowercase, and
+/// `container|subcommand` for subcommands (as in COMMAND INFO and in arity errors).
 pub struct CommandSpec {
     pub id: CmdId,
     pub name: &'static str,
@@ -54,7 +78,36 @@ pub struct CommandSpec {
     pub subcommands: &'static [CommandSpec],
 }
 
-/// One variant per command (§8.2-§8.7) and per subcommand with its own table entry.
+impl CommandSpec {
+    /// Container commands (CLIENT, COMMAND, CONFIG, CLUSTER) dispatch on their first argument.
+    #[inline]
+    pub fn is_container(&self) -> bool {
+        !self.subcommands.is_empty()
+    }
+
+    /// The name after `|` for a subcommand, else the whole name.
+    pub fn short_name(&self) -> &'static str {
+        match self.name.split_once('|') {
+            Some((_, sub)) => sub,
+            None => self.name,
+        }
+    }
+
+    /// Whether the command has key arguments.
+    #[inline]
+    pub fn has_keys(&self) -> bool {
+        !matches!(self.keys, KeySpec::None)
+    }
+}
+
+impl core::fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CommandSpec").field("id", &self.id).field("name", &self.name).field("arity", &self.arity).finish_non_exhaustive()
+    }
+}
+
+/// One variant per command (§8.2-§8.7) and per subcommand with its own table entry. The
+/// discriminants are dense, in declaration order (`CmdId::COUNT` of them).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u16)]
 pub enum CmdId {
@@ -199,4 +252,15 @@ pub enum CmdId {
     Readonly,
     Readwrite,
     Asking,
+}
+
+impl CmdId {
+    /// Number of variants.
+    pub const COUNT: usize = CmdId::Asking as usize + 1;
+
+    /// This command's table entry.
+    #[inline]
+    pub fn spec(self) -> &'static CommandSpec {
+        crate::table::by_id(self)
+    }
 }

@@ -463,9 +463,15 @@ pub(crate) struct OpenTxn {
     requested: bool,
     keys: SmallVec<[(u8, Box<[u8]>); 2]>,
     /// `(db, key, page, seq)` of the txn delete markers.
-    markers: SmallVec<[(u8, Box<[u8]>, PageId, Seq); 1]>,
+    markers: SmallVec<[MarkerAt; 1]>,
     pages: SmallVec<[PageId; 2]>,
 }
+
+/// A txn delete marker: `(db, key, page, seq)`.
+type MarkerAt = (u8, Box<[u8]>, PageId, Seq);
+
+/// A delete waiting for older copies: `(db, key, tickets)`.
+type GoneWait = (u8, Box<[u8]>, SmallVec<[TicketId; 1]>);
 
 /// A newest copy that stands for "absent" (a committed txn marker, or an expired record that
 /// still has older copies) and is dropped once it is the key's only copy (D1, §16.2, §18.3).
@@ -556,7 +562,7 @@ pub(crate) struct Core {
     pub(crate) recovery_mode: Option<RecoveryMode>,
     /// Deletes whose newest copy never reached media: waiting until no older copy is left
     /// (D2): `(db, key, tickets)`.
-    gone_wait: Vec<(u8, Box<[u8]>, SmallVec<[TicketId; 1]>)>,
+    gone_wait: Vec<GoneWait>,
     /// Absent newest copies waiting for their older copies to be zeroed.
     pub(crate) retire: Vec<RetireItem>,
     /// Barrier tickets waiting for the partition to drain.
@@ -1608,7 +1614,7 @@ impl PartitionStore {
         if let Some(t) = ticket {
             self.core.tickets.seal(t);
         }
-        let group = (self.core.cfg.produce_groups && !ops.is_empty()).then(|| Group { seq, ops });
+        let group = (self.core.cfg.produce_groups && !ops.is_empty()).then_some(Group { seq, ops });
         Commit::Done(ExecOut { ticket, group, seq: (writes > 0).then_some(seq) })
     }
 
@@ -2879,7 +2885,7 @@ impl PartitionStore {
             })
             .collect();
         let n = recs.len();
-        let mut retire: SmallVec<[(u8, Box<[u8]>, Seq); 1]> = SmallVec::new();
+        let mut retire: SmallVec<[RetireItem; 1]> = SmallVec::new();
         let mut done = vec![false; n];
         for i in 0..n {
             if done[i] {
@@ -2945,7 +2951,7 @@ impl PartitionStore {
                     // they are zeroed (D1, v1.2)
                     recs[newest].status = RecStatus::Protected;
                     if !open_txn {
-                        retire.push((db, key.into(), rn.seq));
+                        retire.push(RetireItem { db, key: key.into(), page, seq: rn.seq });
                     }
                 } else {
                     if !rn.is_marker() && rn.expire_at().is_none_or(|t| t > cx.now.unix_ms) {
@@ -2955,9 +2961,7 @@ impl PartitionStore {
                 }
             }
         }
-        for (db, key, seq) in retire {
-            self.core.retire.push(RetireItem { db, key, page, seq });
-        }
+        self.core.retire.extend(retire);
         PageState::loaded(page, f, recs)
     }
 
@@ -3012,7 +3016,7 @@ impl PartitionStore {
                     match refs {
                         Some(refs) if !refs.is_empty() => {
                             let cs: SmallVec<[ChunkFetch; 4]> =
-                                refs.iter().map(|c| ChunkFetch { page: c.page, n_pages: c.n_pages, len: c.len, crc: c.crc, buf: None }).collect();
+                                refs.iter().map(|c| ChunkFetch { page: c.page, n_pages: c.n_pages, crc: c.crc, buf: None }).collect();
                             next_chunk = Some((cs[0].page, cs[0].n_pages, 0));
                             fe.chunks = Some(cs);
                         }

@@ -98,8 +98,6 @@ pub(crate) mod domain {
     pub(crate) const UNCACHED_PAGE: u64 = 5;
     pub(crate) const EXTENT_TIE: u64 = 6;
     pub(crate) const CARVE: u64 = 7;
-    pub(crate) const AG_DEVICE: u64 = 8;
-    pub(crate) const AG_PICK: u64 = 9;
     pub(crate) const WARM: u64 = 10;
 }
 
@@ -146,10 +144,6 @@ impl Bits4096 {
     /// True when every bit of `[a, a + n)` is clear.
     pub(crate) fn all_clear(&self, a: u32, n: u32) -> bool {
         a + n <= AG_PAGES && (a..a + n).all(|i| !self.get(i))
-    }
-
-    pub(crate) fn count(&self) -> u32 {
-        self.0.iter().map(|w| w.count_ones()).sum()
     }
 
     pub(crate) fn words(&self) -> &[u64; 64] {
@@ -416,14 +410,6 @@ impl Alloc {
         self.pick.pick_index(d, n)
     }
 
-    pub(crate) fn mode(&self) -> PageUpdateMode {
-        self.mode
-    }
-
-    pub(crate) fn layouts(&self) -> &Arc<[DeviceLayout]> {
-        &self.layouts
-    }
-
     /// First device page of `ag`.
     pub(crate) fn ag_first(&self, ag: AgId) -> Option<u32> {
         let l = self.layouts.get(usize::from(ag.dev))?;
@@ -490,15 +476,7 @@ impl Alloc {
         self.small.iter().map(|s| (s.ag, AgKind::Small)).chain(self.extent.iter().map(|e| (e.ag, AgKind::Extent)))
     }
 
-    pub(crate) fn small_count(&self) -> usize {
-        self.small.len()
-    }
 
-    /// `page_free` bytes of owned SMALL AG `i` (snapshot sections).
-    pub(crate) fn page_free_of(&self, i: usize) -> &[u8] {
-        let b = self.small[i].base as usize;
-        &self.page_free[b..b + AG_PAGES as usize]
-    }
 
     /// Bytes of allocator state (`alloc_state_bytes`, reported separately from the index).
     pub(crate) fn state_bytes(&self) -> usize {
@@ -554,10 +532,6 @@ impl Alloc {
         self.set_page_free(page, FRESH);
     }
 
-    /// The page left the cache: its last exact `page_free` stays as the hint.
-    pub(crate) fn forget_cached(&mut self, page: PageId) {
-        self.cached.remove(page);
-    }
 
     /// Slack a page must keep after placing `need` bytes (§11.3).
     fn slack(&self, need: u16, largest: u16) -> u16 {
@@ -934,9 +908,6 @@ impl Alloc {
         })
     }
 
-    pub(crate) fn owns_extent_page(&self, page: PageId) -> bool {
-        self.extent_slot(page).is_some()
-    }
 
     /// Recomputes extent runs, fresh counts and hint bounds after recovery or snapshot restore.
     pub(crate) fn finish_rebuild(&mut self) {
@@ -1019,6 +990,7 @@ impl Alloc {
     }
 
     /// True while an AG of `kind` is requested and not answered.
+    #[cfg(test)]
     pub(crate) fn ag_pending(&self, kind: AgKind) -> bool {
         let s = &self.slots[kind_slot(kind)];
         s.asked || s.want
@@ -1117,7 +1089,8 @@ impl Alloc {
         out
     }
 
-    /// Fresh pages left in owned SMALL AGs (tests, INFO).
+    /// Fresh pages left in owned SMALL AGs (tests).
+    #[cfg(test)]
     pub(crate) fn fresh_pages(&self) -> u64 {
         self.small.iter().map(|a| u64::from(a.fresh)).sum()
     }

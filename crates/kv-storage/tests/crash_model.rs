@@ -35,7 +35,7 @@ impl Rng {
 }
 
 fn key_of(i: u64) -> Vec<u8> {
-    if i % 4 == 0 { format!("{{grp}}k{i}").into_bytes() } else { format!("key:{i}").into_bytes() }
+    if i.is_multiple_of(4) { format!("{{grp}}k{i}").into_bytes() } else { format!("key:{i}").into_bytes() }
 }
 
 /// Value sizes: mostly small records, some across the 2 KiB boundary and some extents.

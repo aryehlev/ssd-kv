@@ -286,10 +286,6 @@ impl StaleCopies {
         self.entries = 0;
     }
 
-    /// Approximate RAM held (INFO).
-    pub(crate) fn memory_bytes(&self) -> usize {
-        self.map.iter().map(|(k, _)| k.key.len() + 64).sum::<usize>() + self.pages.len() * 16
-    }
 }
 
 #[cfg(test)]

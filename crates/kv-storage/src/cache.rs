@@ -460,10 +460,10 @@ mod tests {
             }
         }
         for i in 0..CHUNK_FRAMES as u32 {
-            if let Some(f) = c.peek(pid(i)) {
-                if c.pins(f) == 0 {
-                    c.pin(f);
-                }
+            if let Some(f) = c.peek(pid(i))
+                && c.pins(f) == 0
+            {
+                c.pin(f);
             }
         }
         for i in 0..CHUNK_FRAMES as u32 {

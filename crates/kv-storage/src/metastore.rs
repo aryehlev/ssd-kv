@@ -405,10 +405,6 @@ impl MetaCore {
         (MetaClient { tx, shared: self.shared.clone() }, MetaInbox { rx })
     }
 
-    pub(crate) fn link(&self) -> Arc<SbLink> {
-        self.link.clone()
-    }
-
     /// The durable `resolved_w`.
     pub fn resolved_w(&self) -> u64 {
         self.w
@@ -796,24 +792,20 @@ fn neg(e: &std::io::Error) -> i32 {
 // ---------------------------------------------------------------------------------------------
 // The thread
 
+/// Delivers a meta reply `(partition, token, done)` to one worker.
+pub type ReplyHook = Box<dyn Fn(u16, u64, MetaDone) + Send>;
+
 pub struct MetaStore;
 
 impl MetaStore {
     /// Starts the meta thread over the node's devices; `reply[w]` delivers completions to
     /// worker `w` (the worker of partition `p` is `p % reply.len()`).
-    pub fn start(
-        devs: Vec<Box<dyn BlockDevice + Send>>,
-        reply: Vec<Box<dyn Fn(u16, u64, MetaDone) + Send>>,
-    ) -> (MetaClient, std::thread::JoinHandle<()>) {
+    pub fn start(devs: Vec<Box<dyn BlockDevice + Send>>, reply: Vec<ReplyHook>) -> (MetaClient, std::thread::JoinHandle<()>) {
         Self::start_with_fill(devs, reply, 0.95)
     }
 
     /// [`MetaStore::start`] with a fill limit other than the default 0.95 (§11.6).
-    pub fn start_with_fill(
-        devs: Vec<Box<dyn BlockDevice + Send>>,
-        reply: Vec<Box<dyn Fn(u16, u64, MetaDone) + Send>>,
-        max_fill: f32,
-    ) -> (MetaClient, std::thread::JoinHandle<()>) {
+    pub fn start_with_fill(devs: Vec<Box<dyn BlockDevice + Send>>, reply: Vec<ReplyHook>, max_fill: f32) -> (MetaClient, std::thread::JoinHandle<()>) {
         let mut io = OwnedDevs(devs);
         let now = kv_common::Now::read().unix_ms;
         let core = MetaCore::load(&mut io, now);

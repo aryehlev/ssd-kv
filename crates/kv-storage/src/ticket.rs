@@ -115,18 +115,17 @@ impl Tickets {
     }
 
     /// True for the internal ticket of a txn.
+    #[cfg(test)]
     pub(crate) fn is_internal(&self, t: TicketId) -> bool {
         self.map.get(&t.0).is_some_and(|k| k.txn_effects.is_some())
     }
 
-    pub(crate) fn get_mut(&mut self, t: TicketId) -> Option<&mut Ticket> {
-        self.map.get_mut(&t.0)
-    }
-
+    #[cfg(test)]
     pub(crate) fn contains(&self, t: TicketId) -> bool {
         self.map.contains_key(&t.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
@@ -254,10 +253,6 @@ impl Tickets {
         out.append(&mut self.txns_failed);
     }
 
-    /// Live tickets that are not internal (barriers, drain).
-    pub(crate) fn pending_reply_tickets(&self) -> usize {
-        self.map.values().filter(|k| k.txn_effects.is_none()).count()
-    }
 
     /// Drains the state changes since the last call (in the order they happened).
     pub(crate) fn take(&mut self, out: &mut Vec<(TicketId, TicketState)>) {

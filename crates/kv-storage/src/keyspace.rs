@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 
 use crate::cache::{FrameIdx, PageCache};
 use crate::effect::Op;
-use crate::extent::{self, EXT_KIND_CHUNKMAP, EXT_KIND_VALUE, EXT_VTYPE_HASH, ExtHeader};
+use crate::extent::{self, EXT_KIND_CHUNKMAP, EXT_KIND_VALUE, EXT_VTYPE_HASH};
 use crate::layout::EXT_HDR;
 use crate::image::{Pending, RecDesc, RecStatus};
 use crate::io::AlignedBuf;
@@ -197,7 +197,6 @@ pub(crate) enum Need {
 pub(crate) struct ChunkFetch {
     pub(crate) page: PageId,
     pub(crate) n_pages: u32,
-    pub(crate) len: u32,
     pub(crate) crc: u32,
     pub(crate) buf: Option<AlignedBuf>,
 }
@@ -869,10 +868,6 @@ pub(crate) fn splitmix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The header of an extent image (for staged writes).
-pub(crate) fn value_ext_header(buf: &[u8], start: PageId) -> Option<ExtHeader> {
-    extent::parse_extent_header(buf, start)
-}
 
 #[cfg(test)]
 mod tests {

@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use kv_common::abblock::AbCopy;
-use kv_common::crc::{crc32c, crc32c_append};
+use kv_common::crc::crc32c;
 use kv_index::{Entry, SlotTable};
 use parking_lot::Mutex;
 
@@ -115,13 +115,16 @@ pub(crate) fn encode_section(p: &PartitionStore) -> Vec<u8> {
     out
 }
 
+/// One table of a section: `(db, slot, entries with hints in fp order)`.
+pub(crate) type SectionTable = (u8, u16, Vec<(Entry, u16)>);
+
 /// A decoded section.
 pub(crate) struct Section {
     pub(crate) partition: u16,
     pub(crate) next_seq: Seq,
     pub(crate) hint_base_s: u64,
     /// `(db, slot, entries with hints in fp order)`.
-    pub(crate) tables: Vec<(u8, u16, Vec<(Entry, u16)>)>,
+    pub(crate) tables: Vec<SectionTable>,
     pub(crate) small: Vec<(AgId, Vec<u8>)>,
     pub(crate) extent: Vec<(AgId, Bits4096, Bits4096)>,
 }
@@ -396,14 +399,6 @@ impl SnapshotDir {
     }
 }
 
-/// Crc of `parts` as one message (section reads assembled from several device spans).
-pub(crate) fn crc_of(parts: &[&[u8]]) -> u32 {
-    let mut c = 0u32;
-    for p in parts {
-        c = crc32c_append(c, p);
-    }
-    c
-}
 
 #[cfg(test)]
 mod tests {

@@ -239,12 +239,18 @@ impl<D: BlockDevice> Db<D> {
     }
 }
 
+/// A key's acknowledged state and the states of later unacknowledged operations.
+pub type KeyStates = (Option<Vec<u8>>, Vec<Option<Vec<u8>>>);
+
+/// Valid copies of each key: `(db, key) -> [(page, seq, small)]`.
+pub type CopyMap = hashbrown::HashMap<(u8, Vec<u8>), Vec<(u64, u64, bool)>>;
+
 /// The reference model: per key, the acknowledged value and the values of operations not
 /// acknowledged yet (any of which may survive a crash, I1).
 #[derive(Default, Clone)]
 pub struct Model {
     /// key -> (acked state, states produced by later unacked ops)
-    pub keys: hashbrown::HashMap<Vec<u8>, (Option<Vec<u8>>, Vec<Option<Vec<u8>>>)>,
+    pub keys: hashbrown::HashMap<Vec<u8>, KeyStates>,
 }
 
 impl Model {
@@ -366,13 +372,13 @@ pub fn spearman(xs: &[f64], ys: &[f64]) -> f64 {
 }
 
 /// Every valid copy on an image: `(db, key) -> [(page, seq, small)]`.
-pub fn copy_locations(image: &[u8], dev: u8, boot: &kv_storage::Boot) -> hashbrown::HashMap<(u8, Vec<u8>), Vec<(u64, u64, bool)>> {
+pub fn copy_locations(image: &[u8], dev: u8, boot: &kv_storage::Boot) -> CopyMap {
     use kv_storage::extent;
     use kv_storage::layout::{AG_PAGES, PAGE, PageId};
     use kv_storage::page::{PageParse, parse_small_page};
     let crc = boot.record_crc();
     let l = boot.layouts()[usize::from(dev)];
-    let mut out: hashbrown::HashMap<(u8, Vec<u8>), Vec<(u64, u64, bool)>> = hashbrown::HashMap::new();
+    let mut out: CopyMap = hashbrown::HashMap::new();
     let mut views = Vec::new();
     let first = l.ag_area_page;
     let end = first + u64::from(l.n_ags) * u64::from(AG_PAGES);

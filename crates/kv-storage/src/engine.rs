@@ -122,26 +122,16 @@ pub trait StorageEngine: Sized {
 /// Per-device facts established at open.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DevBoot {
-    pub(crate) pages: u64,
     pub(crate) lba: u32,
     pub(crate) page_update: PageUpdateMode,
     pub(crate) atomic_unit: Option<(u32, u32)>,
     /// Writes carry `RWF_DSYNC` (`flush-method dsync`): durable at completion.
     pub(crate) dsync: bool,
-    /// Completed writes are durable without a flush.
-    pub(crate) write_through: bool,
 }
 
 impl DevBoot {
     fn from_info(i: &DevInfo, dsync: bool) -> Self {
-        DevBoot {
-            pages: i.pages,
-            lba: i.lba.max(512),
-            page_update: i.page_update,
-            atomic_unit: i.atomic_unit,
-            dsync,
-            write_through: i.write_through,
-        }
+        DevBoot { lba: i.lba.max(512), page_update: i.page_update, atomic_unit: i.atomic_unit, dsync }
     }
 }
 
@@ -161,8 +151,6 @@ pub struct Boot {
     pub(crate) pmeta: Vec<PartitionMeta>,
     /// Committed txn ids of earlier boots (§10.7).
     pub(crate) committed: CommittedSet,
-    /// `txn_floor` read at startup: ids below it may be on media.
-    pub(crate) txn_floor: u64,
     /// AGs per owner partition with their kind (§10.4).
     pub(crate) owned: Vec<Vec<(AgId, AgKind)>>,
     /// The snapshot the superblock names, when CLEAN and SNAPSHOT_VALID (§18.1 step 3).
@@ -191,7 +179,6 @@ impl Boot {
             devs: Vec::new(),
             pmeta: (0..partitions).map(PartitionMeta::initial).collect(),
             committed: CommittedSet::default(),
-            txn_floor: 1,
             owned: vec![Vec::new(); usize::from(partitions.max(1))],
             snapshot: None,
             collector: SnapshotWriter::detached(partitions.max(1)),
@@ -343,7 +330,6 @@ impl Boot {
             devs: devboot,
             pmeta,
             committed,
-            txn_floor: ih.txn_floor,
             owned,
             snapshot,
             collector: SnapshotWriter::detached(partitions),
@@ -1020,8 +1006,9 @@ impl<D: BlockDevice> LocalEngine<D> {
         Err(crate::keyspace::StoreError::Io(-libc::ETIMEDOUT))
     }
 
-    /// Like [`LocalEngine::run`] for a SCAN step or RANDOMKEY attempt.
-    pub fn run_scan(&mut self, p: u16, req: crate::partition::Request, matcher: &dyn Fn(&[u8]) -> bool) -> Result<(u64, Vec<Box<[u8]>>), crate::keyspace::StoreError> {
+    /// Like [`LocalEngine::run`] for a SCAN step or RANDOMKEY attempt: the next cursor and
+    /// the keys found.
+    pub fn run_scan(&mut self, p: u16, req: crate::partition::Request, matcher: &dyn Fn(&[u8]) -> bool) -> Result<ScanResult, crate::keyspace::StoreError> {
         use crate::partition::ExecStatus;
         let id = self.submit(p, req);
         let mut ready = Vec::new();
@@ -1095,6 +1082,9 @@ impl<D: BlockDevice> LocalEngine<D> {
         plumb.devs.into_iter().map(|d| d.dev).collect()
     }
 }
+
+/// A SCAN step's next cursor and the keys it found.
+pub type ScanResult = (u64, Vec<Box<[u8]>>);
 
 /// Where a key's current version lives (tests and tools).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

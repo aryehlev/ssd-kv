@@ -346,6 +346,7 @@ pub(crate) struct Built {
 }
 
 impl Built {
+    #[cfg(test)]
     pub(crate) fn writes(&self) -> bool {
         !self.spans.is_empty()
     }

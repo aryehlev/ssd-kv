@@ -582,14 +582,18 @@ impl Alloc {
 
     /// Chooses a page for a new small record of `need` bytes. A `Fresh` result is already
     /// marked used (undo with [`Alloc::unplace_fresh`]); other results change nothing.
-    pub(crate) fn place_small(&mut self, need: u16, cache: &PageCache, now_ns: u64) -> SmallPlace {
-        if let Some(p) = self.best_cached(need, cache) {
+    ///
+    /// `exclude` names pages the record must not go to (a page holding a tracked copy of the
+    /// same key, a corrupt page, the page a record is moving away from); they are skipped by
+    /// the draws.
+    pub(crate) fn place_small(&mut self, need: u16, cache: &PageCache, now_ns: u64, exclude: &dyn Fn(PageId) -> bool) -> SmallPlace {
+        if let Some(p) = self.best_cached(need, cache, exclude) {
             return SmallPlace::Cached(p);
         }
         if let Some(p) = self.take_fresh(need) {
             return SmallPlace::Fresh(p);
         }
-        if let Some(p) = self.best_uncached(need, cache) {
+        if let Some(p) = self.best_uncached(need, cache, exclude) {
             return SmallPlace::Uncached(p);
         }
         let slot = &mut self.slots[0];
@@ -615,7 +619,7 @@ impl Alloc {
         SmallPlace::NeedAg
     }
 
-    fn best_cached(&mut self, need: u16, cache: &PageCache) -> Option<PageId> {
+    fn best_cached(&mut self, need: u16, cache: &PageCache, exclude: &dyn Fn(PageId) -> bool) -> Option<PageId> {
         let min = need.saturating_add(self.slack_min(need));
         let c0 = usize::from(min / 128).min(CACHED_CLASSES - 1);
         for c in c0..CACHED_CLASSES {
@@ -632,7 +636,7 @@ impl Alloc {
                     continue;
                 }
                 let (free, largest) = self.cached.info.get(&p).copied().unwrap_or((0, 0));
-                if self.qualifies(need, free, largest) {
+                if self.qualifies(need, free, largest) && !exclude(p) {
                     return Some(p);
                 }
             }
@@ -671,7 +675,7 @@ impl Alloc {
     }
 
     /// Best fit among uncached pages by hint (§11.3 step 3).
-    fn best_uncached(&mut self, need: u16, cache: &PageCache) -> Option<PageId> {
+    fn best_uncached(&mut self, need: u16, cache: &PageCache, exclude: &dyn Fn(PageId) -> bool) -> Option<PageId> {
         let req = need.saturating_add(self.slack_min(need)).div_ceil(16);
         if req > 254 {
             return None;
@@ -710,7 +714,7 @@ impl Alloc {
                     continue;
                 }
                 let p = PageId::new(dev, first + i);
-                if cache.contains(p) {
+                if cache.contains(p) || exclude(p) {
                     continue;
                 }
                 if v < fit {
@@ -1155,7 +1159,7 @@ mod tests {
         assert!(a.add_small_ag(AgId { dev: 0, idx: 0 }));
         let mut pages = Vec::new();
         for _ in 0..64 {
-            match a.place_small(352, &cache, 0) {
+            match a.place_small(352, &cache, 0, &|_| false) {
                 SmallPlace::Fresh(p) => pages.push(p.page()),
                 other => panic!("{other:?}"),
             }
@@ -1172,7 +1176,7 @@ mod tests {
     fn spare_and_refusal() {
         let mut a = alloc(PageUpdateMode::TwoImage);
         let cache = PageCache::new(1 << 20, false);
-        assert_eq!(a.place_small(100, &cache, 0), SmallPlace::NeedAg);
+        assert_eq!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::NeedAg);
         let mut req = SmallVec::new();
         a.take_ag_requests(&mut req);
         assert_eq!(req.as_slice(), &[AgKind::Small]);
@@ -1180,7 +1184,7 @@ mod tests {
         a.take_ag_requests(&mut req);
         assert!(req.is_empty(), "one request in flight");
         a.ag_granted(AgKind::Small, Some(AgId { dev: 0, idx: 2 }), 0);
-        assert!(matches!(a.place_small(100, &cache, 0), SmallPlace::Fresh(_)));
+        assert!(matches!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::Fresh(_)));
         a.take_ag_requests(&mut req);
         assert_eq!(req.as_slice(), &[AgKind::Small], "consumed spare is replaced");
         a.ag_granted(AgKind::Small, None, 10);
@@ -1236,9 +1240,9 @@ mod tests {
         cache.alloc(p).unwrap();
         a.note_cached(p, 900, 400);
         // 900 - 352 = 548 >= min(max(352, 400), 1024) = 400
-        assert_eq!(a.place_small(352, &cache, 0), SmallPlace::Cached(p));
+        assert_eq!(a.place_small(352, &cache, 0, &|_| false), SmallPlace::Cached(p));
         // 900 - 500 = 400 < 500: no
-        assert!(matches!(a.place_small(500, &cache, 0), SmallPlace::Fresh(_)));
+        assert!(matches!(a.place_small(500, &cache, 0, &|_| false), SmallPlace::Fresh(_)));
         assert!(a.qualifies(100, 300, 100));
         assert!(!a.qualifies(100, 150, 100));
     }
@@ -1255,7 +1259,7 @@ mod tests {
         }
         a.finish_rebuild();
         let want = a.page_of(ag, 77).unwrap();
-        assert_eq!(a.place_small(352, &cache, 0), SmallPlace::Uncached(want));
+        assert_eq!(a.place_small(352, &cache, 0, &|_| false), SmallPlace::Uncached(want));
         for i in 0..AG_PAGES {
             a.note_fresh(a.page_of(ag, i).unwrap());
         }

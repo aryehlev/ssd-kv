@@ -282,6 +282,9 @@ pub(crate) struct Requests {
     barriers: VecDeque<(u64, ReqId)>,
     /// Requests held behind a barrier (re-checked when it finishes).
     blocked: Vec<ReqId>,
+    /// Executed local multi-key txns that keep their key queues until the commit is durable
+    /// (a later command on one of their keys waits for it, LC-15): `txn -> request`.
+    held: HashMap<u64, ReqId, foldhash::fast::FixedState>,
     next_order: u64,
     live: usize,
 }
@@ -565,6 +568,10 @@ pub(crate) struct Core {
     pub(crate) prior_txn_pages: HashSet<PageId, foldhash::fast::FixedState>,
     /// The clean-shutdown section was handed to the snapshot writer.
     pub(crate) snapshot_done: bool,
+    /// Ticks run (cheap periodic work).
+    ticks: u64,
+    /// The local txn the last commit opened (its request keeps its key queues, see `hold`).
+    last_local_txn: Option<u64>,
     /// Scratch vectors (no per-tick allocation).
     scratch_pos: Vec<Pos>,
     scratch_txn: Vec<u64>,
@@ -883,6 +890,8 @@ impl PartitionStore {
             prior_txn_zero: Some(0),
             prior_txn_pages: HashSet::with_hasher(Default::default()),
             snapshot_done: false,
+            ticks: 0,
+            last_local_txn: None,
             scratch_pos: Vec::new(),
             scratch_txn: Vec::new(),
             boot,
@@ -957,6 +966,37 @@ impl PartitionStore {
             c.durable_wait.len(),
             c.gone_wait.len(),
         )
+    }
+
+    /// [`PartitionStore::diag`] plus the deferred pages' staged effects and the tracked copies
+    /// (diagnostics; key lengths only).
+    pub fn diag_deep(&self, cache: &PageCache) -> String {
+        let mut out = self.diag();
+        for p in &self.core.deferred {
+            if let Some(st) = cache.page_state(*p) {
+                out.push_str(&format!("\n  deferred {:#x}: recs=[", p.0));
+                for r in st.recs.iter() {
+                    out.push_str(&format!("({:?} seq={:#x} txn={} klen={}) ", r.status, r.seq.0, r.txn, r.key_len));
+                }
+                out.push_str("] pending=[");
+                for e in st.pending.iter() {
+                    let kind = match e {
+                        Pending::Put(r) => format!("put(seq={:#x} txn={})", r.desc.seq.0, r.desc.txn),
+                        Pending::Remove { .. } => "remove".to_string(),
+                        Pending::Retire { seq, .. } => format!("retire({:#x})", seq.0),
+                    };
+                    out.push_str(&format!("{kind} klen={} tickets={} others={}; ", e.key().len(), e.tickets().len(), self.core.stale.count(e.db(), e.key())));
+                }
+                out.push(']');
+            }
+        }
+        for (db, k, e) in self.core.stale.iter() {
+            out.push_str(&format!("\n  stale db={db} klen={} at={:#x} {:?} fg={}", k.len(), e.at.page().0, e.state, e.foreground));
+        }
+        for (t, o) in &self.core.txns {
+            out.push_str(&format!("\n  txn {t} keys={} pages={} requested={} local={}", o.keys.len(), o.pages.len(), o.requested, o.local));
+        }
+        out
     }
 
     /// Tracked stale copies left (a snapshot needs none, §8.2 SHUTDOWN).
@@ -1247,6 +1287,28 @@ impl PartitionStore {
         }
     }
 
+    /// Keeps an executed local txn's key queues until its commit is durable.
+    fn hold(&mut self, cache: &mut PageCache, id: ReqId, mut r: Req, txn: u64) {
+        for p in r.pins.drain(..) {
+            if let Some(f) = cache.peek(p) {
+                cache.unpin(f);
+            }
+        }
+        r.fetched.clear();
+        r.queued = false;
+        self.reqs.slots[id.0 as usize] = Some(r);
+        self.reqs.held.insert(txn, id);
+    }
+
+    /// Releases the key queues of a held txn request.
+    fn release_held(&mut self, cache: &mut PageCache, txn: u64) {
+        if let Some(id) = self.reqs.held.remove(&txn)
+            && let Some(r) = self.take_req(id)
+        {
+            self.finish(cache, id, r);
+        }
+    }
+
     fn requeue(&mut self, id: ReqId, r: Req) {
         self.reqs.slots[id.0 as usize] = Some(r);
         self.reqs.check_ready(id);
@@ -1328,7 +1390,10 @@ impl PartitionStore {
                 };
                 match self.commit(cx, staged, txn, seqo) {
                     Commit::Done(out) => {
-                        self.finish(cx.cache, id, r);
+                        match self.core.last_local_txn.take() {
+                            Some(t) => self.hold(cx.cache, id, r, t),
+                            None => self.finish(cx.cache, id, r),
+                        }
                         ExecStatus::Done(v, out)
                     }
                     Commit::Need(needs) => {
@@ -1490,6 +1555,9 @@ impl PartitionStore {
                 // the reply waits for the durable COMMITTED listing (E6)
                 self.core.tickets.add_meta(t);
             }
+            if o.local {
+                self.core.last_local_txn = Some(txn_id);
+            }
             self.core.txns.insert(txn_id, o);
         }
         if writes > 0 {
@@ -1540,28 +1608,24 @@ impl PartitionStore {
             {
                 return Ok(Plan::Small { page, fresh: false });
             }
-            for _ in 0..2 {
-                match self.core.alloc.place_small(need, cx.cache, now_ns) {
-                    SmallPlace::Cached(q) => {
-                        if self.core.stale.state_at(s.db, &s.key, q).is_some() || cx.cache.page_state(q).is_none_or(|st| st.corrupt) {
-                            continue; // never stage a key onto a page holding its tracked copy
-                        }
-                        return Ok(Plan::Small { page: q, fresh: false });
-                    }
-                    SmallPlace::Fresh(q) => {
-                        undo.fresh.push(q);
-                        return Ok(Plan::Small { page: q, fresh: true });
-                    }
-                    SmallPlace::Uncached(q) => {
-                        let mut n = SmallVec::new();
-                        n.push(Need::Page(q));
-                        return Err(Commit::Need(n));
-                    }
-                    SmallPlace::NeedAg => return Err(Commit::Park),
-                    SmallPlace::Full => return Err(Commit::Err(StoreError::OutOfSpace)),
+            // never stage a key onto a page holding its tracked copy, or onto a corrupt page
+            let stale = &self.core.stale;
+            let cache: &PageCache = cx.cache;
+            let exclude = |q: PageId| stale.state_at(s.db, &s.key, q).is_some() || cache.page_state(q).is_some_and(|st| st.corrupt);
+            return match self.core.alloc.place_small(need, cache, now_ns, &exclude) {
+                SmallPlace::Cached(q) => Ok(Plan::Small { page: q, fresh: false }),
+                SmallPlace::Fresh(q) => {
+                    undo.fresh.push(q);
+                    Ok(Plan::Small { page: q, fresh: true })
                 }
-            }
-            return Err(Commit::Park);
+                SmallPlace::Uncached(q) => {
+                    let mut n = SmallVec::new();
+                    n.push(Need::Page(q));
+                    Err(Commit::Need(n))
+                }
+                SmallPlace::NeedAg => Err(Commit::Park),
+                SmallPlace::Full => Err(Commit::Err(StoreError::OutOfSpace)),
+            };
         }
         if key_len > u32::MAX as usize {
             return Err(Commit::Err(StoreError::TooLarge));
@@ -3278,6 +3342,7 @@ impl PartitionStore {
     /// `COMMITTED(txn)` is durable (§14.6 steps 3-4): the reply may go; phase 2 starts.
     fn txn_committed(&mut self, cx: &mut StorageCtx<'_>, txn: u64) {
         self.core.committed.insert(txn);
+        self.release_held(cx.cache, txn);
         let Some(o) = self.core.txns.remove(&txn) else { return };
         if o.local
             && let Some(t) = o.ticket
@@ -3318,6 +3383,13 @@ impl PartitionStore {
             self.core.mark_dirty(cx.cache, p);
             if cx.cache.page_state(p).is_some_and(|st| st.inflight.is_none()) && !self.core.dirty.contains(&p) {
                 self.core.dirty.push(p);
+            }
+        }
+        if self.core.state == PartState::ReadOnly && !self.reqs.held.is_empty() {
+            // a txn that cannot commit any more releases its keys (its ticket failed)
+            let held: Vec<u64> = self.reqs.held.keys().copied().collect();
+            for t in held {
+                self.release_held(cx.cache, t);
             }
         }
         self.txn_progress(cx);
@@ -3513,26 +3585,24 @@ impl PartitionStore {
         let slot = key_slot(&key);
         let need = rec.desc.len;
         let now_ns = cx.now.mono_ns;
-        let mut target = None;
-        for _ in 0..2 {
-            match self.core.alloc.place_small(need, cx.cache, now_ns) {
-                SmallPlace::Cached(q) if q != from && self.core.stale.state_at(db, &key, q).is_none() && cx.cache.page_state(q).is_some_and(|s| !s.corrupt) => {
-                    target = Some(q);
-                    break;
-                }
-                SmallPlace::Fresh(q) => {
-                    self.init_fresh(cx.cache, q);
-                    target = Some(q);
-                    break;
-                }
-                SmallPlace::Cached(_) => continue,
-                SmallPlace::Uncached(q) => {
-                    self.load_page(cx, q, None, false);
-                    break;
-                }
-                SmallPlace::NeedAg | SmallPlace::Full => break,
+        let place = {
+            let stale = &self.core.stale;
+            let cache: &PageCache = cx.cache;
+            let exclude = |q: PageId| q == from || stale.state_at(db, &key, q).is_some() || cache.page_state(q).is_some_and(|st| st.corrupt);
+            self.core.alloc.place_small(need, cache, now_ns, &exclude)
+        };
+        let target = match place {
+            SmallPlace::Cached(q) => Some(q),
+            SmallPlace::Fresh(q) => {
+                self.init_fresh(cx.cache, q);
+                Some(q)
             }
-        }
+            SmallPlace::Uncached(q) => {
+                self.load_page(cx, q, None, false);
+                None
+            }
+            SmallPlace::NeedAg | SmallPlace::Full => None,
+        };
         let Some(q) = target else {
             // no room yet (an AG or a page read is on its way): try again next tick
             if let Some(st) = cx.cache.page_state_mut(from) {
@@ -3939,9 +4009,13 @@ impl PartitionStore {
             self.core.counters.expires[d] = self.core.index.expires(d as u8);
         }
         self.core.counters.stale_copies = self.core.stale.len() as u64;
-        self.core.counters.index_bytes = self.core.index.memory_bytes() as u64;
-        self.core.counters.alloc_state_bytes = self.core.alloc.state_bytes() as u64;
-        let _ = cx;
+        self.core.counters.dirty_bytes = self.staged_bytes(cx.cache) as u64;
+        // memory figures walk every table: refreshed every 1024 ticks
+        self.core.ticks = self.core.ticks.wrapping_add(1);
+        if self.core.ticks % 1024 == 1 {
+            self.core.counters.index_bytes = self.core.index.memory_bytes() as u64;
+            self.core.counters.alloc_state_bytes = self.core.alloc.state_bytes() as u64;
+        }
     }
 
     /// Bytes of staged records not in any image yet (`max-dirty-bytes`, §6.7).

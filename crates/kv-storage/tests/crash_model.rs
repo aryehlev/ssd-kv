@@ -212,7 +212,7 @@ fn kill9_on_a_file_device() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kvd.data");
     let opts = kv_storage::format::FormatOpts {
-        devices: vec![(path.clone(), Some(640 << 20))],
+        devices: vec![(path.clone(), Some(1 << 30))],
         partitions: 16,
         cluster: false,
         snapshot_region: kv_storage::format::SnapshotRegionSize::Bytes(16 << 20),
@@ -223,7 +223,7 @@ fn kill9_on_a_file_device() {
     }
     let open = || {
         let probe = kv_storage::devprobe::probe(&path).unwrap();
-        let info = DevInfo::new((640 << 20) / 4096, probe.lba);
+        let info = DevInfo::new((1 << 30) / 4096, probe.lba);
         SyncFileDevice::open_with(&path, info, SyncOpen { direct: true, exclusive: true, read_only: false }).unwrap()
     };
     let mut model = Model::default();
@@ -269,7 +269,8 @@ mod power {
     #[test]
     fn power_cut_random_sequences_keep_durable_acks() {
         let seeds = std::env::var("KVSSD_CRASH_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(8u64);
-        for seed in 0..seeds {
+        let from = std::env::var("KVSSD_SEED_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(0u64);
+        for seed in from..seeds {
             let mut r = Rng(seed ^ 0xBADC0DE);
             let lba = if seed % 2 == 0 { 512 } else { 4096 };
             let atomic = (seed % 3 == 0).then_some(4096);

@@ -947,7 +947,10 @@ impl<D: BlockDevice> LocalEngine<D> {
     /// Pumps until ticket `t` reached `want` (Written or Durable) or failed; returns its state.
     pub fn wait_ticket(&mut self, p: u16, t: crate::ticket::TicketId, want: crate::ticket::TicketState) -> crate::ticket::TicketState {
         use crate::ticket::TicketState as S;
-        for _ in 0..1_000_000 {
+        for n in 0..1_000_000 {
+            if n == 3_000 && std::env::var("KVSSD_TRACE").is_ok() {
+                eprintln!("stuck ticket: {} meta W={}", self.parts[usize::from(p)].diag_deep(&self.cache), self.meta.resolved_w());
+            }
             match self.ticket_state(p, t) {
                 Some(S::Failed(e)) => return S::Failed(e),
                 Some(S::Durable) => return S::Durable,
@@ -971,7 +974,7 @@ impl<D: BlockDevice> LocalEngine<D> {
         let id = self.submit(p, req);
         let mut ready = Vec::new();
         for n in 0..1_000_000 {
-            if n == 200_000 && std::env::var("KVSSD_TRACE").is_ok() {
+            if n == 3_000 && std::env::var("KVSSD_TRACE").is_ok() {
                 eprintln!("stuck request: {} txn_ids={}", self.parts[usize::from(p)].diag(), self.client.txn_ids().available());
             }
             ready.clear();

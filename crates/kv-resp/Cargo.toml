@@ -1,0 +1,19 @@
+[package]
+name = "kv-resp"
+description = "kvssd RESP2/RESP3 incremental parser, reply writer and client-side decoder (DESIGN §7, §24.4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kv-common.workspace = true
+memchr.workspace = true
+itoa.workspace = true
+ryu.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

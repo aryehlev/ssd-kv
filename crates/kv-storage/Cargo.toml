@@ -1,0 +1,27 @@
+[package]
+name = "kv-storage"
+description = "kvssd in-place SSD page store: formats, allocator, page writer, recovery (DESIGN §10-§19, §24.7)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# SimDevice and the deterministic-simulation hooks (DESIGN §25.3); used by kv-sim and faultdev only.
+sim = []
+
+[dependencies]
+kv-common.workspace = true
+kv-index.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+hashbrown.workspace = true
+foldhash.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

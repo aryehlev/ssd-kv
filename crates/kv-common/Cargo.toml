@@ -1,0 +1,20 @@
+[package]
+name = "kv-common"
+description = "kvssd shared primitives: slots, key hashes, checksums, clocks, pacing, A/B blocks, number formats (DESIGN §24.3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+xxhash-rust.workspace = true
+crc32c.workspace = true
+hdrhistogram.workspace = true
+itoa.workspace = true
+ryu.workspace = true
+
+[build-dependencies]
+cc.workspace = true

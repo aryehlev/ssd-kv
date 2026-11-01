@@ -1,0 +1,18 @@
+[package]
+name = "kvbench"
+description = "kvssd benchmark client (DESIGN §27)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kvbench"
+path = "src/main.rs"
+
+[dependencies]
+kv-resp.workspace = true
+kv-common.workspace = true
+clap.workspace = true

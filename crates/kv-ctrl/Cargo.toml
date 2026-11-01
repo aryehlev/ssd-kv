@@ -1,0 +1,16 @@
+[package]
+name = "kv-ctrl"
+description = "kvssd coordinator <-> node control messages, ids and node assignments (DESIGN §23.4, §24.9)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kv-common.workspace = true
+serde.workspace = true
+postcard.workspace = true
+rand.workspace = true
+static_assertions.workspace = true

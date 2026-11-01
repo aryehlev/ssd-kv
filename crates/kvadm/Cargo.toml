@@ -1,0 +1,18 @@
+[package]
+name = "kvadm"
+description = "kvssd operator CLI: RESP KVADM commands to the coordinator admin port (DESIGN §23.12, §24.12)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kvadm"
+path = "src/main.rs"
+
+[dependencies]
+kv-resp.workspace = true
+kv-ctrl.workspace = true
+clap.workspace = true

@@ -1,0 +1,16 @@
+# Workspace clippy configuration (DESIGN §24.1, §25.7). `cargo clippy --workspace -- -D warnings`.
+
+disallowed-types = [
+    # LC-06: std's SipHash maps are not used; use hashbrown with foldhash.
+    { path = "std::collections::HashMap", reason = "LC-06: use hashbrown::HashMap (foldhash)" },
+    { path = "std::collections::HashSet", reason = "LC-06: use hashbrown::HashSet (foldhash)" },
+]
+
+disallowed-methods = [
+    # LC-02: no appended files except the two diagnostic logs (kv-node/src/log.rs,
+    # kv-coord/src/log.rs), which carry `#[allow(clippy::disallowed_methods)]` at the call site.
+    { path = "std::fs::OpenOptions::append", reason = "LC-02: only the diagnostic log.rs files may open a file for appending" },
+    # LC-02: files are sized once at format time and never grown afterwards
+    # (kv-storage/src/format.rs and the coordinator's state-file creation are the exceptions).
+    { path = "std::fs::File::set_len", reason = "LC-02: no file growth after format" },
+]

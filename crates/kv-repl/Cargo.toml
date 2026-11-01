@@ -1,0 +1,18 @@
+[package]
+name = "kv-repl"
+description = "kvssd per-partition replication streams, backlogs, sync decisions and migration endpoints (DESIGN §23.7-§23.13, §24.8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kv-storage.workspace = true
+kv-common.workspace = true
+smallvec.workspace = true
+static_assertions.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

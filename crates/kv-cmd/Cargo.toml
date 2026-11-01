@@ -1,0 +1,15 @@
+[package]
+name = "kv-cmd"
+description = "kvssd command table: names, arity, flags, key specs, COMMAND INFO/DOCS (DESIGN §8, §24.5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kv-common.workspace = true
+kv-resp.workspace = true
+bitflags.workspace = true
+smallvec.workspace = true

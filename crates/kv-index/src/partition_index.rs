@@ -153,6 +153,21 @@ impl PartitionIndex {
         self.tables[idx].get_or_insert_with(Box::default)
     }
 
+    /// The table of `(db, slot)` for mutation if it holds at least one key; never creates one
+    /// (for sweeps over every slot, such as the hourly hint rebase). Same lending rules as
+    /// [`PartitionIndex::table_mut`].
+    pub fn existing_mut(&mut self, db: u8, slot: u16) -> Option<&mut SlotTable> {
+        assert!(
+            db < self.databases && self.owns(slot),
+            "existing_mut: (db, slot) not in this partition"
+        );
+        let idx = self.idx(db, slot);
+        if self.tables[idx].as_deref().is_none_or(SlotTable::is_empty) {
+            return None;
+        }
+        Some(self.table_mut(db, slot))
+    }
+
     fn lend(&mut self, idx: usize) {
         let t = self.tables[idx].get_or_insert_with(Box::default);
         self.lent = Some(Lent {
@@ -429,6 +444,19 @@ mod tests {
         p.drop_db(0);
         p.drop_db(2);
         assert!(p.memory_bytes() < before);
+    }
+
+    #[test]
+    fn existing_mut_never_creates() {
+        let mut p = PartitionIndex::new(0, 16, 1);
+        assert!(p.existing_mut(0, 16).is_none());
+        assert!(p.tables.iter().all(Option::is_none));
+        p.table_mut(0, 16).insert(h(1), small(2), 5);
+        p.existing_mut(0, 16).unwrap().rehint(&mut |_| 0);
+        assert_eq!(p.expires(0), 0);
+        assert_eq!(p.keys(0), 1);
+        assert!(p.existing_mut(0, 32).is_none());
+        assert_eq!(p.keys(0), 1);
     }
 
     #[test]

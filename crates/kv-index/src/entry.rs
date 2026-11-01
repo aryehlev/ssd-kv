@@ -128,9 +128,11 @@ impl Entry {
     }
 
     /// `page36 == 0` on the raw bytes.
-    #[inline]
+    #[inline(always)]
     pub fn is_empty_raw(b: &[u8; 10]) -> bool {
-        raw_w(b) & PAGE36_MASK == 0
+        // one unaligned 8-byte load of bytes 2..10: page36 occupies its bits 24..60
+        let [_, _, rest @ ..] = *b;
+        u64::from_le_bytes(rest) & (PAGE36_MASK << 24) == 0
     }
 
     /// `true` for the EMPTY entry (`page36 == 0`).

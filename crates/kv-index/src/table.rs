@@ -631,8 +631,8 @@ impl SlotTable {
     /// `max_entries` entries or SCAN_STEP_MAX_PAGES distinct pages; filter applied before
     /// emitting; emits de-duplicated page refs only.
     ///
-    /// * `out` is extended (not cleared) and stays de-duplicated as a whole; the page bound applies to its
-    ///   total length, so one SCAN call may walk several tables into one `out`.
+    /// * `out` is extended (not cleared) and stays de-duplicated as a whole; the page bound
+    ///   applies to its total length, so one SCAN call may walk several tables into one `out`.
     /// * `max_entries` counts entries visited (filtered or not); 0 is treated as 1.
     /// * The span covers every fp32 in `fp_lo..fp_hi_excl`; `next` is the fp32 of the first
     ///   group not consumed (`fp_hi_excl` as `u32`), or `None` (`fp_hi_excl = 2^32`) when no

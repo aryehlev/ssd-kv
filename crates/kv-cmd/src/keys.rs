@@ -131,7 +131,7 @@ fn lookup_argv(argv: &[&[u8]]) -> Option<&'static CommandSpec> {
     }
 }
 
-/// Resolves `argv` (argv[0] = command name) to its table entry exactly as Redis 7.0 does
+/// Resolves `argv` (`argv[0]` = command name) to its table entry exactly as Redis 7.0 does
 /// before executing a command: a container command with arguments resolves to its
 /// subcommand, then the arity is checked (a container without arguments is checked against
 /// its own arity, so `CLIENT` alone is an arity error and `COMMAND` alone is valid).

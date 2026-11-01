@@ -970,7 +970,10 @@ impl<D: BlockDevice> LocalEngine<D> {
         use crate::partition::ExecStatus;
         let id = self.submit(p, req);
         let mut ready = Vec::new();
-        for _ in 0..1_000_000 {
+        for n in 0..1_000_000 {
+            if n == 200_000 && std::env::var("KVSSD_TRACE").is_ok() {
+                eprintln!("stuck request: {} txn_ids={}", self.parts[usize::from(p)].diag(), self.client.txn_ids().available());
+            }
             ready.clear();
             self.ready(&mut ready);
             for &(rp, rid) in &ready {

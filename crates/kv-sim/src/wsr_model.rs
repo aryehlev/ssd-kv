@@ -24,7 +24,7 @@
 //! more steps than the exhaustive checker reaches, checking the same properties after every
 //! step.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -224,6 +224,17 @@ impl WsrState {
     /// messages and records ghost commits and elections. Returns whether the step restarts the
     /// member's election timer (leader contact or a granted vote).
     fn step(&mut self, m: &WsrModel, i: u8, input: Input<Val>) -> bool {
+        self.step_collect(m, i, input, &mut Vec::new())
+    }
+
+    /// [`WsrState::step`] that also appends the commits the step made to `fresh`.
+    fn step_collect(
+        &mut self,
+        m: &WsrModel,
+        i: u8,
+        input: Input<Val>,
+        fresh: &mut Vec<(u64, Val, u64)>,
+    ) -> bool {
         let mut out = Vec::new();
         let mut reset = false;
         let member = &mut self.members[usize::from(i)];
@@ -258,6 +269,7 @@ impl WsrState {
                 Output::Commit { version } => {
                     let c = self.members[usize::from(i)].core.committed();
                     debug_assert_eq!(c.version, version);
+                    fresh.push((c.version, c.value.clone(), c.term));
                     self.chosen.insert((c.version, c.value.clone(), c.term));
                 }
                 Output::BecameLeader { term } => {
@@ -493,6 +505,71 @@ pub fn violated(m: &WsrModel, s: &WsrState) -> Option<&'static str> {
 // ---------------------------------------------------------------------------------------------
 // Deterministic simulation over the simulated network.
 
+/// The `always` properties checked incrementally, for runs with thousands of commits (the
+/// exhaustive checker's whole-state functions are quadratic in the number of commits).
+#[derive(Default)]
+struct Incremental {
+    /// The value committed at each version.
+    by_version: BTreeMap<u64, Val>,
+    /// Per proposal term: the highest version committed by a proposal of that term, and its value.
+    by_term: BTreeMap<u64, (u64, Val)>,
+}
+
+impl Incremental {
+    fn add(&mut self, version: u64, val: &Val, term: u64) -> Option<&'static str> {
+        match self.by_version.get(&version) {
+            Some(x) if x != val => return Some("at most one value committed per version"),
+            Some(_) => {}
+            None => {
+                // Prefix order is transitive: the neighbours decide.
+                if let Some((_, lo)) = self.by_version.range(..version).next_back()
+                    && !is_prefix(lo, val)
+                {
+                    return Some("committed state never lost");
+                }
+                if let Some((_, hi)) = self.by_version.range(version + 1..).next()
+                    && !is_prefix(val, hi)
+                {
+                    return Some("committed state never lost");
+                }
+                self.by_version.insert(version, val.clone());
+            }
+        }
+        let e = self.by_term.entry(term).or_insert_with(|| (version, val.clone()));
+        if version > e.0 {
+            *e = (version, val.clone());
+        }
+        None
+    }
+
+    fn check(&self, s: &WsrState) -> Option<&'static str> {
+        if !one_leader_per_term(&WsrModel::new(1, 0, 0), s) {
+            return Some("at most one leader per term");
+        }
+        for m in &s.members {
+            let c = &m.disk.committed;
+            if c.version >= 2 && self.by_version.get(&c.version) != Some(&c.value) {
+                return Some("committed state never lost");
+            }
+            if m.core.role() == Role::Leader {
+                // The newest value committed below the leader's term must be in its last value.
+                let newest = self
+                    .by_term
+                    .range(..m.core.term())
+                    .map(|(_, e)| e)
+                    .max_by_key(|e| e.0);
+                if newest.is_some_and(|(_, v)| !is_prefix(v, m.last_value())) {
+                    return Some("leader completeness");
+                }
+            }
+        }
+        if !accepted_above_committed(&WsrModel::new(1, 0, 0), s) {
+            return Some("accepted above committed");
+        }
+        None
+    }
+}
+
 /// Parameters of one simulated run.
 #[derive(Clone, Debug)]
 pub struct SimCfg {
@@ -563,6 +640,8 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
     let mut round = 0u64;
     let mut report = SimReport::default();
     let mut next_gen = 2u64;
+    let mut inc = Incremental::default();
+    let mut fresh = Vec::new();
 
     // Hands the messages a step queued to the simulated network.
     fn flush(s: &mut WsrState, net: &mut SimNet<(u8, WsrMsg<Val>)>) {
@@ -588,7 +667,7 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
             if let Some((to, (from, msg))) = net.deliver_next() {
                 report.messages += 1;
                 let to8 = to as u8;
-                if s.step(&model, to8, Input::Msg { from: coord_id(from), msg }) {
+                if s.step_collect(&model, to8, Input::Msg { from: coord_id(from), msg }, &mut fresh) {
                     resets.push(to);
                 }
             }
@@ -600,15 +679,15 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
                 if s.members[i].core.role() == Role::Leader {
                     if beat_at[i] <= now {
                         round += 1;
-                        s.step(&model, i8, Input::BeatTimeout { round });
+                        s.step_collect(&model, i8, Input::BeatTimeout { round }, &mut fresh);
                         beat_at[i] = net.after(i, 100 * MS);
                     }
                     if check_at[i] <= now {
-                        s.step(&model, i8, Input::CheckQuorum);
+                        s.step_collect(&model, i8, Input::CheckQuorum, &mut fresh);
                         check_at[i] = net.after(i, 500 * MS);
                     }
                 } else if election_at[i] <= now {
-                    s.step(&model, i8, Input::ElectionTimeout);
+                    s.step_collect(&model, i8, Input::ElectionTimeout, &mut fresh);
                     election_at[i] = net.after(i, rng.random_range(500 * MS..1000 * MS));
                 }
             }
@@ -620,7 +699,7 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
             if c.can_propose() && rng.random_bool(0.3) {
                 let mut value = c.committed().value.clone();
                 value.push((c.term() % 251) as u8);
-                s.step(&model, i as u8, Input::Propose { value });
+                s.step_collect(&model, i as u8, Input::Propose { value }, &mut fresh);
             }
         }
         if rng.random_bool(cfg.crash) {
@@ -645,7 +724,7 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
                     .collect();
                 if !cands.is_empty() {
                     let i = cands[rng.random_range(0..cands.len())];
-                    s.step(&model, i as u8, Input::SetPeers(model.peer_list(next_gen)));
+                    s.step_collect(&model, i as u8, Input::SetPeers(model.peer_list(next_gen)), &mut fresh);
                 }
                 if list.iter().all(|&p| s.gen_of(usize::from(p)) >= next_gen) {
                     report.generation = next_gen;
@@ -669,7 +748,12 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
         }
         report.commits += (s.chosen.len() - before.0) as u64;
         report.elections += (s.leaders.len() - before.1) as u64;
-        if let Some(p) = violated(&model, &s) {
+        for (v, val, t) in fresh.drain(..) {
+            if let Some(p) = inc.add(v, &val, t) {
+                return Err(format!("seed {}: property violated: {p}", cfg.seed));
+            }
+        }
+        if let Some(p) = inc.check(&s) {
             return Err(format!("seed {}: property violated: {p}", cfg.seed));
         }
     }
@@ -785,6 +869,26 @@ mod tests {
         m.duplicate = true;
         let r = run("3 members crash/loss/dup", &m, if release() { 60 } else { 20 });
         assert!(r.unique_states > 10_000);
+    }
+
+    /// Five members, two terms, two versions, at most two messages in flight: the whole state
+    /// space within the bounds.
+    #[test]
+    fn five_members_complete() {
+        let m = cfg(5, 2, 2, false, 0, 2, false);
+        let r = run("5 members (complete)", &m, 900);
+        assert!(r.complete);
+        assert!(r.examples >= 1);
+    }
+
+    /// SETPEERS 3 -> 4 -> 3 with small bounds: the whole state space.
+    #[test]
+    fn setpeers_complete() {
+        let mut m = cfg(3, 2, 2, false, 0, 2, false);
+        m.joiners = 1;
+        m.generations = vec![vec![0, 1, 2, 3], vec![1, 2, 3]];
+        let r = run("SETPEERS 3 -> 4 -> 3 (complete)", &m, 900);
+        assert!(r.complete);
     }
 
     /// Five members: time-bounded.

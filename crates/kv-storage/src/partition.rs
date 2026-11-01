@@ -931,6 +931,34 @@ impl PartitionStore {
             && self.reqs.live == 0
     }
 
+    /// A one-line summary of the partition's queues and waits (diagnostics; no user bytes).
+    pub fn diag(&self) -> String {
+        let c = &self.core;
+        format!(
+            "p{} {:?} live={} ready={} space_wait={} seq_wait={} meta_wait={} txns={} next_seq={:#x} seq_limit={:#x} seq_asked={} dirty={} writes={} ext_w={} ext_z={} stale={} deferred={} loads={} durable_wait={} gone_wait={}",
+            c.cfg.id,
+            c.state,
+            self.reqs.live,
+            self.reqs.ready.len(),
+            c.space_wait.len(),
+            c.seq_wait.len(),
+            c.meta_wait.len(),
+            c.txns.len(),
+            c.next_seq.0,
+            c.seq_limit.0,
+            c.seq_asked,
+            c.dirty.len(),
+            c.writes_in_flight,
+            c.ext.writes.len(),
+            c.ext.zeros.len(),
+            c.stale.len(),
+            c.deferred.len(),
+            c.loads.len(),
+            c.durable_wait.len(),
+            c.gone_wait.len(),
+        )
+    }
+
     /// Tracked stale copies left (a snapshot needs none, §8.2 SHUTDOWN).
     pub fn stale_copies(&self) -> usize {
         self.core.stale.len()

@@ -857,3 +857,176 @@ impl MetaStore {
         (client, handle)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::format_devices;
+    use crate::engine::testdev::MemDev;
+
+    /// A formatted single-device set of `ags` AGs (16 partitions).
+    fn devs(ags: u64) -> OwnedDevs {
+        // 16 MiB metadata area, then the AGs
+        let mut d = MemDev::new((ags + 1) * 4096, 512);
+        format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 42).unwrap();
+        OwnedDevs(vec![Box::new(d)])
+    }
+
+    fn run(core: &mut MetaCore, io: &mut OwnedDevs, msgs: Vec<MetaMsg>) -> MetaReplies {
+        let mut out = Vec::new();
+        core.process(io, msgs, 1_000, &mut out);
+        out
+    }
+
+    fn acquire(core: &mut MetaCore, io: &mut OwnedDevs, p: u16) -> Option<AgId> {
+        let r = run(core, io, vec![MetaMsg::new(p, 1, MetaReq::AcquireAg { partition: p, kind: AgKind::Small })]);
+        match r[0].2 {
+            MetaDone::Ag(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// LC-01 `prop_ag_acquire_aperiodic`: under FIFO release the acquisition sequence has no
+    /// increasing run longer than 8 and no period with >= 10% repeats.
+    #[test]
+    fn ag_acquisition_is_aperiodic() {
+        let mut io = devs(64);
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        let mut held = std::collections::VecDeque::new();
+        let mut seq = Vec::new();
+        for _ in 0..40 {
+            let a = acquire(&mut core, &mut io, 1).unwrap();
+            held.push_back(a);
+            seq.push(a.idx);
+        }
+        for _ in 0..600 {
+            let old = held.pop_front().unwrap();
+            run(&mut core, &mut io, vec![MetaMsg::new(1, 2, MetaReq::ReleaseAg { ag: old })]);
+            let a = acquire(&mut core, &mut io, 1).unwrap();
+            assert!(!held.contains(&a), "an AG granted twice");
+            held.push_back(a);
+            seq.push(a.idx);
+        }
+        let mut run_len = 1;
+        let mut longest = 1;
+        for w in seq.windows(2) {
+            run_len = if w[1] > w[0] { run_len + 1 } else { 1 };
+            longest = longest.max(run_len);
+        }
+        assert!(longest <= 8, "increasing run of {longest}");
+        for p in 1..=100 {
+            let n = seq.len() - p;
+            let same = (0..n).filter(|&i| seq[i] == seq[i + p]).count();
+            assert!(same * 10 < n, "period {p}: {same} of {n} repeat");
+        }
+    }
+
+    #[test]
+    fn fill_limit_refuses_at_once() {
+        let mut io = devs(20);
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        core.set_max_fill(0.5);
+        let got = (0..20).filter_map(|_| acquire(&mut core, &mut io, 0)).count();
+        assert_eq!(got, 10, "half of 20 AGs");
+        assert_eq!(core.ag_usage(), (10, 20));
+    }
+
+    fn credits(r: &MetaReplies) -> u32 {
+        r.iter()
+            .filter_map(|x| match x.2 {
+                MetaDone::Resolved { credits } => Some(credits),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn commits_batch_and_resolution_waits_for_prior_records() {
+        let mut io = devs(4);
+        // a first boot hands out ids and never resolves them (a crash)
+        {
+            let core = MetaCore::load(&mut io, 0).unwrap();
+            for _ in 0..3 {
+                assert_ne!(core.shared.txn_ids.next(), 0);
+            }
+        }
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        let w0 = core.resolved_w();
+        let ids: Vec<u64> = (0..5).map(|_| core.shared.txn_ids.next()).collect();
+        assert!(ids[0] > w0 + 3, "new ids start above the earlier boot's reserved range");
+        let msgs = ids.iter().map(|&t| MetaMsg::new(2, t, MetaReq::CommitTxn { txn: t })).collect();
+        let r = run(&mut core, &mut io, msgs);
+        // one Committed per commit request, in request order, in one cycle
+        let committed: Vec<u64> = r.iter().filter_map(|x| match x.2 {
+            MetaDone::Committed { txn } => Some(txn),
+            _ => None,
+        }).collect();
+        assert_eq!(committed, ids);
+        // the earlier boot's ids are unresolved: W stays below them, no credit returns
+        assert_eq!(credits(&r), 0);
+        assert_eq!(core.resolved_w(), w0);
+        // a partition reporting alone is not enough
+        let r = run(&mut core, &mut io, vec![MetaMsg::new(0, 9, MetaReq::PriorTxnsZeroed { partition: 0 })]);
+        assert_eq!(credits(&r), 0);
+        // every partition reported: W passes everything resolved, credits go back
+        let msgs = (1..16).map(|p| MetaMsg::new(p, 9, MetaReq::PriorTxnsZeroed { partition: p })).collect();
+        let r = run(&mut core, &mut io, msgs);
+        assert_eq!(credits(&r), 5);
+        assert_eq!(core.resolved_w(), ids[4]);
+        // a fresh load sees the durable state: W covers the ids, no slot copy holds open ids
+        let again = MetaCore::load(&mut io, 0).unwrap();
+        assert_eq!(again.resolved_w(), ids[4]);
+        assert!(again.slots.iter().all(|s| s.open_count(again.resolved_w()) == 0));
+        assert!(again.shared.txn_ids.floor() > ids[4]);
+    }
+
+    #[test]
+    fn committed_ids_are_listed_until_resolved() {
+        let mut io = devs(4);
+        {
+            let core = MetaCore::load(&mut io, 0).unwrap();
+            core.shared.txn_ids.next();
+        }
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        let t = core.shared.txn_ids.next();
+        run(&mut core, &mut io, vec![MetaMsg::new(1, 1, MetaReq::CommitTxn { txn: t })]);
+        // W cannot pass the earlier boot's id: the commit is proven by its slot listing
+        let again = MetaCore::load(&mut io, 0).unwrap();
+        assert!(t > again.resolved_w());
+        assert!(again.prior.is_committed(t), "COMMITTED(t) durable in a slot copy");
+    }
+
+    #[test]
+    fn partition_meta_keeps_the_highest_floor_and_cutoffs() {
+        let mut io = devs(4);
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        run(&mut core, &mut io, vec![MetaMsg::new(5, 1, MetaReq::ReserveSeq { partition: 5, floor: Seq(1000) })]);
+        let mut m = PartitionMeta::initial(5);
+        m.seq_floor = Seq(10);
+        m.flush_cutoff[2] = 77;
+        run(&mut core, &mut io, vec![MetaMsg::new(5, 2, MetaReq::PartitionMeta { m })]);
+        let got = core.partition_meta(5).unwrap();
+        assert_eq!(got.seq_floor, Seq(1000));
+        assert_eq!(got.flush_cutoff[2], 77);
+        let again = MetaCore::load(&mut io, 0).unwrap();
+        assert_eq!(again.partition_meta(5).unwrap().seq_floor, Seq(1000));
+        // AG ownership persists too
+        let a = acquire(&mut core, &mut io, 7).unwrap();
+        let again = MetaCore::load(&mut io, 0).unwrap();
+        assert_eq!(again.ag_usage().0, 1);
+        let _ = a;
+    }
+
+    #[test]
+    fn clock_floor_moves_forward_only() {
+        let mut io = devs(4);
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        let mut out = Vec::new();
+        core.process(&mut io, Vec::new(), 2_000_000_000_000, &mut out);
+        assert_eq!(core.superblock().clock_floor_unix_ms, 2_000_000_000_000);
+        core.process(&mut io, Vec::new(), 2_000_000_005_000, &mut out);
+        assert_eq!(core.superblock().clock_floor_unix_ms, 2_000_000_005_000);
+        let again = MetaCore::load(&mut io, 0).unwrap();
+        assert_eq!(again.superblock().clock_floor_unix_ms, 2_000_000_005_000);
+    }
+}

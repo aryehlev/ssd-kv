@@ -2561,9 +2561,40 @@ impl PartitionStore {
                     ExecStatus::Failed(e) => ExecStatus::Failed(e),
                 }
             }
-            ReqKind::ScanStep { db, cursor: cur, count, vtype } => self.scan_step(cx, id, db, cur, count, vtype, matcher, out),
+            ReqKind::ScanStep { db, cursor: cur, count, vtype } => {
+                let plan = self.scan_plan(db, cur, count, vtype);
+                self.scan_step(cx, id, db, plan, vtype, matcher, out)
+            }
+            ReqKind::SlotIter { slot, fp_from, max_entries } => {
+                let db = self.reqs.get(id).map_or(0, |r| r.req.db);
+                let plan = self.slot_plan(db, slot, fp_from, max_entries);
+                self.scan_step(cx, id, db, plan, None, matcher, out)
+            }
+            // merge-sync pruning belongs to replica full sync (M2.2, §23.7), not to M1
+            ReqKind::SyncPrune { .. } => {
+                if let Some(r) = self.take_req(id) {
+                    self.finish(cx.cache, id, r);
+                }
+                ExecStatus::Failed(StoreError::Io(-libc::ENOSYS))
+            }
             _ => ExecStatus::Failed(StoreError::Io(-libc::EINVAL)),
         }
+    }
+
+    /// The walk of one table of a sync or migration source (§23.7): the keys of `(db, slot)`
+    /// from `fp_from`; the result's next value is the span's end (`2^32` once the slot is
+    /// done).
+    fn slot_plan(&self, db: u8, slot: u16, fp_from: u32, max_entries: u32) -> ScanPlan {
+        let mut plan = ScanPlan { spans: SmallVec::new(), refs: Vec::new(), next: 1 << 32 };
+        if db >= self.core.cfg.databases || slot % self.core.cfg.partitions != self.core.cfg.id {
+            return plan;
+        }
+        if let Some(t) = self.core.index.table(db, slot) {
+            let span = t.scan_pages(fp_from, max_entries as usize, ScanFilter::ALL, &mut plan.refs);
+            plan.spans.push((slot, span.fp_lo, span.fp_hi_excl));
+            plan.next = span.fp_hi_excl;
+        }
+        plan
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2572,8 +2603,7 @@ impl PartitionStore {
         cx: &mut StorageCtx<'_>,
         id: ReqId,
         db: u8,
-        cur: u64,
-        count: u32,
+        plan: ScanPlan,
         vtype: Option<VType>,
         matcher: &dyn Fn(&[u8]) -> bool,
         out: &mut Vec<Box<[u8]>>,
@@ -2587,7 +2617,6 @@ impl PartitionStore {
             self.finish(cx.cache, id, r);
             return ExecStatus::Failed(e);
         }
-        let plan = self.scan_plan(db, cur, count, vtype);
         // every referenced page must be present (the index may have changed since submit)
         let mut needs: SmallVec<[Need; 4]> = SmallVec::new();
         for pr in &plan.refs {

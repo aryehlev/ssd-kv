@@ -187,6 +187,10 @@ fn kill9_random_sequences_never_lose_acked_writes() {
         let mut r = Rng(seed ^ 0xC0FFEE);
         let lba = if seed % 2 == 0 { 512 } else { 4096 };
         let mut dev = RamDev::new(96 * 4096, lba, seed);
+        if seed % 3 == 1 {
+            // atomic page-update mode (§13.1): in-place rewrites with RWF_ATOMIC
+            dev = dev.with_atomic((lba, 4096));
+        }
         dev.set_max_completions(1 + (seed % 3) as usize);
         format_devices(&mut [&mut dev as &mut dyn BlockDevice], 16, false, 0, seed).unwrap();
         let mut devs = vec![dev];

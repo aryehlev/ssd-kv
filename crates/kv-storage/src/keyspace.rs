@@ -597,15 +597,26 @@ impl<'p> Keyspace<'p> {
         }
     }
 
+    fn count_lookup(&mut self, found: bool) {
+        let c = &mut self.core.counters;
+        if found {
+            c.keyspace_hits += 1;
+        } else {
+            c.keyspace_misses += 1;
+        }
+    }
+
     pub fn meta(&mut self, key: &[u8]) -> Result<Option<KeyMeta>, StoreError> {
         let db = self.db;
         let (_, hit) = self.find(db, key, false)?;
+        self.count_lookup(hit.is_some());
         Ok(hit.map(|h| KeyMeta { vtype: h.vtype, expire_at_ms: h.expire_at, len: h.len }))
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<(KeyMeta, Value<'_>)>, StoreError> {
         let db = self.db;
         let (_, hit) = self.find(db, key, true)?;
+        self.count_lookup(hit.is_some());
         Ok(hit.map(|h| (KeyMeta { vtype: h.vtype, expire_at_ms: h.expire_at, len: h.len }, self.value_of(&h))))
     }
 

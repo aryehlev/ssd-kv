@@ -960,10 +960,7 @@ impl<D: BlockDevice> LocalEngine<D> {
     /// Pumps until ticket `t` reached `want` (Written or Durable) or failed; returns its state.
     pub fn wait_ticket(&mut self, p: u16, t: crate::ticket::TicketId, want: crate::ticket::TicketState) -> crate::ticket::TicketState {
         use crate::ticket::TicketState as S;
-        for n in 0..1_000_000 {
-            if n == 3_000 && std::env::var("KVSSD_TRACE").is_ok() {
-                eprintln!("stuck ticket: {} meta W={}", self.parts[usize::from(p)].diag_deep(&self.cache), self.meta.resolved_w());
-            }
+        for _ in 0..1_000_000 {
             match self.ticket_state(p, t) {
                 Some(S::Failed(e)) => return S::Failed(e),
                 Some(S::Durable) => return S::Durable,
@@ -986,10 +983,7 @@ impl<D: BlockDevice> LocalEngine<D> {
         use crate::partition::ExecStatus;
         let id = self.submit(p, req);
         let mut ready = Vec::new();
-        for n in 0..1_000_000 {
-            if n == 3_000 && std::env::var("KVSSD_TRACE").is_ok() {
-                eprintln!("stuck request: {} txn_ids={}", self.parts[usize::from(p)].diag(), self.client.txn_ids().available());
-            }
+        for _ in 0..1_000_000 {
             ready.clear();
             self.ready(&mut ready);
             for &(rp, rid) in &ready {
@@ -1205,4 +1199,49 @@ pub fn format_devices(devs: &mut [&mut dyn BlockDevice], partitions: u16, cluste
         flush_sync(d)?;
     }
     Ok(())
+}
+
+/// An in-memory device for the crate's unit tests: requests complete at the next poll.
+#[cfg(test)]
+pub(crate) mod testdev {
+    use crate::io::{BlockDevice, DevInfo, IoDone, IoOp, IoReq};
+
+    pub(crate) struct MemDev {
+        pub(crate) data: Vec<u8>,
+        lba: u32,
+        done: Vec<IoDone>,
+    }
+
+    impl MemDev {
+        pub(crate) fn new(pages: u64, lba: u32) -> Self {
+            MemDev { data: vec![0u8; pages as usize * 4096], lba, done: Vec::new() }
+        }
+    }
+
+    impl BlockDevice for MemDev {
+        fn info(&self) -> DevInfo {
+            let mut i = DevInfo::new((self.data.len() / 4096) as u64, self.lba);
+            i.write_through = true;
+            i
+        }
+        fn submit(&mut self, mut r: IoReq) {
+            let res = r.check(self.lba, self.data.len() as u64).map(|()| {
+                let (off, len) = (r.offset as usize, r.len as usize);
+                match &mut r.op {
+                    IoOp::Read { buf } => buf.as_mut_slice()[..len].copy_from_slice(&self.data[off..off + len]),
+                    IoOp::Write { buf, buf_off, .. } => {
+                        let b = *buf_off as usize;
+                        self.data[off..off + len].copy_from_slice(&buf.as_slice()[b..b + len]);
+                    }
+                    IoOp::Flush | IoOp::Discard => {}
+                }
+                r.len
+            });
+            let tag = r.tag;
+            self.done.push(IoDone { tag, res, buf: r.into_buf() });
+        }
+        fn poll(&mut self, out: &mut Vec<IoDone>, _wait: bool) {
+            out.append(&mut self.done);
+        }
+    }
 }

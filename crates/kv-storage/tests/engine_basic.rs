@@ -213,3 +213,28 @@ fn multi_key_writes_commit_atomically() {
     }
 }
 
+
+#[test]
+fn corrupt_snapshot_section_falls_back_to_the_full_scan() {
+    let mut d = RamDev::new(96 * 4096, 512, 16);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 4096, 16).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    for i in 0..100u64 {
+        let k = format!("c{i}");
+        let t = db.set(0, k.as_bytes(), &value(i, 80), None).unwrap();
+        db.wait(k.as_bytes(), t, TicketState::Durable);
+    }
+    let layout = db.eng.boot().layouts()[0];
+    let mut devs = db.eng.shutdown(true).unwrap();
+    // the snapshot went to region B (the superblock named A): damage a section byte there
+    let region_b = layout.snap_region_page[1] as usize * 4096;
+    devs[0].data[region_b + 4096 + 40] ^= 0x5A;
+    let (mut db, mode) = reopen(devs, T0 + 1);
+    assert_eq!(mode, RecoveryMode::FullScan, "a bad section makes the node take the full scan");
+    for i in 0..100u64 {
+        let k = format!("c{i}");
+        assert_eq!(db.get(0, k.as_bytes()).unwrap().unwrap().1, value(i, 80));
+    }
+}

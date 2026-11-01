@@ -294,19 +294,7 @@ impl SnapshotWriter {
         let total = off;
         let snap_seq = sb0.snap_seq + 1;
         let mut hdr = AlignedBuf::zeroed(PAGE);
-        ab_build(SNAP_HEADER_MAGIC, snap_seq, hdr.page_mut(0), |b| {
-            le::put_u64(b, 0x018, snap_seq);
-            le::put_u32(b, 0x020, sb0.boot_gen);
-            le::put_u16(b, 0x024, partitions as u16);
-            b[0x026] = region.index() as u8;
-            le::put_u64(b, 0x028, total);
-            for (i, &(o, l, crc)) in dir.iter().enumerate() {
-                let at = DIR_OFF + DIR_ENTRY * i;
-                le::put_u64(b, at, o);
-                le::put_u64(b, at + 8, l);
-                le::put_u32(b, at + 16, crc);
-            }
-        });
+        encode_header(snap_seq, sb0.boot_gen, region, total, &dir, hdr.page_mut(0));
         let header_crc = crc32c(hdr.as_slice());
         write_logical(devs, layouts, region, 0, &hdr)?;
         for d in devs.iter_mut() {
@@ -314,6 +302,24 @@ impl SnapshotWriter {
         }
         Ok(Some(SnapshotMark { snap_seq, snap_header_crc: header_crc, snap_region: region.index() as u8, snap_bytes: total }))
     }
+}
+
+/// Encodes the snapshot header block (§10.10): `dir[p] = (offset, len, crc32c)` of partition
+/// `p`'s section.
+pub(crate) fn encode_header(snap_seq: u64, boot_gen: u32, region: AbCopy, total: u64, dir: &[(u64, u64, u32)], out: &mut [u8; PAGE]) {
+    ab_build(SNAP_HEADER_MAGIC, snap_seq, out, |b| {
+        le::put_u64(b, 0x018, snap_seq);
+        le::put_u32(b, 0x020, boot_gen);
+        le::put_u16(b, 0x024, dir.len() as u16);
+        b[0x026] = region.index() as u8;
+        le::put_u64(b, 0x028, total);
+        for (i, &(o, l, crc)) in dir.iter().enumerate() {
+            let at = DIR_OFF + DIR_ENTRY * i;
+            le::put_u64(b, at, o);
+            le::put_u64(b, at + 8, l);
+            le::put_u32(b, at + 16, crc);
+        }
+    });
 }
 
 /// Device spans of logical bytes `[off, off + len)` of region `region`: `(dev, device byte
@@ -403,6 +409,99 @@ impl SnapshotDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::partition::{BgRates, Durability, PartitionCfg, PartitionStore, WriteGranularity};
+    use kv_common::KeyHash;
+    use kv_index::{Kind, VType};
+
+    fn part() -> PartitionStore {
+        PartitionStore::new(PartitionCfg {
+            id: 3,
+            partitions: 16,
+            databases: 16,
+            durability: Durability::Written,
+            granularity: WriteGranularity::Lba,
+            page_update: crate::io::PageUpdateMode::TwoImage,
+            page_slack_cap: 1024,
+            page_slack_atomic: 128,
+            hash_seed: 9,
+            boot_gen: 1,
+            crc: kv_common::RecordCrc::new(1),
+            lba: 512,
+            produce_groups: false,
+            cluster: false,
+            rates: BgRates::defaults(16),
+        })
+    }
+
+    /// Keys of partition 3 (of 16).
+    fn keys(n: usize) -> Vec<Vec<u8>> {
+        (0..).map(|i: u64| format!("k{i}").into_bytes()).filter(|k| kv_common::key_slot(k) % 16 == 3).take(n).collect()
+    }
+
+    #[test]
+    fn section_round_trip_and_corruption() {
+        let mut p = part();
+        let ks = keys(300);
+        for (i, k) in ks.iter().enumerate() {
+            let kh = KeyHash::of(9, k);
+            let slot = kv_common::key_slot(k);
+            let db = (i % 3) as u8;
+            let e = Entry { fp32: kh.fp32(), x8: kh.x8(), page36: 0x1000 + i as u64, kind: Kind::Small, vtype: VType::String, sync_mark: i % 5 == 0 };
+            let hint = if i % 4 == 0 { 7 } else { 0 };
+            p.core.index.table_mut(db, slot).insert(kh, e, hint);
+        }
+        p.core.next_seq = Seq::new(2, 77);
+        let bytes = encode_section(&p);
+        let sec = decode_section(&bytes, 3, 16).expect("valid section");
+        assert_eq!(sec.next_seq, Seq::new(2, 77));
+        let n: usize = sec.tables.iter().map(|t| t.2.len()).sum();
+        assert_eq!(n, 300);
+        for (db, slot, entries) in &sec.tables {
+            let t = p.core.index.table(*db, *slot).unwrap();
+            let want: Vec<(Entry, u16)> = SlotTable::snapshot_iter(t).collect();
+            assert_eq!(&want, entries, "entries in fp order with hints, sync marks cleared");
+            assert!(entries.iter().all(|(e, _)| !e.sync_mark));
+        }
+        // any flipped byte, a wrong partition or a truncation is refused
+        for i in [0usize, 5, 40, bytes.len() / 2, bytes.len() - 1] {
+            let mut b = bytes.clone();
+            b[i] ^= 0x10;
+            assert!(decode_section(&b, 3, 16).is_none(), "flip at {i} accepted");
+        }
+        assert!(decode_section(&bytes, 4, 16).is_none());
+        assert!(decode_section(&bytes[..bytes.len() - 8], 3, 16).is_none());
+    }
+
+    #[test]
+    fn header_golden_vector() {
+        let dir = [(4096u64, 100u64, 0xDEAD_BEEFu32), (8192, 4096, 0x0102_0304)];
+        let mut b = [0u8; PAGE];
+        encode_header(5, 9, AbCopy::B, 12_288, &dir, &mut b);
+        // AbBlock framing
+        assert_eq!(&b[..8], b"KVSNAPH1");
+        assert_eq!(le::u32_at(&b, 0x0C), 1, "AbBlock version");
+        assert_eq!(le::u64_at(&b, 0x10), 5, "block_seq = snap_seq");
+        // fields of §10.10 at their offsets
+        assert_eq!(le::u64_at(&b, 0x18), 5);
+        assert_eq!(le::u32_at(&b, 0x20), 9);
+        assert_eq!(le::u16_at(&b, 0x24), 2);
+        assert_eq!(b[0x26], 1);
+        assert_eq!(b[0x27], 0);
+        assert_eq!(le::u64_at(&b, 0x28), 12_288);
+        assert!(b[0x30..0x40].iter().all(|&x| x == 0));
+        assert_eq!(le::u64_at(&b, 0x40), 4096);
+        assert_eq!(le::u64_at(&b, 0x48), 100);
+        assert_eq!(le::u32_at(&b, 0x50), 0xDEAD_BEEF);
+        assert_eq!(le::u32_at(&b, 0x54), 0);
+        assert_eq!(le::u64_at(&b, 0x58), 8192);
+        assert_eq!(le::u64_at(&b, 0x60), 4096);
+        assert_eq!(le::u32_at(&b, 0x68), 0x0102_0304);
+        assert!(b[0x70..].iter().all(|&x| x == 0));
+        // the AbBlock crc covers [0x0C, 0x1000)
+        assert_eq!(le::u32_at(&b, 0x08), crc32c(&b[0x0C..]));
+        assert!(kv_common::abblock::ab_decode(SNAP_HEADER_MAGIC, &b).is_some());
+    }
 
     #[test]
     fn ag_codes_round_trip() {

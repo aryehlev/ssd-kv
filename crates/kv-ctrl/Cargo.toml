@@ -14,3 +14,6 @@ serde.workspace = true
 postcard.workspace = true
 rand.workspace = true
 static_assertions.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

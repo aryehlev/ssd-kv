@@ -12,9 +12,9 @@
 //! the newest copy is durably gone or durably superseded. Zeroings no command waits for
 //! (post-move cleanup, post-recovery copies of untouched keys) are background work (§19).
 //!
-//! Each tracked copy has a state: [`CopyState::Source`] while the key's newer copy (the one the
+//! Each tracked copy has a state: `CopyState::Source` while the key's newer copy (the one the
 //! index names) is not durable yet (the copy is protected, §13.3 d, edge E2), then
-//! [`CopyState::Stale`] until its zeroing is durable. Every entry counts towards the key's
+//! `CopyState::Stale` until its zeroing is durable. Every entry counts towards the key's
 //! copies on media, which the third-copy rule (E14) bounds at two. Copies inside the page the
 //! index names are visible in that page's records and are never tracked here.
 

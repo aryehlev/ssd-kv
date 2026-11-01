@@ -17,7 +17,7 @@
 //! source of a move whose new copy is not durable), Superseded, Droppable. Builds are event
 //! driven at the end of the tick, never timed (§13.7). I/O shape per §13.6.
 //!
-//! [`build`] is pure: it reads M, writes N into a frame the caller provides and reports what the
+//! `build` is pure: it reads M, writes N into a frame the caller provides and reports what the
 //! image materializes, what it must defer (deletes and writes waiting for older copies to be
 //! zeroed, D1/E9/E14) and what it could not place (the partition moves those records to another
 //! page, §14.3). The partition decides when a build may run (R5) and owns durability.

@@ -10,10 +10,18 @@
 //!
 //! Module map (owners in `crates/OWNERSHIP.md`):
 //! * formats and I/O: [`layout`], [`superblock`], [`agtable`], [`pmeta`], [`intent`],
-//!   [`record`], [`page`], [`extent`], [`io`], `sim` (feature `sim`), [`devprobe`], [`format`];
+//!   [`record`], [`page`], [`extent`], [`io`], `sim` (feature `sim`), [`devprobe`], [`mod@format`];
 //! * engine: [`cache`], [`flush`], [`alloc`], [`stale`], [`ticket`], [`effect`], [`image`],
 //!   [`keyspace`], [`partition`], [`expire`], [`recovery`], [`snapshot`], [`metastore`],
 //!   [`engine`].
+//!
+//! Runtime structure: one [`partition::PartitionStore`] per partition, driven by its owner
+//! worker (submit / take_ready / exec / tick / I/O completions, see the contract at the top of
+//! `partition.rs`); one page cache and one flush tracker per device per worker; one meta thread
+//! ([`metastore::MetaStore`], logic in [`metastore::MetaCore`]) for every fixed-location block.
+//! [`engine::PageStore`] opens the devices and hands out the partitions;
+//! [`engine::LocalEngine`] drives a whole engine synchronously in one thread (tools, tests,
+//! the simulator), and [`engine::format_devices`] formats in-memory devices.
 //!
 //! `unsafe` is allowed only in `io.rs` and `cache.rs` (§24). This crate never depends on the
 //! control-plane crates (LC-30).

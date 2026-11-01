@@ -1,0 +1,2 @@
+# Captured redis-server 7.0.15 replies: exact bytes (CRLF) are compared, never normalize.
+*.bin binary

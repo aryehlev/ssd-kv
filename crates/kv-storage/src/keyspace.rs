@@ -21,7 +21,8 @@ use smallvec::SmallVec;
 
 use crate::cache::{FrameIdx, PageCache};
 use crate::effect::Op;
-use crate::extent::{self, EXT_HDR, EXT_KIND_CHUNKMAP, EXT_KIND_VALUE, EXT_VTYPE_HASH, ExtHeader};
+use crate::extent::{self, EXT_KIND_CHUNKMAP, EXT_KIND_VALUE, EXT_VTYPE_HASH, ExtHeader};
+use crate::layout::EXT_HDR;
 use crate::image::{Pending, RecDesc, RecStatus};
 use crate::io::AlignedBuf;
 use crate::layout::{PAGE, PageId, Seq, class_pages};
@@ -403,7 +404,7 @@ impl<'p> Keyspace<'p> {
         }
         let h32 = kh.h32();
         for (i, p) in st.pending.iter().enumerate().rev() {
-            if p.is_key(db, h32, key) {
+            if p.is_change() && p.is_key(db, h32, key) {
                 return Ok(match p {
                     Pending::Put(r) => {
                         let cur = Cur::Small { page, seq: r.desc.seq };
@@ -423,7 +424,7 @@ impl<'p> Keyspace<'p> {
                         }
                     }
                     // removed from this page: the key may live elsewhere (another candidate)
-                    Pending::Remove { .. } => None,
+                    Pending::Remove { .. } | Pending::Retire { .. } => None,
                 });
             }
         }
@@ -752,7 +753,7 @@ impl<'p> Keyspace<'p> {
                         let b = fe.buf.as_ref().map_or(&[][..], |b| b.as_slice());
                         extent::parse_extent_header(b, page)
                             .filter(|h| EXT_HDR + h.key_len as usize <= b.len())
-                            .map(|h| b[EXT_HDR..EXT_HDR + h.key_len as usize].into())
+                            .map(|h| Box::<[u8]>::from(&b[EXT_HDR..EXT_HDR + h.key_len as usize]))
                     } else {
                         self.need(Need::Extent { start: page, pages: 1, chunks: false });
                         return Err(StoreError::NeedMore);
@@ -831,13 +832,12 @@ impl<'p> Keyspace<'p> {
             Op::Put { vtype, expire_at, value, .. } => {
                 let vt = if *vtype == EXT_VTYPE_HASH { VType::Hash } else { VType::String };
                 let exp = (*expire_at != 0).then_some(*expire_at);
-                if mode == ApplyMode::SnapshotMerge
-                    && let Some((m, v)) = self.get(key)?
-                    && m.vtype == vt
-                    && m.expire_at_ms == exp
-                    && v.len() == value.len() as u64
-                    && v.to_vec() == *value
-                {
+                let identical = mode == ApplyMode::SnapshotMerge
+                    && match self.get(key)? {
+                        Some((m, v)) => m.vtype == vt && m.expire_at_ms == exp && v.len() == value.len() as u64 && v.to_vec() == *value,
+                        None => false,
+                    };
+                if identical {
                     let (cur, _) = self.find(db, key, false)?;
                     self.stage(db, key, cur, Change::Confirm, None);
                     return Ok(ApplyOutcome::Confirmed);
@@ -862,7 +862,7 @@ impl<'p> Keyspace<'p> {
     }
 }
 
-fn splitmix(mut z: u64) -> u64 {
+pub(crate) fn splitmix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

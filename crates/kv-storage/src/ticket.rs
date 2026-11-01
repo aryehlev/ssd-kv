@@ -52,6 +52,9 @@ pub(crate) struct Ticket {
     meta: u32,
     /// Still being assembled by the executing command (no state is reported before `seal`).
     open: bool,
+    /// Internal ticket of a txn's effects (§14.6): its completion is reported through
+    /// [`Tickets::take_txns_durable`], never to a reply.
+    txn_effects: Option<u64>,
 }
 
 /// The partition's live tickets.
@@ -60,11 +63,21 @@ pub(crate) struct Tickets {
     map: HashMap<u64, Ticket, foldhash::fast::FixedState>,
     next: u64,
     changes: Vec<(TicketId, TicketState)>,
+    /// Txns whose every effect is durable (internal tickets that completed).
+    txns_durable: Vec<u64>,
+    /// Txns whose internal ticket failed: `(txn, errno)`.
+    txns_failed: Vec<(u64, i32)>,
 }
 
 impl Tickets {
     pub(crate) fn new() -> Self {
-        Tickets { map: HashMap::with_hasher(foldhash::fast::FixedState::default()), next: 1, changes: Vec::new() }
+        Tickets {
+            map: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            next: 1,
+            changes: Vec::new(),
+            txns_durable: Vec::new(),
+            txns_failed: Vec::new(),
+        }
     }
 
     /// A new open ticket (dependencies are added while the command commits; see `seal`).
@@ -83,9 +96,27 @@ impl Tickets {
                 undurable: 0,
                 meta: 0,
                 open: true,
+                txn_effects: None,
             },
         );
         TicketId(id)
+    }
+
+    /// An internal ticket counting the effects of txn `txn` (§14.6). It travels with the
+    /// txn's staged effects like a command ticket (superseded effects hand it to their
+    /// survivor, D2); when it is durable the txn may be committed.
+    pub(crate) fn create_txn(&mut self, txn: u64) -> TicketId {
+        let t = self.create(0);
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.txn_effects = Some(txn);
+            k.txn = Some(txn);
+        }
+        t
+    }
+
+    /// True for the internal ticket of a txn.
+    pub(crate) fn is_internal(&self, t: TicketId) -> bool {
+        self.map.get(&t.0).is_some_and(|k| k.txn_effects.is_some())
     }
 
     pub(crate) fn get_mut(&mut self, t: TicketId) -> Option<&mut Ticket> {
@@ -176,7 +207,10 @@ impl Tickets {
     pub(crate) fn fail(&mut self, t: TicketId, errno: i32) {
         if let Some(k) = self.map.remove(&t.0) {
             debug_assert!(!matches!(k.state, TicketState::Durable));
-            self.changes.push((t, TicketState::Failed(errno)));
+            match k.txn_effects {
+                Some(txn) => self.txns_failed.push((txn, errno)),
+                None => self.changes.push((t, TicketState::Failed(errno))),
+            }
         }
     }
 
@@ -193,6 +227,13 @@ impl Tickets {
         if k.open || k.meta > 0 {
             return;
         }
+        if let Some(txn) = k.txn_effects {
+            if k.undurable == 0 {
+                self.map.remove(&t.0);
+                self.txns_durable.push(txn);
+            }
+            return;
+        }
         if k.unwritten == 0 && k.state == TicketState::Executed {
             k.state = TicketState::Written;
             self.changes.push((t, TicketState::Written));
@@ -201,6 +242,21 @@ impl Tickets {
             self.map.remove(&t.0);
             self.changes.push((t, TicketState::Durable));
         }
+    }
+
+    /// Txns whose effects all became durable since the last call.
+    pub(crate) fn take_txns_durable(&mut self, out: &mut Vec<u64>) {
+        out.append(&mut self.txns_durable);
+    }
+
+    /// Txns whose effects failed since the last call.
+    pub(crate) fn take_txns_failed(&mut self, out: &mut Vec<(u64, i32)>) {
+        out.append(&mut self.txns_failed);
+    }
+
+    /// Live tickets that are not internal (barriers, drain).
+    pub(crate) fn pending_reply_tickets(&self) -> usize {
+        self.map.values().filter(|k| k.txn_effects.is_none()).count()
     }
 
     /// Drains the state changes since the last call (in the order they happened).
@@ -266,6 +322,32 @@ mod tests {
         assert!(drain(&mut t).is_empty());
         t.meta_done(a);
         assert_eq!(drain(&mut t), vec![(a, TicketState::Written), (a, TicketState::Durable)]);
+    }
+
+    #[test]
+    fn txn_ticket_reports_to_the_txn_list_only() {
+        let mut t = Tickets::new();
+        let x = t.create_txn(77);
+        assert!(t.is_internal(x));
+        t.add_effect(x);
+        t.add_effect(x);
+        t.seal(x);
+        t.effect_durable(x);
+        let mut done = Vec::new();
+        t.take_txns_durable(&mut done);
+        assert!(done.is_empty());
+        t.effect_durable(x);
+        t.take_txns_durable(&mut done);
+        assert_eq!(done, vec![77]);
+        assert!(drain(&mut t).is_empty(), "internal tickets never reach replies");
+        let y = t.create_txn(78);
+        t.add_effect(y);
+        t.seal(y);
+        t.fail_all(-5);
+        let mut failed = Vec::new();
+        t.take_txns_failed(&mut failed);
+        assert_eq!(failed, vec![(78, -5)]);
+        assert!(drain(&mut t).is_empty());
     }
 
     #[test]

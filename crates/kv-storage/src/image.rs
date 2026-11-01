@@ -141,34 +141,51 @@ impl EncodedRecord {
 pub enum Pending {
     Put(EncodedRecord),
     Remove { db: u8, h32: u32, key: Box<[u8]>, tickets: SmallVec<[TicketId; 1]> },
+    /// Drops the copy of the key with exactly `seq` (a committed txn delete marker, or an
+    /// expired newest copy kept while older copies existed, §16.2) once it is the key's only
+    /// copy (D1, E9). A newer version of the key makes it a no-op.
+    Retire { db: u8, h32: u32, key: Box<[u8]>, seq: Seq, tickets: SmallVec<[TicketId; 1]> },
 }
 
 impl Pending {
     pub fn db(&self) -> u8 {
         match self {
             Pending::Put(r) => r.desc.db,
-            Pending::Remove { db, .. } => *db,
+            Pending::Remove { db, .. } | Pending::Retire { db, .. } => *db,
         }
     }
 
     pub fn h32(&self) -> u32 {
         match self {
             Pending::Put(r) => r.desc.h32,
-            Pending::Remove { h32, .. } => *h32,
+            Pending::Remove { h32, .. } | Pending::Retire { h32, .. } => *h32,
         }
     }
 
     pub fn key(&self) -> &[u8] {
         match self {
             Pending::Put(r) => r.key(),
-            Pending::Remove { key, .. } => key,
+            Pending::Remove { key, .. } | Pending::Retire { key, .. } => key,
         }
+    }
+
+    /// True for a client-visible change (a put or a remove), false for a retirement.
+    pub fn is_change(&self) -> bool {
+        !matches!(self, Pending::Retire { .. })
     }
 
     pub(crate) fn tickets_mut(&mut self) -> &mut SmallVec<[TicketId; 1]> {
         match self {
             Pending::Put(r) => &mut r.tickets,
-            Pending::Remove { tickets, .. } => tickets,
+            Pending::Remove { tickets, .. } | Pending::Retire { tickets, .. } => tickets,
+        }
+    }
+
+    /// The tickets waiting for this effect.
+    pub(crate) fn tickets(&self) -> &[TicketId] {
+        match self {
+            Pending::Put(r) => &r.tickets,
+            Pending::Remove { tickets, .. } | Pending::Retire { tickets, .. } => tickets,
         }
     }
 
@@ -181,10 +198,11 @@ impl Pending {
     pub fn bytes(&self) -> usize {
         match self {
             Pending::Put(r) => r.bytes.len(),
-            Pending::Remove { key, .. } => key.len() + 16,
+            Pending::Remove { key, .. } | Pending::Retire { key, .. } => key.len() + 16,
         }
     }
 }
+
 
 /// Write state of an in-flight image.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -454,10 +472,11 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
     };
 
     // 1. classify M's records: `keep` stays in N, `drop` is zeroed, droppables become free space
+    //    (a scrub build zeroes them too, §13.4 step 3 iii)
     let mut keep: SmallVec<[RecDesc; 16]> = SmallVec::new();
     let mut drop: SmallVec<[RecDesc; 8]> = SmallVec::new();
     if !st.fresh {
-        for r in st.recs.iter() {
+        for (i, r) in st.recs.iter().enumerate() {
             let mut r = *r;
             let key = r.key(m);
             if env.dead(&r) {
@@ -468,6 +487,10 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     CopyState::Source => RecStatus::Protected,
                 };
             }
+            if r.status == RecStatus::Superseded && newer_open_txn(&st.recs, i, m, env) {
+                // a txn version that supersedes it is not committed yet (§13.3 c, E6)
+                r.status = RecStatus::Protected;
+            }
             match r.status {
                 RecStatus::Superseded => {
                     if env.tracked_here(r.db, key).is_some() {
@@ -475,6 +498,7 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     }
                     drop.push(r);
                 }
+                RecStatus::Droppable if st.scrub => drop.push(r),
                 RecStatus::Droppable => {}
                 RecStatus::Live | RecStatus::Protected => keep.push(r),
             }
@@ -483,7 +507,9 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
 
     // 2. staged effects (one per key: staging coalesces)
     let pending = core::mem::take(&mut st.pending);
-    let mut puts: SmallVec<[EncodedRecord; 4]> = SmallVec::new();
+    // puts to place by R2, with the offset of the old copy that the same image zeroes once the
+    // new version is placed in it (atomic mode, grown records)
+    let mut puts: SmallVec<[(EncodedRecord, Option<u16>); 4]> = SmallVec::new();
     for eff in pending {
         let (db, h32) = (eff.db(), eff.h32());
         let same = |r: &RecDesc| r.db == db && r.h32 == h32;
@@ -522,6 +548,30 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     out.applied.push(Pending::Remove { db, h32, key, tickets });
                 }
             }
+            Pending::Retire { db, h32, key, seq, tickets } => {
+                let target = idx.iter().copied().find(|&i| keep[i].seq == seq);
+                let newer = idx.iter().any(|&i| keep[i].seq > seq);
+                let Some(_) = target.filter(|_| !newer) else {
+                    // already gone, or a newer version makes it an ordinary older copy
+                    out.applied.push(Pending::Retire { db, h32, key, seq, tickets });
+                    continue;
+                };
+                let older: SmallVec<[usize; 2]> = idx.iter().copied().filter(|&i| keep[i].seq < seq).collect();
+                let older_dropping = drop.iter().any(|r| same(r) && r.seq < seq && r.key(m) == &*key);
+                let wait_older = mode == PageUpdateMode::TwoImage && (!older.is_empty() || older_dropping);
+                if others > 0 || wait_older {
+                    // D1: the older copies go first; those of this page are zeroed now
+                    mark_drop(&mut keep, &older, &mut drop);
+                    if others > 0 {
+                        out.foreground.push((db, key.clone()));
+                    }
+                    st.pending.push(Pending::Retire { db, h32, key, seq, tickets });
+                } else {
+                    let all: SmallVec<[usize; 2]> = idx.iter().copied().filter(|&i| keep[i].seq <= seq).collect();
+                    mark_drop(&mut keep, &all, &mut drop);
+                    out.applied.push(Pending::Retire { db, h32, key, seq, tickets });
+                }
+            }
             Pending::Put(rec) => {
                 let is_txn = rec.desc.txn != 0;
                 let kept_newest = mode == PageUpdateMode::TwoImage && newest.is_some();
@@ -540,7 +590,7 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     (PageUpdateMode::TwoImage, Some(i)) => {
                         // R1: the previous version stays byte-identical until N is durable
                         keep[i].status = RecStatus::Protected;
-                        puts.push(rec);
+                        puts.push((rec, None));
                     }
                     (PageUpdateMode::Atomic, Some(i)) if !is_txn && rec.desc.len <= keep[i].len => {
                         // R1a: rewritten at its existing offset
@@ -558,16 +608,14 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                         out.applied.push(Pending::Put(rec));
                     }
                     (PageUpdateMode::Atomic, Some(i)) => {
-                        // grown (or txn) update: placed by R2, old copy zeroed in the same image
-                        if is_txn {
-                            keep[i].status = RecStatus::Protected;
-                        } else {
-                            let all: SmallVec<[usize; 2]> = SmallVec::from_slice(&[i]);
-                            mark_drop(&mut keep, &all, &mut drop);
-                        }
-                        puts.push(rec);
+                        // grown (or txn) update: placed by R2; the old copy is zeroed in the
+                        // same image when the new version lands in it, else it stays protected
+                        // while the record moves (E2); a txn version never replaces it (13.3 c)
+                        keep[i].status = RecStatus::Protected;
+                        let old = (!is_txn).then_some(keep[i].off);
+                        puts.push((rec, old));
                     }
-                    (_, None) => puts.push(rec),
+                    (_, None) => puts.push((rec, None)),
                 }
             }
         }
@@ -581,9 +629,10 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
     }
 
     // 4. R2: first-fit-decreasing placement over the bytes no kept record occupies
-    puts.sort_by(|a, b| b.desc.len.cmp(&a.desc.len).then(a.desc.h32.cmp(&b.desc.h32)).then_with(|| a.key().cmp(b.key())));
+    puts.sort_by(|(a, _), (b, _)| b.desc.len.cmp(&a.desc.len).then(a.desc.h32.cmp(&b.desc.h32)).then_with(|| a.key().cmp(b.key())));
     let mut occupied: SmallVec<[(u16, u16); 24]> = keep.iter().map(|r| (r.off, r.end())).collect();
-    for rec in puts {
+    let mut replaced: SmallVec<[u16; 2]> = SmallVec::new();
+    for (rec, old) in puts {
         match find_gap(&mut occupied, rec.desc.len) {
             Some(off) => {
                 write_rec(n, &rec, off, page, crc);
@@ -596,8 +645,18 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                 out.placed += 1;
                 out.user_bytes += u32::from(d.len);
                 out.applied.push(Pending::Put(rec));
+                replaced.extend(old);
             }
             None => out.relocate.push(rec),
+        }
+    }
+    for off in replaced {
+        // atomic mode: the grown record's old copy goes in the image that holds the new one
+        if let Some(i) = keep.iter().position(|r| r.off == off && r.status == RecStatus::Protected) {
+            let r = keep.remove(i);
+            n[usize::from(r.off)..usize::from(r.end())].fill(0);
+            ch.add(r.off, r.end());
+            out.zeroed += 1;
         }
     }
 
@@ -629,6 +688,15 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
     out.atomic = atomic;
     out.recs = keep;
     out
+}
+
+/// True when a newer copy of `recs[i]`'s key in the same image belongs to a txn whose commit
+/// is not durable yet.
+fn newer_open_txn(recs: &[RecDesc], i: usize, img: &[u8; PAGE], env: &dyn BuildEnv) -> bool {
+    let a = recs[i];
+    recs.iter().enumerate().any(|(j, b)| {
+        j != i && b.txn != 0 && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && env.txn_open(b.txn) && b.key(img) == a.key(img)
+    })
 }
 
 /// Moves `keep[idx]` to `drop` (indexes refer to `keep` before removal).

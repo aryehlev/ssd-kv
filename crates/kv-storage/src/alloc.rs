@@ -1042,6 +1042,64 @@ impl Alloc {
     pub(crate) fn fresh_pages(&self) -> u64 {
         self.small.iter().map(|a| u64::from(a.fresh)).sum()
     }
+
+    /// Owned SMALL pages that are not fresh (FLUSHDB reclaim walk, §16.5).
+    pub(crate) fn owned_small_pages(&self) -> impl Iterator<Item = PageId> + '_ {
+        self.small.iter().flat_map(move |a| {
+            (0..AG_PAGES).filter(move |&i| self.page_free[(a.base + i) as usize] != FRESH).map(move |i| PageId::new(a.ag.dev, a.first + i))
+        })
+    }
+
+    /// First pages of every allocated extent run (FLUSHDB reclaim walk, snapshot checks).
+    pub(crate) fn extent_starts(&self) -> impl Iterator<Item = PageId> + '_ {
+        self.extent.iter().flat_map(|a| (0..AG_PAGES).filter(move |&i| a.start.get(i)).map(move |i| PageId::new(a.ag.dev, a.first + i)))
+    }
+
+    /// Cached SMALL pages known to the best-fit search.
+    pub(crate) fn cached_pages(&self) -> usize {
+        self.cached.len()
+    }
+
+    /// Page `i` of the AG whose first page is `first` on `dev` (AG release).
+    pub(crate) fn page_of_first(&self, dev: u8, first: u32, i: u32) -> PageId {
+        PageId::new(dev, first + i)
+    }
+
+    /// Recovery: the occupied bytes of page `page` of an owned SMALL AG (0 = no valid
+    /// record: the page is fresh again).
+    pub(crate) fn recovered_page(&mut self, page: PageId, occupied: u16) {
+        if occupied == 0 {
+            self.set_page_free(page, FRESH);
+        } else {
+            self.set_page_free(page, free_code(PAGE_ROOM.saturating_sub(occupied)));
+        }
+    }
+
+    /// Page `i` of a recovered AG (recovery walks AGs by index).
+    pub(crate) fn ag_page(&self, ag: AgId, i: u32) -> Option<PageId> {
+        self.page_of(ag, i)
+    }
+
+    /// Owned EXTENT AGs (snapshot sections): `(ag, alloc bits, start bits)`.
+    pub(crate) fn extent_ags(&self) -> impl Iterator<Item = (AgId, &Bits4096, &Bits4096)> + '_ {
+        self.extent.iter().map(|e| (e.ag, &e.alloc, &e.start))
+    }
+
+    /// Owned SMALL AGs with their `page_free` bytes (snapshot sections).
+    pub(crate) fn small_ags(&self) -> impl Iterator<Item = (AgId, &[u8])> + '_ {
+        self.small.iter().map(|a| (a.ag, &self.page_free[a.base as usize..(a.base + AG_PAGES) as usize]))
+    }
+
+    /// Replaces the `page_free` bytes of an owned SMALL AG (snapshot restore).
+    pub(crate) fn set_small_free(&mut self, ag: AgId, bytes: &[u8]) {
+        if bytes.len() != AG_PAGES as usize {
+            return;
+        }
+        if let Some(&si) = self.small_of.get(&ag) {
+            let b = self.small[si as usize].base as usize;
+            self.page_free[b..b + AG_PAGES as usize].copy_from_slice(bytes);
+        }
+    }
 }
 
 #[cfg(test)]

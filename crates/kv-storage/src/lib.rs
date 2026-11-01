@@ -19,7 +19,6 @@
 //! control-plane crates (LC-30).
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
-#![allow(dead_code, unused_variables)]
 
 pub mod agtable;
 pub mod alloc;
@@ -49,8 +48,12 @@ pub mod stale;
 pub mod superblock;
 pub mod ticket;
 
-pub use engine::{EngineCfg, PageStore, StorageEngine};
-pub use io::{BlockDevice, DevInfo, PageUpdateMode, SyncFileDevice};
+pub use devprobe::probe;
+pub use engine::{Boot, EngineCfg, LocalEngine, PageStore, StorageEngine, format_devices};
+pub use io::{BlockDevice, DevInfo, LockedMem, PageUpdateMode, SyncFileDevice};
 pub use keyspace::{Keyspace, StoreError};
 pub use layout::{AgId, PageId, Seq};
+pub use metastore::{MetaClient, MetaCore, MetaStore};
 pub use partition::{Durability, PartitionCfg, PartitionStore};
+pub use recovery::{RecoveryMode, RecoveryProgress};
+pub use snapshot::SnapshotWriter;

@@ -17,7 +17,6 @@
 //! * `PartitionIndex`: [`partition_index`].
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
-#![allow(dead_code, unused_variables)]
 
 pub mod cursor;
 pub mod entry;
@@ -30,4 +29,7 @@ pub mod table;
 pub use entry::{Cand, Entry, Kind, Pos, VType};
 pub use kv_common::KeyHash;
 pub use partition_index::PartitionIndex;
-pub use table::{PageRef, SCAN_STEP_MAX_PAGES, ScanFilter, ScanSpan, SlotTable};
+pub use table::{
+    IndexFull, MAX_DIR_DEPTH, PageRef, SCAN_STEP_MAX_PAGES, ScanFilter, ScanSpan, SlotTable,
+    dir_bytes,
+};

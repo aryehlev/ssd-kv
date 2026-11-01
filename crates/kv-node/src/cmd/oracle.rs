@@ -258,6 +258,19 @@ fn serve_conn(node: Arc<Node>, mut s: TcpStream, id: u64) {
     }
 }
 
+/// Accepts connections on `listener` forever, one thread per connection.
+fn serve(listener: TcpListener) {
+    let node = Arc::new(Node {
+        model: Mutex::new(Model::new(unix_ms())),
+        shared: NodeShared::new(Config::default(), 4, 1).expect("node state"),
+    });
+    for (id, s) in listener.incoming().enumerate() {
+        let Ok(s) = s else { continue };
+        let node = node.clone();
+        std::thread::spawn(move || serve_conn(node, s, id as u64 + 1));
+    }
+}
+
 #[test]
 #[ignore = "serves RESP on $KVD_MODEL_PORT until killed (run with --ignored)"]
 fn serve_model() {
@@ -266,15 +279,138 @@ fn serve_model() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7790);
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
-    let node = Arc::new(Node {
-        model: Mutex::new(Model::new(unix_ms())),
-        shared: NodeShared::new(Config::default(), 4, 1).expect("node state"),
-    });
     eprintln!("model server on 127.0.0.1:{port}");
-    for (id, s) in listener.incoming().enumerate() {
-        let Ok(s) = s else { continue };
-        let node = node.clone();
-        std::thread::spawn(move || serve_conn(node, s, id as u64 + 1));
+    serve(listener);
+}
+
+/// A client library (the `redis` crate, RESP2 and RESP3) drives every command module through
+/// the model server and decodes the replies into typed values (§25.5).
+#[test]
+fn redis_client_session() {
+    use redis::{Commands, RedisResult, Value};
+    use std::collections::BTreeMap;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    std::thread::spawn(move || serve(listener));
+
+    for (db, proto) in [(2u8, "2"), (3, "resp3")] {
+        let url = format!("redis://127.0.0.1:{port}/{db}?protocol={proto}");
+        let client = redis::Client::open(url).expect("client");
+        let mut c = client.get_connection().expect("connection");
+        let _: () = redis::cmd("FLUSHDB").query(&mut c).unwrap();
+
+        // connection and server commands
+        let pong: String = redis::cmd("PING").query(&mut c).unwrap();
+        assert_eq!(pong, "PONG");
+        let echo: Vec<u8> = redis::cmd("ECHO").arg(b"a\0b").query(&mut c).unwrap();
+        assert_eq!(echo, b"a\0b");
+        let _: () = redis::cmd("CLIENT")
+            .arg("SETNAME")
+            .arg("tester")
+            .query(&mut c)
+            .unwrap();
+        let name: Option<String> = redis::cmd("CLIENT").arg("GETNAME").query(&mut c).unwrap();
+        assert_eq!(name.as_deref(), Some("tester"));
+        let n: i64 = redis::cmd("COMMAND").arg("COUNT").query(&mut c).unwrap();
+        assert!(n > 50);
+        let time: (String, String) = redis::cmd("TIME").query(&mut c).unwrap();
+        assert!(time.0.parse::<u64>().unwrap() > 1_600_000_000);
+        let cfg: BTreeMap<String, String> = redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("databases")
+            .query(&mut c)
+            .unwrap();
+        assert_eq!(cfg.get("databases").map(String::as_str), Some("16"));
+        let info: String = redis::cmd("INFO").arg("server").query(&mut c).unwrap();
+        assert!(info.contains("redis_version:7.2.0"), "{info}");
+
+        // strings
+        let _: () = c.set("s", "10").unwrap();
+        assert_eq!(c.incr::<_, _, i64>("s", 5).unwrap(), 15);
+        let f: String = redis::cmd("INCRBYFLOAT")
+            .arg("s")
+            .arg("0.5")
+            .query(&mut c)
+            .unwrap();
+        assert_eq!(f, "15.5");
+        assert_eq!(c.append::<_, _, i64>("s", "x").unwrap(), 5);
+        assert_eq!(c.strlen::<_, i64>("s").unwrap(), 5);
+        assert_eq!(c.getrange::<_, String>("s", 1, -2).unwrap(), "5.5");
+        assert_eq!(c.setrange::<_, _, i64>("s", 6, "z").unwrap(), 7);
+        let _: () = c.mset(&[("a", "1"), ("b", "2")]).unwrap();
+        let v: Vec<Option<String>> = c.mget(&["a", "nokey", "b"]).unwrap();
+        assert_eq!(v, [Some("1".into()), None, Some("2".into())]);
+        let old: Option<String> = c.getset("a", "3").unwrap();
+        assert_eq!(old.as_deref(), Some("1"));
+        let r: RedisResult<i64> = c.incr("b", i64::MAX);
+        let e = r.expect_err("overflow");
+        assert!(
+            e.to_string()
+                .contains("increment or decrement would overflow"),
+            "{e}"
+        );
+
+        // keys and expiry
+        assert!(c.expire::<_, bool>("a", 100).unwrap());
+        assert_eq!(c.ttl::<_, i64>("a").unwrap(), 100);
+        assert!(c.persist::<_, bool>("a").unwrap());
+        assert_eq!(c.ttl::<_, i64>("a").unwrap(), -1);
+        assert_eq!(c.exists::<_, i64>(&["a", "b", "a", "nokey"]).unwrap(), 3);
+        let t: String = redis::cmd("TYPE").arg("a").query(&mut c).unwrap();
+        assert_eq!(t, "string");
+        let _: () = c.rename("a", "a2").unwrap();
+        assert_eq!(c.del::<_, i64>(&["a2", "a2", "nokey"]).unwrap(), 1);
+
+        // hashes (RESP3: HGETALL is a map)
+        let _: () = c.hset_multiple("h", &[("f1", "v1"), ("f2", "v2")]).unwrap();
+        let all: BTreeMap<String, String> = c.hgetall("h").unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["f2"], "v2");
+        assert_eq!(c.hincr::<_, _, _, i64>("h", "n", 7).unwrap(), 7);
+        assert_eq!(c.hlen::<_, i64>("h").unwrap(), 3);
+        let keys: Vec<String> = c.hkeys("h").unwrap();
+        assert_eq!(keys, ["f1", "f2", "n"]);
+        let t: String = redis::cmd("TYPE").arg("h").query(&mut c).unwrap();
+        assert_eq!(t, "hash");
+
+        // iteration
+        let mut seen: Vec<String> = c.scan().unwrap().collect::<RedisResult<_>>().unwrap();
+        seen.sort();
+        assert_eq!(seen, ["b", "h", "s"]);
+        let hashes: Vec<String> = redis::cmd("SCAN")
+            .cursor_arg(0)
+            .arg("TYPE")
+            .arg("hash")
+            .clone()
+            .iter(&mut c)
+            .unwrap()
+            .collect::<RedisResult<_>>()
+            .unwrap();
+        assert_eq!(hashes, ["h"]);
+        let mut k: Vec<String> = c.keys("[bh]*").unwrap();
+        k.sort();
+        assert_eq!(k, ["b", "h"]);
+        let n: i64 = redis::cmd("DBSIZE").query(&mut c).unwrap();
+        assert_eq!(n, 3);
+
+        // transactions
+        let (x, y): (i64, String) = redis::pipe()
+            .atomic()
+            .cmd("INCR")
+            .arg("ctr")
+            .cmd("GET")
+            .arg("ctr")
+            .query(&mut c)
+            .unwrap();
+        assert_eq!((x, y.as_str()), (1, "1"));
+        let e = redis::cmd("EXEC")
+            .query::<Value>(&mut c)
+            .expect_err("EXEC without MULTI");
+        assert!(e.to_string().contains("EXEC without MULTI"), "{e}");
+        let _: () = redis::cmd("FLUSHDB").query(&mut c).unwrap();
+        let n: i64 = redis::cmd("DBSIZE").query(&mut c).unwrap();
+        assert_eq!(n, 0);
     }
 }
 

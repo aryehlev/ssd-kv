@@ -24,7 +24,7 @@
 //! FAILOVER sid [--to node]
 //! MIGRATE ranges --to sid [--rate mbps] [--barriers k] | MIGRATE PAUSE|RESUME|ABORT id | MIGRATIONS
 //! REBALANCE PLAN [--by slots] | REBALANCE APPLY plan-text | REBALANCE STATUS
-//! COORD SETPEERS gen list | COORD PEERS | COORD EXPORT
+//! COORD SETPEERS gen list | COORD PEERS | COORD STATE | COORD SYNC | COORD EXPORT
 //! STATUS [--json]
 //! ```
 //! Node ids are 40 hex digits or a unique prefix of at least 4.
@@ -475,7 +475,7 @@ async fn command(ctl: &Arc<Controllers>, authed: &mut bool, argv: &[Vec<u8>]) ->
     // Per-coordinator operations, never relayed.
     let local = matches!(
         (verb.as_str(), sub.as_str()),
-        ("COORD", "SETPEERS" | "PEERS" | "EXPORT")
+        ("COORD", "SETPEERS" | "PEERS" | "STATE" | "EXPORT")
     );
     if !local && !ctl.wsr.is_leader() {
         return relay(ctl, argv, &verb).await;
@@ -877,6 +877,31 @@ async fn run_verb(ctl: &Arc<Controllers>, verb: &str, sub: &str, words: &[String
         ("COORD", "PEERS") => {
             let p = ctl.wsr.peers();
             Ok(bulk(format!("{} {}", p.r#gen, p).as_bytes()))
+        }
+        ("COORD", "STATE") => {
+            // `<peer generation> <term> <committed version> <leader|follower>`
+            let w = &ctl.wsr;
+            Ok(bulk(
+                format!(
+                    "{} {} {} {}",
+                    w.peers().r#gen,
+                    w.term(),
+                    w.committed().version,
+                    if w.is_leader() { "leader" } else { "follower" }
+                )
+                .as_bytes(),
+            ))
+        }
+        ("COORD", "SYNC") => {
+            // The sync commit of the SETPEERS sequence: a value committed by this leader under
+            // its current peer generation (the next peer-list change waits until every staying
+            // coordinator has committed it; see kv-sim wsr_model `may_start`).
+            let g = ctl.wsr.peers().r#gen;
+            let v = ctl.wsr.propose(Vec::new()).await.map_err(|e| e.to_string())?;
+            if ctl.wsr.peers().r#gen != g {
+                return Err("the peer generation changed during the sync commit".into());
+            }
+            Ok(simple(format!("OK version {v} generation {g}")))
         }
         ("COORD", "EXPORT") => {
             let (version, value_term, blob) = ctl.wsr.committed_entry();

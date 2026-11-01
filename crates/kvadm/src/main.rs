@@ -367,9 +367,12 @@ fn peers_of(addr: SocketAddr, token: &str) -> Result<(u64, String), String> {
 /// The SETPEERS sequence (§23.3). Before anything is sent: every coordinator of the current
 /// list reports the current generation (one that leaves the list may be unreachable: removing a
 /// dead coordinator is the usual reason for a removal), and every coordinator of the new list
-/// answers (a coordinator being added reports the joining generation 0 or the current one). The
-/// new list then goes to each reachable coordinator of both lists in turn, and every
-/// coordinator of the new list must report the new generation.
+/// answers (a coordinator being added reports the joining generation 0 or the current one).
+/// Then the sync: the leader commits a value under the current generation and every coordinator
+/// staying in the list must have committed it (generation reports alone are not enough: the
+/// kv-sim model finds two leaders in one term without this step). The new list then goes to each
+/// reachable coordinator of both lists in turn, and every coordinator of the new list must report
+/// the new generation.
 fn setpeers(coords: &[String], token: &str, new_gen: Option<u64>, make: &dyn Fn(&[Entry]) -> Result<String, String>) -> Result<(), String> {
     let mut a = connect_any(coords, token)?;
     let t = text(a.kvadm(&["COORD".into(), "PEERS".into()])?)?;
@@ -407,6 +410,37 @@ fn setpeers(coords: &[String], token: &str, new_gen: Option<u64>, make: &dyn Fn(
             Err(err) => return Err(format!("coordinator {} to add: {err}", e.id)),
         }
     }
+    // The sync commit under generation g, then every staying coordinator holds it.
+    let r = text(a.kvadm(&["COORD".into(), "SYNC".into()])?)?;
+    let w: Vec<&str> = r.split_whitespace().collect();
+    let (v, sg) = match w.as_slice() {
+        ["OK", "version", v, "generation", sg] => (
+            v.parse::<u64>().map_err(|_| "malformed sync reply".to_owned())?,
+            sg.parse::<u64>().map_err(|_| "malformed sync reply".to_owned())?,
+        ),
+        _ => return Err(format!("unexpected sync reply: {r}")),
+    };
+    if sg != g {
+        return Err(format!("the leader is at peer generation {sg}, not {g}"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for e in cur_list.iter().filter(|e| stays(&e.id)) {
+        loop {
+            let st = Admin::connect(e.admin, token)
+                .and_then(|mut c| text(c.kvadm(&["COORD".into(), "STATE".into()])?));
+            let committed = st
+                .ok()
+                .and_then(|t| t.split_whitespace().nth(2).and_then(|x| x.parse::<u64>().ok()));
+            if committed.is_some_and(|c| c >= v) {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(format!("coordinator {} has not committed version {v}", e.id));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    outln!("sync: version {v} committed under generation {g} on every staying coordinator");
     for e in &reachable {
         let mut c = Admin::connect(e.admin, token)?;
         let r = c.kvadm(&["COORD".into(), "SETPEERS".into(), target.to_string(), new.clone()])?;

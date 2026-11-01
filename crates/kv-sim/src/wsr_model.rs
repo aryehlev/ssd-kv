@@ -13,7 +13,10 @@
 //! which is a crash before the write); election timeouts, beats, check-quorum step-downs and
 //! proposals at any moment; and operator SETPEERS sequences of single-server deltas applied to
 //! the members of the old and the new list in any order, the next change starting only when
-//! every member of the current list has reported the current generation (§23.3).
+//! every member of the current list has reported the current generation, a leader of the current
+//! generation has committed a value, and every member staying in the list has committed it
+//! ([`WsrState::may_start`]; kvadm's sequence, a strengthening of §23.3 that this model showed
+//! necessary).
 //!
 //! Properties: at most one value committed per version; committed state never lost (every
 //! committed value extends every committed value of a lower version); leader completeness (a
@@ -64,6 +67,9 @@ pub struct WsrModel {
     /// Explore dropping any message in flight (without it, loss is a message never
     /// delivered).
     pub drops: bool,
+    /// The operator's sync commit before each peer-list change ([`WsrState::may_start`]);
+    /// `false` models the generation-only rule, which the checker shows unsafe.
+    pub sync_rule: bool,
 }
 
 impl WsrModel {
@@ -80,6 +86,7 @@ impl WsrModel {
             max_net: 8,
             beats: true,
             drops: true,
+            sync_rule: true,
         }
     }
 
@@ -202,6 +209,9 @@ pub struct WsrState {
     pub chosen: BTreeSet<(u64, Val, u64)>,
     /// Every election won: `(term, member)`.
     pub leaders: BTreeSet<(u64, u8)>,
+    /// Per peer generation: the highest version a leader of that generation committed (the
+    /// operator's sync commit before the next peer-list change, see [`WsrState::may_start`]).
+    pub gen_commits: BTreeMap<u64, u64>,
     pub crashes: u8,
 }
 
@@ -271,6 +281,11 @@ impl WsrState {
                     debug_assert_eq!(c.version, version);
                     fresh.push((c.version, c.value.clone(), c.term));
                     self.chosen.insert((c.version, c.value.clone(), c.term));
+                    let me = &self.members[usize::from(i)].core;
+                    if me.role() == Role::Leader {
+                        let e = self.gen_commits.entry(me.peers().r#gen).or_insert(0);
+                        *e = (*e).max(version);
+                    }
                 }
                 Output::BecameLeader { term } => {
                     self.leaders.insert((term, i));
@@ -284,6 +299,30 @@ impl WsrState {
 
     fn gen_of(&self, i: usize) -> u64 {
         self.members[i].core.peers().r#gen
+    }
+
+    /// The operator precondition for starting peer generation `g` (kvadm's SETPEERS sequence):
+    /// every member of list `g - 1` reports generation `g - 1`, a leader of generation `g - 1`
+    /// committed a value (kvadm's sync commit), and every member of both lists has committed at
+    /// least that version. Generation alone is not enough: without the sync, the lists of
+    /// generations `g - 2` and `g` (two servers apart) can both assemble a majority of members
+    /// that never saw each other's commits (found by this model: 3 -> 4 -> 3 elects two leaders
+    /// in one term).
+    fn may_start(&self, m: &WsrModel, g: u64) -> bool {
+        let prev = m.list(g - 1);
+        let next = m.list(g);
+        if !prev.iter().all(|&p| self.gen_of(usize::from(p)) >= g - 1) {
+            return false;
+        }
+        if !m.sync_rule {
+            return true;
+        }
+        let Some(&v) = self.gen_commits.get(&(g - 1)) else {
+            return false;
+        };
+        prev.iter()
+            .filter(|p| next.contains(p))
+            .all(|&p| self.members[usize::from(p)].core.committed().version >= v)
     }
 }
 
@@ -360,6 +399,7 @@ impl Model for WsrModel {
             net: BTreeSet::new(),
             chosen: BTreeSet::new(),
             leaders: BTreeSet::new(),
+            gen_commits: BTreeMap::new(),
             crashes: 0,
         }]
     }
@@ -394,10 +434,10 @@ impl Model for WsrModel {
                 actions.push(WsrAction::Drop(e.clone()));
             }
         }
-        // SETPEERS: generation g starts only once every member of list g - 1 reports g - 1.
+        // SETPEERS: generation g starts only once its precondition holds.
         for g in 2..=self.max_gen() {
             let prev = self.list(g - 1);
-            if !prev.iter().all(|&p| s.gen_of(usize::from(p)) >= g - 1) {
+            if !s.may_start(self, g) {
                 continue;
             }
             let next = self.list(g);
@@ -625,6 +665,7 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
         max_net: usize::MAX,
         beats: true,
         drops: true,
+        sync_rule: true,
     };
     let mut s = model.init_states().remove(0);
     let n = model.total();
@@ -713,7 +754,7 @@ pub fn simulate(cfg: &SimCfg) -> Result<SimReport, String> {
         if next_gen <= model.max_gen() && rng.random_bool(0.01) {
             let prev = model.list(next_gen - 1);
             let list = model.list(next_gen);
-            if prev.iter().all(|&p| s.gen_of(usize::from(p)) >= next_gen - 1) {
+            if s.may_start(&model, next_gen) {
                 let cands: Vec<usize> = (0..n)
                     .filter(|&i| {
                         let i8 = i as u8;
@@ -871,11 +912,11 @@ mod tests {
         assert!(r.unique_states > 10_000);
     }
 
-    /// Five members, two terms, two versions, at most two messages in flight: the whole state
-    /// space within the bounds.
+    /// Five members, two terms, two versions, at most two messages in flight (one in debug
+    /// builds): the whole state space within the bounds.
     #[test]
     fn five_members_complete() {
-        let m = cfg(5, 2, 2, false, 0, 2, false);
+        let m = cfg(5, 2, 2, false, 0, if release() { 2 } else { 1 }, false);
         let r = run("5 members (complete)", &m, 900);
         assert!(r.complete);
         assert!(r.examples >= 1);
@@ -884,11 +925,26 @@ mod tests {
     /// SETPEERS 3 -> 4 -> 3 with small bounds: the whole state space.
     #[test]
     fn setpeers_complete() {
-        let mut m = cfg(3, 2, 2, false, 0, 2, false);
+        let mut m = cfg(3, 2, 4, false, 0, if release() { 2 } else { 1 }, false);
         m.joiners = 1;
         m.generations = vec![vec![0, 1, 2, 3], vec![1, 2, 3]];
         let r = run("SETPEERS 3 -> 4 -> 3 (complete)", &m, 900);
         assert!(r.complete);
+    }
+
+    /// The generation-only rule of the original design (start the next change once every member
+    /// reports the current generation) is unsafe: 3 -> 4 -> 3 makes the lists of generations 1
+    /// and 3 disjoint majorities of members that never saw each other's commits, and the checker
+    /// finds two leaders in one term. The sync commit of [`WsrState::may_start`] prevents it.
+    #[test]
+    fn generation_only_rule_is_unsafe() {
+        use stateright::Checker;
+        let mut m = cfg(3, 2, 2, false, 0, 1, false);
+        m.joiners = 1;
+        m.generations = vec![vec![0, 1, 2, 3], vec![1, 2, 3]];
+        m.sync_rule = false;
+        let c = m.checker().spawn_bfs().join();
+        assert!(c.discovery("at most one leader per term").is_some());
     }
 
     /// Five members: time-bounded.
@@ -903,7 +959,7 @@ mod tests {
     /// the members in any order; elections and commits in every generation.
     #[test]
     fn setpeers_single_server_deltas() {
-        let mut m = cfg(3, 3, 3, false, 1, 4, true);
+        let mut m = cfg(3, 3, 4, false, 1, 4, true);
         m.joiners = 1;
         m.generations = vec![vec![0, 1, 2, 3], vec![1, 2, 3]];
         let r = run("SETPEERS 3 -> 4 -> 3", &m, if release() { 60 } else { 20 });
@@ -913,7 +969,7 @@ mod tests {
     /// The same deltas from five members: add a sixth, remove the first.
     #[test]
     fn setpeers_from_five_members() {
-        let mut m = cfg(5, 3, 2, false, 0, 4, false);
+        let mut m = cfg(5, 3, 4, false, 0, 4, false);
         m.joiners = 1;
         m.generations = vec![vec![0, 1, 2, 3, 4, 5], vec![1, 2, 3, 4, 5]];
         let r = run("SETPEERS 5 -> 6 -> 5", &m, if release() { 30 } else { 10 });
@@ -971,7 +1027,7 @@ mod tests {
         m.duplicate = true;
         run("3 members t3 v3 beats crash dup", &m, 300);
         run("5 members t3 v3", &cfg(5, 3, 3, true, 1, 6, true), 300);
-        let mut m = cfg(3, 3, 3, true, 1, 5, true);
+        let mut m = cfg(3, 3, 4, true, 1, 5, true);
         m.joiners = 1;
         m.generations = vec![vec![0, 1, 2, 3], vec![1, 2, 3]];
         run("SETPEERS 3 -> 4 -> 3", &m, 300);

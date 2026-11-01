@@ -365,8 +365,7 @@ fn db_after(cmds: &[OwnedCmd], db: u8, databases: u8) -> u8 {
     cmds.iter()
         .filter(|c| c.id == CmdId::Select && c.argc() == 2)
         .filter_map(|c| kv_common::num::string2ll(c.arg(1)))
-        .filter(|&n| n >= 0 && n < i64::from(databases))
-        .next_back()
+        .rfind(|&n| n >= 0 && n < i64::from(databases))
         .map_or(db, |n| n as u8)
 }
 

@@ -523,12 +523,15 @@ pub mod mem {
         }
     }
 
+    /// Where the in-RAM backend's meta requests go (cross-partition commits).
+    pub type MetaSink = Box<dyn Fn(u16, u64, MetaReq) + Send>;
+
     /// The in-RAM backend of one worker.
     pub struct MemBackend {
         owned: Vec<u16>,
         parts: Vec<Option<MemPart>>,
         next_txn: u64,
-        meta_sink: Option<Box<dyn Fn(u16, u64, MetaReq) + Send>>,
+        meta_sink: Option<MetaSink>,
     }
 
     impl MemBackend {
@@ -542,7 +545,7 @@ pub mod mem {
         }
 
         /// Routes meta requests (cross-partition commits) to `f`.
-        pub fn with_meta(mut self, f: Box<dyn Fn(u16, u64, MetaReq) + Send>) -> Self {
+        pub fn with_meta(mut self, f: MetaSink) -> Self {
             self.meta_sink = Some(f);
             self
         }

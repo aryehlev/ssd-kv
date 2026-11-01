@@ -401,8 +401,8 @@ pub fn hstrlen<S: Store + ?Sized>(
     let field = a.arg(2);
     read_hash(ks, a.arg(1), w, |h, w| {
         w.int(
-            h.and_then(|h| find(h, field))
-                .map_or(0, |i| h.unwrap()[i].1.len() as i64),
+            h.and_then(|h| find(h, field).map(|i| h[i].1.len() as i64))
+                .unwrap_or(0),
         )
     })
 }

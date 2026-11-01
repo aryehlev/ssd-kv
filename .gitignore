@@ -1,2 +1,4 @@
 /target
 /operator/operator
+tests/compat/.venv/
+__pycache__/

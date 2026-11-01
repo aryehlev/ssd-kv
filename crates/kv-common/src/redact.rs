@@ -44,7 +44,10 @@ mod tests {
         assert!(s.starts_with("<len=10 tag="));
         let r = Redacted(b"secret-key");
         assert_eq!(s, format!("{r} {r}"));
-        assert_eq!(format!("{}", Redacted(b"")).len(), "<len=0 tag=00000000>".len());
+        assert_eq!(
+            format!("{}", Redacted(b"")).len(),
+            "<len=0 tag=00000000>".len()
+        );
         assert_ne!(Redacted(b"a").tag(), Redacted(b"b").tag());
     }
 }

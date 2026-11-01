@@ -52,13 +52,27 @@ fn meta(id: CmdId) -> &'static Meta {
             key_specs: &[],
         },
         CmdId::Hello => &Meta {
-            flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"],
+            flags: &[
+                "noscript",
+                "loading",
+                "stale",
+                "fast",
+                "no_auth",
+                "allow_busy",
+            ],
             acl: &["@fast", "@connection"],
             tips: &[],
             key_specs: &[],
         },
         CmdId::Auth => &Meta {
-            flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"],
+            flags: &[
+                "noscript",
+                "loading",
+                "stale",
+                "fast",
+                "no_auth",
+                "allow_busy",
+            ],
             acl: &["@fast", "@connection"],
             tips: &[],
             key_specs: &[],
@@ -70,13 +84,27 @@ fn meta(id: CmdId) -> &'static Meta {
             key_specs: &[],
         },
         CmdId::Quit => &Meta {
-            flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"],
+            flags: &[
+                "noscript",
+                "loading",
+                "stale",
+                "fast",
+                "no_auth",
+                "allow_busy",
+            ],
             acl: &["@fast", "@connection"],
             tips: &[],
             key_specs: &[],
         },
         CmdId::Reset => &Meta {
-            flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"],
+            flags: &[
+                "noscript",
+                "loading",
+                "stale",
+                "fast",
+                "no_auth",
+                "allow_busy",
+            ],
             acl: &["@fast", "@connection"],
             tips: &[],
             key_specs: &[],
@@ -186,7 +214,11 @@ fn meta(id: CmdId) -> &'static Meta {
         CmdId::Info => &Meta {
             flags: &["loading", "stale"],
             acl: &["@slow", "@dangerous"],
-            tips: &["nondeterministic_output", "request_policy:all_shards", "response_policy:special"],
+            tips: &[
+                "nondeterministic_output",
+                "request_policy:all_shards",
+                "response_policy:special",
+            ],
             key_specs: &[],
         },
         CmdId::Config => &Meta {
@@ -262,7 +294,14 @@ fn meta(id: CmdId) -> &'static Meta {
             key_specs: &[],
         },
         CmdId::Shutdown => &Meta {
-            flags: &["admin", "noscript", "loading", "stale", "no_multi", "allow_busy"],
+            flags: &[
+                "admin",
+                "noscript",
+                "loading",
+                "stale",
+                "no_multi",
+                "allow_busy",
+            ],
             acl: &["@admin", "@slow", "@dangerous"],
             tips: &[],
             key_specs: &[],
@@ -283,9 +322,14 @@ fn meta(id: CmdId) -> &'static Meta {
             flags: &["readonly", "fast"],
             acl: &["@keyspace", "@read", "@fast"],
             tips: &["request_policy:multi_shard", "response_policy:agg_sum"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: -1, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: -1,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Replicaof => &Meta {
             flags: &["admin", "noscript", "stale", "no_async_loading"],
@@ -303,228 +347,398 @@ fn meta(id: CmdId) -> &'static Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Set => &Meta {
             flags: &["write", "denyoom"],
             acl: &["@write", "@string", "@slow"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: Some("RW and ACCESS due to the optional `GET` argument"), flags: &["RW", "access", "update", "variable_flags"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: Some("RW and ACCESS due to the optional `GET` argument"),
+                flags: &["RW", "access", "update", "variable_flags"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Setnx => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["OW", "insert"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["OW", "insert"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Setex => &Meta {
             flags: &["write", "denyoom"],
             acl: &["@write", "@string", "@slow"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["OW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["OW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Psetex => &Meta {
             flags: &["write", "denyoom"],
             acl: &["@write", "@string", "@slow"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["OW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["OW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Getset => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Getdel => &Meta {
             flags: &["write", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "delete"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "delete"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Getex => &Meta {
             flags: &["write", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: Some("RW and UPDATE because it changes the TTL"), flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: Some("RW and UPDATE because it changes the TTL"),
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Mget => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@string", "@fast"],
             tips: &["request_policy:multi_shard"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: -1, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: -1,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Mset => &Meta {
             flags: &["write", "denyoom"],
             acl: &["@write", "@string", "@slow"],
-            tips: &["request_policy:multi_shard", "response_policy:all_succeeded"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["OW", "update"], index: 1, lastkey: -1, keystep: 2, limit: 0 },
-        ],
+            tips: &[
+                "request_policy:multi_shard",
+                "response_policy:all_succeeded",
+            ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["OW", "update"],
+                index: 1,
+                lastkey: -1,
+                keystep: 2,
+                limit: 0,
+            }],
         },
         CmdId::Msetnx => &Meta {
             flags: &["write", "denyoom"],
             acl: &["@write", "@string", "@slow"],
             tips: &["request_policy:multi_shard", "response_policy:agg_min"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["OW", "insert"], index: 1, lastkey: -1, keystep: 2, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["OW", "insert"],
+                index: 1,
+                lastkey: -1,
+                keystep: 2,
+                limit: 0,
+            }],
         },
         CmdId::Append => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "insert"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "insert"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Strlen => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Getrange => &Meta {
             flags: &["readonly"],
             acl: &["@read", "@string", "@slow"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Substr => &Meta {
             flags: &["readonly"],
             acl: &["@read", "@string", "@slow"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Setrange => &Meta {
             flags: &["write", "denyoom"],
             acl: &["@write", "@string", "@slow"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Incr => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Decr => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Incrby => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Decrby => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Incrbyfloat => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@string", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Del => &Meta {
             flags: &["write"],
             acl: &["@keyspace", "@write", "@slow"],
             tips: &["request_policy:multi_shard", "response_policy:agg_sum"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RM", "delete"], index: 1, lastkey: -1, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RM", "delete"],
+                index: 1,
+                lastkey: -1,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Unlink => &Meta {
             flags: &["write", "fast"],
             acl: &["@keyspace", "@write", "@fast"],
             tips: &["request_policy:multi_shard", "response_policy:agg_sum"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RM", "delete"], index: 1, lastkey: -1, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RM", "delete"],
+                index: 1,
+                lastkey: -1,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Exists => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@keyspace", "@read", "@fast"],
             tips: &["request_policy:multi_shard", "response_policy:agg_sum"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: -1, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: -1,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Type => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@keyspace", "@read", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Rename => &Meta {
             flags: &["write"],
             acl: &["@keyspace", "@write", "@slow"],
             tips: &[],
             key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "delete"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-            KeySpecDoc { notes: None, flags: &["OW", "update"], index: 2, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+                KeySpecDoc {
+                    notes: None,
+                    flags: &["RW", "access", "delete"],
+                    index: 1,
+                    lastkey: 0,
+                    keystep: 1,
+                    limit: 0,
+                },
+                KeySpecDoc {
+                    notes: None,
+                    flags: &["OW", "update"],
+                    index: 2,
+                    lastkey: 0,
+                    keystep: 1,
+                    limit: 0,
+                },
+            ],
         },
         CmdId::Renamenx => &Meta {
             flags: &["write", "fast"],
             acl: &["@keyspace", "@write", "@fast"],
             tips: &[],
             key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "delete"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-            KeySpecDoc { notes: None, flags: &["OW", "insert"], index: 2, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+                KeySpecDoc {
+                    notes: None,
+                    flags: &["RW", "access", "delete"],
+                    index: 1,
+                    lastkey: 0,
+                    keystep: 1,
+                    limit: 0,
+                },
+                KeySpecDoc {
+                    notes: None,
+                    flags: &["OW", "insert"],
+                    index: 2,
+                    lastkey: 0,
+                    keystep: 1,
+                    limit: 0,
+                },
+            ],
         },
         CmdId::Copy => &Meta {
             flags: &["write", "denyoom"],
             acl: &["@keyspace", "@write", "@slow"],
             tips: &[],
             key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-            KeySpecDoc { notes: None, flags: &["OW", "update"], index: 2, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+                KeySpecDoc {
+                    notes: None,
+                    flags: &["RO", "access"],
+                    index: 1,
+                    lastkey: 0,
+                    keystep: 1,
+                    limit: 0,
+                },
+                KeySpecDoc {
+                    notes: None,
+                    flags: &["OW", "update"],
+                    index: 2,
+                    lastkey: 0,
+                    keystep: 1,
+                    limit: 0,
+                },
+            ],
         },
         CmdId::Randomkey => &Meta {
             flags: &["readonly"],
@@ -548,73 +762,118 @@ fn meta(id: CmdId) -> &'static Meta {
             flags: &["write", "fast"],
             acl: &["@keyspace", "@write", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Pexpire => &Meta {
             flags: &["write", "fast"],
             acl: &["@keyspace", "@write", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Expireat => &Meta {
             flags: &["write", "fast"],
             acl: &["@keyspace", "@write", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Pexpireat => &Meta {
             flags: &["write", "fast"],
             acl: &["@keyspace", "@write", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Ttl => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@keyspace", "@read", "@fast"],
             tips: &["nondeterministic_output"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Pttl => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@keyspace", "@read", "@fast"],
             tips: &["nondeterministic_output"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Expiretime => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@keyspace", "@read", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Pexpiretime => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@keyspace", "@read", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Persist => &Meta {
             flags: &["write", "fast"],
             acl: &["@keyspace", "@write", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Multi => &Meta {
             flags: &["noscript", "loading", "stale", "fast", "allow_busy"],
@@ -638,9 +897,14 @@ fn meta(id: CmdId) -> &'static Meta {
             flags: &["noscript", "loading", "stale", "fast", "allow_busy"],
             acl: &["@fast", "@transaction"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: -1, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: -1,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Unwatch => &Meta {
             flags: &["noscript", "loading", "stale", "fast", "allow_busy"],
@@ -652,113 +916,183 @@ fn meta(id: CmdId) -> &'static Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hsetnx => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "insert"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "insert"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hget => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hmget => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hmset => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hdel => &Meta {
             flags: &["write", "fast"],
             acl: &["@write", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "delete"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "delete"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hgetall => &Meta {
             flags: &["readonly"],
             acl: &["@read", "@hash", "@slow"],
             tips: &["nondeterministic_output_order"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hkeys => &Meta {
             flags: &["readonly"],
             acl: &["@read", "@hash", "@slow"],
             tips: &["nondeterministic_output_order"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hvals => &Meta {
             flags: &["readonly"],
             acl: &["@read", "@hash", "@slow"],
             tips: &["nondeterministic_output_order"],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO", "access"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO", "access"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hlen => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hexists => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hincrby => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hincrbyfloat => &Meta {
             flags: &["write", "denyoom", "fast"],
             acl: &["@write", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RW", "access", "update"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RW", "access", "update"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Hstrlen => &Meta {
             flags: &["readonly", "fast"],
             acl: &["@read", "@hash", "@fast"],
             tips: &[],
-            key_specs: &[
-            KeySpecDoc { notes: None, flags: &["RO"], index: 1, lastkey: 0, keystep: 1, limit: 0 },
-        ],
+            key_specs: &[KeySpecDoc {
+                notes: None,
+                flags: &["RO"],
+                index: 1,
+                lastkey: 0,
+                keystep: 1,
+                limit: 0,
+            }],
         },
         CmdId::Cluster => &Meta {
             flags: &[],
@@ -954,7 +1288,9 @@ fn meta(id: CmdId) -> &'static Meta {
 pub fn write_command_info(spec: &CommandSpec, w: &mut ReplyWriter<'_>) {
     let m = meta(spec.id);
     let (first, last, step) = match spec.keys {
-        KeySpec::Range { first, last, step } => (i64::from(first), i64::from(last), i64::from(step)),
+        KeySpec::Range { first, last, step } => {
+            (i64::from(first), i64::from(last), i64::from(step))
+        }
         KeySpec::None | KeySpec::Custom(_) => (0, 0, 0),
     };
     w.array(10);
@@ -1001,7 +1337,9 @@ pub fn write_command_info(spec: &CommandSpec, w: &mut ReplyWriter<'_>) {
         w.int(ks.limit);
     }
     w.set(spec.subcommands.len());
-    spec.subcommands.iter().for_each(|s| write_command_info(s, w));
+    spec.subcommands
+        .iter()
+        .for_each(|s| write_command_info(s, w));
 }
 
 /// Writes the COMMAND DOCS map of `spec` (the value; the caller writes the name key):
@@ -1061,7 +1399,8 @@ pub fn write_command_docs_reply(names: &[&[u8]], w: &mut ReplyWriter<'_>) {
         }
         return;
     }
-    let found: smallvec::SmallVec<[&'static CommandSpec; 8]> = names.iter().filter_map(|n| lookup_fullname(n)).collect();
+    let found: smallvec::SmallVec<[&'static CommandSpec; 8]> =
+        names.iter().filter_map(|n| lookup_fullname(n)).collect();
     w.map(found.len());
     for spec in found {
         w.bulk(spec.name.as_bytes());
@@ -1099,14 +1438,17 @@ pub fn write_command_list_reply(args: &[&[u8]], w: &mut ReplyWriter<'_>) {
     let keep = |spec: &CommandSpec| match filter {
         Filter::All => true,
         Filter::Module => false,
-        Filter::AclCat(cat) => {
-            meta(spec.id).acl.iter().any(|c| c.as_bytes()[1..].eq_ignore_ascii_case(cat))
-        }
+        Filter::AclCat(cat) => meta(spec.id)
+            .acl
+            .iter()
+            .any(|c| c.as_bytes()[1..].eq_ignore_ascii_case(cat)),
         Filter::Pattern(p) => glob_match(p, spec.name.as_bytes(), true),
     };
     let n = all_with_subcommands().filter(|s| keep(s)).count();
     w.array(n);
-    all_with_subcommands().filter(|s| keep(s)).for_each(|s| w.bulk(s.name.as_bytes()));
+    all_with_subcommands()
+        .filter(|s| keep(s))
+        .for_each(|s| w.bulk(s.name.as_bytes()));
 }
 
 #[cfg(test)]
@@ -1162,11 +1504,23 @@ mod tests {
     #[test]
     fn legacy_key_triples() {
         use kv_resp::Value::*;
-        for (name, triple) in [("mset", (1, -1, 2)), ("rename", (1, 2, 1)), ("copy", (1, 2, 1)), ("del", (1, -1, 1)), ("ping", (0, 0, 0))] {
-            let v = run(Proto::Resp2, |w| write_command_info_reply(&[name.as_bytes()], w));
+        for (name, triple) in [
+            ("mset", (1, -1, 2)),
+            ("rename", (1, 2, 1)),
+            ("copy", (1, 2, 1)),
+            ("del", (1, -1, 1)),
+            ("ping", (0, 0, 0)),
+        ] {
+            let v = run(Proto::Resp2, |w| {
+                write_command_info_reply(&[name.as_bytes()], w)
+            });
             let Array(Some(outer)) = v else { panic!() };
             let Array(Some(e)) = &outer[0] else { panic!() };
-            assert_eq!((&e[3], &e[4], &e[5]), (&Int(triple.0), &Int(triple.1), &Int(triple.2)), "{name}");
+            assert_eq!(
+                (&e[3], &e[4], &e[5]),
+                (&Int(triple.0), &Int(triple.1), &Int(triple.2)),
+                "{name}"
+            );
         }
     }
 
@@ -1177,9 +1531,14 @@ mod tests {
         let Array(Some(outer)) = v else { panic!() };
         let Array(Some(e)) = &outer[0] else { panic!() };
         let Array(Some(subs)) = &e[9] else { panic!() };
-        assert_eq!(subs.len(), crate::lookup(b"client").unwrap().subcommands.len());
+        assert_eq!(
+            subs.len(),
+            crate::lookup(b"client").unwrap().subcommands.len()
+        );
         let v = run(Proto::Resp3, write_command_all);
-        let Array(Some(all_entries)) = v else { panic!() };
+        let Array(Some(all_entries)) = v else {
+            panic!()
+        };
         assert_eq!(all_entries.len(), command_count());
     }
 
@@ -1187,7 +1546,9 @@ mod tests {
     fn docs_shape() {
         use kv_resp::Value::*;
         let bulk = |s: &str| Bulk(Some(s.as_bytes().to_vec()));
-        let v = run(Proto::Resp3, |w| write_command_docs_reply(&[b"get", b"bogus"], w));
+        let v = run(Proto::Resp3, |w| {
+            write_command_docs_reply(&[b"get", b"bogus"], w)
+        });
         assert_eq!(
             v,
             Map(vec![(
@@ -1240,9 +1601,15 @@ mod tests {
         assert!(!conn.contains(&"get".to_string()));
         assert!(names(&[b"FILTERBY", b"ACLCAT", b"bogus"]).is_empty());
         assert!(names(&[b"FILTERBY", b"MODULE", b"x"]).is_empty());
-        assert_eq!(names(&[b"FILTERBY", b"X", b"y"]), vec!["ERROR ERR syntax error"]);
+        assert_eq!(
+            names(&[b"FILTERBY", b"X", b"y"]),
+            vec!["ERROR ERR syntax error"]
+        );
         assert_eq!(names(&[b"FOO"]), vec!["ERROR ERR syntax error"]);
-        assert_eq!(names(&[b"FILTERBY", b"PATTERN"]), vec!["ERROR ERR syntax error"]);
+        assert_eq!(
+            names(&[b"FILTERBY", b"PATTERN"]),
+            vec!["ERROR ERR syntax error"]
+        );
     }
 
     #[test]
@@ -1250,9 +1617,24 @@ mod tests {
         use crate::spec::CmdFlags;
         for spec in all_with_subcommands() {
             let m = meta(spec.id);
-            assert_eq!(m.flags.contains(&"write"), spec.flags.contains(CmdFlags::WRITE), "{}", spec.name);
-            assert_eq!(m.flags.contains(&"readonly"), spec.flags.contains(CmdFlags::READONLY), "{}", spec.name);
-            assert_eq!(m.flags.contains(&"no_auth"), spec.flags.contains(CmdFlags::NO_AUTH), "{}", spec.name);
+            assert_eq!(
+                m.flags.contains(&"write"),
+                spec.flags.contains(CmdFlags::WRITE),
+                "{}",
+                spec.name
+            );
+            assert_eq!(
+                m.flags.contains(&"readonly"),
+                spec.flags.contains(CmdFlags::READONLY),
+                "{}",
+                spec.name
+            );
+            assert_eq!(
+                m.flags.contains(&"no_auth"),
+                spec.flags.contains(CmdFlags::NO_AUTH),
+                "{}",
+                spec.name
+            );
             assert_eq!(m.key_specs.is_empty(), !spec.has_keys(), "{}", spec.name);
             assert!(m.acl.iter().all(|c| c.starts_with('@')));
             for ks in m.key_specs {

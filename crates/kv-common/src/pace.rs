@@ -112,7 +112,11 @@ impl TokenBucket {
     /// Applies the latency controller's scale to the static rate (`scale` is clamped to
     /// `[0, 1]`; NaN is treated as 1).
     pub fn scaled(&mut self, scale: f32) {
-        self.scale = if scale.is_nan() { 1.0 } else { scale.clamp(0.0, 1.0) };
+        self.scale = if scale.is_nan() {
+            1.0
+        } else {
+            scale.clamp(0.0, 1.0)
+        };
         self.effective_rate = Self::apply_scale(self.rate_per_s, self.scale);
     }
 
@@ -122,7 +126,11 @@ impl TokenBucket {
     }
 
     fn apply_scale(rate: u64, scale: f32) -> u64 {
-        if scale >= 1.0 { rate } else { (rate as f64 * f64::from(scale)) as u64 }
+        if scale >= 1.0 {
+            rate
+        } else {
+            (rate as f64 * f64::from(scale)) as u64
+        }
     }
 }
 
@@ -150,8 +158,16 @@ impl LatencyController {
 
     /// `min_scale` is clamped to `[0, 1]` (NaN: 0.1, the documented default).
     pub fn new(target_p99_us: u32, min_scale: f32) -> Self {
-        let min_scale = if min_scale.is_nan() { 0.1 } else { min_scale.clamp(0.0, 1.0) };
-        LatencyController { target_p99_us, min_scale, ewma: 1.0 }
+        let min_scale = if min_scale.is_nan() {
+            0.1
+        } else {
+            min_scale.clamp(0.0, 1.0)
+        };
+        LatencyController {
+            target_p99_us,
+            min_scale,
+            ewma: 1.0,
+        }
     }
 
     /// Feeds one sample; returns the scale in `[min_scale, 1.0]`.
@@ -232,7 +248,10 @@ mod tests {
     fn oversized_requests_pass_with_debt() {
         let mut b = TokenBucket::new(100, 10);
         let t0 = S;
-        assert!(b.try_take(t0, 25), "full bucket grants an oversized request");
+        assert!(
+            b.try_take(t0, 25),
+            "full bucket grants an oversized request"
+        );
         assert!(!b.try_take(t0, 1));
         // the 15-token debt plus 10 tokens of refill take 250 ms
         assert!(!b.try_take(t0 + 240_000_000, 25));
@@ -292,7 +311,9 @@ mod tests {
         assert!((s - 0.25).abs() < 0.01, "{s}");
         // pathological latency: clamped at min_scale
         for _ in 0..50 {
-            s = c.update(DeviceLatencySample { p99_read_us: 1_000_000 });
+            s = c.update(DeviceLatencySample {
+                p99_read_us: 1_000_000,
+            });
         }
         assert!((s - 0.1).abs() < 1e-3, "{s}");
         // recovery is proportional, not a jump
@@ -313,7 +334,11 @@ mod tests {
             for us in [0u32, 1, 10, 800, 801, 5000, u32::MAX] {
                 let s = c.update(DeviceLatencySample { p99_read_us: us });
                 assert!((0.0..=1.0).contains(&s), "{s}");
-                let lo = if min.is_nan() { 0.1 } else { min.clamp(0.0, 1.0) };
+                let lo = if min.is_nan() {
+                    0.1
+                } else {
+                    min.clamp(0.0, 1.0)
+                };
                 assert!(s >= lo - 1e-6, "{s} < {lo}");
             }
         }

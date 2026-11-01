@@ -45,7 +45,11 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Splits `line` (without its line terminator) into arguments. Returns `Ok(false)` when the
 /// `(offset, len)` pairs pushed to `args` refer to `line`, `Ok(true)` when they refer to `side`
 /// (cleared first). A NUL byte ends the line, as the C string terminator does.
-pub(crate) fn split_inline(line: &[u8], side: &mut Vec<u8>, args: &mut Vec<(u32, u32)>) -> Result<bool, ProtoError> {
+pub(crate) fn split_inline(
+    line: &[u8],
+    side: &mut Vec<u8>,
+    args: &mut Vec<(u32, u32)>,
+) -> Result<bool, ProtoError> {
     let line = match memchr::memchr(0, line) {
         Some(n) => &line[..n],
         None => line,
@@ -81,7 +85,11 @@ fn split_plain(line: &[u8], args: &mut Vec<(u32, u32)>) {
 }
 
 /// General path: a transcription of `sdssplitargs`, writing unescaped words into `side`.
-fn split_quoted(line: &[u8], side: &mut Vec<u8>, args: &mut Vec<(u32, u32)>) -> Result<(), ProtoError> {
+fn split_quoted(
+    line: &[u8],
+    side: &mut Vec<u8>,
+    args: &mut Vec<(u32, u32)>,
+) -> Result<(), ProtoError> {
     // the byte at `i`, 0 at and past the end (the C terminator)
     let at = |i: usize| line.get(i).copied().unwrap_or(0);
     let mut p = 0usize;
@@ -97,7 +105,11 @@ fn split_quoted(line: &[u8], side: &mut Vec<u8>, args: &mut Vec<(u32, u32)>) -> 
         loop {
             let c = at(p);
             if inq {
-                if c == b'\\' && at(p + 1) == b'x' && hex_val(at(p + 2)).is_some() && hex_val(at(p + 3)).is_some() {
+                if c == b'\\'
+                    && at(p + 1) == b'x'
+                    && hex_val(at(p + 2)).is_some()
+                    && hex_val(at(p + 3)).is_some()
+                {
                     let hi = hex_val(at(p + 2)).unwrap_or(0);
                     let lo = hex_val(at(p + 3)).unwrap_or(0);
                     side.push(hi * 16 + lo);
@@ -169,7 +181,10 @@ mod tests {
         let mut args = Vec::new();
         let in_side = split_inline(line, &mut side, &mut args)?;
         let src = if in_side { &side[..] } else { line };
-        Ok(args.iter().map(|&(o, l)| src[o as usize..(o + l) as usize].to_vec()).collect())
+        Ok(args
+            .iter()
+            .map(|&(o, l)| src[o as usize..(o + l) as usize].to_vec())
+            .collect())
     }
 
     fn v(words: &[&[u8]]) -> Vec<Vec<u8>> {
@@ -182,38 +197,78 @@ mod tests {
         assert_eq!(split(b"  PING   ").unwrap(), v(&[b"PING"]));
         assert_eq!(split(b"").unwrap(), v(&[]));
         assert_eq!(split(b" \t\x0b\x0c ").unwrap(), v(&[]));
-        assert_eq!(split(b"ECHO a\x0bb").unwrap(), v(&[b"ECHO", b"a\x0bb"]), "\\v does not end a word");
-        assert_eq!(split(b"\x0bECHO ab").unwrap(), v(&[b"ECHO", b"ab"]), "but is skipped as a blank");
+        assert_eq!(
+            split(b"ECHO a\x0bb").unwrap(),
+            v(&[b"ECHO", b"a\x0bb"]),
+            "\\v does not end a word"
+        );
+        assert_eq!(
+            split(b"\x0bECHO ab").unwrap(),
+            v(&[b"ECHO", b"ab"]),
+            "but is skipped as a blank"
+        );
         assert_eq!(split(b"ECHO a\rb").unwrap(), v(&[b"ECHO", b"a", b"b"]));
-        assert_eq!(split(b"a\\nb").unwrap(), v(&[b"a\\nb"]), "no escapes outside quotes");
+        assert_eq!(
+            split(b"a\\nb").unwrap(),
+            v(&[b"a\\nb"]),
+            "no escapes outside quotes"
+        );
         assert_eq!(split(b"a\x00b c").unwrap(), v(&[b"a"]), "NUL ends the line");
     }
 
     #[test]
     fn quoting_matches_redis() {
         // Replies of Redis 7.0.15 to `ECHO <arg>` sent inline.
-        assert_eq!(split(b"ECHO \"a\\x41\\n\\tb\"").unwrap(), v(&[b"ECHO", b"aA\n\tb"]));
+        assert_eq!(
+            split(b"ECHO \"a\\x41\\n\\tb\"").unwrap(),
+            v(&[b"ECHO", b"aA\n\tb"])
+        );
         assert_eq!(split(b"ECHO 'it\\'s'").unwrap(), v(&[b"ECHO", b"it's"]));
-        assert_eq!(split(b"ECHO foo\"bar baz\"").unwrap(), v(&[b"ECHO", b"foobar baz"]));
+        assert_eq!(
+            split(b"ECHO foo\"bar baz\"").unwrap(),
+            v(&[b"ECHO", b"foobar baz"])
+        );
         assert_eq!(split(b"ECHO \"\\xZZ\"").unwrap(), v(&[b"ECHO", b"xZZ"]));
-        assert_eq!(split(b"ECHO \"\\b\\a\\\\\\\"\\q\"").unwrap(), v(&[b"ECHO", b"\x08\x07\\\"q"]));
-        assert_eq!(split(b"ECHO 'a\\nb'").unwrap(), v(&[b"ECHO", b"a\\nb"]), "single quotes keep backslashes");
+        assert_eq!(
+            split(b"ECHO \"\\b\\a\\\\\\\"\\q\"").unwrap(),
+            v(&[b"ECHO", b"\x08\x07\\\"q"])
+        );
+        assert_eq!(
+            split(b"ECHO 'a\\nb'").unwrap(),
+            v(&[b"ECHO", b"a\\nb"]),
+            "single quotes keep backslashes"
+        );
         assert_eq!(split(b"a \"\" b").unwrap(), v(&[b"a", b"", b"b"]));
-        assert_eq!(split(b"\"x\"\x0b").unwrap(), v(&[b"x"]), "closing quote followed by \\v");
+        assert_eq!(
+            split(b"\"x\"\x0b").unwrap(),
+            v(&[b"x"]),
+            "closing quote followed by \\v"
+        );
         assert_eq!(split(b"\"\\x4a\\x4B\"").unwrap(), v(&[b"JK"]));
         assert_eq!(split(b"x \"y\"").unwrap(), v(&[b"x", b"y"]));
     }
 
     #[test]
     fn unbalanced() {
-        for line in [&b"PING \"abc"[..], b"ECHO \"abc\"x", b"ECHO \"abc\\\"", b"'abc", b"'abc'x", b"\"\\"] {
+        for line in [
+            &b"PING \"abc"[..],
+            b"ECHO \"abc\"x",
+            b"ECHO \"abc\\\"",
+            b"'abc",
+            b"'abc'x",
+            b"\"\\",
+        ] {
             assert_eq!(split(line), Err(ProtoError::UnbalancedQuotes), "{line:?}");
         }
     }
 
     #[test]
     fn side_buffer_never_longer_than_line() {
-        for line in [&b"ECHO \"a\\x41\\n\\tb\""[..], b"'it\\'s' \"x\" y", b"foo\"bar baz\""] {
+        for line in [
+            &b"ECHO \"a\\x41\\n\\tb\""[..],
+            b"'it\\'s' \"x\" y",
+            b"foo\"bar baz\"",
+        ] {
             let mut side = Vec::new();
             let mut args = Vec::new();
             assert!(split_inline(line, &mut side, &mut args).unwrap());

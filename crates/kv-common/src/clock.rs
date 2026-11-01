@@ -26,7 +26,11 @@ pub struct Now {
 impl Now {
     /// Reads the three clocks (in this order: monotonic, boot, wall).
     pub fn read() -> Self {
-        Now { mono_ns: mono_ns(), boot_ns: boot_ns(), unix_ms: unix_ms() }
+        Now {
+            mono_ns: mono_ns(),
+            boot_ns: boot_ns(),
+            unix_ms: unix_ms(),
+        }
     }
 }
 
@@ -56,7 +60,10 @@ mod tests {
     #[test]
     fn wall_clock_matches_std() {
         let ours = unix_ms();
-        let std_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let std_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         assert!(ours.abs_diff(std_ms) < 1_000, "{ours} vs {std_ms}");
     }
 
@@ -79,6 +86,9 @@ mod tests {
         let (i1, m1) = (std::time::Instant::now(), mono_ns());
         let by_instant = (i1 - i0).as_nanos() as i128;
         let by_mono = i128::from(m1 - m0);
-        assert!((by_instant - by_mono).abs() < 2_000_000, "{by_instant} vs {by_mono}");
+        assert!(
+            (by_instant - by_mono).abs() < 2_000_000,
+            "{by_instant} vs {by_mono}"
+        );
     }
 }

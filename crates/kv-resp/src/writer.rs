@@ -26,7 +26,8 @@ impl<'a> ReplyWriter<'a> {
     #[inline]
     fn header(&mut self, tag: u8, n: usize) {
         self.buf.push(tag);
-        self.buf.extend_from_slice(itoa::Buffer::new().format(n).as_bytes());
+        self.buf
+            .extend_from_slice(itoa::Buffer::new().format(n).as_bytes());
         self.buf.extend_from_slice(b"\r\n");
     }
 
@@ -66,7 +67,8 @@ impl<'a> ReplyWriter<'a> {
     #[inline]
     pub fn int(&mut self, v: i64) {
         self.buf.push(b':');
-        self.buf.extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
+        self.buf
+            .extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
         self.buf.extend_from_slice(b"\r\n");
     }
 
@@ -166,7 +168,9 @@ impl<'a> ReplyWriter<'a> {
     pub fn boolean(&mut self, b: bool) {
         match self.proto {
             Proto::Resp2 => self.int(i64::from(b)),
-            Proto::Resp3 => self.buf.extend_from_slice(if b { b"#t\r\n" } else { b"#f\r\n" }),
+            Proto::Resp3 => self
+                .buf
+                .extend_from_slice(if b { b"#t\r\n" } else { b"#f\r\n" }),
         }
     }
 
@@ -221,30 +225,57 @@ mod tests {
     fn scalar_encodings() {
         assert_eq!(both(|w| w.ok()), (b"+OK\r\n".to_vec(), b"+OK\r\n".to_vec()));
         assert_eq!(both(|w| w.simple(b"PONG")).0, b"+PONG\r\n");
-        assert_eq!(both(|w| w.error(b"ERR syntax error")).1, b"-ERR syntax error\r\n");
-        assert_eq!(both(|w| w.error(b"ERR a\r\nb")).0, b"-ERR a  b\r\n", "CR/LF never break framing");
+        assert_eq!(
+            both(|w| w.error(b"ERR syntax error")).1,
+            b"-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            both(|w| w.error(b"ERR a\r\nb")).0,
+            b"-ERR a  b\r\n",
+            "CR/LF never break framing"
+        );
         assert_eq!(both(|w| w.simple(b"x\ny")).0, b"+x y\r\n");
         assert_eq!(both(|w| w.int(-42)).0, b":-42\r\n");
         assert_eq!(both(|w| w.int(i64::MIN)).1, b":-9223372036854775808\r\n");
         assert_eq!(both(|w| w.bulk(b"")).0, b"$0\r\n\r\n");
         assert_eq!(both(|w| w.bulk(b"a\r\nb")).1, b"$4\r\na\r\nb\r\n");
         assert_eq!(both(|w| w.bulk_i64(-7)).0, b"$2\r\n-7\r\n");
-        assert_eq!(both(|w| { w.bulk_len(3); w.buf.extend_from_slice(b"abc"); w.crlf(); }).0, b"$3\r\nabc\r\n");
-        assert_eq!(both(|w| w.empty_array()), (b"*0\r\n".to_vec(), b"*0\r\n".to_vec()));
+        assert_eq!(
+            both(|w| {
+                w.bulk_len(3);
+                w.buf.extend_from_slice(b"abc");
+                w.crlf();
+            })
+            .0,
+            b"$3\r\nabc\r\n"
+        );
+        assert_eq!(
+            both(|w| w.empty_array()),
+            (b"*0\r\n".to_vec(), b"*0\r\n".to_vec())
+        );
     }
 
     #[test]
     fn null_encodings() {
         assert_eq!(both(|w| w.null()), (b"$-1\r\n".to_vec(), b"_\r\n".to_vec()));
-        assert_eq!(both(|w| w.null_array()), (b"*-1\r\n".to_vec(), b"_\r\n".to_vec()));
+        assert_eq!(
+            both(|w| w.null_array()),
+            (b"*-1\r\n".to_vec(), b"_\r\n".to_vec())
+        );
     }
 
     #[test]
     fn aggregate_encodings() {
-        assert_eq!(both(|w| w.array(3)), (b"*3\r\n".to_vec(), b"*3\r\n".to_vec()));
+        assert_eq!(
+            both(|w| w.array(3)),
+            (b"*3\r\n".to_vec(), b"*3\r\n".to_vec())
+        );
         assert_eq!(both(|w| w.map(2)), (b"*4\r\n".to_vec(), b"%2\r\n".to_vec()));
         assert_eq!(both(|w| w.set(5)), (b"*5\r\n".to_vec(), b"~5\r\n".to_vec()));
-        assert_eq!(both(|w| w.push(2)), (b"*2\r\n".to_vec(), b">2\r\n".to_vec()));
+        assert_eq!(
+            both(|w| w.push(2)),
+            (b"*2\r\n".to_vec(), b">2\r\n".to_vec())
+        );
         // HELLO-style map: same element sequence in both protocols
         let (r2, r3) = both(|w| {
             w.map(1);
@@ -257,16 +288,31 @@ mod tests {
 
     #[test]
     fn resp3_only_types() {
-        assert_eq!(both(|w| w.double(1.5)), (b"$3\r\n1.5\r\n".to_vec(), b",1.5\r\n".to_vec()));
+        assert_eq!(
+            both(|w| w.double(1.5)),
+            (b"$3\r\n1.5\r\n".to_vec(), b",1.5\r\n".to_vec())
+        );
         assert_eq!(both(|w| w.double(0.1)).1, b",0.10000000000000001\r\n");
-        assert_eq!(both(|w| w.double(f64::INFINITY)), (b"$3\r\ninf\r\n".to_vec(), b",inf\r\n".to_vec()));
+        assert_eq!(
+            both(|w| w.double(f64::INFINITY)),
+            (b"$3\r\ninf\r\n".to_vec(), b",inf\r\n".to_vec())
+        );
         assert_eq!(both(|w| w.double(f64::NEG_INFINITY)).1, b",-inf\r\n");
         assert_eq!(both(|w| w.double(1e17)).0, b"$5\r\n1e+17\r\n");
-        assert_eq!(both(|w| w.boolean(true)), (b":1\r\n".to_vec(), b"#t\r\n".to_vec()));
-        assert_eq!(both(|w| w.boolean(false)), (b":0\r\n".to_vec(), b"#f\r\n".to_vec()));
+        assert_eq!(
+            both(|w| w.boolean(true)),
+            (b":1\r\n".to_vec(), b"#t\r\n".to_vec())
+        );
+        assert_eq!(
+            both(|w| w.boolean(false)),
+            (b":0\r\n".to_vec(), b"#f\r\n".to_vec())
+        );
         assert_eq!(
             both(|w| w.verbatim(b"txt", b"# Server\r\n")),
-            (b"$10\r\n# Server\r\n\r\n".to_vec(), b"=14\r\ntxt:# Server\r\n\r\n".to_vec())
+            (
+                b"$10\r\n# Server\r\n\r\n".to_vec(),
+                b"=14\r\ntxt:# Server\r\n\r\n".to_vec()
+            )
         );
         assert_eq!(
             both(|w| w.big_number(b"-3492890328409238509324850943850943825024385")),

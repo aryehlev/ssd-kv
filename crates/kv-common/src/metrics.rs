@@ -26,7 +26,11 @@ impl Hist {
 
     /// Value at percentile `p` (0.0 ..= 100.0), in microseconds; 0 when empty.
     pub fn percentile(&self, p: f64) -> u64 {
-        if self.0.is_empty() { 0 } else { self.0.value_at_percentile(p.clamp(0.0, 100.0)) }
+        if self.0.is_empty() {
+            0
+        } else {
+            self.0.value_at_percentile(p.clamp(0.0, 100.0))
+        }
     }
 
     /// Adds every sample of `o`.
@@ -51,7 +55,11 @@ impl Hist {
 
     /// Mean of the recorded values (0 when empty).
     pub fn mean(&self) -> f64 {
-        if self.0.is_empty() { 0.0 } else { self.0.mean() }
+        if self.0.is_empty() {
+            0.0
+        } else {
+            self.0.mean()
+        }
     }
 
     /// Removes every sample (CONFIG RESETSTAT).

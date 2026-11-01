@@ -45,7 +45,11 @@ pub fn string2ll(s: &[u8]) -> Option<i64> {
     }
     if negative {
         // up to 2^63, which is i64::MIN
-        if v > i64::MAX as u64 + 1 { None } else { Some((v as i64).wrapping_neg()) }
+        if v > i64::MAX as u64 + 1 {
+            None
+        } else {
+            Some((v as i64).wrapping_neg())
+        }
     } else if v > i64::MAX as u64 {
         None
     } else {
@@ -152,7 +156,10 @@ struct StackBuf<const N: usize> {
 impl<const N: usize> core::fmt::Write for StackBuf<N> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let end = self.len + s.len();
-        self.buf.get_mut(self.len..end).ok_or(core::fmt::Error)?.copy_from_slice(s.as_bytes());
+        self.buf
+            .get_mut(self.len..end)
+            .ok_or(core::fmt::Error)?
+            .copy_from_slice(s.as_bytes());
         self.len = end;
         Ok(())
     }
@@ -179,16 +186,31 @@ pub fn fmt_double_17g_buf(v: f64, out: &mut [u8; DOUBLE_17G_MAX]) -> usize {
     }
     // Exactly 17 significant digits, correctly rounded (round half to even on the exact binary
     // value, like glibc): "d.dddddddddddddddde<exp>".
-    let mut sci = StackBuf::<40> { buf: [0; 40], len: 0 };
+    let mut sci = StackBuf::<40> {
+        buf: [0; 40],
+        len: 0,
+    };
     write!(sci, "{:.16e}", v.abs()).expect("40 bytes hold any {:.16e} rendering");
     let sci = &sci.buf[..sci.len];
-    let e_at = sci.iter().position(|&b| b == b'e').expect("exponent marker");
+    let e_at = sci
+        .iter()
+        .position(|&b| b == b'e')
+        .expect("exponent marker");
     let mut digits = [0u8; 17];
     digits[0] = sci[0];
     digits[1..].copy_from_slice(&sci[2..e_at]);
-    let exp: i32 = core::str::from_utf8(&sci[e_at + 1..]).ok().and_then(|e| e.parse().ok()).expect("exponent");
+    let exp: i32 = core::str::from_utf8(&sci[e_at + 1..])
+        .ok()
+        .and_then(|e| e.parse().ok())
+        .expect("exponent");
     // %g drops trailing zeros of the fraction
-    let sig = 17 - digits.iter().rev().take_while(|&&d| d == b'0').count().min(16);
+    let sig = 17
+        - digits
+            .iter()
+            .rev()
+            .take_while(|&&d| d == b'0')
+            .count()
+            .min(16);
     if !(-4..17).contains(&exp) {
         put(&digits[..1]);
         if sig > 1 {
@@ -302,7 +324,18 @@ mod tests {
         for &(s, v) in ok {
             assert_eq!(parse_scan_cursor(s), Some(v), "{s:?}");
         }
-        for s in [&b" 1"[..], b"1 ", b"\t1", b"18446744073709551616", b"+", b"-", b"abc", b"0x10", b"1e3", b"+-1"] {
+        for s in [
+            &b" 1"[..],
+            b"1 ",
+            b"\t1",
+            b"18446744073709551616",
+            b"+",
+            b"-",
+            b"abc",
+            b"0x10",
+            b"1e3",
+            b"+-1",
+        ] {
             assert_eq!(parse_scan_cursor(s), None, "{s:?}");
         }
     }
@@ -370,7 +403,13 @@ mod tests {
     #[test]
     fn double_17g_buffer_bound() {
         let mut b = [0u8; DOUBLE_17G_MAX];
-        for v in [-1.2345678901234567e-308, -f64::MAX, -f64::MIN_POSITIVE, -5e-324, -0.00012345678901234567] {
+        for v in [
+            -1.2345678901234567e-308,
+            -f64::MAX,
+            -f64::MIN_POSITIVE,
+            -5e-324,
+            -0.00012345678901234567,
+        ] {
             let n = fmt_double_17g_buf(v, &mut b);
             assert!(n <= 24, "{n}");
         }

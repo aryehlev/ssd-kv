@@ -58,7 +58,11 @@ pub enum KeySpec {
     None,
     /// Keys at `first, first + step, ...` up to `last` (negative: counted from the end, `-1` =
     /// last argument). This is the legacy `(first, last, step)` triple of COMMAND INFO.
-    Range { first: u16, last: i16, step: u16 },
+    Range {
+        first: u16,
+        last: i16,
+        step: u16,
+    },
     /// Command-specific key extraction.
     Custom(fn(&[&[u8]]) -> smallvec::SmallVec<[u16; 4]>),
 }
@@ -102,7 +106,11 @@ impl CommandSpec {
 
 impl core::fmt::Debug for CommandSpec {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CommandSpec").field("id", &self.id).field("name", &self.name).field("arity", &self.arity).finish_non_exhaustive()
+        f.debug_struct("CommandSpec")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("arity", &self.arity)
+            .finish_non_exhaustive()
     }
 }
 

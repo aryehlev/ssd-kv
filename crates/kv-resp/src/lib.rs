@@ -108,7 +108,16 @@ fn int_of(s: &[u8]) -> Result<i64, ProtoError> {
     let mut v: i64 = 0;
     for &d in digits {
         let d = i64::from(d - b'0');
-        v = v.checked_mul(10).and_then(|v| if neg { v.checked_sub(d) } else { v.checked_add(d) }).ok_or(ProtoError::InvalidReply)?;
+        v = v
+            .checked_mul(10)
+            .and_then(|v| {
+                if neg {
+                    v.checked_sub(d)
+                } else {
+                    v.checked_add(d)
+                }
+            })
+            .ok_or(ProtoError::InvalidReply)?;
     }
     Ok(v)
 }
@@ -117,7 +126,9 @@ fn int_of(s: &[u8]) -> Result<i64, ProtoError> {
 fn len_of(s: &[u8]) -> Result<Option<usize>, ProtoError> {
     match int_of(s)? {
         -1 => Ok(None),
-        n if n >= 0 => usize::try_from(n).map(Some).map_err(|_| ProtoError::InvalidReply),
+        n if n >= 0 => usize::try_from(n)
+            .map(Some)
+            .map_err(|_| ProtoError::InvalidReply),
         _ => Err(ProtoError::InvalidReply),
     }
 }
@@ -161,7 +172,10 @@ fn decode_at(buf: &[u8], pos: &mut usize, depth: usize) -> Result<Option<Value>,
             b"inf" | b"+inf" => f64::INFINITY,
             b"-inf" => f64::NEG_INFINITY,
             b"nan" | b"-nan" => f64::NAN,
-            _ => core::str::from_utf8(head).ok().and_then(|s| s.parse().ok()).ok_or(ProtoError::InvalidReply)?,
+            _ => core::str::from_utf8(head)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or(ProtoError::InvalidReply)?,
         }),
         b'(' => {
             let digits = head.strip_prefix(b"-").unwrap_or(head);
@@ -268,10 +282,22 @@ mod tests {
         assert_eq!(dec(b"$3\r\na\r\n\r\n"), bulk(b"a\r\n"));
         assert_eq!(dec(b"$-1\r\n"), Value::Bulk(None));
         assert_eq!(dec(b"*-1\r\n"), Value::Array(None));
-        assert_eq!(dec(b"*2\r\n:1\r\n$1\r\nx\r\n"), Value::Array(Some(vec![Value::Int(1), bulk(b"x")])));
-        assert_eq!(dec(b"~1\r\n+a\r\n"), Value::Array(Some(vec![Value::Simple(b"a".to_vec())])));
-        assert_eq!(dec(b">1\r\n+a\r\n"), Value::Array(Some(vec![Value::Simple(b"a".to_vec())])));
-        assert_eq!(dec(b"%1\r\n+k\r\n:2\r\n"), Value::Map(vec![(Value::Simple(b"k".to_vec()), Value::Int(2))]));
+        assert_eq!(
+            dec(b"*2\r\n:1\r\n$1\r\nx\r\n"),
+            Value::Array(Some(vec![Value::Int(1), bulk(b"x")]))
+        );
+        assert_eq!(
+            dec(b"~1\r\n+a\r\n"),
+            Value::Array(Some(vec![Value::Simple(b"a".to_vec())]))
+        );
+        assert_eq!(
+            dec(b">1\r\n+a\r\n"),
+            Value::Array(Some(vec![Value::Simple(b"a".to_vec())]))
+        );
+        assert_eq!(
+            dec(b"%1\r\n+k\r\n:2\r\n"),
+            Value::Map(vec![(Value::Simple(b"k".to_vec()), Value::Int(2))])
+        );
         assert_eq!(dec(b"_\r\n"), Value::Null);
         assert_eq!(dec(b"#t\r\n"), Value::Bool(true));
         assert_eq!(dec(b",1.5\r\n"), Value::Double(1.5));
@@ -280,15 +306,37 @@ mod tests {
         assert_eq!(dec(b"=8\r\ntxt:abcd\r\n"), bulk(b"abcd"));
         assert_eq!(dec(b"(-123\r\n"), bulk(b"-123"));
         assert_eq!(dec(b"!5\r\nERR x\r\n"), Value::Error(b"ERR x".to_vec()));
-        assert_eq!(dec(b"|1\r\n+ttl\r\n:3\r\n+value\r\n"), Value::Simple(b"value".to_vec()));
+        assert_eq!(
+            dec(b"|1\r\n+ttl\r\n:3\r\n+value\r\n"),
+            Value::Simple(b"value".to_vec())
+        );
     }
 
     #[test]
     fn incomplete_and_malformed() {
-        for b in [&b""[..], b"+OK", b"+OK\r", b"$3\r\nab", b"$3\r\nabc\r", b"*2\r\n:1\r\n", b"%1\r\n+k\r\n", b"|1\r\n+a\r\n:1\r\n"] {
+        for b in [
+            &b""[..],
+            b"+OK",
+            b"+OK\r",
+            b"$3\r\nab",
+            b"$3\r\nabc\r",
+            b"*2\r\n:1\r\n",
+            b"%1\r\n+k\r\n",
+            b"|1\r\n+a\r\n:1\r\n",
+        ] {
             assert_eq!(decode_value(b), Ok(None), "{b:?}");
         }
-        for b in [&b"?x\r\n"[..], b":1x\r\n", b"$-2\r\n", b"$3\r\nabcXY", b"#x\r\n", b"+a\rb", b"=2\r\nab\r\n", b"(1a\r\n", b"%-1\r\n"] {
+        for b in [
+            &b"?x\r\n"[..],
+            b":1x\r\n",
+            b"$-2\r\n",
+            b"$3\r\nabcXY",
+            b"#x\r\n",
+            b"+a\rb",
+            b"=2\r\nab\r\n",
+            b"(1a\r\n",
+            b"%-1\r\n",
+        ] {
             assert_eq!(decode_value(b), Err(ProtoError::InvalidReply), "{b:?}");
         }
         let deep = b"*1\r\n".repeat(MAX_REPLY_DEPTH + 2);
@@ -302,7 +350,10 @@ mod tests {
 
     #[test]
     fn debug_redacts_payloads() {
-        let s = format!("{:?}", Value::Array(Some(vec![bulk(b"secret"), Value::Int(3)])));
+        let s = format!(
+            "{:?}",
+            Value::Array(Some(vec![bulk(b"secret"), Value::Int(3)]))
+        );
         assert!(!s.contains("secret"), "{s}");
         assert!(s.contains("Int(3)"));
     }

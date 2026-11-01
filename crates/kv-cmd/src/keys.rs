@@ -24,11 +24,18 @@ pub fn key_positions(spec: &CommandSpec, argv: &[&[u8]]) -> SmallVec<[u16; 4]> {
         KeySpec::Range { first, last, step } => {
             let argc = argv.len() as i64;
             let first = i64::from(first);
-            let last = if last >= 0 { i64::from(last) } else { argc + i64::from(last) };
+            let last = if last >= 0 {
+                i64::from(last)
+            } else {
+                argc + i64::from(last)
+            };
             if first == 0 || first >= argc || last >= argc || last < first || step == 0 {
                 return SmallVec::new();
             }
-            (first..=last).step_by(usize::from(step)).map(|i| i as u16).collect()
+            (first..=last)
+                .step_by(usize::from(step))
+                .map(|i| i as u16)
+                .collect()
         }
     }
 }
@@ -41,12 +48,30 @@ pub fn key_access(spec: &CommandSpec, argv: &[&[u8]], pos: u16) -> Access {
     match spec.id {
         CmdId::Set => {
             let reads = argv.iter().skip(3).any(|a| {
-                [&b"GET"[..], b"KEEPTTL", b"NX", b"XX"].iter().any(|o| a.eq_ignore_ascii_case(o))
+                [&b"GET"[..], b"KEEPTTL", b"NX", b"XX"]
+                    .iter()
+                    .any(|o| a.eq_ignore_ascii_case(o))
             });
-            if reads { Access::ReadWrite } else { Access::Write }
+            if reads {
+                Access::ReadWrite
+            } else {
+                Access::Write
+            }
         }
-        CmdId::Rename | CmdId::Renamenx => if pos == 1 { Access::ReadWrite } else { Access::Write },
-        CmdId::Copy => if pos == 1 { Access::Read } else { Access::Write },
+        CmdId::Rename | CmdId::Renamenx => {
+            if pos == 1 {
+                Access::ReadWrite
+            } else {
+                Access::Write
+            }
+        }
+        CmdId::Copy => {
+            if pos == 1 {
+                Access::Read
+            } else {
+                Access::Write
+            }
+        }
         _ => spec.access,
     }
 }
@@ -99,7 +124,11 @@ pub enum ResolveError {
 /// argument, else the command itself.
 fn lookup_argv(argv: &[&[u8]]) -> Option<&'static CommandSpec> {
     let base = lookup(argv.first()?)?;
-    if argv.len() == 1 || !base.is_container() { Some(base) } else { lookup_sub(base, argv[1]) }
+    if argv.len() == 1 || !base.is_container() {
+        Some(base)
+    } else {
+        lookup_sub(base, argv[1])
+    }
 }
 
 /// Resolves `argv` (argv[0] = command name) to its table entry exactly as Redis 7.0 does
@@ -113,7 +142,11 @@ pub fn resolve(argv: &[&[u8]]) -> Result<&'static CommandSpec, ResolveError> {
             _ => ResolveError::UnknownCommand,
         });
     };
-    if check_arity(spec, argv.len()) { Ok(spec) } else { Err(ResolveError::WrongArity(spec)) }
+    if check_arity(spec, argv.len()) {
+        Ok(spec)
+    } else {
+        Err(ResolveError::WrongArity(spec))
+    }
 }
 
 /// A C string view: the bytes before the first NUL (Redis formats these arguments with `%s`).
@@ -161,7 +194,13 @@ impl ResolveError {
                 let sub = argv.get(1).map(|s| c_str(s)).unwrap_or(b"");
                 out.extend_from_slice(&sub[..sub.len().min(128)]);
                 out.extend_from_slice(b"'. Try ");
-                out.extend(argv.first().map(|n| c_str(n)).unwrap_or(b"").iter().map(u8::to_ascii_uppercase));
+                out.extend(
+                    argv.first()
+                        .map(|n| c_str(n))
+                        .unwrap_or(b"")
+                        .iter()
+                        .map(u8::to_ascii_uppercase),
+                );
                 out.extend_from_slice(b" HELP.");
             }
             ResolveError::WrongArity(spec) => write_arity_message(spec, out),
@@ -229,20 +268,66 @@ mod tests {
     fn arity_vectors() {
         // (command, arity) from Redis 7.0.15 COMMAND INFO (7.2 for WAITAOF and CLIENT SETINFO)
         let table: &[(&str, i16)] = &[
-            ("get", 2), ("set", -3), ("mset", -3), ("mget", -2), ("del", -2), ("exists", -2), ("incr", 2),
-            ("incrby", 3), ("getrange", 4), ("setrange", 4), ("getex", -2), ("expire", -3), ("ttl", 2),
-            ("rename", 3), ("copy", -3), ("scan", -2), ("keys", 2), ("ping", -1), ("echo", 2), ("hello", -1),
-            ("auth", -2), ("select", 2), ("client", -2), ("client|setname", 3), ("client|kill", -3),
-            ("client|setinfo", -4), ("command", -1), ("command|getkeys", -4), ("command|info", -2),
-            ("config|set", -4), ("config|get", -3), ("flushdb", -1), ("shutdown", -1), ("wait", 3),
-            ("waitaof", 4), ("hset", -4), ("hgetall", 2), ("cluster|keyslot", 3), ("multi", 1), ("exec", 1),
-            ("watch", -2), ("info", -1), ("time", 1), ("readonly", 1), ("substr", 4), ("getset", 3),
+            ("get", 2),
+            ("set", -3),
+            ("mset", -3),
+            ("mget", -2),
+            ("del", -2),
+            ("exists", -2),
+            ("incr", 2),
+            ("incrby", 3),
+            ("getrange", 4),
+            ("setrange", 4),
+            ("getex", -2),
+            ("expire", -3),
+            ("ttl", 2),
+            ("rename", 3),
+            ("copy", -3),
+            ("scan", -2),
+            ("keys", 2),
+            ("ping", -1),
+            ("echo", 2),
+            ("hello", -1),
+            ("auth", -2),
+            ("select", 2),
+            ("client", -2),
+            ("client|setname", 3),
+            ("client|kill", -3),
+            ("client|setinfo", -4),
+            ("command", -1),
+            ("command|getkeys", -4),
+            ("command|info", -2),
+            ("config|set", -4),
+            ("config|get", -3),
+            ("flushdb", -1),
+            ("shutdown", -1),
+            ("wait", 3),
+            ("waitaof", 4),
+            ("hset", -4),
+            ("hgetall", 2),
+            ("cluster|keyslot", 3),
+            ("multi", 1),
+            ("exec", 1),
+            ("watch", -2),
+            ("info", -1),
+            ("time", 1),
+            ("readonly", 1),
+            ("substr", 4),
+            ("getset", 3),
         ];
         for &(name, arity) in table {
             assert_eq!(spec(name).arity, arity, "{name}");
         }
-        assert!(check_arity(spec("get"), 2) && !check_arity(spec("get"), 3) && !check_arity(spec("get"), 1));
-        assert!(check_arity(spec("set"), 3) && check_arity(spec("set"), 9) && !check_arity(spec("set"), 2));
+        assert!(
+            check_arity(spec("get"), 2)
+                && !check_arity(spec("get"), 3)
+                && !check_arity(spec("get"), 1)
+        );
+        assert!(
+            check_arity(spec("set"), 3)
+                && check_arity(spec("set"), 9)
+                && !check_arity(spec("set"), 2)
+        );
     }
 
     #[test]
@@ -250,7 +335,11 @@ mod tests {
         assert_eq!(pos(&["GET", "k"]), [1]);
         assert_eq!(pos(&["SET", "k", "v", "EX", "10"]), [1]);
         assert_eq!(pos(&["MSET", "a", "1", "b", "2"]), [1, 3]);
-        assert_eq!(pos(&["MSET", "a", "1", "b"]), [1, 3], "Redis's range over an odd tail");
+        assert_eq!(
+            pos(&["MSET", "a", "1", "b"]),
+            [1, 3],
+            "Redis's range over an odd tail"
+        );
         assert_eq!(pos(&["MGET", "a", "b", "c"]), [1, 2, 3]);
         assert_eq!(pos(&["DEL", "a"]), [1]);
         assert_eq!(pos(&["RENAME", "a", "b"]), [1, 2]);
@@ -291,7 +380,10 @@ mod tests {
     #[test]
     fn same_slot_rule() {
         let argv: [&[u8]; 5] = [b"MSET", b"{u}a", b"1", b"{u}b", b"2"];
-        assert_eq!(common_slot(&argv, &[1, 3]), Ok(Some(kv_common::key_slot(b"u"))));
+        assert_eq!(
+            common_slot(&argv, &[1, 3]),
+            Ok(Some(kv_common::key_slot(b"u")))
+        );
         let argv: [&[u8]; 3] = [b"MGET", b"foo", b"bar"];
         assert_eq!(common_slot(&argv, &[1, 2]), Err(CrossSlot));
         assert_eq!(common_slot(&argv, &[1, 1]), Ok(Some(12182)));
@@ -301,10 +393,22 @@ mod tests {
     #[test]
     fn resolution_errors_match_redis() {
         // texts captured from Redis 7.0.15
-        assert_eq!(err(&[b"FOO", b"a", b"b"]), b"-ERR unknown command 'FOO', with args beginning with: 'a' 'b' \r\n");
-        assert_eq!(err(&[b"FOO"]), b"-ERR unknown command 'FOO', with args beginning with: \r\n");
-        assert_eq!(err(&[b"FO\r\nO", b"a\nb"]), b"-ERR unknown command 'FO  O', with args beginning with: 'a b' \r\n");
-        assert_eq!(err(&[b"FO\x00O", b"a\x00b"]), b"-ERR unknown command 'FO', with args beginning with: 'a' \r\n");
+        assert_eq!(
+            err(&[b"FOO", b"a", b"b"]),
+            b"-ERR unknown command 'FOO', with args beginning with: 'a' 'b' \r\n"
+        );
+        assert_eq!(
+            err(&[b"FOO"]),
+            b"-ERR unknown command 'FOO', with args beginning with: \r\n"
+        );
+        assert_eq!(
+            err(&[b"FO\r\nO", b"a\nb"]),
+            b"-ERR unknown command 'FO  O', with args beginning with: 'a b' \r\n"
+        );
+        assert_eq!(
+            err(&[b"FO\x00O", b"a\x00b"]),
+            b"-ERR unknown command 'FO', with args beginning with: 'a' \r\n"
+        );
         let long = vec![b'x'; 200];
         let mut want = b"-ERR unknown command 'FOO', with args beginning with: '".to_vec();
         want.extend_from_slice(&[b'x'; 128]);
@@ -312,7 +416,10 @@ mod tests {
         assert_eq!(err(&[b"FOO", &long, b"yyyy"]), want);
         let name = vec![b'n'; 300];
         let e = err(&[&name]);
-        assert!(e.starts_with(b"-ERR unknown command 'nnnn") && e.windows(129).all(|w| w != [b'n'; 129]));
+        assert!(
+            e.starts_with(b"-ERR unknown command 'nnnn")
+                && e.windows(129).all(|w| w != [b'n'; 129])
+        );
         // budget shared across arguments
         let a100 = vec![b'a'; 100];
         let mut want = b"-ERR unknown command 'X', with args beginning with: '".to_vec();
@@ -321,28 +428,74 @@ mod tests {
         want.extend_from_slice(&[b'b'; 25]);
         want.extend_from_slice(b"' \r\n");
         assert_eq!(err(&[b"X", &a100, &[b'b'; 40], b"c"]), want);
-        assert_eq!(err(&[b"CLIENT", b"BOGUS", b"x"]), b"-ERR unknown subcommand 'BOGUS'. Try CLIENT HELP.\r\n");
-        assert_eq!(err(&[b"client", b"bo\x00gs"]), b"-ERR unknown subcommand 'bo'. Try CLIENT HELP.\r\n");
-        assert_eq!(err(&[b"Command", b"bogus"]), b"-ERR unknown subcommand 'bogus'. Try COMMAND HELP.\r\n");
-        assert_eq!(err(&[b"CLIENT", b"SETNAME"]), b"-ERR wrong number of arguments for 'client|setname' command\r\n");
-        assert_eq!(err(&[b"CLIENT"]), b"-ERR wrong number of arguments for 'client' command\r\n");
-        assert_eq!(err(&[b"get"]), b"-ERR wrong number of arguments for 'get' command\r\n");
-        assert_eq!(err(&[]), b"-ERR unknown command '', with args beginning with: \r\n");
+        assert_eq!(
+            err(&[b"CLIENT", b"BOGUS", b"x"]),
+            b"-ERR unknown subcommand 'BOGUS'. Try CLIENT HELP.\r\n"
+        );
+        assert_eq!(
+            err(&[b"client", b"bo\x00gs"]),
+            b"-ERR unknown subcommand 'bo'. Try CLIENT HELP.\r\n"
+        );
+        assert_eq!(
+            err(&[b"Command", b"bogus"]),
+            b"-ERR unknown subcommand 'bogus'. Try COMMAND HELP.\r\n"
+        );
+        assert_eq!(
+            err(&[b"CLIENT", b"SETNAME"]),
+            b"-ERR wrong number of arguments for 'client|setname' command\r\n"
+        );
+        assert_eq!(
+            err(&[b"CLIENT"]),
+            b"-ERR wrong number of arguments for 'client' command\r\n"
+        );
+        assert_eq!(
+            err(&[b"get"]),
+            b"-ERR wrong number of arguments for 'get' command\r\n"
+        );
+        assert_eq!(
+            err(&[]),
+            b"-ERR unknown command '', with args beginning with: \r\n"
+        );
         assert_eq!(resolve(&[b"COMMAND"]).unwrap().id, CmdId::Command);
         assert_eq!(resolve(&[b"get", b"k"]).unwrap().id, CmdId::Get);
-        assert_eq!(resolve(&[b"PING", b"x"]).unwrap().id, CmdId::Ping, "no subcommands: extra args are arguments");
+        assert_eq!(
+            resolve(&[b"PING", b"x"]).unwrap().id,
+            CmdId::Ping,
+            "no subcommands: extra args are arguments"
+        );
     }
 
     #[test]
     fn getkeys_matches_redis() {
         let gk = |t: &[&[u8]]| reply(|w| write_command_getkeys(t, w));
-        assert_eq!(gk(&[b"mset", b"a", b"1", b"b"]), b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
-        assert_eq!(gk(&[b"rename", b"a", b"b"]), b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+        assert_eq!(
+            gk(&[b"mset", b"a", b"1", b"b"]),
+            b"*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            gk(&[b"rename", b"a", b"b"]),
+            b"*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
         assert_eq!(gk(&[b"bogus", b"x"]), b"-ERR Invalid command specified\r\n");
-        assert_eq!(gk(&[b"client", b"bogus"]), b"-ERR Invalid command specified\r\n");
-        assert_eq!(gk(&[b"ping", b"x"]), b"-ERR The command has no key arguments\r\n");
-        assert_eq!(gk(&[b"client", b"setname", b"x"]), b"-ERR The command has no key arguments\r\n");
-        assert_eq!(gk(&[b"command", b"getkeys", b"get", b"a"]), b"-ERR The command has no key arguments\r\n");
-        assert_eq!(gk(&[b"get", b"a", b"b"]), b"-ERR Invalid number of arguments specified for command\r\n");
+        assert_eq!(
+            gk(&[b"client", b"bogus"]),
+            b"-ERR Invalid command specified\r\n"
+        );
+        assert_eq!(
+            gk(&[b"ping", b"x"]),
+            b"-ERR The command has no key arguments\r\n"
+        );
+        assert_eq!(
+            gk(&[b"client", b"setname", b"x"]),
+            b"-ERR The command has no key arguments\r\n"
+        );
+        assert_eq!(
+            gk(&[b"command", b"getkeys", b"get", b"a"]),
+            b"-ERR The command has no key arguments\r\n"
+        );
+        assert_eq!(
+            gk(&[b"get", b"a", b"b"]),
+            b"-ERR Invalid number of arguments specified for command\r\n"
+        );
     }
 }

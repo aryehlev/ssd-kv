@@ -57,7 +57,11 @@ impl AbCopy {
 /// # Panics
 /// If `payload` is longer than [`AB_PAYLOAD_MAX`] (a caller bug: every block layout is fixed).
 pub fn ab_encode(magic: u64, block_seq: u64, payload: &[u8], out: &mut [u8; AB_BLOCK]) {
-    assert!(payload.len() <= AB_PAYLOAD_MAX, "AbBlock payload of {} bytes exceeds {AB_PAYLOAD_MAX}", payload.len());
+    assert!(
+        payload.len() <= AB_PAYLOAD_MAX,
+        "AbBlock payload of {} bytes exceeds {AB_PAYLOAD_MAX}",
+        payload.len()
+    );
     out[..8].copy_from_slice(&magic.to_le_bytes());
     out[VERSION_OFF..VERSION_OFF + 4].copy_from_slice(&AB_VERSION.to_le_bytes());
     out[SEQ_OFF..SEQ_OFF + 8].copy_from_slice(&block_seq.to_le_bytes());
@@ -134,7 +138,10 @@ mod tests {
         assert_eq!(&b[0x0C..0x10], &1u32.to_le_bytes());
         assert_eq!(&b[0x10..0x18], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(&b[0x18..0x1D], b"hello");
-        assert!(b[0x1D..].iter().all(|&x| x == 0), "payload area is zero padded");
+        assert!(
+            b[0x1D..].iter().all(|&x| x == 0),
+            "payload area is zero padded"
+        );
         assert_eq!(&b[8..12], &crc32c(&b[0x0C..]).to_le_bytes());
     }
 
@@ -153,13 +160,19 @@ mod tests {
     #[test]
     fn rejects_damage() {
         let b = block(7, b"payload");
-        assert!(ab_decode(magic(b"KVOTHER1"), &b[..]).is_none(), "wrong magic");
+        assert!(
+            ab_decode(magic(b"KVOTHER1"), &b[..]).is_none(),
+            "wrong magic"
+        );
         assert!(ab_decode(M, &b[..AB_BLOCK - 1]).is_none(), "short");
         let mut long = b.to_vec();
         long.push(0);
         assert!(ab_decode(M, &long).is_none(), "long");
         // every single-byte change anywhere is detected
-        for off in (0..AB_BLOCK).step_by(97).chain([0x08, 0x0C, 0x10, 0x18, AB_BLOCK - 1]) {
+        for off in (0..AB_BLOCK)
+            .step_by(97)
+            .chain([0x08, 0x0C, 0x10, 0x18, AB_BLOCK - 1])
+        {
             let mut d = b.clone();
             d[off] ^= 0x01;
             assert!(ab_decode(M, &d[..]).is_none(), "flip at {off:#x}");
@@ -188,11 +201,26 @@ mod tests {
     #[test]
     fn pick_rules() {
         let p: &[u8] = b"x";
-        assert_eq!(ab_pick(Some((3, p)), Some((4, p))).map(|x| (x.0, x.1)), Some((AbCopy::B, 4)));
-        assert_eq!(ab_pick(Some((5, p)), Some((4, p))).map(|x| (x.0, x.1)), Some((AbCopy::A, 5)));
-        assert_eq!(ab_pick(Some((5, p)), Some((5, p))).map(|x| (x.0, x.1)), Some((AbCopy::A, 5)));
-        assert_eq!(ab_pick(None, Some((1, p))).map(|x| (x.0, x.1)), Some((AbCopy::B, 1)));
-        assert_eq!(ab_pick(Some((1, p)), None).map(|x| (x.0, x.1)), Some((AbCopy::A, 1)));
+        assert_eq!(
+            ab_pick(Some((3, p)), Some((4, p))).map(|x| (x.0, x.1)),
+            Some((AbCopy::B, 4))
+        );
+        assert_eq!(
+            ab_pick(Some((5, p)), Some((4, p))).map(|x| (x.0, x.1)),
+            Some((AbCopy::A, 5))
+        );
+        assert_eq!(
+            ab_pick(Some((5, p)), Some((5, p))).map(|x| (x.0, x.1)),
+            Some((AbCopy::A, 5))
+        );
+        assert_eq!(
+            ab_pick(None, Some((1, p))).map(|x| (x.0, x.1)),
+            Some((AbCopy::B, 1))
+        );
+        assert_eq!(
+            ab_pick(Some((1, p)), None).map(|x| (x.0, x.1)),
+            Some((AbCopy::A, 1))
+        );
         assert!(ab_pick(None, None).is_none());
         assert_eq!(ab_next_write(None), (AbCopy::A, 1));
         assert_eq!(ab_next_write(Some((AbCopy::A, 1))), (AbCopy::B, 2));

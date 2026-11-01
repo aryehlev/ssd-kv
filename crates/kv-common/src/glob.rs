@@ -77,7 +77,11 @@ fn match_token(pat: &[u8], mut p: usize, c: u8, nocase: bool) -> (bool, usize) {
                         core::mem::swap(&mut lo, &mut hi);
                     }
                     let (lo, hi, x) = if nocase {
-                        (fold(lo as u8, true) as i8, fold(hi as u8, true) as i8, fold(c, true) as i8)
+                        (
+                            fold(lo as u8, true) as i8,
+                            fold(hi as u8, true) as i8,
+                            fold(c, true) as i8,
+                        )
                     } else {
                         (lo, hi, c as i8)
                     };
@@ -161,7 +165,14 @@ mod tests {
     /// Direct transcription of Redis 7.0 `stringmatchlen_impl` (recursive, with the
     /// `skipLongerMatches` cut-off), emulating the C string terminator and signed `char`.
     fn redis_ref(pattern: &[u8], s: &[u8], nocase: bool) -> bool {
-        fn imp(pat: &[u8], mut p: usize, s: &[u8], mut i: usize, nocase: bool, skip: &mut bool) -> bool {
+        fn imp(
+            pat: &[u8],
+            mut p: usize,
+            s: &[u8],
+            mut i: usize,
+            nocase: bool,
+            skip: &mut bool,
+        ) -> bool {
             let low = |b: u8| if nocase { b.to_ascii_lowercase() } else { b };
             let plen_total = pat.len();
             while p < plen_total && i < s.len() {
@@ -213,7 +224,8 @@ mod tests {
                                     core::mem::swap(&mut start, &mut end);
                                 }
                                 if nocase {
-                                    let tl = |x: i32| if (65..=90).contains(&x) { x + 32 } else { x };
+                                    let tl =
+                                        |x: i32| if (65..=90).contains(&x) { x + 32 } else { x };
                                     start = tl(start);
                                     end = tl(end);
                                     c = tl(c);
@@ -325,7 +337,11 @@ mod tests {
     fn redis_keys_vectors() {
         for &(p, s, want) in KEYS_VECTORS {
             assert_eq!(glob_match(p, s, false), want, "pattern {p:?} key {s:?}");
-            assert_eq!(redis_ref(p, s, false), want, "reference: pattern {p:?} key {s:?}");
+            assert_eq!(
+                redis_ref(p, s, false),
+                want,
+                "reference: pattern {p:?} key {s:?}"
+            );
         }
     }
 
@@ -336,23 +352,39 @@ mod tests {
         assert!(glob_match(b"MAXMEMORY*", b"maxmemory-policy", true));
         assert!(glob_match(b"*MEMORY-POL?CY", b"maxmemory-policy", true));
         assert!(glob_match(b"[L-N]axmemory", b"maxmemory", true));
-        assert!(glob_match(b"[l-n]AXMEMORY?policy", b"maxmemory-policy", true));
-        assert!(!glob_match(b"[\\M]axmemory", b"maxmemory", true), "class escapes are case-sensitive");
+        assert!(glob_match(
+            b"[l-n]AXMEMORY?policy",
+            b"maxmemory-policy",
+            true
+        ));
+        assert!(
+            !glob_match(b"[\\M]axmemory", b"maxmemory", true),
+            "class escapes are case-sensitive"
+        );
         assert!(glob_match(b"\\Maxmemor?", b"maxmemory", true));
         assert!(!glob_match(b"[^M]axmemory*", b"maxmemory", true));
         assert!(!glob_match(b"[^m]axmemory*", b"maxmemory", true));
-        assert!(!glob_match(b"[Z-a]axmemory*", b"maxmemory", true), "bounds folded after the swap");
+        assert!(
+            !glob_match(b"[Z-a]axmemory*", b"maxmemory", true),
+            "bounds folded after the swap"
+        );
         assert!(glob_match(b"[Z-a]", b"_", false));
         assert!(!glob_match(b"MAXMEMORY", b"maxmemory", false));
         assert!(glob_match(b"\xc3\x89", b"\xc3\x89", true));
-        assert!(!glob_match(b"\xc3\x89", b"\xc3\xa9", true), "ASCII folding only");
+        assert!(
+            !glob_match(b"\xc3\x89", b"\xc3\xa9", true),
+            "ASCII folding only"
+        );
     }
 
     #[test]
     fn match_all_shortcut() {
         assert!(is_match_all(b"*"));
         assert!(!is_match_all(b"**"));
-        assert!(!glob_match(b"*", b"", false), "stringmatchlen itself does not match ''");
+        assert!(
+            !glob_match(b"*", b"", false),
+            "stringmatchlen itself does not match ''"
+        );
     }
 
     #[test]
@@ -370,8 +402,21 @@ mod tests {
     fn token_bytes() -> impl Strategy<Value = Vec<u8>> {
         proptest::collection::vec(
             prop_oneof![
-                Just(b'*'), Just(b'?'), Just(b'['), Just(b']'), Just(b'^'), Just(b'-'), Just(b'\\'),
-                Just(b'a'), Just(b'b'), Just(b'A'), Just(b'B'), Just(b'z'), Just(0x80u8), Just(0xffu8), Just(0u8),
+                Just(b'*'),
+                Just(b'?'),
+                Just(b'['),
+                Just(b']'),
+                Just(b'^'),
+                Just(b'-'),
+                Just(b'\\'),
+                Just(b'a'),
+                Just(b'b'),
+                Just(b'A'),
+                Just(b'B'),
+                Just(b'z'),
+                Just(0x80u8),
+                Just(0xffu8),
+                Just(0u8),
             ],
             0..10,
         )
@@ -380,8 +425,19 @@ mod tests {
     fn subject_bytes() -> impl Strategy<Value = Vec<u8>> {
         proptest::collection::vec(
             prop_oneof![
-                Just(b'a'), Just(b'b'), Just(b'A'), Just(b'B'), Just(b'z'), Just(b'-'), Just(b']'),
-                Just(b'['), Just(b'*'), Just(b'\\'), Just(0x80u8), Just(0xffu8), Just(0u8),
+                Just(b'a'),
+                Just(b'b'),
+                Just(b'A'),
+                Just(b'B'),
+                Just(b'z'),
+                Just(b'-'),
+                Just(b']'),
+                Just(b'['),
+                Just(b'*'),
+                Just(b'\\'),
+                Just(0x80u8),
+                Just(0xffu8),
+                Just(0u8),
             ],
             0..10,
         )

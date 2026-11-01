@@ -81,7 +81,10 @@ mod tests {
         // bound to page, offset and salt
         assert_ne!(base, k.compute(43, 0x20, &[b"headbody"]));
         assert_ne!(base, k.compute(42, 0x30, &[b"headbody"]));
-        assert_ne!(base, RecordCrc::new(0xDEAD_BEEE).compute(42, 0x20, &[b"headbody"]));
+        assert_ne!(
+            base,
+            RecordCrc::new(0xDEAD_BEEE).compute(42, 0x20, &[b"headbody"])
+        );
     }
 
     #[test]
@@ -89,8 +92,14 @@ mod tests {
         let k = RecordCrc::new(7);
         let mut m = 9u64.to_le_bytes().to_vec();
         m.extend_from_slice(b"hdrbody");
-        assert_eq!(k.compute_extent(9, &[b"hdr", b"body"]), crc32c_append(7, &m));
-        assert_ne!(k.compute_extent(9, &[b"hdrbody"]), k.compute_extent(10, &[b"hdrbody"]));
+        assert_eq!(
+            k.compute_extent(9, &[b"hdr", b"body"]),
+            crc32c_append(7, &m)
+        );
+        assert_ne!(
+            k.compute_extent(9, &[b"hdrbody"]),
+            k.compute_extent(10, &[b"hdrbody"])
+        );
         // differs from the small-record form with offset 0 (no offset bytes are fed)
         assert_ne!(k.compute_extent(9, &[b"x"]), k.compute(9, 0, &[b"x"]));
     }

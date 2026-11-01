@@ -235,7 +235,10 @@ mod tests {
         let b = clock_ns(ShimClock::Boottime);
         let c = clock_ns(ShimClock::Realtime);
         assert!(a > 0 && b > 0);
-        assert!(b >= a, "boottime includes suspend time, so it is never behind monotonic");
+        assert!(
+            b >= a,
+            "boottime includes suspend time, so it is never behind monotonic"
+        );
         // after 2020-01-01
         assert!(c > 1_577_836_800_000_000_000);
         assert!(clock_ns(ShimClock::Monotonic) >= a);

@@ -62,7 +62,11 @@ impl Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_bulk: Self::DEFAULT_MAX_BULK, max_args: Self::DEFAULT_MAX_ARGS, max_inline: Self::DEFAULT_MAX_INLINE }
+        Limits {
+            max_bulk: Self::DEFAULT_MAX_BULK,
+            max_args: Self::DEFAULT_MAX_ARGS,
+            max_inline: Self::DEFAULT_MAX_INLINE,
+        }
     }
 }
 
@@ -112,7 +116,10 @@ enum State {
     Multibulk(Mb),
     /// An inline line without terminator: `scanned` bytes hold no `\n`; `nul` when a NUL byte
     /// was met (the line can then never complete, as with C `strchr`).
-    Inline { scanned: usize, nul: bool },
+    Inline {
+        scanned: usize,
+        nul: bool,
+    },
 }
 
 /// Incremental parser state for one connection.
@@ -241,7 +248,12 @@ fn parse_header(lim: &Limits, auth_required: bool, buf: &[u8]) -> Result<Header,
     if n <= 0 {
         return Ok(Header::Empty(cr + 2));
     }
-    Ok(Header::Start(Mb { argc: n as u32, done: 0, pos: cr + 2, bulk: None }))
+    Ok(Header::Start(Mb {
+        argc: n as u32,
+        done: 0,
+        pos: cr + 2,
+        bulk: None,
+    }))
 }
 
 impl Parser {
@@ -286,8 +298,11 @@ impl Parser {
     /// [`Parser::parse_in_place`].
     pub fn parse(&mut self, buf: &[u8], args: &mut Vec<(u32, u32)>) -> Result<Parsed, ProtoError> {
         self.args_in_side = false;
+        let base = args.len();
         let r = self.parse_inner(buf, args);
         if r.is_err() {
+            // arguments are only ever returned with a complete command
+            args.truncate(base);
             self.reset();
         }
         r
@@ -296,7 +311,11 @@ impl Parser {
     /// As [`Parser::parse`], but the arguments of an inline command with quotes or escapes are
     /// written back over the start of its line in `buf` (unescaping never lengthens a line), so
     /// the pairs always refer to `buf`.
-    pub fn parse_in_place(&mut self, buf: &mut [u8], args: &mut Vec<(u32, u32)>) -> Result<Parsed, ProtoError> {
+    pub fn parse_in_place(
+        &mut self,
+        buf: &mut [u8],
+        args: &mut Vec<(u32, u32)>,
+    ) -> Result<Parsed, ProtoError> {
         let r = self.parse(buf, args)?;
         if self.args_in_side {
             buf[..self.side.len()].copy_from_slice(&self.side);
@@ -313,7 +332,11 @@ impl Parser {
         if self.args_in_side { &self.side } else { buf }
     }
 
-    fn parse_inner(&mut self, buf: &[u8], args: &mut Vec<(u32, u32)>) -> Result<Parsed, ProtoError> {
+    fn parse_inner(
+        &mut self,
+        buf: &[u8],
+        args: &mut Vec<(u32, u32)>,
+    ) -> Result<Parsed, ProtoError> {
         let mut mb = match self.state {
             State::Idle => {
                 let Some(&first) = buf.first() else {
@@ -341,7 +364,13 @@ impl Parser {
             }
         };
         let base = args.len() - mb.done as usize;
-        if scan_bulks(&self.limits, self.auth_required, &mut mb, buf, &mut |o, l| args.push((o, l)))? {
+        if scan_bulks(
+            &self.limits,
+            self.auth_required,
+            &mut mb,
+            buf,
+            &mut |o, l| args.push((o, l)),
+        )? {
             self.state = State::Idle;
             Ok(Parsed::Command { consumed: mb.pos })
         } else {
@@ -351,8 +380,18 @@ impl Parser {
         }
     }
 
-    fn parse_inline(&mut self, buf: &[u8], scanned: usize, nul: bool, args: &mut Vec<(u32, u32)>) -> Result<Parsed, ProtoError> {
-        let found = if nul { None } else { memchr::memchr2(b'\n', 0, &buf[scanned.min(buf.len())..]).map(|i| scanned + i) };
+    fn parse_inline(
+        &mut self,
+        buf: &[u8],
+        scanned: usize,
+        nul: bool,
+        args: &mut Vec<(u32, u32)>,
+    ) -> Result<Parsed, ProtoError> {
+        let found = if nul {
+            None
+        } else {
+            memchr::memchr2(b'\n', 0, &buf[scanned.min(buf.len())..]).map(|i| scanned + i)
+        };
         let nl = match found {
             Some(i) if buf[i] == b'\n' => i,
             other => {
@@ -361,14 +400,24 @@ impl Parser {
                     return Err(ProtoError::TooBigInline);
                 }
                 self.state = match other {
-                    Some(z) => State::Inline { scanned: z, nul: true },
-                    None => State::Inline { scanned: buf.len(), nul },
+                    Some(z) => State::Inline {
+                        scanned: z,
+                        nul: true,
+                    },
+                    None => State::Inline {
+                        scanned: buf.len(),
+                        nul,
+                    },
                 };
                 return Ok(Parsed::Incomplete);
             }
         };
         self.state = State::Idle;
-        let line_end = if nl > 0 && buf[nl - 1] == b'\r' { nl - 1 } else { nl };
+        let line_end = if nl > 0 && buf[nl - 1] == b'\r' {
+            nl - 1
+        } else {
+            nl
+        };
         let consumed = nl + 1;
         if consumed > u32::MAX as usize {
             return Err(ProtoError::TooBigInline);
@@ -388,7 +437,11 @@ impl Parser {
     /// for bytes appended since. `None` when `buf` is empty, holds a complete (or empty) command,
     /// or starts with a protocol error (which `parse` reports).
     pub fn in_progress(&self, buf: &[u8]) -> Option<InProgress> {
-        let incomplete = InProgress { name: None, argc: 0, bulk_len: None };
+        let incomplete = InProgress {
+            name: None,
+            argc: 0,
+            bulk_len: None,
+        };
         let (mut mb, mut name) = match self.state {
             State::Idle => {
                 let &first = buf.first()?;
@@ -410,16 +463,26 @@ impl Parser {
         if mb.pos > buf.len() {
             return None;
         }
-        let complete = scan_bulks(&self.limits, self.auth_required, &mut mb, buf, &mut |o, l| {
-            if name.is_none() {
-                name = Some((o, l));
-            }
-        })
+        let complete = scan_bulks(
+            &self.limits,
+            self.auth_required,
+            &mut mb,
+            buf,
+            &mut |o, l| {
+                if name.is_none() {
+                    name = Some((o, l));
+                }
+            },
+        )
         .ok()?;
         if complete {
             return None;
         }
-        Some(InProgress { name, argc: mb.argc, bulk_len: mb.bulk })
+        Some(InProgress {
+            name,
+            argc: mb.argc,
+            bulk_len: mb.bulk,
+        })
     }
 }
 
@@ -442,7 +505,11 @@ mod tests {
             match p.parse(&buf[off..], &mut args)? {
                 Parsed::Command { consumed } => {
                     let src = p.arg_source(&buf[off..]);
-                    out.push(args.iter().map(|&(o, l)| src[o as usize..(o + l) as usize].to_vec()).collect());
+                    out.push(
+                        args.iter()
+                            .map(|&(o, l)| src[o as usize..(o + l) as usize].to_vec())
+                            .collect(),
+                    );
                     off += consumed;
                 }
                 Parsed::Empty { consumed } => off += consumed,
@@ -462,30 +529,57 @@ mod tests {
     #[test]
     fn multibulk_basic() {
         let b = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n*1\r\n$4\r\nPING\r\n";
-        assert_eq!(parse_all(b).unwrap(), vec![cmd(&[b"SET", b"k", b"value"]), cmd(&[b"PING"])]);
+        assert_eq!(
+            parse_all(b).unwrap(),
+            vec![cmd(&[b"SET", b"k", b"value"]), cmd(&[b"PING"])]
+        );
         let mut args = Vec::new();
-        assert_eq!(Parser::new(lim()).parse(b, &mut args).unwrap(), Parsed::Command { consumed: 31 });
+        assert_eq!(
+            Parser::new(lim()).parse(b, &mut args).unwrap(),
+            Parsed::Command { consumed: 31 }
+        );
         assert_eq!(args, vec![(8, 3), (17, 1), (24, 5)]);
         // binary-safe bulks
-        assert_eq!(parse_all(b"*2\r\n$4\r\nECHO\r\n$4\r\n\r\n\x00\n\r\n").unwrap(), vec![cmd(&[b"ECHO", b"\r\n\x00\n"])]);
-        assert_eq!(parse_all(b"*2\r\n$4\r\nECHO\r\n$0\r\n\r\n").unwrap(), vec![cmd(&[b"ECHO", b""])]);
+        assert_eq!(
+            parse_all(b"*2\r\n$4\r\nECHO\r\n$4\r\n\r\n\x00\n\r\n").unwrap(),
+            vec![cmd(&[b"ECHO", b"\r\n\x00\n"])]
+        );
+        assert_eq!(
+            parse_all(b"*2\r\n$4\r\nECHO\r\n$0\r\n\r\n").unwrap(),
+            vec![cmd(&[b"ECHO", b""])]
+        );
     }
 
     #[test]
     fn redis_quirks() {
         // the byte after a header's `\r`, and the two bytes after a bulk, are not checked
-        assert_eq!(parse_all(b"*1\rX$4\r\nPING\r\n").unwrap(), vec![cmd(&[b"PING"])]);
-        assert_eq!(parse_all(b"*1\r\n$4\r\nPINGxx").unwrap(), vec![cmd(&[b"PING"])]);
+        assert_eq!(
+            parse_all(b"*1\rX$4\r\nPING\r\n").unwrap(),
+            vec![cmd(&[b"PING"])]
+        );
+        assert_eq!(
+            parse_all(b"*1\r\n$4\r\nPINGxx").unwrap(),
+            vec![cmd(&[b"PING"])]
+        );
         // counts <= 0 are empty commands
         assert_eq!(one(b"*0\r\n"), Ok(Parsed::Empty { consumed: 4 }));
         assert_eq!(one(b"*-1\r\n"), Ok(Parsed::Empty { consumed: 5 }));
-        assert_eq!(parse_all(b"*-5\r\n*0\r\nPING\r\n").unwrap(), vec![cmd(&[b"PING"])]);
+        assert_eq!(
+            parse_all(b"*-5\r\n*0\r\nPING\r\n").unwrap(),
+            vec![cmd(&[b"PING"])]
+        );
         // an inline command may follow a multibulk one and vice versa
-        assert_eq!(parse_all(b"PING\r\n*1\r\n$4\r\nPING\r\n").unwrap(), vec![cmd(&[b"PING"]), cmd(&[b"PING"])]);
+        assert_eq!(
+            parse_all(b"PING\r\n*1\r\n$4\r\nPING\r\n").unwrap(),
+            vec![cmd(&[b"PING"]), cmd(&[b"PING"])]
+        );
         // `$` is checked only once the header line is complete
         assert_eq!(one(b"*1\r\nPING"), Ok(Parsed::Incomplete));
         assert_eq!(one(b"*1\r\nPING\r"), Ok(Parsed::Incomplete));
-        assert_eq!(one(b"*1\r\nPING\r\n"), Err(ProtoError::ExpectedDollar(b'P')));
+        assert_eq!(
+            one(b"*1\r\nPING\r\n"),
+            Err(ProtoError::ExpectedDollar(b'P'))
+        );
         assert_eq!(one(b"*1\r\n\r\n"), Err(ProtoError::ExpectedDollar(b'\r')));
         // NUL before a terminator: never complete, until too big
         assert_eq!(one(b"*1\x00\r\n$4\r\nPING\r\n"), Ok(Parsed::Incomplete));
@@ -505,7 +599,10 @@ mod tests {
         assert_eq!(one(b"*-0\r\n"), Err(ProtoError::InvalidMultibulkLen));
         assert_eq!(one(b"*1048577\r\n"), Err(ProtoError::InvalidMultibulkLen));
         assert_eq!(one(b"*1048576\r\n"), Ok(Parsed::Incomplete));
-        let redis = Limits { max_args: usize::MAX, ..lim() };
+        let redis = Limits {
+            max_args: usize::MAX,
+            ..lim()
+        };
         let p = |b: &[u8]| Parser::new(redis).parse(b, &mut Vec::new());
         assert_eq!(p(b"*2147483647\r\n"), Ok(Parsed::Incomplete));
         assert_eq!(p(b"*2147483648\r\n"), Err(ProtoError::InvalidMultibulkLen));
@@ -514,7 +611,10 @@ mod tests {
         assert_eq!(one(b"*1\r\n$abc\r\n"), Err(ProtoError::InvalidBulkLen));
         assert_eq!(one(b"*1\r\n$+4\r\n"), Err(ProtoError::InvalidBulkLen));
         assert_eq!(one(b"*1\r\n$ 4\r\n"), Err(ProtoError::InvalidBulkLen));
-        assert_eq!(one(b"*1\r\n$536870913\r\n"), Err(ProtoError::InvalidBulkLen));
+        assert_eq!(
+            one(b"*1\r\n$536870913\r\n"),
+            Err(ProtoError::InvalidBulkLen)
+        );
         assert_eq!(one(b"*1\r\n$536870912\r\n"), Ok(Parsed::Incomplete));
         assert_eq!(one(b"PING \"abc\r\n"), Err(ProtoError::UnbalancedQuotes));
         // too-big header lines: more than 64 KiB buffered without a terminator
@@ -524,7 +624,11 @@ mod tests {
         b.push(b'1');
         assert_eq!(one(&b), Err(ProtoError::TooBigMultibulkCount));
         b.extend_from_slice(b"\r\n");
-        assert_eq!(one(&b), Err(ProtoError::InvalidMultibulkLen), "a complete line is parsed as Redis does");
+        assert_eq!(
+            one(&b),
+            Err(ProtoError::InvalidMultibulkLen),
+            "a complete line is parsed as Redis does"
+        );
         let mut b = b"*1\r\n$".to_vec();
         b.resize(70_000, b'1');
         assert_eq!(one(&b), Err(ProtoError::TooBigBulkCount));
@@ -545,14 +649,26 @@ mod tests {
         p.set_auth_required(true);
         assert_eq!(p.parse(b"*10\r\n", &mut Vec::new()), Ok(Parsed::Incomplete));
         p.reset();
-        assert_eq!(p.parse(b"*11\r\n", &mut Vec::new()), Err(ProtoError::UnauthenticatedMultibulkLen));
-        assert_eq!(p.parse(b"*1\r\n$16384\r\n", &mut Vec::new()), Ok(Parsed::Incomplete));
+        assert_eq!(
+            p.parse(b"*11\r\n", &mut Vec::new()),
+            Err(ProtoError::UnauthenticatedMultibulkLen)
+        );
+        assert_eq!(
+            p.parse(b"*1\r\n$16384\r\n", &mut Vec::new()),
+            Ok(Parsed::Incomplete)
+        );
         p.reset();
-        assert_eq!(p.parse(b"*1\r\n$16385\r\n", &mut Vec::new()), Err(ProtoError::UnauthenticatedBulkLen));
+        assert_eq!(
+            p.parse(b"*1\r\n$16385\r\n", &mut Vec::new()),
+            Err(ProtoError::UnauthenticatedBulkLen)
+        );
         let mut big = b"GET ".to_vec();
         big.resize(20_004, b'x');
         big.extend_from_slice(b"\r\n");
-        assert!(matches!(p.parse(&big, &mut Vec::new()), Ok(Parsed::Command { .. })), "inline is not limited");
+        assert!(
+            matches!(p.parse(&big, &mut Vec::new()), Ok(Parsed::Command { .. })),
+            "inline is not limited"
+        );
         p.set_auth_required(false);
         assert_eq!(p.parse(b"*11\r\n", &mut Vec::new()), Ok(Parsed::Incomplete));
     }
@@ -560,18 +676,37 @@ mod tests {
     #[test]
     fn inline_commands() {
         assert_eq!(parse_all(b"PING\r\n").unwrap(), vec![cmd(&[b"PING"])]);
-        assert_eq!(parse_all(b"PING\nPING\n").unwrap(), vec![cmd(&[b"PING"]), cmd(&[b"PING"])]);
-        assert_eq!(parse_all(b"SET inline value\r\nGET inline\r\n").unwrap(), vec![
-            cmd(&[b"SET", b"inline", b"value"]),
-            cmd(&[b"GET", b"inline"])
-        ]);
-        assert_eq!(parse_all(b"\r\n\n  \r\nPING\r\n").unwrap(), vec![cmd(&[b"PING"])]);
+        assert_eq!(
+            parse_all(b"PING\nPING\n").unwrap(),
+            vec![cmd(&[b"PING"]), cmd(&[b"PING"])]
+        );
+        assert_eq!(
+            parse_all(b"SET inline value\r\nGET inline\r\n").unwrap(),
+            vec![
+                cmd(&[b"SET", b"inline", b"value"]),
+                cmd(&[b"GET", b"inline"])
+            ]
+        );
+        assert_eq!(
+            parse_all(b"\r\n\n  \r\nPING\r\n").unwrap(),
+            vec![cmd(&[b"PING"])]
+        );
         assert_eq!(one(b"\r\n"), Ok(Parsed::Empty { consumed: 2 }));
         assert_eq!(one(b"   \n"), Ok(Parsed::Empty { consumed: 4 }));
         assert_eq!(one(b"PING"), Ok(Parsed::Incomplete));
-        assert_eq!(parse_all(b"$4\r\n").unwrap(), vec![cmd(&[b"$4"])], "only `*` starts a multibulk");
-        assert_eq!(parse_all(b"ECHO \"a b\" 'c'\r\n").unwrap(), vec![cmd(&[b"ECHO", b"a b", b"c"])]);
-        assert_eq!(parse_all(b"ECHO \"a\\x41\\n\"\r\n").unwrap(), vec![cmd(&[b"ECHO", b"aA\n"])]);
+        assert_eq!(
+            parse_all(b"$4\r\n").unwrap(),
+            vec![cmd(&[b"$4"])],
+            "only `*` starts a multibulk"
+        );
+        assert_eq!(
+            parse_all(b"ECHO \"a b\" 'c'\r\n").unwrap(),
+            vec![cmd(&[b"ECHO", b"a b", b"c"])]
+        );
+        assert_eq!(
+            parse_all(b"ECHO \"a\\x41\\n\"\r\n").unwrap(),
+            vec![cmd(&[b"ECHO", b"aA\n"])]
+        );
     }
 
     #[test]
@@ -579,9 +714,14 @@ mod tests {
         let mut buf = b"ECHO \"a\\x41\\n\" x\r\nPING\r\n".to_vec();
         let mut p = Parser::new(lim());
         let mut args = Vec::new();
-        let Parsed::Command { consumed } = p.parse_in_place(&mut buf, &mut args).unwrap() else { panic!() };
+        let Parsed::Command { consumed } = p.parse_in_place(&mut buf, &mut args).unwrap() else {
+            panic!()
+        };
         assert_eq!(consumed, 18);
-        let words: Vec<&[u8]> = args.iter().map(|&(o, l)| &buf[o as usize..(o + l) as usize]).collect();
+        let words: Vec<&[u8]> = args
+            .iter()
+            .map(|&(o, l)| &buf[o as usize..(o + l) as usize])
+            .collect();
         assert_eq!(words, vec![&b"ECHO"[..], b"aA\n", b"x"]);
         assert_eq!(p.arg_source(&buf).as_ptr(), buf.as_ptr());
         // the next command is untouched
@@ -594,10 +734,19 @@ mod tests {
         let mut p = Parser::new(lim());
         let mut args = vec![(99, 99)]; // the caller's earlier entries are kept
         for cut in [3, 9, 12, 20, 30] {
-            assert_eq!(p.parse(&full[..cut], &mut args).unwrap(), Parsed::Incomplete, "cut {cut}");
+            assert_eq!(
+                p.parse(&full[..cut], &mut args).unwrap(),
+                Parsed::Incomplete,
+                "cut {cut}"
+            );
             assert_eq!(args, vec![(99, 99)], "no partial arguments are returned");
         }
-        assert_eq!(p.parse(full, &mut args).unwrap(), Parsed::Command { consumed: full.len() });
+        assert_eq!(
+            p.parse(full, &mut args).unwrap(),
+            Parsed::Command {
+                consumed: full.len()
+            }
+        );
         assert_eq!(args, vec![(99, 99), (8, 3), (17, 1), (25, 10)]);
     }
 
@@ -606,18 +755,49 @@ mod tests {
         let full = b"*3\r\n$4\r\nMSET\r\n$1\r\nk\r\n$5000\r\n";
         let mut p = Parser::new(lim());
         assert_eq!(p.in_progress(b""), None);
-        assert_eq!(p.in_progress(b"*3"), Some(InProgress { name: None, argc: 0, bulk_len: None }));
-        assert_eq!(p.in_progress(b"*3\r\n$4\r\nMS"), Some(InProgress { name: None, argc: 3, bulk_len: Some(4) }));
+        assert_eq!(
+            p.in_progress(b"*3"),
+            Some(InProgress {
+                name: None,
+                argc: 0,
+                bulk_len: None
+            })
+        );
+        assert_eq!(
+            p.in_progress(b"*3\r\n$4\r\nMS"),
+            Some(InProgress {
+                name: None,
+                argc: 3,
+                bulk_len: Some(4)
+            })
+        );
         assert_eq!(p.parse(full, &mut Vec::new()).unwrap(), Parsed::Incomplete);
-        assert_eq!(p.in_progress(full), Some(InProgress { name: Some((8, 4)), argc: 3, bulk_len: Some(5000) }));
+        assert_eq!(
+            p.in_progress(full),
+            Some(InProgress {
+                name: Some((8, 4)),
+                argc: 3,
+                bulk_len: Some(5000)
+            })
+        );
         // bytes appended after the last parse are taken into account
         let mut more = full.to_vec();
         more.extend_from_slice(&[b'v'; 5000]);
         more.extend_from_slice(b"\r\n");
         assert_eq!(p.in_progress(&more), None, "complete");
-        assert_eq!(p.in_progress(&more[..full.len() + 10]).unwrap().bulk_len, Some(5000));
+        assert_eq!(
+            p.in_progress(&more[..full.len() + 10]).unwrap().bulk_len,
+            Some(5000)
+        );
         let p = Parser::new(lim());
-        assert_eq!(p.in_progress(b"GET k"), Some(InProgress { name: None, argc: 0, bulk_len: None }));
+        assert_eq!(
+            p.in_progress(b"GET k"),
+            Some(InProgress {
+                name: None,
+                argc: 0,
+                bulk_len: None
+            })
+        );
         assert_eq!(p.in_progress(b"GET k\r\n"), None);
         assert_eq!(p.in_progress(b"*0\r\n"), None);
         assert_eq!(p.in_progress(b"*x\r\n"), None);
@@ -639,9 +819,14 @@ mod tests {
             crate::encode_command(&refs, &mut out);
             out
         });
-        let inline = proptest::collection::vec("[a-z0-9]{1,6}|\"[a-z \\\\]{0,6}\"|'[a-z ]{0,4}'", 0..4)
-            .prop_map(|words| format!("{}\r\n", words.join(" ")).into_bytes());
-        let empty = prop_oneof![Just(b"*0\r\n".to_vec()), Just(b"*-1\r\n".to_vec()), Just(b"\n".to_vec())];
+        let inline =
+            proptest::collection::vec("[a-z0-9]{1,6}|\"[a-z \\\\]{0,6}\"|'[a-z ]{0,4}'", 0..4)
+                .prop_map(|words| format!("{}\r\n", words.join(" ")).into_bytes());
+        let empty = prop_oneof![
+            Just(b"*0\r\n".to_vec()),
+            Just(b"*-1\r\n".to_vec()),
+            Just(b"\n".to_vec())
+        ];
         let garbage = prop_oneof![
             Just(b"*x\r\n".to_vec()),
             Just(b"*1\r\nPING\r\n".to_vec()),
@@ -670,7 +855,11 @@ mod tests {
                 match p.parse(window, &mut args)? {
                     Parsed::Command { consumed } => {
                         let src = p.arg_source(window);
-                        out.push(args.iter().map(|&(o, l)| src[o as usize..(o + l) as usize].to_vec()).collect());
+                        out.push(
+                            args.iter()
+                                .map(|&(o, l)| src[o as usize..(o + l) as usize].to_vec())
+                                .collect(),
+                        );
                         start += consumed;
                     }
                     Parsed::Empty { consumed } => start += consumed,

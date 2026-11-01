@@ -19,12 +19,12 @@ pub mod spec;
 pub mod table;
 
 pub use docs::{
-    command_count, write_command_all, write_command_docs, write_command_docs_reply, write_command_info,
-    write_command_info_reply, write_command_list_reply,
+    command_count, write_command_all, write_command_docs, write_command_docs_reply,
+    write_command_info, write_command_info_reply, write_command_list_reply,
 };
 pub use keys::{
-    CrossSlot, ResolveError, check_arity, common_slot, key_access, key_positions, resolve, write_arity_message,
-    write_command_getkeys,
+    CrossSlot, ResolveError, check_arity, common_slot, key_access, key_positions, resolve,
+    write_arity_message, write_command_getkeys,
 };
 pub use spec::{Access, CmdFlags, CmdId, CommandSpec, KeySpec};
 pub use table::{all, all_with_subcommands, by_id, lookup, lookup_fullname, lookup_sub};

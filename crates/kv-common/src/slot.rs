@@ -20,7 +20,11 @@ const CRC16_TABLE: [u16; 256] = {
         let mut crc = (i as u16) << 8;
         let mut bit = 0;
         while bit < 8 {
-            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
             bit += 1;
         }
         t[i] = crc;
@@ -33,7 +37,9 @@ const CRC16_TABLE: [u16; 256] = {
 /// Cluster.
 #[inline]
 pub fn crc16_xmodem(data: &[u8]) -> u16 {
-    data.iter().fold(0u16, |crc, &b| (crc << 8) ^ CRC16_TABLE[usize::from((crc >> 8) as u8 ^ b)])
+    data.iter().fold(0u16, |crc, &b| {
+        (crc << 8) ^ CRC16_TABLE[usize::from((crc >> 8) as u8 ^ b)]
+    })
 }
 
 /// Redis hashtag rule: the bytes between the first `{` and the next `}` if that range is
@@ -250,7 +256,11 @@ mod tests {
         for &b in data {
             crc ^= u16::from(b) << 8;
             for _ in 0..8 {
-                crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+                crc = if crc & 0x8000 != 0 {
+                    (crc << 1) ^ 0x1021
+                } else {
+                    crc << 1
+                };
             }
         }
         crc
@@ -274,7 +284,10 @@ mod tests {
         assert_eq!(key_slot(b"hello"), 866);
         assert_eq!(key_slot(b""), 0);
         assert_eq!(key_slot(b"{user1000}.following"), key_slot(b"user1000"));
-        assert_eq!(key_slot(b"{user1000}.followers"), key_slot(b"{user1000}.following"));
+        assert_eq!(
+            key_slot(b"{user1000}.followers"),
+            key_slot(b"{user1000}.following")
+        );
         assert_eq!(key_slot(b"foo{}{bar}"), key_slot(b"foo{}{bar}")); // whole key hashed
         assert_eq!(key_slot(b"foo{{bar}}zap"), key_slot(b"{bar"));
         assert_eq!(key_slot(b"foo{bar}{zap}"), key_slot(b"bar"));

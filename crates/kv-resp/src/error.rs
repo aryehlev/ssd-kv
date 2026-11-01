@@ -52,7 +52,9 @@ impl ProtoError {
             ProtoError::TooBigInline => "ERR Protocol error: too big inline request",
             ProtoError::TooBigMultibulkCount => "ERR Protocol error: too big mbulk count string",
             ProtoError::TooBigBulkCount => "ERR Protocol error: too big bulk count string",
-            ProtoError::UnauthenticatedMultibulkLen => "ERR Protocol error: unauthenticated multibulk length",
+            ProtoError::UnauthenticatedMultibulkLen => {
+                "ERR Protocol error: unauthenticated multibulk length"
+            }
             ProtoError::UnauthenticatedBulkLen => "ERR Protocol error: unauthenticated bulk length",
             ProtoError::InvalidReply => "ERR Protocol error: invalid reply",
         }
@@ -102,7 +104,10 @@ mod tests {
         out.clear();
         ProtoError::TooBigMultibulkCount.write_reply(&mut out);
         assert_eq!(out, b"-ERR Protocol error: too big mbulk count string\r\n");
-        assert_eq!(ProtoError::InvalidBulkLen.to_string(), "ERR Protocol error: invalid bulk length");
+        assert_eq!(
+            ProtoError::InvalidBulkLen.to_string(),
+            "ERR Protocol error: invalid bulk length"
+        );
         assert_eq!(
             ProtoError::UnbalancedQuotes.redis_message(),
             "ERR Protocol error: unbalanced quotes in request"

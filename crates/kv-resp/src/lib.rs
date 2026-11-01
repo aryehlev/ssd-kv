@@ -244,6 +244,109 @@ fn decode_at(buf: &[u8], pos: &mut usize, depth: usize) -> Result<Option<Value>,
     Ok(Some(value))
 }
 
+/// Arguments of `HELLO [protover [AUTH username password] [SETNAME clientname]]` (§7.4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HelloArgs<'a> {
+    /// Requested protocol; `None` keeps the connection's current one.
+    pub proto: Option<Proto>,
+    /// `AUTH username password`, checked before anything else changes.
+    pub auth: Option<(&'a [u8], &'a [u8])>,
+    /// `SETNAME name` (already validated with [`valid_client_name`]).
+    pub setname: Option<&'a [u8]>,
+}
+
+impl fmt::Debug for HelloArgs<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HelloArgs")
+            .field("proto", &self.proto)
+            .field("auth", &self.auth.map(|(u, _)| Redacted(u)))
+            .field("setname", &self.setname.map(Redacted))
+            .finish()
+    }
+}
+
+/// Why HELLO's arguments were refused; [`HelloError::write`] renders Redis 7.0's reply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HelloError {
+    /// `-ERR Protocol version is not an integer or out of range`
+    NotInteger,
+    /// `-NOPROTO unsupported protocol version`
+    NoProto,
+    /// `-ERR Syntax error in HELLO option '<opt>'`, with the index of the option in argv.
+    Syntax(usize),
+    /// `-ERR Client names cannot contain spaces, newlines or special characters.`
+    BadClientName,
+}
+
+impl HelloError {
+    /// Writes the error reply (`argv` as given to [`parse_hello`]).
+    pub fn write(&self, argv: &[&[u8]], w: &mut ReplyWriter<'_>) {
+        match *self {
+            HelloError::NotInteger => {
+                w.error(b"ERR Protocol version is not an integer or out of range")
+            }
+            HelloError::NoProto => w.error(b"NOPROTO unsupported protocol version"),
+            HelloError::BadClientName => w.error(CLIENT_NAME_ERROR),
+            HelloError::Syntax(i) => {
+                let opt = argv.get(i).copied().unwrap_or(b"");
+                let opt = &opt[..memchr::memchr(0, opt).unwrap_or(opt.len())];
+                let mut m = Vec::with_capacity(40 + opt.len());
+                m.extend_from_slice(b"ERR Syntax error in HELLO option '");
+                m.extend_from_slice(opt);
+                m.push(b'\'');
+                w.error(&m);
+            }
+        }
+    }
+}
+
+/// The error text of an invalid client name (HELLO SETNAME, CLIENT SETNAME).
+pub const CLIENT_NAME_ERROR: &[u8] =
+    b"ERR Client names cannot contain spaces, newlines or special characters.";
+
+/// Redis `validateClientName`: empty, or printable ASCII without spaces (`!` ..= `~`).
+pub fn valid_client_name(name: &[u8]) -> bool {
+    name.iter().all(|&b| (b'!'..=b'~').contains(&b))
+}
+
+/// Parses HELLO's arguments (`argv[0]` = `HELLO`) in Redis 7.0's order: the protocol version
+/// first (an integer, then 2 or 3), then the options left to right (`AUTH` needs two more
+/// arguments, `SETNAME` one, and the name is validated on the spot). Authentication, the
+/// `-NOAUTH` check, the name change and the protocol switch are the caller's, in that order.
+pub fn parse_hello<'a>(argv: &[&'a [u8]]) -> Result<HelloArgs<'a>, HelloError> {
+    let mut args = HelloArgs {
+        proto: None,
+        auth: None,
+        setname: None,
+    };
+    if argv.len() < 2 {
+        return Ok(args);
+    }
+    args.proto = match kv_common::num::string2ll(argv[1]).ok_or(HelloError::NotInteger)? {
+        2 => Some(Proto::Resp2),
+        3 => Some(Proto::Resp3),
+        _ => return Err(HelloError::NoProto),
+    };
+    let mut j = 2;
+    while j < argv.len() {
+        let more = argv.len() - 1 - j;
+        let opt = argv[j];
+        if opt.eq_ignore_ascii_case(b"AUTH") && more >= 2 {
+            args.auth = Some((argv[j + 1], argv[j + 2]));
+            j += 3;
+        } else if opt.eq_ignore_ascii_case(b"SETNAME") && more >= 1 {
+            if !valid_client_name(argv[j + 1]) {
+                return Err(HelloError::BadClientName);
+            }
+            args.setname = Some(argv[j + 1]);
+            j += 2;
+        } else {
+            return Err(HelloError::Syntax(j));
+        }
+    }
+    Ok(args)
+}
+
 /// Appends `args` encoded as a RESP multibulk command.
 pub fn encode_command(args: &[&[u8]], out: &mut Vec<u8>) {
     let mut n = itoa::Buffer::new();
@@ -346,6 +449,69 @@ mod tests {
         // pipelined values decode one at a time
         let (v, n) = decode_value(b"+A\r\n+B\r\n").unwrap().unwrap();
         assert_eq!((v, n), (Value::Simple(b"A".to_vec()), 4));
+    }
+
+    #[test]
+    fn hello_arguments() {
+        fn ok<'a>(a: &[&'a [u8]]) -> HelloArgs<'a> {
+            parse_hello(a).unwrap()
+        }
+        assert_eq!(ok(&[b"HELLO"]).proto, None);
+        assert_eq!(ok(&[b"HELLO", b"3"]).proto, Some(Proto::Resp3));
+        assert_eq!(
+            ok(&[b"hello", b"2", b"setname", b"x"]).setname,
+            Some(&b"x"[..])
+        );
+        let a = ok(&[b"HELLO", b"3", b"AUTH", b"default", b"pw", b"SETNAME", b""]);
+        assert_eq!(
+            (a.auth, a.setname),
+            (Some((&b"default"[..], &b"pw"[..])), Some(&b""[..]))
+        );
+        let e = |a: &[&[u8]]| {
+            let err = parse_hello(a).unwrap_err();
+            let mut b = Vec::new();
+            err.write(a, &mut ReplyWriter::new(&mut b, Proto::Resp2));
+            String::from_utf8(b).unwrap()
+        };
+        // replies of Redis 7.0.15
+        assert_eq!(
+            e(&[b"HELLO", b"4"]),
+            "-NOPROTO unsupported protocol version\r\n"
+        );
+        assert_eq!(
+            e(&[b"HELLO", b"4", b"FOO"]),
+            "-NOPROTO unsupported protocol version\r\n"
+        );
+        assert_eq!(
+            e(&[b"HELLO", b"abc"]),
+            "-ERR Protocol version is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            e(&[b"HELLO", b"03"]),
+            "-ERR Protocol version is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            e(&[b"HELLO", b"3", b"FOO"]),
+            "-ERR Syntax error in HELLO option 'FOO'\r\n"
+        );
+        assert_eq!(
+            e(&[b"HELLO", b"3", b"AUTH", b"u"]),
+            "-ERR Syntax error in HELLO option 'AUTH'\r\n"
+        );
+        assert_eq!(
+            e(&[b"HELLO", b"3", b"SETNAME"]),
+            "-ERR Syntax error in HELLO option 'SETNAME'\r\n"
+        );
+        assert_eq!(
+            e(&[b"HELLO", b"3", b"SETNAME", b"a\x01b"]),
+            "-ERR Client names cannot contain spaces, newlines or special characters.\r\n"
+        );
+        assert!(valid_client_name(b"conn-1!~") && valid_client_name(b""));
+        assert!(
+            !valid_client_name(b"a b")
+                && !valid_client_name(b"\xc3\xa9")
+                && !valid_client_name(b"a\x7f")
+        );
     }
 
     #[test]

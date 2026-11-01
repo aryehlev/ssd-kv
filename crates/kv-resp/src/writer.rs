@@ -205,6 +205,30 @@ impl<'a> ReplyWriter<'a> {
     pub fn empty_array(&mut self) {
         self.buf.extend_from_slice(b"*0\r\n");
     }
+
+    /// The HELLO reply (§7.4) in the writer's protocol, which the caller has already switched to
+    /// the requested version: a map of `server`, `version`, `proto`, `id`, `mode`, `role` and an
+    /// empty `modules` array, in Redis 7's order and types.
+    pub fn hello(&mut self, server: &[u8], version: &[u8], id: i64, mode: &[u8], role: &[u8]) {
+        self.map(7);
+        self.bulk(b"server");
+        self.bulk(server);
+        self.bulk(b"version");
+        self.bulk(version);
+        self.bulk(b"proto");
+        self.int(match self.proto {
+            Proto::Resp2 => 2,
+            Proto::Resp3 => 3,
+        });
+        self.bulk(b"id");
+        self.int(id);
+        self.bulk(b"mode");
+        self.bulk(mode);
+        self.bulk(b"role");
+        self.bulk(role);
+        self.bulk(b"modules");
+        self.empty_array();
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +308,18 @@ mod tests {
         });
         assert_eq!(r2, b"*2\r\n$5\r\nproto\r\n:3\r\n");
         assert_eq!(r3, b"%1\r\n$5\r\nproto\r\n:3\r\n");
+    }
+
+    #[test]
+    fn hello_reply_matches_redis() {
+        // Redis 7.0.15's reply to HELLO 3 / HELLO 2 (server and version differ by design)
+        let (r2, r3) = both(|w| w.hello(b"redis", b"7.0.15", 3374, b"standalone", b"master"));
+        assert_eq!(
+            r3,
+            &b"%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:3374\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n"[..]
+        );
+        assert!(r2.starts_with(b"*14\r\n$6\r\nserver\r\n"));
+        assert!(r2.windows(11).any(|w| w == b"proto\r\n:2\r\n"));
     }
 
     #[test]

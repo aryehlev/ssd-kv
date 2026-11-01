@@ -349,6 +349,8 @@ struct SpareSlot {
     spare: Option<AgId>,
     /// An `AcquireAg` should be sent.
     want: bool,
+    /// The AG is wanted on this device (the chunks of a large value, LC-08).
+    want_dev: Option<u8>,
     /// An `AcquireAg` is in flight.
     asked: bool,
     /// The last acquisition was refused (fill limit); retried after `RETRY_NS`.
@@ -604,10 +606,10 @@ impl Alloc {
                 return SmallPlace::Fresh(p);
             }
         }
-        self.need_ag(AgKind::Small, now_ns)
+        self.need_ag(AgKind::Small, now_ns, None)
     }
 
-    fn need_ag(&mut self, kind: AgKind, now_ns: u64) -> SmallPlace {
+    fn need_ag(&mut self, kind: AgKind, now_ns: u64, dev: Option<u8>) -> SmallPlace {
         let slot = &mut self.slots[kind_slot(kind)];
         if let Some(t) = slot.refused_at_ns {
             if now_ns.saturating_sub(t) < RETRY_NS {
@@ -616,6 +618,9 @@ impl Alloc {
             slot.refused_at_ns = None;
         }
         slot.want = true;
+        if dev.is_some() {
+            slot.want_dev = dev;
+        }
         SmallPlace::NeedAg
     }
 
@@ -778,38 +783,53 @@ impl Alloc {
 
     /// Allocates `n` pages (`n` a size class, <= 2048): the twin run when free, else the best
     /// fit hole (ties drawn), carved at a drawn `n`-aligned offset when longer, else the spare
-    /// EXTENT AG.
-    pub(crate) fn alloc_extent(&mut self, n: u32, twin: Option<PageId>, now_ns: u64) -> ExtPlace {
+    /// EXTENT AG. `dev` restricts the run to one device (the chunks of a large value live on
+    /// their chunkmap's device, LC-08).
+    pub(crate) fn alloc_extent(&mut self, n: u32, twin: Option<PageId>, now_ns: u64, dev: Option<u8>) -> ExtPlace {
         debug_assert!((1..=crate::layout::EXT_MAX_PAGES).contains(&n));
         let n16 = n as u16;
         if let Some(t) = twin
+            && dev.is_none_or(|d| t.dev() == d)
             && let Some((ei, off)) = self.extent_slot(t)
             && self.extent[ei].alloc.all_clear(u32::from(off), n)
         {
             self.extent[ei].take(off, n16);
             return ExtPlace::Run(t);
         }
-        if let Some(p) = self.best_fit(n16) {
+        if let Some(p) = self.best_fit(n16, dev) {
             return ExtPlace::Run(p);
         }
         let slot = &mut self.slots[1];
-        if let Some(ag) = slot.spare.take() {
+        if let Some(ag) = slot.spare
+            && dev.is_none_or(|d| ag.dev == d)
+        {
+            slot.spare = None;
             slot.want = true;
             self.add_extent_ag(ag);
-            if let Some(p) = self.best_fit(n16) {
+            if let Some(p) = self.best_fit(n16, dev) {
                 return ExtPlace::Run(p);
             }
         }
-        match self.need_ag(AgKind::Extent, now_ns) {
+        match self.need_ag(AgKind::Extent, now_ns, dev) {
             SmallPlace::Full => ExtPlace::Full,
             _ => ExtPlace::NeedAg,
         }
     }
 
-    fn best_fit(&mut self, n: u16) -> Option<PageId> {
+    /// Runs of at least this many times the request are open space: the carve position is a
+    /// keyed draw over every `n`-aligned position of all of them, weighted by length, rather
+    /// than inside the smallest one. Runs too short for two requests are holes and are filled
+    /// first (best fit). Filling the smallest of several open runs first would lay extents down
+    /// in clusters that follow allocation order (LC-01 `prop_placement_uncorrelated`).
+    const OPEN_SPACE: u16 = 2;
+
+    fn best_fit(&mut self, n: u16, dev: Option<u8>) -> Option<PageId> {
         let mut best = u16::MAX;
         let mut ties: SmallVec<[(usize, usize); 4]> = SmallVec::new();
         for (ai, a) in self.extent.iter().enumerate() {
+            if dev.is_some_and(|d| a.ag.dev != d) {
+                continue;
+            }
             let i = a.runs.partition_point(|&(l, _)| l < n);
             let Some(&(l, _)) = a.runs.get(i) else { continue };
             if l < best {
@@ -824,6 +844,12 @@ impl Alloc {
                 }
             }
         }
+        if ties.is_empty() {
+            return None;
+        }
+        if best >= n.saturating_mul(Self::OPEN_SPACE) {
+            return self.carve_open(n, dev);
+        }
         let (ai, ri) = ties[self.pick_index(domain::EXTENT_TIE, ties.len())?];
         let (l, s) = self.extent[ai].runs[ri];
         let off = if l == n {
@@ -834,6 +860,39 @@ impl Alloc {
         };
         self.extent[ai].take(off, n);
         Some(PageId::new(self.extent[ai].ag.dev, self.extent[ai].first + u32::from(off)))
+    }
+
+    /// Carves `n` pages at a keyed draw over every `n`-aligned position of the open-space
+    /// runs (no small hole fits the request).
+    fn carve_open(&mut self, n: u16, dev: Option<u8>) -> Option<PageId> {
+        let min = n.saturating_mul(Self::OPEN_SPACE);
+        let mut total = 0usize;
+        for a in &self.extent {
+            if dev.is_some_and(|d| a.ag.dev != d) {
+                continue;
+            }
+            total += a.runs.iter().filter(|r| r.0 >= min).map(|r| usize::from(r.0 / n)).sum::<usize>();
+        }
+        let mut k = self.pick_index(domain::CARVE, total)?;
+        for ai in 0..self.extent.len() {
+            if dev.is_some_and(|d| self.extent[ai].ag.dev != d) {
+                continue;
+            }
+            for ri in 0..self.extent[ai].runs.len() {
+                let (l, s) = self.extent[ai].runs[ri];
+                if l < min {
+                    continue;
+                }
+                let slots = usize::from(l / n);
+                if k < slots {
+                    let off = s + k as u16 * n;
+                    self.extent[ai].take(off, n);
+                    return Some(PageId::new(self.extent[ai].ag.dev, self.extent[ai].first + u32::from(off)));
+                }
+                k -= slots;
+            }
+        }
+        None
     }
 
     /// Frees an extent run (its first-sector zeroing is durable, or it is dead).
@@ -911,28 +970,44 @@ impl Alloc {
         }
     }
 
-    /// Kinds to send `AcquireAg` for now.
-    pub(crate) fn take_ag_requests(&mut self, out: &mut SmallVec<[AgKind; 2]>) {
+    /// Kinds (and a wanted device, if any) to send `AcquireAg` for now. A spare on another
+    /// device than the one wanted does not stop a request for the wanted device.
+    pub(crate) fn take_ag_requests(&mut self, out: &mut SmallVec<[(AgKind, Option<u8>); 2]>) {
         for (i, kind) in [(0, AgKind::Small), (1, AgKind::Extent)] {
             let s = &mut self.slots[i];
-            if s.want && !s.asked && s.spare.is_none() && s.refused_at_ns.is_none() {
+            let spare_ok = match (s.spare, s.want_dev) {
+                (None, _) => true,
+                (Some(ag), Some(d)) => ag.dev != d,
+                (Some(_), None) => false,
+            };
+            if s.want && !s.asked && spare_ok && s.refused_at_ns.is_none() {
                 s.want = false;
                 s.asked = true;
-                out.push(kind);
+                out.push((kind, s.want_dev.take()));
             }
         }
     }
 
     /// The meta thread answered an `AcquireAg` of `kind`.
     pub(crate) fn ag_granted(&mut self, kind: AgKind, ag: Option<AgId>, now_ns: u64) {
-        let s = &mut self.slots[kind_slot(kind)];
-        s.asked = false;
+        let ki = kind_slot(kind);
+        self.slots[ki].asked = false;
         match ag {
             Some(ag) => {
-                s.spare = Some(ag);
-                s.refused_at_ns = None;
+                // a spare already held (on another device) becomes an owned AG
+                if let Some(old) = self.slots[ki].spare.replace(ag) {
+                    match kind {
+                        AgKind::Small => {
+                            self.add_small_ag(old);
+                        }
+                        _ => {
+                            self.add_extent_ag(old);
+                        }
+                    }
+                }
+                self.slots[ki].refused_at_ns = None;
             }
-            None => s.refused_at_ns = Some(now_ns.max(1)),
+            None => self.slots[ki].refused_at_ns = Some(now_ns.max(1)),
         }
     }
 
@@ -1179,14 +1254,14 @@ mod tests {
         assert_eq!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::NeedAg);
         let mut req = SmallVec::new();
         a.take_ag_requests(&mut req);
-        assert_eq!(req.as_slice(), &[AgKind::Small]);
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None)]);
         req.clear();
         a.take_ag_requests(&mut req);
         assert!(req.is_empty(), "one request in flight");
         a.ag_granted(AgKind::Small, Some(AgId { dev: 0, idx: 2 }), 0);
         assert!(matches!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::Fresh(_)));
         a.take_ag_requests(&mut req);
-        assert_eq!(req.as_slice(), &[AgKind::Small], "consumed spare is replaced");
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None)], "consumed spare is replaced");
         a.ag_granted(AgKind::Small, None, 10);
         assert!(!a.ag_pending(AgKind::Small));
     }
@@ -1194,18 +1269,18 @@ mod tests {
     #[test]
     fn extent_twin_best_fit_and_carving() {
         let mut a = alloc(PageUpdateMode::TwoImage);
-        assert_eq!(a.alloc_extent(4, None, 0), ExtPlace::NeedAg);
+        assert_eq!(a.alloc_extent(4, None, 0, None), ExtPlace::NeedAg);
         a.ag_granted(AgKind::Extent, Some(AgId { dev: 0, idx: 1 }), 0);
-        let ExtPlace::Run(e1) = a.alloc_extent(4, None, 0) else { panic!() };
+        let ExtPlace::Run(e1) = a.alloc_extent(4, None, 0, None) else { panic!() };
         let first = a.ag_first(AgId { dev: 0, idx: 1 }).unwrap();
         assert_eq!((e1.page() - first) % 4, 0, "carved at an n-aligned offset");
         assert!(a.extent_allocated(e1, 4));
-        let ExtPlace::Run(e2) = a.alloc_extent(4, None, 0) else { panic!() };
+        let ExtPlace::Run(e2) = a.alloc_extent(4, None, 0, None) else { panic!() };
         assert_ne!(e1, e2);
         // free e1, then the twin preference takes exactly that run
         a.free_extent(e1, 4);
         assert!(!a.extent_allocated(e1, 4));
-        assert_eq!(a.alloc_extent(4, Some(e1), 0), ExtPlace::Run(e1));
+        assert_eq!(a.alloc_extent(4, Some(e1), 0, None), ExtPlace::Run(e1));
         // free everything: the AG is one run again and becomes releasable (kept as spare)
         a.free_extent(e1, 4);
         a.free_extent(e2, 4);

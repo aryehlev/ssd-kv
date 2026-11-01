@@ -49,7 +49,7 @@ pub mod superblock;
 pub mod ticket;
 
 pub use devprobe::probe;
-pub use engine::{Boot, EngineCfg, LocalEngine, PageStore, StorageEngine, format_devices};
+pub use engine::{Boot, EngineCfg, LocalEngine, Located, PageStore, StorageEngine, format_devices};
 pub use io::{BlockDevice, DevInfo, LockedMem, PageUpdateMode, SyncFileDevice};
 pub use keyspace::{Keyspace, StoreError};
 pub use layout::{AgId, PageId, Seq};

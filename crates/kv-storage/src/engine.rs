@@ -222,6 +222,21 @@ impl Boot {
         if self.snapshot.is_some() { RecoveryMode::Snapshot } else { RecoveryMode::FullScan }
     }
 
+    /// The seed of key hashes (`KeyHash::of(hash_seed, key)`, §6.2).
+    pub fn hash_seed(&self) -> u64 {
+        self.hash_seed
+    }
+
+    /// The keyed record checksum of this engine (tools: `kvd inspect`, tests).
+    pub fn record_crc(&self) -> kv_common::RecordCrc {
+        kv_common::RecordCrc::new(self.salt)
+    }
+
+    /// The geometry of every device.
+    pub fn layouts(&self) -> &[DeviceLayout] {
+        &self.layouts
+    }
+
     /// The committed-txn view of earlier boots (§10.7).
     pub fn committed(&self) -> &CommittedSet {
         &self.committed
@@ -772,8 +787,20 @@ impl<D: BlockDevice> LocalEngine<D> {
         &self.meta
     }
 
+    /// Device `i` (tests read simulated media through it).
+    pub fn device(&self, i: usize) -> &D {
+        &self.plumb.devs[i].dev
+    }
+
     pub fn cache(&self) -> &PageCache {
         &self.cache
+    }
+
+    /// Where the current version of `(db, key)` lives: the index entry's kind and page, the
+    /// record offset when the page is cached, and the extent's size in pages.
+    pub fn locate(&self, db: u8, key: &[u8]) -> Option<Located> {
+        let p = self.partition_of(key);
+        self.parts[usize::from(p)].locate(&self.cache, db, key)
     }
 
     /// Recovers every partition (§18): the clean snapshot path when the superblock allows it,
@@ -1067,6 +1094,17 @@ impl<D: BlockDevice> LocalEngine<D> {
         let plumb = core::mem::replace(&mut self.plumb, Plumbing { devs: Vec::new(), flush: Vec::new(), io: Vec::new() });
         plumb.devs.into_iter().map(|d| d.dev).collect()
     }
+}
+
+/// Where a key's current version lives (tests and tools).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Located {
+    pub kind: kv_index::Kind,
+    pub page: crate::layout::PageId,
+    /// Offset of the small record in its page (cached pages only).
+    pub off: Option<u16>,
+    /// Pages of the extent (1 for small records).
+    pub n_pages: u32,
 }
 
 /// One partition and the context lent to it.

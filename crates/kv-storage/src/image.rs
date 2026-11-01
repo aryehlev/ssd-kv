@@ -479,12 +479,15 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
         for (i, r) in st.recs.iter().enumerate() {
             let mut r = *r;
             let key = r.key(m);
+            let tracked = if env.dead(&r) { None } else { env.tracked_here(r.db, key) };
             if env.dead(&r) {
                 r.status = RecStatus::Droppable;
-            } else if let Some(t) = env.tracked_here(r.db, key) {
+            } else if let Some(t) = tracked {
                 r.status = match t {
                     CopyState::Stale => RecStatus::Superseded,
-                    CopyState::Source => RecStatus::Protected,
+                    // the tracked (current) copy is its newest one here; older ones go (R3)
+                    CopyState::Source if newest_here(&st.recs, i, m) => RecStatus::Protected,
+                    CopyState::Source => RecStatus::Superseded,
                 };
             }
             if r.status == RecStatus::Superseded && newer_open_txn(&st.recs, i, m, env) {
@@ -493,7 +496,7 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
             }
             match r.status {
                 RecStatus::Superseded => {
-                    if env.tracked_here(r.db, key).is_some() {
+                    if tracked == Some(CopyState::Stale) {
                         out.cleared.push((r.db, key.into()));
                     }
                     drop.push(r);
@@ -545,6 +548,10 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     let mut all = older.clone();
                     all.extend(newest);
                     mark_drop(&mut keep, &all, &mut drop);
+                    if env.tracked_here(db, &key).is_some() {
+                        // the deleted copy was tracked as a copy of the key: gone when N is
+                        out.cleared.push((db, key.clone()));
+                    }
                     out.applied.push(Pending::Remove { db, h32, key, tickets });
                 }
             }
@@ -688,6 +695,12 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
     out.atomic = atomic;
     out.recs = keep;
     out
+}
+
+/// True when `recs[i]` has the highest seq among its key's records of the image.
+fn newest_here(recs: &[RecDesc], i: usize, img: &[u8; PAGE]) -> bool {
+    let a = recs[i];
+    !recs.iter().enumerate().any(|(j, b)| j != i && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && b.key(img) == a.key(img))
 }
 
 /// True when a newer copy of `recs[i]`'s key in the same image belongs to a txn whose commit

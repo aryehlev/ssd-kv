@@ -572,6 +572,8 @@ pub(crate) struct Core {
     ticks: u64,
     /// The local txn the last commit opened (its request keeps its key queues, see `hold`).
     last_local_txn: Option<u64>,
+    /// Tracked locations that also hold an older copy of their key: `(page, db, key)`.
+    older_pages: Vec<(PageId, u8, Box<[u8]>)>,
     /// Scratch vectors (no per-tick allocation).
     scratch_pos: Vec<Pos>,
     scratch_txn: Vec<u64>,
@@ -798,7 +800,7 @@ impl BuildEnv for Env<'_> {
         self.lba().max(unit_min)
     }
     fn others(&self, db: u8, key: &[u8]) -> usize {
-        self.core.stale.get(db, key).iter().filter(|e| e.at.page() != self.page).count()
+        self.core.stale.count_outside(db, key, self.page)
     }
     fn tracked_here(&self, db: u8, key: &[u8]) -> Option<CopyState> {
         self.core.stale.state_at(db, key, self.page)
@@ -892,6 +894,7 @@ impl PartitionStore {
             snapshot_done: false,
             ticks: 0,
             last_local_txn: None,
+            older_pages: Vec::new(),
             scratch_pos: Vec::new(),
             scratch_txn: Vec::new(),
             boot,
@@ -997,6 +1000,38 @@ impl PartitionStore {
             out.push_str(&format!("\n  txn {t} keys={} pages={} requested={} local={}", o.keys.len(), o.pages.len(), o.requested, o.local));
         }
         out
+    }
+
+    /// Where the current version of `(db, key)` lives (see [`crate::engine::Located`]).
+    pub fn locate(&self, cache: &PageCache, db: u8, key: &[u8]) -> Option<crate::engine::Located> {
+        let kh = KeyHash::of(self.core.cfg.hash_seed, key);
+        let slot = key_slot(key);
+        if slot % self.core.cfg.partitions != self.core.cfg.id || db >= self.core.cfg.databases {
+            return None;
+        }
+        let t = self.core.index.table(db, slot)?;
+        let mut c = SmallVec::new();
+        t.candidates(kh, &mut c);
+        for c in c.iter() {
+            let page = PageId::from36(c.entry.page36);
+            match c.entry.kind {
+                Kind::Small => {
+                    let Some(st) = cache.page_state(page) else {
+                        return Some(crate::engine::Located { kind: Kind::Small, page, off: None, n_pages: 1 });
+                    };
+                    if st.pending.iter().any(|p| p.is_change() && p.is_key(db, kh.h32(), key)) {
+                        return Some(crate::engine::Located { kind: Kind::Small, page, off: None, n_pages: 1 });
+                    }
+                    let (recs, fr) = st.image();
+                    let img = cache.frame(fr);
+                    if let Some(r) = recs.iter().filter(|r| r.status == RecStatus::Live && r.db == db && r.key(img) == key).max_by_key(|r| r.seq) {
+                        return Some(crate::engine::Located { kind: Kind::Small, page, off: Some(r.off), n_pages: 1 });
+                    }
+                }
+                k => return Some(crate::engine::Located { kind: k, page, off: None, n_pages: class_pages(c.entry.x8) }),
+            }
+        }
+        None
     }
 
     /// Tracked stale copies left (a snapshot needs none, §8.2 SHUTDOWN).
@@ -1644,7 +1679,7 @@ impl PartitionStore {
                 Cur::Extent { twin, .. } => twin,
                 _ => None,
             };
-            return match self.core.alloc.alloc_extent(n, twin, now_ns) {
+            return match self.core.alloc.alloc_extent(n, twin, now_ns, None) {
                 ExtPlace::Run(start) => {
                     undo.ext.push((start, n));
                     Ok(Plan::Ext { start, n_pages: n, inplace: false })
@@ -1661,7 +1696,7 @@ impl PartitionStore {
             Cur::Extent { twin, kind: Kind::ChunkMap, .. } => twin,
             _ => None,
         };
-        let map = match self.core.alloc.alloc_extent(map_pages, twin, now_ns) {
+        let map = match self.core.alloc.alloc_extent(map_pages, twin, now_ns, None) {
             ExtPlace::Run(p) => p,
             ExtPlace::NeedAg => return Err(Commit::Park),
             ExtPlace::Full => return Err(Commit::Err(StoreError::OutOfSpace)),
@@ -1673,7 +1708,8 @@ impl PartitionStore {
             let len = left.min(CHUNK_MAX_PAYLOAD as u64);
             left -= len;
             let n = class_pages(class_for(pages_for(EXT_HDR as u64 + len) as u32).ok_or(Commit::Err(StoreError::TooLarge))?);
-            match self.core.alloc.alloc_extent(n, None, now_ns) {
+            // every chunk on the chunkmap's device (LC-08)
+            match self.core.alloc.alloc_extent(n, None, now_ns, Some(map.dev())) {
                 ExtPlace::Run(p) => {
                     undo.ext.push((p, n));
                     chunks.push((p, n));
@@ -2006,6 +2042,7 @@ impl PartitionStore {
                 }
                 if self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
                     self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source);
+                    self.note_older_copy(cx.cache, page, s.db, h32, &s.key);
                 }
                 self.core.note_page_space(cx.cache, page);
                 Core::maybe_unpin(cx.cache, page);
@@ -2036,6 +2073,25 @@ impl PartitionStore {
             }
         }
         out
+    }
+
+    /// A key moves away from `page`, which still holds an older superseded copy of it next to
+    /// the current one: that copy is zeroed by a foreground scrub, and until then it counts as
+    /// one more copy, so the moved version waits (third-copy rule, E14, I11).
+    fn note_older_copy(&mut self, cache: &mut PageCache, page: PageId, db: u8, h32: u32, key: &[u8]) {
+        let copies = cache.page_state(page).map_or(0, |st| {
+            let (recs, fr) = st.image();
+            let img = cache.frame(fr);
+            recs.iter().filter(|r| r.db == db && r.h32 == h32 && r.status != RecStatus::Droppable && r.key(img) == key).count()
+        });
+        if copies > 1 {
+            self.core.stale.set_older(db, key, page, true);
+            self.core.older_pages.push((page, db, key.into()));
+            if let Some(st) = cache.page_state_mut(page) {
+                st.scrub = true;
+            }
+            self.core.mark_dirty(cache, page);
+        }
     }
 
     /// Cancels the staged chunk writes of a chunkmap that was never written.
@@ -2132,6 +2188,11 @@ impl PartitionStore {
             Cur::Small { page, .. } => {
                 self.core.index_remove(s, page.to36());
                 self.stage_remove(cx.cache, page, s.db, s.kh.h32(), s.key.clone(), tickets);
+                // the deleted copy counts towards the key's copies until it is gone (E14): a
+                // write of the key elsewhere meanwhile waits like a third copy
+                if self.protect_in_page(cx.cache, page, s.db, s.kh.h32(), &s.key) {
+                    self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source);
+                }
             }
             Cur::Extent { start, n_pages, .. } => {
                 self.core.index_remove(s, start.to36());
@@ -2153,18 +2214,13 @@ impl PartitionStore {
                             self.core.gone_wait.push((s.db, s.key.clone(), all));
                         }
                     }
-                    Some(_) => {
-                        // in flight: the zeroing is issued after it is durable
+                    // on media or in flight (then the zeroing is issued after it is durable)
+                    _ => {
                         self.core.ext.zeros.insert(
                             start,
                             ExtZero { n_pages, why: ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets }, state: ExtState::Pending, wid: 0 },
                         );
-                    }
-                    None => {
-                        self.core.ext.zeros.insert(
-                            start,
-                            ExtZero { n_pages, why: ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets }, state: ExtState::Pending, wid: 0 },
-                        );
+                        self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source);
                     }
                 }
             }
@@ -2196,6 +2252,9 @@ impl PartitionStore {
                 }
                 if others || staged || older_here {
                     self.stage_remove(cx.cache, page, s.db, h32, s.key.clone(), SmallVec::new());
+                    if self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
+                        self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source);
+                    }
                     return;
                 }
                 if let Some(mut st) = cx.cache.take_state(f) {
@@ -2223,12 +2282,10 @@ impl PartitionStore {
                     self.cancel_chunks(start);
                     return;
                 }
-                self.core.ext.zeros.entry(start).or_insert(ExtZero {
-                    n_pages,
-                    why: ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets: SmallVec::new() },
-                    state: ExtState::Pending,
-                    wid: 0,
-                });
+                if !self.core.ext.zeros.contains_key(&start) {
+                    self.core.ext.zeros.insert(start, ExtZero::pending(n_pages, ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets: SmallVec::new() }));
+                    self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source);
+                }
             }
         }
     }
@@ -3124,6 +3181,27 @@ impl PartitionStore {
                 self.stale_gone(cx, db, &key);
             }
         }
+        if self.core.older_pages.iter().any(|o| o.0 == page) {
+            // older copies zeroed by this image no longer count (E14)
+            let list = core::mem::take(&mut self.core.older_pages);
+            for (p, db, key) in list {
+                if p != page {
+                    self.core.older_pages.push((p, db, key));
+                    continue;
+                }
+                let h32 = KeyHash::of(self.core.cfg.hash_seed, &key).h32();
+                let left = cx.cache.page_state(page).map_or(0, |st| {
+                    let img = cx.cache.frame(st.m_frame);
+                    st.recs.iter().filter(|r| r.db == db && r.h32 == h32 && r.status != RecStatus::Droppable && r.key(img) == &*key).count()
+                });
+                if left > 1 {
+                    self.core.older_pages.push((p, db, key));
+                } else {
+                    self.core.stale.set_older(db, &key, page, false);
+                    self.stale_gone(cx, db, &key);
+                }
+            }
+        }
         for (db, key) in supersede {
             self.sources_superseded(cx, db, &key, false);
         }
@@ -3170,9 +3248,12 @@ impl PartitionStore {
             *n = n.saturating_sub(1);
         }
         match z.why {
-            ZeroWhy::Delete { tickets, .. } => {
+            ZeroWhy::Delete { db, key, tickets } => {
                 for t in tickets {
                     self.core.tickets.effect_durable(t);
+                }
+                if self.core.stale.remove_at(db, &key, start) {
+                    self.stale_gone(cx, db, &key);
                 }
             }
             ZeroWhy::Stale { db, key } => {
@@ -3657,7 +3738,7 @@ impl PartitionStore {
                 if kind != EXT_KIND_CHUNK {
                     // E14: a further copy waits until the key's older tracked copy is zeroed
                     let key = self.core.ext.writes[&start].key.clone();
-                    let older = self.core.stale.get(db, &key).iter().any(|e| e.state == CopyState::Stale && e.at.page() != start);
+                    let older = self.core.stale.get(db, &key).iter().any(|e| e.at.page() != start && (e.state == CopyState::Stale || e.older));
                     if older {
                         self.core.fg_keys.push((db, key));
                         continue;
@@ -3686,7 +3767,7 @@ impl PartitionStore {
                     continue;
                 }
                 if let ZeroWhy::Delete { db, key, .. } = &self.core.ext.zeros[&start].why
-                    && self.core.stale.count(*db, key) > 0
+                    && self.core.stale.get(*db, key).iter().any(|e| e.at.page() != start)
                 {
                     // D1: the newest copy goes after the older ones
                     let k = (*db, key.clone());
@@ -3708,11 +3789,15 @@ impl PartitionStore {
     }
 
     fn meta_requests(&mut self, cx: &mut StorageCtx<'_>) {
-        let mut kinds: SmallVec<[AgKind; 2]> = SmallVec::new();
+        let mut kinds: SmallVec<[(AgKind, Option<u8>); 2]> = SmallVec::new();
         self.core.alloc.take_ag_requests(&mut kinds);
-        for kind in kinds {
+        for (kind, dev) in kinds {
             let partition = self.core.cfg.id;
-            self.core.meta_req(cx.meta, MetaReq::AcquireAg { partition, kind }, MetaWait::Ag(kind));
+            let r = match dev {
+                Some(dev) => MetaReq::AcquireAgOn { partition, kind, dev },
+                None => MetaReq::AcquireAg { partition, kind },
+            };
+            self.core.meta_req(cx.meta, r, MetaWait::Ag(kind));
         }
         // keep a reservation ahead of the counter (E12)
         if !self.core.seq_asked

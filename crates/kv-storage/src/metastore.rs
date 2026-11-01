@@ -40,6 +40,9 @@ use crate::superblock::{SbUpdate, Superblock};
 
 pub enum MetaReq {
     AcquireAg { partition: u16, kind: AgKind },
+    /// An AG on device `dev` (the chunks of a large value stay on their chunkmap's device,
+    /// LC-08); refused when that device has no free AG.
+    AcquireAgOn { partition: u16, kind: AgKind, dev: u8 },
     ReleaseAg { ag: AgId },
     PartitionMeta { m: PartitionMeta },
     NodeMeta { m: NodeMeta },
@@ -429,7 +432,8 @@ impl MetaCore {
         let mut sb_updates: SmallVec<[SbUpdate; 1]> = SmallVec::new();
         for m in msgs {
             let done = match m.req {
-                MetaReq::AcquireAg { partition, kind } => MetaDone::Ag(self.acquire(partition, kind)),
+                MetaReq::AcquireAg { partition, kind } => MetaDone::Ag(self.acquire(partition, kind, None)),
+                MetaReq::AcquireAgOn { partition, kind, dev } => MetaDone::Ag(self.acquire(partition, kind, Some(dev))),
                 MetaReq::ReleaseAg { ag } => {
                     self.release(ag);
                     MetaDone::Ok
@@ -587,7 +591,7 @@ impl MetaCore {
         }
     }
 
-    fn acquire(&mut self, partition: u16, kind: AgKind) -> Option<AgId> {
+    fn acquire(&mut self, partition: u16, kind: AgKind, want_dev: Option<u8>) -> Option<AgId> {
         if kind == AgKind::Free || partition >= self.partitions {
             return None;
         }
@@ -611,6 +615,12 @@ impl MetaCore {
             if c == most {
                 tied[0] |= 1 << d;
             }
+        }
+        if let Some(d) = want_dev {
+            if counts.get(usize::from(d)).is_none_or(|&c| c == 0) {
+                return None;
+            }
+            tied[0] = 1 << d;
         }
         let dev = self.pick.pick(DOMAIN_AG_DEVICE | u64::from(partition), &tied)?;
         let idx = self.pick.pick(DOMAIN_AG_PICK | u64::from(partition), &self.free[dev])? as u32;

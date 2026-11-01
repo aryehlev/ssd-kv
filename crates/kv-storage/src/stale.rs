@@ -57,6 +57,9 @@ pub(crate) struct StaleEntry {
     pub(crate) state: CopyState,
     /// A received command waits for this zeroing: it is built by the foreground page writer.
     pub(crate) foreground: bool,
+    /// The location also holds an older, superseded copy of the key whose zeroing is not
+    /// durable yet (it counts as one more copy for the third-copy rule, E14).
+    pub(crate) older: bool,
 }
 
 /// Owned map key: `(db, exact key bytes)`.
@@ -129,7 +132,7 @@ impl StaleCopies {
 
     /// Registers a copy of `(db, key)` at `at` (no duplicate entries per location).
     pub(crate) fn add(&mut self, db: u8, key: &[u8], at: StaleRef, state: CopyState) {
-        let entry = StaleEntry { at, state, foreground: false };
+        let entry = StaleEntry { at, state, foreground: false, older: false };
         match self.map.get_mut(&KeyRef { db, key }) {
             Some(list) => {
                 if let Some(e) = list.iter_mut().find(|e| e.at == at) {
@@ -162,6 +165,24 @@ impl StaleCopies {
             return 0;
         }
         self.get(db, key).len()
+    }
+
+    /// Copies of `(db, key)` tracked outside `except` (an older copy sharing a tracked
+    /// location counts too).
+    pub(crate) fn count_outside(&self, db: u8, key: &[u8], except: PageId) -> usize {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.get(db, key).iter().filter(|e| e.at.page() != except).map(|e| 1 + usize::from(e.older)).sum()
+    }
+
+    /// Sets or clears the older-copy flag of the copy of `(db, key)` at `at`.
+    pub(crate) fn set_older(&mut self, db: u8, key: &[u8], at: PageId, on: bool) {
+        if let Some(list) = self.map.get_mut(&KeyRef { db, key })
+            && let Some(e) = list.iter_mut().find(|e| e.at.page() == at)
+        {
+            e.older = on;
+        }
     }
 
     /// The state of the copy of `(db, key)` at `at`, if tracked.

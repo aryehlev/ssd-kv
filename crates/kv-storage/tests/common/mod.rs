@@ -294,3 +294,147 @@ pub fn value(seed: u64, len: usize) -> Vec<u8> {
 pub fn buf(data: &[u8]) -> AlignedBuf {
     AlignedBuf::from_slice(data)
 }
+
+/// Counts the valid copies of every key on a device image (SMALL records and VALUE/CHUNKMAP
+/// extents; checksums verified, the location bound): `(db, key) -> copies`. Dead records are
+/// not filtered (callers avoid FLUSH and multi-key txns).
+pub fn count_copies(image: &[u8], dev: u8, boot: &kv_storage::Boot) -> hashbrown::HashMap<(u8, Vec<u8>), usize> {
+    use kv_storage::extent;
+    use kv_storage::layout::{AG_PAGES, PAGE, PageId};
+    use kv_storage::page::{PageParse, parse_small_page};
+    let crc = boot.record_crc();
+    let l = boot.layouts()[usize::from(dev)];
+    let mut out: hashbrown::HashMap<(u8, Vec<u8>), usize> = hashbrown::HashMap::new();
+    let mut views = Vec::new();
+    let first = l.ag_area_page;
+    let end = first + u64::from(l.n_ags) * u64::from(AG_PAGES);
+    let mut page = first;
+    while page < end {
+        let at = page as usize * PAGE;
+        let buf: &[u8; PAGE] = image[at..at + PAGE].try_into().unwrap();
+        let id = PageId((u64::from(dev) << 32) | page);
+        let part = u16::from(buf[5]);
+        if parse_small_page(buf, id, part, crc, &mut views) == PageParse::Ok {
+            for v in &views {
+                *out.entry((v.hdr.db, v.key.to_vec())).or_insert(0) += 1;
+            }
+            page += 1;
+            continue;
+        }
+        if let Some(h) = extent::parse_extent_header(buf, id) {
+            let n = h.n_pages as usize;
+            if at + n * PAGE <= image.len() && h.kind != extent::EXT_KIND_CHUNK && extent::verify_extent(&image[at..at + n * PAGE], &h, crc) {
+                let kl = h.key_len as usize;
+                let key = image[at + 80..at + 80 + kl].to_vec();
+                *out.entry((h.db, key)).or_insert(0) += 1;
+                page += n as u64;
+                continue;
+            }
+        }
+        page += 1;
+    }
+    out
+}
+
+/// Spearman's rank correlation of `xs` and `ys`.
+pub fn spearman(xs: &[f64], ys: &[f64]) -> f64 {
+    fn ranks(v: &[f64]) -> Vec<f64> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
+        let mut r = vec![0.0; v.len()];
+        let mut i = 0;
+        while i < idx.len() {
+            let mut j = i;
+            while j + 1 < idx.len() && v[idx[j + 1]] == v[idx[i]] {
+                j += 1;
+            }
+            let avg = (i + j) as f64 / 2.0;
+            for k in i..=j {
+                r[idx[k]] = avg;
+            }
+            i = j + 1;
+        }
+        r
+    }
+    let (a, b) = (ranks(xs), ranks(ys));
+    let n = a.len() as f64;
+    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+    let cov: f64 = a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+    let va: f64 = a.iter().map(|x| (x - ma).powi(2)).sum();
+    let vb: f64 = b.iter().map(|y| (y - mb).powi(2)).sum();
+    cov / (va.sqrt() * vb.sqrt())
+}
+
+/// Every valid copy on an image: `(db, key) -> [(page, seq, small)]`.
+pub fn copy_locations(image: &[u8], dev: u8, boot: &kv_storage::Boot) -> hashbrown::HashMap<(u8, Vec<u8>), Vec<(u64, u64, bool)>> {
+    use kv_storage::extent;
+    use kv_storage::layout::{AG_PAGES, PAGE, PageId};
+    use kv_storage::page::{PageParse, parse_small_page};
+    let crc = boot.record_crc();
+    let l = boot.layouts()[usize::from(dev)];
+    let mut out: hashbrown::HashMap<(u8, Vec<u8>), Vec<(u64, u64, bool)>> = hashbrown::HashMap::new();
+    let mut views = Vec::new();
+    let first = l.ag_area_page;
+    let end = first + u64::from(l.n_ags) * u64::from(AG_PAGES);
+    let mut page = first;
+    while page < end {
+        let at = page as usize * PAGE;
+        let buf: &[u8; PAGE] = image[at..at + PAGE].try_into().unwrap();
+        let id = PageId((u64::from(dev) << 32) | page);
+        if parse_small_page(buf, id, u16::from(buf[5]), crc, &mut views) == PageParse::Ok {
+            for v in &views {
+                out.entry((v.hdr.db, v.key.to_vec())).or_default().push((page, v.hdr.seq.0, true));
+            }
+            page += 1;
+            continue;
+        }
+        if let Some(h) = extent::parse_extent_header(buf, id) {
+            let n = h.n_pages as usize;
+            if at + n * PAGE <= image.len() && h.kind != extent::EXT_KIND_CHUNK && extent::verify_extent(&image[at..at + n * PAGE], &h, crc) {
+                let kl = h.key_len as usize;
+                out.entry((h.db, image[at + 80..at + 80 + kl].to_vec())).or_default().push((page, h.seq.0, false));
+                page += n as u64;
+                continue;
+            }
+        }
+        page += 1;
+    }
+    out
+}
+
+/// Spearman correlation pooled over groups: each group's values are ranked within the group
+/// (seqs are per partition, so they are only comparable inside one), then the centred,
+/// normalised ranks of every group are pooled into one Pearson correlation.
+pub fn pooled_spearman(groups: &[(Vec<f64>, Vec<f64>)]) -> f64 {
+    fn ranks(v: &[f64]) -> Vec<f64> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
+        let mut r = vec![0.0; v.len()];
+        let n = v.len().max(2) as f64 - 1.0;
+        let mut i = 0;
+        while i < idx.len() {
+            let mut j = i;
+            while j + 1 < idx.len() && v[idx[j + 1]] == v[idx[i]] {
+                j += 1;
+            }
+            let avg = (i + j) as f64 / 2.0;
+            for k in i..=j {
+                r[idx[k]] = avg / n - 0.5;
+            }
+            i = j + 1;
+        }
+        r
+    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for (x, y) in groups {
+        if x.len() < 2 {
+            continue;
+        }
+        a.extend(ranks(x));
+        b.extend(ranks(y));
+    }
+    let cov: f64 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    let va: f64 = a.iter().map(|x| x * x).sum();
+    let vb: f64 = b.iter().map(|y| y * y).sum();
+    cov / (va.sqrt() * vb.sqrt())
+}

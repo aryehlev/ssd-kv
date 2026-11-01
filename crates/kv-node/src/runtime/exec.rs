@@ -78,6 +78,9 @@ pub struct Job {
     pub id: CmdId,
     pub start_ns: u64,
     pub _lv: Reservation,
+    /// The txn credit of a multi-key write (§14.6 step 0): spent when the partition opened a
+    /// txn for it (the meta thread returns it on `Resolved`), given back otherwise.
+    pub credit: Option<CreditGuard>,
 }
 
 /// What a durability wait continues with.
@@ -103,6 +106,8 @@ struct Coord {
     coord: XTxnCoord,
     to: ReplyTo,
     start_ns: u64,
+    /// Spent once the transaction takes a txn id; given back when it ends without one.
+    credit: Option<CreditGuard>,
 }
 
 /// A partition locked by a cross-partition transaction (participant side): new requests wait
@@ -257,10 +262,21 @@ fn written_keys(cmds: &[OwnedCmd]) -> usize {
 pub struct CreditGuard(Option<Arc<NodeShared>>);
 
 impl CreditGuard {
-    /// The command reached a partition (or a transaction): the credit returns when the meta
-    /// thread reports the txn resolved.
+    /// Takes over a credit that travelled with a command to its owner worker.
+    fn adopt(shared: &Arc<NodeShared>) -> Self {
+        CreditGuard(Some(shared.clone()))
+    }
+
+    /// A txn was opened with this credit: it returns when the meta thread reports the txn
+    /// resolved (`MetaDone::Resolved`).
     fn spend(mut self) {
         self.0 = None;
+    }
+
+    /// The credit moves with its command to another worker, which adopts it.
+    fn transfer(mut self) -> bool {
+        self.0 = None;
+        true
     }
 }
 
@@ -276,12 +292,6 @@ impl Drop for CreditGuard {
 pub struct PreConsume {
     pub lv: Reservation,
     pub credit: Option<CreditGuard>,
-}
-
-fn spend(credit: &mut Option<CreditGuard>) {
-    if let Some(c) = credit.take() {
-        c.spend();
-    }
 }
 
 /// The partition request of a keyed command: its keys with their access modes (key bytes only;
@@ -444,15 +454,16 @@ impl<B: Backend> Worker<B> {
     /// Handles a message from another worker (or this one).
     pub(super) fn handle_message(&mut self, m: XMsg) {
         match m {
-            XMsg::Cmd { from, conn, req_seq, partition, cmd, env, part } => {
+            XMsg::Cmd { from, conn, req_seq, partition, cmd, env, part, credit, lv } => {
                 let to = ReplyTo { conn, seq: req_seq, part };
                 let _ = from;
                 let spec = cmd.id.spec();
                 let req = keyed_request(spec, &cmd.argv(), env.db);
-                let job = Job { to: Some(to), id: cmd.id, kind: JobKind::Cmd(cmd), env, start_ns: self.now.mono_ns, _lv: Reservation::NONE };
+                let credit = credit.then(|| CreditGuard::adopt(&self.shared));
+                let job = Job { to: Some(to), id: cmd.id, kind: JobKind::Cmd(cmd), env, start_ns: self.now.mono_ns, _lv: lv, credit };
                 self.submit_job(partition, req, job);
             }
-            XMsg::Exec { from, conn, req_seq, partition, cmds, env } => {
+            XMsg::Exec { from, conn, req_seq, partition, cmds, env, credit } => {
                 let _ = from;
                 let req = multi_request(&cmds, env.db);
                 let job = Job {
@@ -462,6 +473,7 @@ impl<B: Backend> Worker<B> {
                     env,
                     start_ns: self.now.mono_ns,
                     _lv: Reservation::NONE,
+                    credit: credit.then(|| CreditGuard::adopt(&self.shared)),
                 };
                 self.submit_job(partition, req, job);
             }
@@ -487,6 +499,7 @@ impl<B: Backend> Worker<B> {
                     env: ExecEnv { proto: kv_resp::Proto::Resp2, db: request.db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 },
                     start_ns: self.now.mono_ns,
                     _lv: Reservation::NONE,
+                    credit: None,
                 };
                 self.submit_job(partition, request, job);
             }
@@ -501,6 +514,13 @@ impl<B: Backend> Worker<B> {
     }
 
     fn on_meta(&mut self, partition: u16, token: u64, done: MetaDone) {
+        if let MetaDone::Resolved { credits } = done {
+            // the txns resolved: their credits return (whoever asked for the commit)
+            self.shared.give_back_txn_credits(credits);
+            if token & WORKER_TOKEN_BIT != 0 {
+                return;
+            }
+        }
         if token & WORKER_TOKEN_BIT != 0 {
             let xtxn = token & !WORKER_TOKEN_BIT;
             let res = match done {
@@ -510,9 +530,6 @@ impl<B: Backend> Worker<B> {
             };
             self.xtxn_step(xtxn, |c| c.on_committed(res));
             return;
-        }
-        if let MetaDone::Resolved { credits } = done {
-            self.shared.give_back_txn_credits(credits);
         }
         if self.backend.owned().contains(&partition) {
             self.backend.on_meta(partition, self.now, done);
@@ -664,19 +681,17 @@ impl<B: Backend> Worker<B> {
             Route::Local { partition } => {
                 let req = keyed_request(spec, &argv, env.db);
                 drop(argv);
-                spend(credit);
                 let seq = conn.reserve_slot();
                 let to = ReplyTo { conn: self.conn_ref(slot), seq, part: None };
-                let job = Job { to: Some(to), id: spec.id, kind: JobKind::Cmd(cmd), env, start_ns: self.now.mono_ns, _lv: lv };
+                let job = Job { to: Some(to), id: spec.id, kind: JobKind::Cmd(cmd), env, start_ns: self.now.mono_ns, _lv: lv, credit: credit.take() };
                 self.submit_job(partition, req, job);
             }
             Route::Remote { worker, partition } => {
                 drop(argv);
-                spend(credit);
                 let seq = conn.reserve_slot();
-                let msg = XMsg::Cmd { from: self.id, conn: self.conn_ref(slot), req_seq: seq, partition, cmd, env, part: None };
-                // the large-value reservation stays with the home connection until the reply
-                drop(lv);
+                let credit = credit.take().is_some_and(CreditGuard::transfer);
+                // the large-value reservation travels with the command's buffer (§6.9)
+                let msg = XMsg::Cmd { from: self.id, conn: self.conn_ref(slot), req_seq: seq, partition, cmd, env, part: None, credit, lv };
                 self.send_cmd(conn, worker, msg);
             }
             Route::FanOut(split) => {
@@ -694,10 +709,9 @@ impl<B: Backend> Worker<B> {
             }
             Route::XTxn => {
                 drop(argv);
-                spend(credit);
                 let seq = conn.reserve_slot();
                 let to = ReplyTo { conn: self.conn_ref(slot), seq, part: None };
-                self.start_xtxn(to, cmd, env);
+                self.start_xtxn(to, cmd, env, credit.take());
             }
             Route::Home => {
                 drop(argv);
@@ -726,10 +740,10 @@ impl<B: Backend> Worker<B> {
             let owner = partition % worker;
             if owner == self.id {
                 let req = keyed_request(id.spec(), &sub.argv(), env.db);
-                let job = Job { to: Some(to), id, kind: JobKind::Cmd(sub), env, start_ns: self.now.mono_ns, _lv: Reservation::NONE };
+                let job = Job { to: Some(to), id, kind: JobKind::Cmd(sub), env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
                 self.submit_job(partition, req, job);
             } else {
-                let msg = XMsg::Cmd { from: self.id, conn: cref, req_seq: seq, partition, cmd: sub, env, part: Some(i as u16) };
+                let msg = XMsg::Cmd { from: self.id, conn: cref, req_seq: seq, partition, cmd: sub, env, part: Some(i as u16), credit: false, lv: Reservation::NONE };
                 self.send_cmd(conn, owner, msg);
             }
         }
@@ -819,16 +833,16 @@ impl<B: Backend> Worker<B> {
         }
         let env = self.env_of(conn);
         conn.db = db_after(&cmds, conn.db, self.cfg.databases);
-        spend(credit);
         let seq = conn.reserve_slot();
         let to = ReplyTo { conn: self.conn_ref(slot), seq, part: None };
         let owner = partition % self.router.workers;
         if owner == self.id {
             let req = multi_request(&cmds, env.db);
-            let job = Job { to: Some(to), id: CmdId::Exec, kind: JobKind::Multi(cmds), env, start_ns: self.now.mono_ns, _lv: Reservation::NONE };
+            let job = Job { to: Some(to), id: CmdId::Exec, kind: JobKind::Multi(cmds), env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: credit.take() };
             self.submit_job(partition, req, job);
         } else {
-            let msg = XMsg::Exec { from: self.id, conn: to.conn, req_seq: seq, partition, cmds, env };
+            let credit = credit.take().is_some_and(CreditGuard::transfer);
+            let msg = XMsg::Exec { from: self.id, conn: to.conn, req_seq: seq, partition, cmds, env, credit };
             self.send_cmd(conn, owner, msg);
         }
     }
@@ -901,7 +915,7 @@ impl<B: Backend> Worker<B> {
         let owner = partition % self.router.workers;
         if owner == self.id {
             let env = ExecEnv { proto: kv_resp::Proto::Resp2, db: request.db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
-            let job = Job { to: None, id: CmdId::Scan, kind: JobKind::Scan { pattern, home }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE };
+            let job = Job { to: None, id: CmdId::Scan, kind: JobKind::Scan { pattern, home }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
             self.submit_job(partition, request, job);
         } else {
             let req = ScanReq { kind, partition, request, pattern };
@@ -1016,6 +1030,7 @@ impl<B: Backend> Worker<B> {
         let mut reply = std::mem::take(&mut self.x.reply);
         reply.clear();
         let databases = self.cfg.databases;
+        let txns_before = self.backend.txns_opened(p);
         let status = {
             let work = match &job.kind {
                 JobKind::Cmd(c) => Work::Cmd(c),
@@ -1030,7 +1045,16 @@ impl<B: Backend> Worker<B> {
             ExecStatus::Requeued => {
                 self.x.jobs.insert((p, id.0), job);
             }
-            ExecStatus::Done(out, eo) => self.job_done(p, job, out, eo.ticket, &mut reply),
+            ExecStatus::Done(out, eo) => {
+                let mut job = job;
+                if self.backend.txns_opened(p) != txns_before {
+                    // the partition opened a txn: its resolution returns the credit
+                    if let Some(c) = job.credit.take() {
+                        c.spend();
+                    }
+                }
+                self.job_done(p, job, out, eo.ticket, &mut reply);
+            }
             ExecStatus::Failed(e) => self.job_failed(p, job, e),
         }
         self.x.reply = reply;
@@ -1179,7 +1203,7 @@ impl<B: Backend> Worker<B> {
     // -----------------------------------------------------------------------------------------
     // cross-partition transactions (§6.8)
 
-    fn start_xtxn(&mut self, to: ReplyTo, cmd: OwnedCmd, env: ExecEnv) {
+    fn start_xtxn(&mut self, to: ReplyTo, cmd: OwnedCmd, env: ExecEnv, credit: Option<CreditGuard>) {
         self.x.next_xtxn += 1;
         let xtxn = (u64::from(self.id) << 40) | self.x.next_xtxn;
         let router = self.router;
@@ -1194,7 +1218,7 @@ impl<B: Backend> Worker<B> {
         // the gate ticket is taken only for a transaction that will run (it must be released
         // in turn)
         coord.ticket = self.shared.xtxn.ticket();
-        self.x.coords.insert(xtxn, Coord { coord, to, start_ns: self.now.mono_ns });
+        self.x.coords.insert(xtxn, Coord { coord, to, start_ns: self.now.mono_ns, credit });
         self.x.gate_q.push_back(xtxn);
         self.poll_gate();
     }
@@ -1236,7 +1260,13 @@ impl<B: Backend> Worker<B> {
                     let id = self.backend.next_txn_id();
                     let Some(c) = self.x.coords.get_mut(&xtxn) else { return };
                     step = match id {
-                        Some(t) => c.coord.apply(t),
+                        Some(t) => {
+                            // the id's resolution returns the credit
+                            if let Some(cr) = c.credit.take() {
+                                cr.spend();
+                            }
+                            c.coord.apply(t)
+                        }
                         None => c.coord.abort(b"ERR cross-partition transactions are not available: no transaction id (use a common hashtag)"),
                     };
                 }
@@ -1271,7 +1301,7 @@ impl<B: Backend> Worker<B> {
                     origin: Origin::Client,
                 };
                 let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
-                let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Lock { xtxn, coord: from, keys }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE };
+                let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Lock { xtxn, coord: from, keys }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
                 self.submit_job(partition, req, job);
             }
             XTxnMsg::Apply { xtxn, txn_id, partition, ops } => {
@@ -1280,7 +1310,7 @@ impl<B: Backend> Worker<B> {
                 let keys = ops.iter().filter_map(op_key).map(|k| (Box::<[u8]>::from(k), kv_cmd::Access::Write)).collect();
                 let req = Request { db, keys, kind: ReqKind::Txn { txn_id }, origin: Origin::Client };
                 let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
-                let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Apply { xtxn, coord, ops }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE };
+                let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Apply { xtxn, coord, ops }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
                 self.submit_job(partition, req, job);
             }
             XTxnMsg::Commit { xtxn, txn_id, partition } => {
@@ -1355,7 +1385,7 @@ impl<B: Backend> Worker<B> {
             let req = Request { db, keys: SmallVec::new(), kind, origin: Origin::Client };
             let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
             let id = if matches!(kind, ReqKind::FlushDb { .. }) { CmdId::Flushdb } else { CmdId::Save };
-            let job = Job { to: None, id, kind: JobKind::Node { gather }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE };
+            let job = Job { to: None, id, kind: JobKind::Node { gather }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
             self.submit_job(p, req, job);
         }
     }

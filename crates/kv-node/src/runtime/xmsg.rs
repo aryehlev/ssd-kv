@@ -46,8 +46,20 @@ pub struct GatherRef {
 
 pub enum XMsg {
     /// A keyed command for `partition` (owned by the destination worker). `part` is set for a
-    /// sub-request of a fan-out (§6.8): its reply comes back as [`XMsg::Part`].
-    Cmd { from: u16, conn: ConnRef, req_seq: u64, partition: u16, cmd: OwnedCmd, env: ExecEnv, part: Option<u16> },
+    /// sub-request of a fan-out (§6.8): its reply comes back as [`XMsg::Part`]. `credit`: the
+    /// command carries the txn credit taken before it was consumed (§14.6 step 0); `lv`: the
+    /// large-value reservation of its buffer (§6.9).
+    Cmd {
+        from: u16,
+        conn: ConnRef,
+        req_seq: u64,
+        partition: u16,
+        cmd: OwnedCmd,
+        env: ExecEnv,
+        part: Option<u16>,
+        credit: bool,
+        lv: crate::net::budget::Reservation,
+    },
     Reply { conn: ConnRef, req_seq: u64, reply: ReplyBody },
     Part { conn: ConnRef, req_seq: u64, part: u16, reply: ReplyBody },
     /// FLUSHDB (`Some(db)`) / FLUSHALL (`None`) of every partition the destination owns.
@@ -67,7 +79,7 @@ pub enum XMsg {
     /// One worker's answer to a [`XMsg::Flush`] or [`XMsg::Barrier`].
     GatherDone { gather: GatherRef, from: u16, res: Result<(), StoreError> },
     /// An EXEC body whose keys share `partition` (§8.5), run as one partition request.
-    Exec { from: u16, conn: ConnRef, req_seq: u64, partition: u16, cmds: Vec<OwnedCmd>, env: ExecEnv },
+    Exec { from: u16, conn: ConnRef, req_seq: u64, partition: u16, cmds: Vec<OwnedCmd>, env: ExecEnv, credit: bool },
     /// CLIENT LIST / CLIENT KILL over the destination's connections (`caller` = the asking
     /// client's id).
     Clients { gather: GatherRef, op: std::sync::Arc<crate::cmd::NodeOp>, caller: u64 },

@@ -144,6 +144,9 @@ pub trait Backend {
     /// A fresh txn id for a cross-partition transaction, `None` when the engine cannot provide
     /// one.
     fn next_txn_id(&mut self) -> Option<u64>;
+    /// How many multi-key txns partition `p` has opened (monotonic): a request whose exec
+    /// moved it spent its txn credit (§14.6 step 0).
+    fn txns_opened(&self, p: u16) -> u64;
 }
 
 /// Storage resources of one worker for the page store.
@@ -303,6 +306,12 @@ impl Backend for PageBackend {
     fn next_txn_id(&mut self) -> Option<u64> {
         self.txn_ids.as_ref().and_then(|t| t.try_next())
     }
+
+    fn txns_opened(&self, p: u16) -> u64 {
+        // The engine reports no per-request txn flag (ExecOut has none): every opened txn
+        // stages TXN-flagged records, which `page_writes_txn` counts once per txn at exec.
+        self.parts[usize::from(p)].as_ref().map_or(0, |part| part.counters().page_writes_txn)
+    }
 }
 
 /// The partitions of worker `w` among `partitions` (`{p : p % W == w}`, §5).
@@ -352,6 +361,14 @@ pub mod mem {
     }
 
     impl MemStore<'_> {
+        /// Lazy expiry: an expired key touched by a command is deleted (as the page store does).
+        fn reap(&mut self, key: &[u8]) {
+            let k = (self.db, key.to_vec());
+            if !self.staged.contains_key(&k) && self.base.get(&k).is_some_and(|r| r.expire.is_some_and(|e| e <= self.now)) {
+                self.staged.insert(k, None);
+            }
+        }
+
         fn live(&self, key: &[u8]) -> Option<&Rec> {
             let k = (self.db, key.to_vec());
             let r = match self.staged.get(&k) {
@@ -373,18 +390,22 @@ pub mod mem {
             self.now
         }
         fn meta(&mut self, key: &[u8]) -> Result<Option<KeyMeta>, StoreError> {
+            self.reap(key);
             Ok(self.live(key).map(|r| KeyMeta { vtype: r.vtype, expire_at_ms: r.expire, len: r.value.len() as u64 }))
         }
         fn get(&mut self, key: &[u8]) -> Result<Option<(KeyMeta, Value<'_>)>, StoreError> {
+            self.reap(key);
             Ok(self.live(key).map(|r| {
                 (KeyMeta { vtype: r.vtype, expire_at_ms: r.expire, len: r.value.len() as u64 }, Value::Contig(&r.value))
             }))
         }
         fn put(&mut self, key: &[u8], value: &[u8], vtype: VType, expire_at_ms: Option<u64>) -> Result<(), StoreError> {
+            self.reap(key);
             self.staged.insert((self.db, key.to_vec()), Some(Rec { vtype, value: value.to_vec(), expire: expire_at_ms }));
             Ok(())
         }
         fn append(&mut self, key: &[u8], data: &[u8]) -> Result<u64, StoreError> {
+            self.reap(key);
             let mut r = self.live(key).cloned().unwrap_or(Rec { vtype: VType::String, value: Vec::new(), expire: None });
             r.value.extend_from_slice(data);
             let n = r.value.len() as u64;
@@ -392,6 +413,7 @@ pub mod mem {
             Ok(n)
         }
         fn set_range(&mut self, key: &[u8], off: u64, data: &[u8]) -> Result<u64, StoreError> {
+            self.reap(key);
             let mut r = self.live(key).cloned().unwrap_or(Rec { vtype: VType::String, value: Vec::new(), expire: None });
             let end = off as usize + data.len();
             if r.value.len() < end {
@@ -403,6 +425,7 @@ pub mod mem {
             Ok(n)
         }
         fn set_expire(&mut self, key: &[u8], expire_at_ms: Option<u64>) -> Result<bool, StoreError> {
+            self.reap(key);
             match self.live(key).cloned() {
                 Some(mut r) => {
                     r.expire = expire_at_ms;
@@ -413,6 +436,7 @@ pub mod mem {
             }
         }
         fn delete(&mut self, key: &[u8]) -> Result<bool, StoreError> {
+            self.reap(key);
             let existed = self.live(key).is_some();
             self.staged.insert((self.db, key.to_vec()), None);
             Ok(existed)
@@ -542,7 +566,16 @@ pub mod mem {
         }
         fn take_tickets(&mut self, _p: u16, _out: &mut Vec<(TicketId, TicketState)>) {}
         fn on_meta(&mut self, _p: u16, _now: Now, _done: MetaDone) {}
-        fn tick(&mut self, _now: Now) {}
+        fn tick(&mut self, now: Now) {
+            // active expiry: keys past their TTL go even when nothing touches them
+            for part in self.parts.iter_mut().flatten() {
+                let before = part.data.len();
+                part.data.retain(|_, r| r.expire.is_none_or(|e| e > now.unix_ms));
+                if part.data.len() != before {
+                    Self::recount(part, now.unix_ms);
+                }
+            }
+        }
         fn recover(&mut self, _p: u16, _now: Now, _mode: RecoveryMode) -> RecoveryProgress {
             RecoveryProgress::Done { bytes_scanned: 0 }
         }
@@ -557,11 +590,16 @@ pub mod mem {
             }
         }
         fn busy(&self) -> bool {
-            false
+            // keys with a TTL need the periodic tick of active expiry
+            self.parts.iter().flatten().any(|p| p.data.values().any(|r| r.expire.is_some()))
         }
         fn next_txn_id(&mut self) -> Option<u64> {
             self.next_txn += 1;
             Some(self.next_txn)
+        }
+        fn txns_opened(&self, _p: u16) -> u64 {
+            // every effect is final at exec: no txn is ever left open
+            0
         }
     }
 }

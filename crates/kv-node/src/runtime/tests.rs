@@ -37,7 +37,10 @@ impl TestNode {
             let s = shared.clone();
             MemBackend::new(w, threads, PARTITIONS).with_meta(Box::new(move |p, token, r| {
                 if let MetaReq::CommitTxn { txn } = r {
-                    s.workers[usize::from(w)].send_side(XMsg::Meta { partition: p, token, done: MetaDone::Committed { txn } });
+                    // the meta thread answers a commit, then resolves it (credits return)
+                    let me = &s.workers[usize::from(w)];
+                    me.send_side(XMsg::Meta { partition: p, token, done: MetaDone::Committed { txn } });
+                    me.send_side(XMsg::Meta { partition: p, token, done: MetaDone::Resolved { credits: 1 } });
                 }
             }))
         })
@@ -351,7 +354,10 @@ fn serve_mem_node() {
         let s = shared.clone();
         MemBackend::new(w, threads, PARTITIONS).with_meta(Box::new(move |p, token, r| {
             if let MetaReq::CommitTxn { txn } = r {
-                s.workers[usize::from(w)].send_side(XMsg::Meta { partition: p, token, done: MetaDone::Committed { txn } });
+                // the meta thread answers a commit, then resolves it (credits return)
+                let me = &s.workers[usize::from(w)];
+                me.send_side(XMsg::Meta { partition: p, token, done: MetaDone::Committed { txn } });
+                me.send_side(XMsg::Meta { partition: p, token, done: MetaDone::Resolved { credits: 1 } });
             }
         }))
     })

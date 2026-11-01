@@ -414,8 +414,10 @@ mod tests {
         );
     }
 
+    /// `keys_sequential` (§25.2, LC-18): a KEYS walk has at most one step outstanding and visits
+    /// the partitions strictly in order.
     #[test]
-    fn keys_walk_is_sequential() {
+    fn keys_sequential() {
         let mut k = KeysWalk::new(2, 3);
         let mut seen = Vec::new();
         while let Some((p, req)) = k.next_step() {
@@ -442,6 +444,69 @@ mod tests {
         assert_eq!(seen, [0, 0, 1, 1, 2, 2]);
         assert!(k.is_done());
         assert!(KeysWalk::new(0, 0).next_step().is_none());
+    }
+
+    proptest::proptest! {
+        /// `keys_sequential` over random step results: whatever cursors the partitions return,
+        /// the walk never moves backwards, never skips a partition and ends after the last one.
+        #[test]
+        fn keys_sequential_random(partitions in 1u16..80, steps in proptest::collection::vec((0u16..4, 1u32..u32::MAX), 1..400)) {
+            let mut k = KeysWalk::new(1, partitions);
+            let mut last = 0u16;
+            for (advance, fp) in steps {
+                let Some((p, req)) = k.next_step() else { break };
+                let ReqKind::ScanStep { cursor, .. } = req.kind else { panic!("not a scan step") };
+                proptest::prop_assert_eq!(cursor::decode(cursor).0, p);
+                proptest::prop_assert!(p == last || p == last + 1, "partition {} after {}", p, last);
+                last = p;
+                // the step either stops mid-partition or moves to the start of the next one
+                let next = if advance == 0 { cursor::encode(p + 1, 0, 0) } else { cursor::encode(p, 0, fp) };
+                k.on_step_done(next);
+                proptest::prop_assert_eq!(k.is_done(), advance == 0 && p + 1 == partitions);
+            }
+        }
+
+        /// `scan_single_thread` (§25.2, LC-18): one SCAN call is at most one step, on exactly the
+        /// partition its cursor names, carrying no keys, with the TYPE filter inside the step.
+        #[test]
+        fn scan_single_thread(c in proptest::prelude::any::<u64>(), db in 0u8..16, count in 1u32..5000, partitions in 1u16..129, ty in 0u8..4) {
+            let type_filter = match ty {
+                0 => TypeFilter::Any,
+                1 => TypeFilter::Only(VType::String),
+                2 => TypeFilter::Only(VType::Hash),
+                _ => TypeFilter::Nothing,
+            };
+            let a = ScanArgs { cursor: c, pattern: None, count, type_filter };
+            match plan_scan(db, &a, partitions) {
+                ScanPlan::Reply { next } => {
+                    proptest::prop_assert_eq!(next, 0);
+                    proptest::prop_assert!(ty == 3 || cursor::decode(c).0 >= partitions);
+                }
+                ScanPlan::Step { partition, request, .. } => {
+                    proptest::prop_assert_eq!(partition, cursor::decode(c).0);
+                    proptest::prop_assert!(partition < partitions);
+                    proptest::prop_assert!(request.keys.is_empty());
+                    let vtype = match type_filter {
+                        TypeFilter::Only(t) => Some(t),
+                        _ => None,
+                    };
+                    proptest::prop_assert_eq!(request.kind, ReqKind::ScanStep { db, cursor: c, count, vtype });
+                }
+            }
+        }
+
+        /// MATCH: `*` (and no pattern) accept every key; a pattern without glob characters
+        /// accepts exactly itself; matching is case-sensitive.
+        #[test]
+        fn match_filter(key in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..24), lit in "[a-z0-9:_]{0,12}") {
+            proptest::prop_assert!(key_matcher(None)(&key));
+            proptest::prop_assert!(key_matcher(Some(b"*"))(&key));
+            let m = key_matcher(Some(lit.as_bytes()));
+            proptest::prop_assert_eq!(m(&key), key == lit.as_bytes());
+            proptest::prop_assert!(m(lit.as_bytes()));
+            let upper = lit.to_ascii_uppercase();
+            proptest::prop_assert_eq!(m(upper.as_bytes()), upper == lit);
+        }
     }
 
     #[test]

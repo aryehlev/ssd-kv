@@ -141,6 +141,8 @@ pub(crate) struct CopyOpts {
 pub(crate) enum CopyOptsError {
     Syntax,
     NotInteger,
+    /// An integer outside the 32-bit range (`getIntFromObjectOrReply`).
+    IntRange,
     DbRange,
 }
 
@@ -156,10 +158,11 @@ pub(crate) fn parse_copy_opts(argv: &[&[u8]], databases: u8) -> Result<CopyOpts,
         if is_opt(argv[j], b"replace") {
             o.replace = true;
         } else if is_opt(argv[j], b"db") && more >= 1 {
-            // getIntFromObjectOrReply: a 32-bit int
-            let db = parse_i64(argv[j + 1])
-                .filter(|v| i32::try_from(*v).is_ok())
-                .ok_or(CopyOptsError::NotInteger)?;
+            // getIntFromObjectOrReply: a 64-bit integer, then the 32-bit range
+            let db = parse_i64(argv[j + 1]).ok_or(CopyOptsError::NotInteger)?;
+            if i32::try_from(db).is_err() {
+                return Err(CopyOptsError::IntRange);
+            }
             if db < 0 || db >= i64::from(databases) {
                 return Err(CopyOptsError::DbRange);
             }
@@ -178,6 +181,7 @@ impl CopyOptsError {
         w.error(match self {
             CopyOptsError::Syntax => err::SYNTAX,
             CopyOptsError::NotInteger => err::NOT_INTEGER,
+            CopyOptsError::IntRange => err::INT_RANGE,
             CopyOptsError::DbRange => err::DB_RANGE,
         });
     }
@@ -340,7 +344,12 @@ mod tests {
         );
         assert_eq!(p("COPY a b DB 16"), Err(CopyOptsError::DbRange));
         assert_eq!(p("COPY a b DB -1"), Err(CopyOptsError::DbRange));
-        assert_eq!(p("COPY a b DB 4294967296"), Err(CopyOptsError::NotInteger));
+        assert_eq!(p("COPY a b DB 4294967296"), Err(CopyOptsError::IntRange));
+        assert_eq!(p("COPY a b DB -2147483649"), Err(CopyOptsError::IntRange));
+        assert_eq!(
+            p("COPY a b DB 9223372036854775808"),
+            Err(CopyOptsError::NotInteger)
+        );
         assert_eq!(p("COPY a b DB abc"), Err(CopyOptsError::NotInteger));
         assert_eq!(p("COPY a b REPLACE DB"), Err(CopyOptsError::Syntax));
         assert_eq!(p("COPY a b foo"), Err(CopyOptsError::Syntax));
@@ -379,6 +388,11 @@ mod tests {
             &mut m,
             "COPY y x DB abc",
             "-ERR value is not an integer or out of range\r\n",
+        );
+        check(
+            &mut m,
+            "COPY y x DB 99999999999 REPLACE",
+            "-ERR value is out of range, value must between -2147483648 and 2147483647\r\n",
         );
         check(&mut m, "COPY y x REPLACE DB", "-ERR syntax error\r\n");
         check(&mut m, "COPY missing x", ":0\r\n");

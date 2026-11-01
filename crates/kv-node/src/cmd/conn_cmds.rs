@@ -22,8 +22,6 @@ pub const HELLO_SERVER: &[u8] = b"kvd";
 pub const HELLO_VERSION: &[u8] = b"7.2.0";
 
 const WRONGPASS: &[u8] = b"WRONGPASS invalid username-password pair or user is disabled.";
-const INT_RANGE: &[u8] =
-    b"ERR value is out of range, value must between -2147483648 and 2147483647";
 
 /// PING [msg]: `+PONG` or the message as a bulk.
 pub fn ping(_cx: &mut ConnCtx<'_>, a: &Args<'_>, w: &mut ReplyWriter<'_>) -> ConnOutcome {
@@ -144,7 +142,7 @@ fn parse_c_int(arg: &[u8], w: &mut ReplyWriter<'_>) -> Option<i32> {
         None => w.error(err::NOT_INTEGER),
         Some(v) => match i32::try_from(v) {
             Ok(v) => return Some(v),
-            Err(_) => w.error(INT_RANGE),
+            Err(_) => w.error(err::INT_RANGE),
         },
     }
     None

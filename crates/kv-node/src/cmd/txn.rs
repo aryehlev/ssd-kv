@@ -152,9 +152,21 @@ pub fn argv_of(cmd: &OwnedCmd) -> smallvec::SmallVec<[&[u8]; 8]> {
 /// Whether every queued command can run inside one partition request (keyed commands and the
 /// connection commands [`run_queued`] executes inline). Others need the home worker.
 pub fn runs_in_partition(id: CmdId) -> bool {
-    matches!(super::handler(id), Handler::Keyed(_))
-        || matches!(id, CmdId::Ping | CmdId::Echo | CmdId::Select)
+    matches!(super::handler(id), Handler::Keyed(_)) || inline_conn_cmd(id)
 }
+
+/// The connection commands an EXEC body answers inline, from the request alone: they read no
+/// node state and change nothing but the body's database.
+fn inline_conn_cmd(id: CmdId) -> bool {
+    matches!(
+        id,
+        CmdId::Ping | CmdId::Echo | CmdId::Select | CmdId::Unwatch | CmdId::Time | CmdId::ClientId
+    )
+}
+
+/// The reply of a queued command that needs the home worker or node-wide state (INFO, DBSIZE,
+/// FLUSH*, CONFIG, HELLO, SCAN, ...): such commands are not executed inside a transaction.
+const NOT_IN_TXN: &[u8] = b"ERR command not supported inside a single-partition transaction";
 
 /// Runs an EXEC body inside one partition request: the EXEC array header, then each queued
 /// command's reply in order. SELECT inside the transaction switches the database of the
@@ -180,9 +192,7 @@ pub fn run_queued<S: Store>(
             CmdId::Echo => w.bulk(args.arg(1)),
             CmdId::Select => match super::parse_i64(args.arg(1)) {
                 None => w.error(err::NOT_INTEGER),
-                Some(id) if i32::try_from(id).is_err() => w.error(
-                    b"ERR value is out of range, value must between -2147483648 and 2147483647",
-                ),
+                Some(id) if i32::try_from(id).is_err() => w.error(err::INT_RANGE),
                 Some(id) if id < 0 || id >= i64::from(databases) => w.error(err::DB_RANGE),
                 Some(id) => {
                     ks.select(id as u8);
@@ -190,9 +200,13 @@ pub fn run_queued<S: Store>(
                     w.ok();
                 }
             },
+            // EXEC dropped the WATCH list before the body runs
+            CmdId::Unwatch => w.ok(),
+            CmdId::Time => super::server::write_time(w),
+            CmdId::ClientId => w.int(env.conn_id as i64),
             id => match super::keyed::<S>(id) {
                 Some(f) => f(ks, &args, w, &env)?,
-                None => w.error(b"ERR command not supported inside a single-partition transaction"),
+                None => w.error(NOT_IN_TXN),
             },
         }
     }
@@ -326,6 +340,9 @@ mod tests {
             owned("MSET a b c"),
             owned("INCR k"),
             owned("GET k"),
+            owned("UNWATCH"),
+            owned("CLIENT ID"),
+            owned("DBSIZE"),
         ];
         let env = ExecEnv {
             proto: Proto::Resp2,
@@ -346,8 +363,9 @@ mod tests {
         assert_eq!(db, 3);
         assert_eq!(
             show(&out),
-            "*6\\r\\n+OK\\r\\n+OK\\r\\n+PONG\\r\\n-ERR wrong number of arguments for 'mset' command\\r\\n\
-             -ERR value is not an integer or out of range\\r\\n$1\\r\\nv\\r\\n"
+            "*9\\r\\n+OK\\r\\n+OK\\r\\n+PONG\\r\\n-ERR wrong number of arguments for 'mset' command\\r\\n\
+             -ERR value is not an integer or out of range\\r\\n$1\\r\\nv\\r\\n+OK\\r\\n:1\\r\\n\
+             -ERR command not supported inside a single-partition transaction\\r\\n"
         );
         assert!(m.rec(3, b"k").is_some() && m.rec(0, b"k").is_none());
         let cmds = [owned("SELECT 16")];
@@ -367,7 +385,23 @@ mod tests {
         assert!(
             runs_in_partition(CmdId::Set)
                 && runs_in_partition(CmdId::Select)
+                && runs_in_partition(CmdId::Unwatch)
                 && !runs_in_partition(CmdId::Info)
+                && !runs_in_partition(CmdId::Dbsize)
+        );
+        let mut out = Vec::new();
+        run_queued(
+            &mut m,
+            &[owned("TIME")],
+            &mut ReplyWriter::new(&mut out, Proto::Resp2),
+            &env,
+            16,
+        )
+        .unwrap();
+        assert!(
+            show(&out).starts_with("*1\\r\\n*2\\r\\n$10\\r\\n"),
+            "{}",
+            show(&out)
         );
     }
 }

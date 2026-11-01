@@ -240,11 +240,16 @@ pub fn touch<S: Store + ?Sized>(
 
 /// TIME: `[unix seconds, microseconds]` as two bulks.
 pub fn time(_cx: &mut ConnCtx<'_>, _a: &Args<'_>, w: &mut ReplyWriter<'_>) -> ConnOutcome {
+    write_time(w);
+    ConnOutcome::Done
+}
+
+/// The TIME reply: `[unix seconds, microseconds]` as bulks.
+pub(crate) fn write_time(w: &mut ReplyWriter<'_>) {
     let us = super::expire::unix_time_us();
     w.array(2);
     w.bulk_i64((us / 1_000_000) as i64);
     w.bulk_i64((us % 1_000_000) as i64);
-    ConnOutcome::Done
 }
 
 /// SAVE: a durability barrier; `+OK` when every executed effect is written and flushed.

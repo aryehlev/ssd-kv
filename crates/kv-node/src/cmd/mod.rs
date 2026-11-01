@@ -42,6 +42,8 @@ pub mod txn;
 #[cfg(test)]
 mod oracle;
 #[cfg(test)]
+mod props;
+#[cfg(test)]
 mod testkit;
 
 use kv_cmd::CmdId;
@@ -445,6 +447,9 @@ fn memchr_crlf(s: &[u8]) -> Option<usize> {
 pub(crate) mod err {
     pub const SYNTAX: &[u8] = b"ERR syntax error";
     pub const NOT_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
+    /// `getIntFromObjectOrReply` outside the 32-bit range.
+    pub const INT_RANGE: &[u8] =
+        b"ERR value is out of range, value must between -2147483648 and 2147483647";
     pub const WRONGTYPE: &[u8] =
         b"WRONGTYPE Operation against a key holding the wrong kind of value";
     pub const NOT_FLOAT: &[u8] = b"ERR value is not a valid float";

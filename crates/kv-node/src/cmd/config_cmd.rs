@@ -91,7 +91,10 @@ pub fn config_set(cx: &mut ConnCtx<'_>, a: &Args<'_>, w: &mut ReplyWriter<'_>) -
         .shared
         .update_config(|c| pairs.iter().try_for_each(|(n, v)| c.set(n, v)))
     {
-        Ok(()) => w.ok(),
+        Ok(()) => {
+            super::apply_value_limits(&cx.shared.config());
+            w.ok();
+        }
         Err(e) => {
             let mut m = b"ERR ".to_vec();
             m.extend_from_slice(e.0.as_bytes());

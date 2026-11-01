@@ -17,7 +17,7 @@ use kv_storage::keyspace::{StoreError, Value};
 
 use super::expire::{self, Unit};
 use super::store::{self, Store};
-use super::{Args, MAX_STRING_LEN, err, parse_i64, write_arity_error, write_value};
+use super::{Args, err, parse_i64, write_arity_error, write_value};
 use crate::runtime::xmsg::ExecEnv;
 
 /// GET: the value, nil when missing, WRONGTYPE on a hash.
@@ -434,11 +434,15 @@ pub fn msetnx<S: Store + ?Sized>(
     Ok(())
 }
 
-/// Redis `checkStringLength`: `size + append` must not exceed the maximum string length.
+/// Redis `checkStringLength`: `size + append` must not exceed `proto-max-bulk-len`.
 #[inline]
 fn fits(size: u64, append: u64) -> bool {
-    size.checked_add(append)
-        .is_some_and(|t| t <= MAX_STRING_LEN)
+    fits_within(size, append, super::string_limit())
+}
+
+#[inline]
+fn fits_within(size: u64, append: u64, limit: u64) -> bool {
+    size.checked_add(append).is_some_and(|t| t <= limit)
 }
 
 /// APPEND k v: the new length; creates the key without TTL, keeps an existing TTL.
@@ -981,8 +985,10 @@ mod tests {
         // the length limit applies to existing keys only (the argument is already bounded)
         m.set_str(b"big", &[], None);
         m.data.get_mut(&(0, b"big".to_vec())).unwrap().value = vec![b'x'; 16];
-        assert!(fits(MAX_STRING_LEN - 1, 1));
-        assert!(!fits(MAX_STRING_LEN, 1));
+        assert!(fits(crate::cmd::MAX_STRING_LEN - 1, 1));
+        assert!(!fits(crate::cmd::MAX_STRING_LEN, 1));
+        assert!(fits_within(10, 0, 10) && !fits_within(10, 1, 10));
+        assert!(!fits_within(u64::MAX, 1, u64::MAX), "no wrap-around");
         assert!(!fits(u64::MAX, 2));
     }
 

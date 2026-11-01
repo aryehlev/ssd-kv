@@ -46,6 +46,8 @@ mod props;
 #[cfg(test)]
 mod testkit;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use kv_cmd::CmdId;
 use kv_resp::ReplyWriter;
 use kv_storage::keyspace::{Keyspace, StoreError};
@@ -463,9 +465,38 @@ pub(crate) mod err {
     pub const CLUSTER_DISABLED: &[u8] = b"ERR This instance has cluster support disabled";
 }
 
-/// The longest string value (§8.3: 512 MiB; Redis checks `proto-max-bulk-len`, whose default
-/// and maximum here it is).
+/// The longest string value (§8.3: 512 MiB), the default and the ceiling of
+/// `proto-max-bulk-len`.
 pub(crate) const MAX_STRING_LEN: u64 = 512 * 1024 * 1024;
+
+/// `proto-max-bulk-len` as the keyed handlers apply it (Redis `checkStringLength`).
+static STRING_LIMIT: AtomicU64 = AtomicU64::new(MAX_STRING_LEN);
+/// `hash-max-bytes` as the hash handlers apply it.
+static HASH_LIMIT: AtomicU64 = AtomicU64::new(hash::HASH_MAX_BYTES as u64);
+
+/// Publishes the value limits of `cfg` (`proto-max-bulk-len`, `hash-max-bytes`; both settable at
+/// run time, §20.2) to the keyed handlers. Those run inside partitions without access to the
+/// configuration, so the node calls this once the configuration is loaded and CONFIG SET calls
+/// it after every change. The string limit never exceeds 512 MiB (§8.3).
+pub fn apply_value_limits(cfg: &Config) {
+    STRING_LIMIT.store(
+        cfg.proto_max_bulk_len.min(MAX_STRING_LEN),
+        Ordering::Relaxed,
+    );
+    HASH_LIMIT.store(cfg.hash_max_bytes, Ordering::Relaxed);
+}
+
+/// The longest string a write may produce now.
+#[inline]
+pub(crate) fn string_limit() -> u64 {
+    STRING_LIMIT.load(Ordering::Relaxed)
+}
+
+/// The largest encoded hash a write may produce now.
+#[inline]
+pub(crate) fn hash_limit() -> u64 {
+    HASH_LIMIT.load(Ordering::Relaxed)
+}
 
 /// The bytes before the first NUL: Redis compares option names as C strings.
 #[inline]
@@ -646,6 +677,20 @@ mod tests {
             &mut ReplyWriter::new(&mut out, Proto::Resp2),
         );
         assert_eq!(out, b"-LOADING x\r\n");
+    }
+
+    #[test]
+    fn value_limits_follow_config() {
+        // the defaults (other tests run concurrently and expect them): a configured string
+        // limit above 512 MiB is clamped to it
+        let cfg = Config {
+            proto_max_bulk_len: 4 * MAX_STRING_LEN,
+            ..Config::default()
+        };
+        apply_value_limits(&cfg);
+        assert_eq!(string_limit(), MAX_STRING_LEN);
+        assert_eq!(hash_limit(), hash::HASH_MAX_BYTES as u64);
+        assert_eq!(cfg.hash_max_bytes, hash::HASH_MAX_BYTES as u64);
     }
 
     #[test]

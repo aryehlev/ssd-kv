@@ -19,7 +19,8 @@ use super::store::{self, Store};
 use super::{Args, err, parse_i64, write_arity_error};
 use crate::runtime::xmsg::ExecEnv;
 
-/// `hash-max-bytes` default (§20.2): the largest encoded hash a write may produce.
+/// `hash-max-bytes` default (§20.2): the largest encoded hash a write may produce (the current
+/// value is `cmd::hash_limit`).
 pub(crate) const HASH_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Field/value pairs of one decoded hash, borrowing the record bytes.
@@ -145,7 +146,7 @@ fn store_hash<S: Store + ?Sized>(
         ks.delete(key)?;
         return Ok(true);
     }
-    if encoded.len() > HASH_MAX_BYTES {
+    if encoded.len() as u64 > super::hash_limit() {
         w.error(b"ERR hash exceeds maximum allowed size (hash-max-bytes)");
         return Ok(false);
     }

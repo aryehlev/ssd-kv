@@ -395,6 +395,11 @@ fn render(shared: &NodeShared, sel: Selection) -> String {
                 f!("foreground_scrub_writes", parts.foreground_scrub_writes);
                 f!("txn_markers", parts.txn_markers);
                 f!(
+                    "txn_credits_in_use",
+                    crate::shared::TXN_CREDITS
+                        .saturating_sub(shared.txn_credits.load(Ordering::Relaxed))
+                );
+                f!(
                     "large_value_backpressured_conns",
                     workers.large_value_backpressured_conns
                 );
@@ -403,6 +408,7 @@ fn render(shared: &NodeShared, sel: Selection) -> String {
                     parts.flush_reclaim_pending_pages
                 );
                 f!("corrupt_pages", parts.corrupt_pages);
+                f!("unexpected_orphans", parts.unexpected_orphans);
             }
         }
     }
@@ -470,6 +476,13 @@ mod tests {
         assert!(r.contains("cmdstat_get:calls=2,usec=40,usec_per_call=20.00,rejected_calls=0,failed_calls=1\r\n"), "{r}");
         assert!(
             r.contains("latency_percentiles_usec_get:p50=30.000,"),
+            "{r}"
+        );
+        assert!(f.shared.take_txn_credit());
+        let r = f.run_conn(info, "INFO kvd");
+        assert!(
+            r.contains("\r\ntxn_credits_in_use:1\r\n")
+                && r.contains("\r\nunexpected_orphans:0\r\n"),
             "{r}"
         );
         let r = f.run_conn(info, "INFO replication cluster");

@@ -10,10 +10,12 @@ use core::fmt;
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Diagnostic stand-in for user bytes: `<len=N tag=xxxxxxxx>`.
+#[derive(Clone, Copy)]
 pub struct Redacted<'a>(pub &'a [u8]);
 
 impl Redacted<'_> {
-    /// The 32-bit tag: the low half of the unseeded xxh3-64 of the bytes.
+    /// The 32-bit tag: the low half of the unseeded xxh3-64 of the bytes (equal bytes give equal
+    /// tags, so diagnostics can be correlated without revealing content).
     pub fn tag(&self) -> u32 {
         xxh3_64(self.0) as u32
     }
@@ -40,5 +42,9 @@ mod tests {
         let s = format!("{} {:?}", Redacted(b"secret-key"), Redacted(b"secret-key"));
         assert!(!s.contains("secret"));
         assert!(s.starts_with("<len=10 tag="));
+        let r = Redacted(b"secret-key");
+        assert_eq!(s, format!("{r} {r}"));
+        assert_eq!(format!("{}", Redacted(b"")).len(), "<len=0 tag=00000000>".len());
+        assert_ne!(Redacted(b"a").tag(), Redacted(b"b").tag());
     }
 }

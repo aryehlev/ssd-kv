@@ -13,10 +13,10 @@
 //! * [`shared_buf`]: reference-counted reply bodies passed between threads (§7.1).
 //! * [`redact`]: the only way user bytes may appear in a diagnostic (LC-32).
 //!
-//! `unsafe` is allowed only in `ldouble.rs` (the C shim FFI, §24).
+//! `unsafe` is allowed only in `ldouble.rs`, the crate's single FFI boundary to its C shim
+//! (§24).
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
-#![allow(dead_code, unused_variables)]
 
 pub mod abblock;
 pub mod clock;
@@ -36,7 +36,7 @@ pub use crc::RecordCrc;
 pub use hash::KeyHash;
 pub use redact::Redacted;
 pub use shared_buf::SharedBuf;
-pub use slot::{SLOTS, SlotSet};
+pub use slot::{SLOTS, SlotSet, key_slot};
 
 /// Per-key access mode of a command (§6.5, §8.1): `Meta` = header only (existence, type, TTL,
 /// length), `Read` = full value, `Write` = write (prefetches an existing candidate record),

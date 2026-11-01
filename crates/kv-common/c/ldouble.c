@@ -6,7 +6,8 @@
  * limit, the strtold acceptance rules (hex floats and values beyond the double
  * range are accepted; NaN is rejected; overflow/underflow to zero is rejected),
  * the "%.17Lf" rendering with trailing zeros and a trailing '.' removed, and
- * the "-0" -> "0" rewrite.
+ * the "-0" -> "0" rewrite. Also Redis string2d() (strict strtod) for commands
+ * that take a double.
  *
  * Ported from Redis 7.0 (BSD-3-Clause),
  * Copyright (c) 2009-2012, Salvatore Sanfilippo. See NOTICE.
@@ -79,6 +80,37 @@ static size_t kv_ld2string_human(char *buf, size_t len, long double value) {
     }
     buf[l] = '\0';
     return l;
+}
+
+/* Redis string2d(): 1 and *dp set when s[0..slen) strictly represents a
+ * double (strtod, no leading space, every byte consumed, no overflow, no
+ * underflow to zero, not NaN), else 0. */
+int kv_string2d(const unsigned char *s, size_t slen, double *dp) {
+    char stackbuf[KV_MAX_LONG_DOUBLE_CHARS];
+    char *buf = stackbuf;
+    double value;
+    char *eptr;
+    int ok;
+
+    *dp = 0;
+    if (slen == 0) return 0;
+    /* Redis parses the NUL-terminated argument in place, whatever its length. */
+    if (slen >= sizeof(stackbuf)) {
+        buf = malloc(slen + 1);
+        if (buf == NULL) return 0;
+    }
+    memcpy(buf, s, slen);
+    buf[slen] = '\0';
+
+    errno = 0;
+    value = strtod(buf, &eptr);
+    ok = !(isspace((unsigned char)buf[0]) || (size_t)(eptr - buf) != slen ||
+           (errno == ERANGE &&
+            (value == HUGE_VAL || value == -HUGE_VAL || fpclassify(value) == FP_ZERO)) ||
+           isnan(value));
+    if (buf != stackbuf) free(buf);
+    if (ok) *dp = value;
+    return ok;
 }
 
 /* current (when has_cur) + incr, rendered like Redis INCRBYFLOAT into

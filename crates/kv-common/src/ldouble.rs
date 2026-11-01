@@ -1,4 +1,5 @@
-//! INCRBYFLOAT arithmetic in C `long double` (DESIGN §8.1, §8.3, §24.3).
+//! INCRBYFLOAT arithmetic in C `long double` (DESIGN §8.1, §8.3, §24.3), and the crate's only
+//! FFI boundary to the C shim.
 //!
 //! The arithmetic and the rendering are done by the C shim `c/ldouble.c` (compiled by
 //! `build.rs`), which reproduces Redis 7.0's `string2ld` / `ld2string(LD_STR_HUMAN)`: the current
@@ -8,7 +9,10 @@
 //! is printed with `%.17Lf`, then trailing zeros after the `.` and a trailing `.` are removed and
 //! `-0` becomes `0`. Replication ships the formatted result as a `Put` (§23.7).
 //!
-//! This is one of the files allowed to contain `unsafe` (§24); each block has a `SAFETY:` note.
+//! Two more shim functions are declared here because this is the only `kv-common` file allowed to
+//! contain `unsafe` (§24): Redis `string2d` (strict `strtod`, used by
+//! [`crate::num::parse_f64_strict`]) and the clock reads behind [`crate::clock`]
+//! (`c/clock.c`; `std` has no CLOCK_BOOTTIME reader). Each `unsafe` item has a `SAFETY:` note.
 #![allow(unsafe_code)]
 
 use core::ffi::{c_int, c_uchar};
@@ -41,6 +45,48 @@ unsafe extern "C" {
         out_cap: usize,
         out_len: *mut usize,
     ) -> c_int;
+}
+
+// SAFETY: matches `int kv_string2d(const unsigned char *, size_t, double *)` in c/ldouble.c; it
+// reads `len` bytes from `s`, writes one `double` through `out` and keeps no pointer.
+unsafe extern "C" {
+    fn kv_string2d(s: *const c_uchar, len: usize, out: *mut f64) -> c_int;
+}
+
+// SAFETY: matches `uint64_t kv_clock_ns(int)` in c/clock.c: it takes an integer by value,
+// returns an integer, touches no memory owned by Rust and accepts every `int` (unknown selectors
+// read CLOCK_MONOTONIC), so calling it is safe.
+unsafe extern "C" {
+    safe fn kv_clock_ns(which: c_int) -> u64;
+}
+
+/// Clock selectors of `kv_clock_ns` (mirrored in c/clock.c).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ShimClock {
+    Monotonic = 0,
+    Boottime = 1,
+    Realtime = 2,
+}
+
+/// Nanoseconds of `clock` (`clock_gettime`); 0 if it cannot be read.
+#[inline]
+pub(crate) fn clock_ns(clock: ShimClock) -> u64 {
+    kv_clock_ns(clock as c_int)
+}
+
+/// Redis 7.0 `string2d`: `strtod` over the whole argument, refusing an empty string, a leading
+/// space, trailing bytes (including an embedded NUL), overflow, underflow to zero and NaN.
+/// Hex floats and `inf`/`infinity` are accepted, as by `strtod`.
+pub(crate) fn string2d(s: &[u8]) -> Option<f64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut out = 0f64;
+    // SAFETY: `s` is a live, initialized slice of `s.len()` bytes that the shim only reads (it
+    // copies them into its own NUL-terminated buffer); `out` is a valid, exclusive pointer for
+    // the duration of the call. The shim keeps no pointer after returning.
+    let ok = unsafe { kv_string2d(s.as_ptr(), s.len(), &mut out) };
+    (ok != 0).then_some(out)
 }
 
 /// `current + incr` with Redis 7.0 INCRBYFLOAT semantics; `current = None` means the key does
@@ -156,6 +202,43 @@ mod tests {
         // input of MAX_LONG_DOUBLE_CHARS bytes or more is refused
         let long = "1".repeat(MAX_LONG_DOUBLE_CHARS);
         assert_eq!(err(None, &long), LdError::NotFloat);
+    }
+
+    #[test]
+    fn string2d_rules() {
+        assert_eq!(string2d(b"1.5"), Some(1.5));
+        assert_eq!(string2d(b"-0"), Some(-0.0));
+        assert_eq!(string2d(b"+3"), Some(3.0));
+        assert_eq!(string2d(b"1e3"), Some(1000.0));
+        assert_eq!(string2d(b"0x10"), Some(16.0));
+        assert_eq!(string2d(b"0x1p-3"), Some(0.125));
+        assert_eq!(string2d(b"inf"), Some(f64::INFINITY));
+        assert_eq!(string2d(b"-Infinity"), Some(f64::NEG_INFINITY));
+        assert_eq!(string2d(b"4.9e-324"), Some(4.9e-324)); // denormal: accepted
+        assert_eq!(string2d(b""), None);
+        assert_eq!(string2d(b" 1"), None);
+        assert_eq!(string2d(b"1 "), None);
+        assert_eq!(string2d(b"1\x002"), None);
+        assert_eq!(string2d(b"nan"), None);
+        assert_eq!(string2d(b"1e400"), None); // overflow
+        assert_eq!(string2d(b"1e-400"), None); // underflow to zero
+        assert_eq!(string2d(b"abc"), None);
+        // no length limit (Redis parses the argument in place)
+        let mut long = b"0.5".to_vec();
+        long.extend(std::iter::repeat_n(b'0', 6000));
+        assert_eq!(string2d(&long), Some(0.5));
+    }
+
+    #[test]
+    fn clocks_advance() {
+        let a = clock_ns(ShimClock::Monotonic);
+        let b = clock_ns(ShimClock::Boottime);
+        let c = clock_ns(ShimClock::Realtime);
+        assert!(a > 0 && b > 0);
+        assert!(b >= a, "boottime includes suspend time, so it is never behind monotonic");
+        // after 2020-01-01
+        assert!(c > 1_577_836_800_000_000_000);
+        assert!(clock_ns(ShimClock::Monotonic) >= a);
     }
 
     #[test]

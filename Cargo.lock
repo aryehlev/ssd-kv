@@ -687,6 +687,7 @@ dependencies = [
  "crc32c",
  "hdrhistogram",
  "itoa",
+ "proptest",
  "ryu",
  "xxhash-rust",
 ]

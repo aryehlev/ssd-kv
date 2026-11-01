@@ -285,6 +285,28 @@ fn replicas_add_remove_resync() {
         }],
     );
     assert_eq!(n.resync_allowed(&nid(4), false), Ok(()));
+    // only the operator brings a NeedsFullSync member back (no automatic path)
+    let back = Transition::MemberState {
+        shard: S1,
+        node: nid(4),
+        state: MemberState::InSync,
+    };
+    assert!(is_pre(n.apply(std::slice::from_ref(&back))));
+    let expand = Transition::Isr {
+        shard: S1,
+        term: 1,
+        node: nid(4),
+        add: true,
+    };
+    assert!(is_pre(n.apply(std::slice::from_ref(&expand))));
+    apply_ok(
+        &n,
+        &[Transition::MemberState {
+            shard: S1,
+            node: nid(4),
+            state: MemberState::Failed,
+        }],
+    );
     assert!(
         !n.shard(S1).unwrap().member(&nid(4)).unwrap().in_isr,
         "NeedsFullSync leaves the ISR"

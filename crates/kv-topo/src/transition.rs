@@ -9,7 +9,8 @@
 //! Non-admin transitions may move slots only between the source and destination shard of a
 //! migration the operator started (cutover, and the revert to the source when the migration is
 //! paused by a failure). They never add or remove nodes or members, never assign an unassigned
-//! slot and never start a full sync (no non-admin path sets a member to `Syncing`).
+//! slot, never start a full sync (no non-admin path sets a member to `Syncing`) and never bring
+//! a `NeedsFullSync` member back without the operator's `replica resync`.
 //!
 //! Every function here is deterministic: no clock, no randomness, no hash-map iteration order.
 
@@ -157,6 +158,9 @@ impl fmt::Display for Reject {
 }
 
 impl std::error::Error for Reject {}
+
+/// A NeedsFullSync member leaves that state only through `replica resync` (or removal).
+const NEEDS_RESYNC: &str = "member needs an operator resync (kvadm replica resync)";
 
 fn pre(s: &str) -> Reject {
     Reject::Precondition(s.to_owned())
@@ -565,6 +569,9 @@ fn apply_isr(
     };
     let m = &mut sh.members[mi];
     if add {
+        if m.state == MemberState::NeedsFullSync {
+            return Err(pre(NEEDS_RESYNC));
+        }
         m.in_isr = true;
         m.state = MemberState::InSync;
     } else {
@@ -595,6 +602,11 @@ fn apply_member_state(
         return Err(pre("the primary's member state is in-sync"));
     }
     let m = &mut sh.members[mi];
+    if m.state == MemberState::NeedsFullSync
+        && !matches!(state, MemberState::NeedsFullSync | MemberState::Failed)
+    {
+        return Err(pre(NEEDS_RESYNC));
+    }
     m.state = state;
     if !matches!(state, MemberState::InSync | MemberState::Reconciling) {
         m.in_isr = false;

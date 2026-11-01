@@ -31,25 +31,85 @@ use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
 enum Op {
-    NodeAdd { prio: u8 },
-    NodeRemove { n: u8, force: bool },
-    NodeMaint { n: u8, on: bool },
-    ShardCreate { n: u8, min_isr: u8 },
-    ShardDelete { s: u8 },
-    SlotsAssign { s: u8, a: u16, len: u16 },
-    ReplicaAdd { s: u8, n: u8 },
-    ReplicaRemove { s: u8, m: u8 },
-    ReplicaResync { n: u8 },
-    ParamSet { k: u8, v: u32 },
-    MigrateStart { slot: u16, len: u16, dst: u8, barriers: u8 },
-    MigrateCtl { m: u8, what: u8 },
-    Health { n: u8, fail: bool },
-    Promote { s: u8, pick: u8, flagged: u8, handoff: bool, skew: i8 },
-    Isr { s: u8, m: u8, add: bool, skew: i8 },
-    SetState { s: u8, m: u8, state: u8 },
-    Phase { m: u8, phase: u8, flag_ok: bool },
+    NodeAdd {
+        prio: u8,
+    },
+    NodeRemove {
+        n: u8,
+        force: bool,
+    },
+    NodeMaint {
+        n: u8,
+        on: bool,
+    },
+    ShardCreate {
+        n: u8,
+        min_isr: u8,
+    },
+    ShardDelete {
+        s: u8,
+    },
+    SlotsAssign {
+        s: u8,
+        a: u16,
+        len: u16,
+    },
+    ReplicaAdd {
+        s: u8,
+        n: u8,
+    },
+    ReplicaRemove {
+        s: u8,
+        m: u8,
+    },
+    ReplicaResync {
+        n: u8,
+    },
+    ParamSet {
+        k: u8,
+        v: u32,
+    },
+    MigrateStart {
+        slot: u16,
+        len: u16,
+        dst: u8,
+        barriers: u8,
+    },
+    MigrateCtl {
+        m: u8,
+        what: u8,
+    },
+    Health {
+        n: u8,
+        fail: bool,
+    },
+    Promote {
+        s: u8,
+        pick: u8,
+        flagged: u8,
+        handoff: bool,
+        skew: i8,
+    },
+    Isr {
+        s: u8,
+        m: u8,
+        add: bool,
+        skew: i8,
+    },
+    SetState {
+        s: u8,
+        m: u8,
+        state: u8,
+    },
+    Phase {
+        m: u8,
+        phase: u8,
+        flag_ok: bool,
+    },
     /// The migration's natural next phase (Copy -> Ready -> Cutover -> Done).
-    Advance { m: u8 },
+    Advance {
+        m: u8,
+    },
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -87,18 +147,32 @@ const STATES: [MemberState; 6] = [
     MemberState::NeedsFullSync,
 ];
 
-const PHASES: [MigPhase; 5] = [MigPhase::Copy, MigPhase::Ready, MigPhase::Cutover, MigPhase::Done, MigPhase::Paused];
+const PHASES: [MigPhase; 5] = [
+    MigPhase::Copy,
+    MigPhase::Ready,
+    MigPhase::Cutover,
+    MigPhase::Done,
+    MigPhase::Paused,
+];
 
 fn unknown_node() -> NodeId {
     NodeId([0xEE; 20])
 }
 
 fn pick_node(s: &ClusterState, n: u8) -> NodeId {
-    if s.nodes.is_empty() { unknown_node() } else { s.nodes[usize::from(n) % s.nodes.len()].id }
+    if s.nodes.is_empty() {
+        unknown_node()
+    } else {
+        s.nodes[usize::from(n) % s.nodes.len()].id
+    }
 }
 
 fn pick_shard(s: &ClusterState, i: u8) -> ShardId {
-    if s.shards.is_empty() { ShardId(4000) } else { s.shards[usize::from(i) % s.shards.len()].id }
+    if s.shards.is_empty() {
+        ShardId(4000)
+    } else {
+        s.shards[usize::from(i) % s.shards.len()].id
+    }
 }
 
 fn pick_member(s: &ClusterState, sid: ShardId, m: u8) -> NodeId {
@@ -109,7 +183,11 @@ fn pick_member(s: &ClusterState, sid: ShardId, m: u8) -> NodeId {
 }
 
 fn pick_migration(s: &ClusterState, m: u8) -> u64 {
-    if s.migrations.is_empty() { 999_999 } else { s.migrations[usize::from(m) % s.migrations.len()].id }
+    if s.migrations.is_empty() {
+        999_999
+    } else {
+        s.migrations[usize::from(m) % s.migrations.len()].id
+    }
 }
 
 /// Resolves an abstract op against the current state. `serial` numbers new nodes, shards and
@@ -125,27 +203,65 @@ fn resolve(s: &ClusterState, op: &Op, serial: &mut u32) -> Transition {
             let ip = std::net::Ipv4Addr::from(0x0B00_0000 + k);
             node_add_at(NodeId(b), SocketAddr::new(ip.into(), 6379), prio % 4)
         }
-        Op::NodeRemove { n, force } => admin(AdminOp::NodeRemove { id: pick_node(s, n), force }),
-        Op::NodeMaint { n, on } => admin(AdminOp::NodeMaint { id: pick_node(s, n), on }),
-        Op::ShardCreate { n, min_isr } => {
-            admin(AdminOp::ShardCreate { id: ShardId(100 + (k % 50) as u16), primary: pick_node(s, n), min_isr })
-        }
-        Op::ShardDelete { s: i } => admin(AdminOp::ShardDelete { id: pick_shard(s, i) }),
+        Op::NodeRemove { n, force } => admin(AdminOp::NodeRemove {
+            id: pick_node(s, n),
+            force,
+        }),
+        Op::NodeMaint { n, on } => admin(AdminOp::NodeMaint {
+            id: pick_node(s, n),
+            on,
+        }),
+        Op::ShardCreate { n, min_isr } => admin(AdminOp::ShardCreate {
+            id: ShardId(100 + (k % 50) as u16),
+            primary: pick_node(s, n),
+            min_isr,
+        }),
+        Op::ShardDelete { s: i } => admin(AdminOp::ShardDelete {
+            id: pick_shard(s, i),
+        }),
         Op::SlotsAssign { s: i, a, len } => {
             let b = a.saturating_add(len).min(16383);
-            admin(AdminOp::SlotsAssign { slots: SlotRanges(vec![(a, b)]), shard: pick_shard(s, i) })
+            admin(AdminOp::SlotsAssign {
+                slots: SlotRanges(vec![(a, b)]),
+                shard: pick_shard(s, i),
+            })
         }
-        Op::ReplicaAdd { s: i, n } => admin(AdminOp::ReplicaAdd { shard: pick_shard(s, i), node: pick_node(s, n) }),
+        Op::ReplicaAdd { s: i, n } => admin(AdminOp::ReplicaAdd {
+            shard: pick_shard(s, i),
+            node: pick_node(s, n),
+        }),
         Op::ReplicaRemove { s: i, m } => {
             let sid = pick_shard(s, i);
-            admin(AdminOp::ReplicaRemove { shard: sid, node: pick_member(s, sid, m) })
+            admin(AdminOp::ReplicaRemove {
+                shard: sid,
+                node: pick_member(s, sid, m),
+            })
         }
-        Op::ReplicaResync { n } => admin(AdminOp::ReplicaResync { node: pick_node(s, n) }),
+        Op::ReplicaResync { n } => admin(AdminOp::ReplicaResync {
+            node: pick_node(s, n),
+        }),
         Op::ParamSet { k: key, v } => {
-            let keys = ["lease_ms", "renew_ms", "fail_grace_ms", "repl_ack_timeout_ms", "requirepass", "partitions", "bogus", "lease-ms"];
-            admin(AdminOp::ParamSet { key: keys[usize::from(key)].into(), value: v.to_string() })
+            let keys = [
+                "lease_ms",
+                "renew_ms",
+                "fail_grace_ms",
+                "repl_ack_timeout_ms",
+                "requirepass",
+                "partitions",
+                "bogus",
+                "lease-ms",
+            ];
+            admin(AdminOp::ParamSet {
+                key: keys[usize::from(key)].into(),
+                value: v.to_string(),
+            })
         }
-        Op::MigrateStart { slot, len, dst, barriers } => admin(AdminOp::MigrateStart {
+        Op::MigrateStart {
+            slot,
+            len,
+            dst,
+            barriers,
+        } => admin(AdminOp::MigrateStart {
             id: u64::from(k),
             slots: SlotRanges(vec![(slot, slot.saturating_add(len).min(16383))]),
             dst: pick_shard(s, dst),
@@ -160,16 +276,37 @@ fn resolve(s: &ClusterState, op: &Op, serial: &mut u32) -> Transition {
                 _ => AdminOp::MigrateAbort { id },
             })
         }
-        Op::Health { n, fail } => Transition::Health { node: pick_node(s, n), fail },
-        Op::Promote { s: i, pick, flagged, handoff, skew } => {
+        Op::Health { n, fail } => Transition::Health {
+            node: pick_node(s, n),
+            fail,
+        },
+        Op::Promote {
+            s: i,
+            pick,
+            flagged,
+            handoff,
+            skew,
+        } => {
             let sid = pick_shard(s, i);
             let Some(sh) = s.shard(sid) else {
-                return Transition::Health { node: unknown_node(), fail: true };
+                return Transition::Health {
+                    node: unknown_node(),
+                    fail: true,
+                };
             };
             let isr: Vec<NodeId> = sh.isr().map(|m| m.node).collect();
-            let to = if isr.is_empty() { unknown_node() } else { isr[usize::from(pick) % isr.len()] };
-            let flagged_set: Vec<NodeId> =
-                sh.members.iter().enumerate().filter(|(j, _)| flagged & (1 << (j % 8)) != 0).map(|(_, m)| m.node).collect();
+            let to = if isr.is_empty() {
+                unknown_node()
+            } else {
+                isr[usize::from(pick) % isr.len()]
+            };
+            let flagged_set: Vec<NodeId> = sh
+                .members
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| flagged & (1 << (j % 8)) != 0)
+                .map(|(_, m)| m.node)
+                .collect();
             let take = vec![u64::from(k); usize::from(s.params.partitions)];
             let t = if handoff {
                 s.handoff_promote(sid, to, take)
@@ -177,7 +314,13 @@ fn resolve(s: &ClusterState, op: &Op, serial: &mut u32) -> Transition {
                 s.failover_promote(sid, to, &|n: &NodeId| flagged_set.contains(n), take)
             };
             match t {
-                Ok(Transition::Promote { shard, primary, term, isr, term_end }) => Transition::Promote {
+                Ok(Transition::Promote {
+                    shard,
+                    primary,
+                    term,
+                    isr,
+                    term_end,
+                }) => Transition::Promote {
                     shard,
                     primary,
                     term: term.saturating_add_signed(i32::from(skew)),
@@ -189,23 +332,42 @@ fn resolve(s: &ClusterState, op: &Op, serial: &mut u32) -> Transition {
                     primary: to,
                     term: sh.term + 1,
                     isr: vec![to],
-                    term_end: kv_ctrl::TermEnd { term: sh.term, takeover: vec![] },
+                    term_end: kv_ctrl::TermEnd {
+                        term: sh.term,
+                        takeover: vec![],
+                    },
                 },
             }
         }
         Op::Isr { s: i, m, add, skew } => {
             let sid = pick_shard(s, i);
-            let term = s.shard(sid).map_or(1, |sh| sh.term).saturating_add_signed(i32::from(skew));
-            Transition::Isr { shard: sid, term, node: pick_member(s, sid, m), add }
+            let term = s
+                .shard(sid)
+                .map_or(1, |sh| sh.term)
+                .saturating_add_signed(i32::from(skew));
+            Transition::Isr {
+                shard: sid,
+                term,
+                node: pick_member(s, sid, m),
+                add,
+            }
         }
         Op::SetState { s: i, m, state } => {
             let sid = pick_shard(s, i);
-            Transition::MemberState { shard: sid, node: pick_member(s, sid, m), state: STATES[usize::from(state)] }
+            Transition::MemberState {
+                shard: sid,
+                node: pick_member(s, sid, m),
+                state: STATES[usize::from(state)],
+            }
         }
         Op::Phase { m, phase, flag_ok } => {
             let phase = PHASES[usize::from(phase)];
             let flag = matches!(phase, MigPhase::Cutover | MigPhase::Done);
-            Transition::Migration { id: pick_migration(s, m), phase, slots_to_dst: if flag_ok { flag } else { !flag } }
+            Transition::Migration {
+                id: pick_migration(s, m),
+                phase,
+                slots_to_dst: if flag_ok { flag } else { !flag },
+            }
         }
         Op::Advance { m } => {
             let id = pick_migration(s, m);
@@ -214,17 +376,28 @@ fn resolve(s: &ClusterState, op: &Op, serial: &mut u32) -> Transition {
                 Some(MigPhase::Ready) => MigPhase::Cutover,
                 _ => MigPhase::Done,
             };
-            Transition::Migration { id, phase: next, slots_to_dst: matches!(next, MigPhase::Cutover | MigPhase::Done) }
+            Transition::Migration {
+                id,
+                phase: next,
+                slots_to_dst: matches!(next, MigPhase::Cutover | MigPhase::Done),
+            }
         }
     }
 }
 
 fn base(rich: bool) -> ClusterState {
-    if rich { three_by_two() } else { ClusterState::initial(ClusterParams::default(), [5; 16]) }
+    if rich {
+        three_by_two()
+    } else {
+        ClusterState::initial(ClusterParams::default(), [5; 16])
+    }
 }
 
 /// Runs a sequence one transition per batch: (transition, result) per step.
-fn run(start: &ClusterState, ops: &[Op]) -> Vec<(Transition, Result<ClusterState, Reject>, ClusterState)> {
+fn run(
+    start: &ClusterState,
+    ops: &[Op],
+) -> Vec<(Transition, Result<ClusterState, Reject>, ClusterState)> {
     let mut s = start.clone();
     let mut serial = 0;
     let mut out = Vec::new();
@@ -240,20 +413,59 @@ fn run(start: &ClusterState, ops: &[Op]) -> Vec<(Transition, Result<ClusterState
     out
 }
 
+/// A registered node as the operator entered it.
+type Registered = (
+    NodeId,
+    SocketAddr,
+    SocketAddr,
+    SocketAddr,
+    String,
+    u8,
+    u16,
+    u64,
+    bool,
+);
+
 /// Nodes as the operator registered them (everything but the FAIL flag, which health updates).
-fn registry(s: &ClusterState) -> Vec<(NodeId, SocketAddr, SocketAddr, SocketAddr, String, u8, u16, u64, bool)> {
+fn registry(s: &ClusterState) -> Vec<Registered> {
     s.nodes
         .iter()
-        .map(|n| (n.id, n.ctrl, n.client, n.repl, n.zone.clone(), n.priority, n.partitions, n.added_version, n.flags.maint))
+        .map(|n| {
+            (
+                n.id,
+                n.ctrl,
+                n.client,
+                n.repl,
+                n.zone.clone(),
+                n.priority,
+                n.partitions,
+                n.added_version,
+                n.flags.maint,
+            )
+        })
         .collect()
 }
 
 fn member_lists(s: &ClusterState) -> Vec<(ShardId, Vec<NodeId>, u8)> {
-    s.shards.iter().map(|sh| (sh.id, sh.members.iter().map(|m| m.node).collect(), sh.min_isr)).collect()
+    s.shards
+        .iter()
+        .map(|sh| {
+            (
+                sh.id,
+                sh.members.iter().map(|m| m.node).collect(),
+                sh.min_isr,
+            )
+        })
+        .collect()
 }
 
-fn migration_records(s: &ClusterState) -> Vec<(u64, SlotRanges, ShardId, ShardId, Option<u32>, u8)> {
-    s.migrations.iter().map(|m| (m.id, m.slots.clone(), m.src, m.dst, m.rate_mbps, m.barriers)).collect()
+fn migration_records(
+    s: &ClusterState,
+) -> Vec<(u64, SlotRanges, ShardId, ShardId, Option<u32>, u8)> {
+    s.migrations
+        .iter()
+        .map(|m| (m.id, m.slots.clone(), m.src, m.dst, m.rate_mbps, m.barriers))
+        .collect()
 }
 
 fn normalized_for_batch(s: &ClusterState) -> ClusterState {
@@ -333,6 +545,12 @@ proptest! {
                     if ma.state == MemberState::Syncing {
                         prop_assert_eq!(mb.state, MemberState::Syncing, "{:?} started a full sync", t);
                     }
+                    if mb.state == MemberState::NeedsFullSync {
+                        prop_assert!(
+                            matches!(ma.state, MemberState::NeedsFullSync | MemberState::Failed) && !ma.in_isr,
+                            "{:?} brought a NeedsFullSync member back", t
+                        );
+                    }
                 }
             }
         }
@@ -393,7 +611,13 @@ fn shard_spec() -> impl Strategy<Value = ShardSpec> {
             prop::collection::vec(prop::bool::weighted(0.15), k),
             prop::collection::vec(prop::bool::weighted(0.8), k),
         )
-            .prop_map(|(prio, maint, in_isr, fail, lease)| ShardSpec { prio, maint, in_isr, fail, lease })
+            .prop_map(|(prio, maint, in_isr, fail, lease)| ShardSpec {
+                prio,
+                maint,
+                in_isr,
+                fail,
+                lease,
+            })
     })
 }
 
@@ -406,20 +630,38 @@ fn build_shard(spec: &ShardSpec, ids: &[NodeId], reg_order: &[usize]) -> Cluster
         .collect();
     s = apply_ok(&s, &adds);
     let sid = ShardId(1);
-    s = apply_ok(&s, &[admin(AdminOp::ShardCreate { id: sid, primary: ids[0], min_isr: 1 })]);
-    for j in 1..k {
-        s = apply_ok(&s, &[admin(AdminOp::ReplicaAdd { shard: sid, node: ids[j] })]);
+    s = apply_ok(
+        &s,
+        &[admin(AdminOp::ShardCreate {
+            id: sid,
+            primary: ids[0],
+            min_isr: 1,
+        })],
+    );
+    for (j, &node) in ids.iter().enumerate().take(k).skip(1) {
+        s = apply_ok(&s, &[admin(AdminOp::ReplicaAdd { shard: sid, node })]);
         if spec.in_isr[j] {
-            s = apply_ok(&s, &[Transition::Isr { shard: sid, term: 1, node: ids[j], add: true }]);
+            s = apply_ok(
+                &s,
+                &[Transition::Isr {
+                    shard: sid,
+                    term: 1,
+                    node,
+                    add: true,
+                }],
+            );
         }
     }
     let mut b = Vec::new();
-    for j in 0..k {
+    for (j, &id) in ids.iter().enumerate().take(k) {
         if spec.maint[j] {
-            b.push(admin(AdminOp::NodeMaint { id: ids[j], on: true }));
+            b.push(admin(AdminOp::NodeMaint { id, on: true }));
         }
         if spec.fail[j] {
-            b.push(Transition::Health { node: ids[j], fail: true });
+            b.push(Transition::Health {
+                node: id,
+                fail: true,
+            });
         }
     }
     apply_ok(&s, &b)
@@ -427,7 +669,10 @@ fn build_shard(spec: &ShardSpec, ids: &[NodeId], reg_order: &[usize]) -> Cluster
 
 fn distinct_ids(raw: &[[u8; 20]]) -> Option<Vec<NodeId>> {
     let ids: Vec<NodeId> = raw.iter().copied().map(NodeId).collect();
-    let distinct = ids.iter().enumerate().all(|(i, a)| ids[..i].iter().all(|b| a != b));
+    let distinct = ids
+        .iter()
+        .enumerate()
+        .all(|(i, a)| ids[..i].iter().all(|b| a != b));
     distinct.then_some(ids)
 }
 
@@ -518,9 +763,12 @@ proptest! {
 fn generator_reaches_failovers_and_migrations() {
     use proptest::strategy::ValueTree;
     use proptest::test_runner::{Config, TestRunner};
-    let mut runner = TestRunner::new_with_rng(Config::default(), proptest::test_runner::TestRng::deterministic_rng(
-        proptest::test_runner::RngAlgorithm::ChaCha,
-    ));
+    let mut runner = TestRunner::new_with_rng(
+        Config::default(),
+        proptest::test_runner::TestRng::deterministic_rng(
+            proptest::test_runner::RngAlgorithm::ChaCha,
+        ),
+    );
     let strat = (any::<bool>(), prop::collection::vec(op(), 40..80));
     let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
     for _ in 0..200 {
@@ -530,8 +778,20 @@ fn generator_reaches_failovers_and_migrations() {
                 (Transition::Promote { .. }, true) => "promote",
                 (Transition::Isr { add: true, .. }, true) => "isr-expand",
                 (Transition::Isr { add: false, .. }, true) => "isr-shrink",
-                (Transition::Migration { phase: MigPhase::Cutover, .. }, true) => "cutover",
-                (Transition::Migration { phase: MigPhase::Done, .. }, true) => "done",
+                (
+                    Transition::Migration {
+                        phase: MigPhase::Cutover,
+                        ..
+                    },
+                    true,
+                ) => "cutover",
+                (
+                    Transition::Migration {
+                        phase: MigPhase::Done,
+                        ..
+                    },
+                    true,
+                ) => "done",
                 (Transition::Admin(AdminOp::MigrateStart { .. }), true) => "migrate-start",
                 (Transition::Health { fail: true, .. }, true) => "health-fail",
                 (_, false) => "rejected",
@@ -540,7 +800,16 @@ fn generator_reaches_failovers_and_migrations() {
             *counts.entry(key).or_default() += 1;
         }
     }
-    for k in ["promote", "isr-expand", "isr-shrink", "cutover", "done", "migrate-start", "health-fail", "rejected"] {
+    for k in [
+        "promote",
+        "isr-expand",
+        "isr-shrink",
+        "cutover",
+        "done",
+        "migrate-start",
+        "health-fail",
+        "rejected",
+    ] {
         assert!(counts.get(k).copied().unwrap_or(0) >= 20, "{k}: {counts:?}");
     }
 }

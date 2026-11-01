@@ -1017,6 +1017,11 @@ def shrink(runner: Runner, history: list[Cmd], budget: float, log) -> list[Cmd]:
     deadline = time.monotonic() + budget
     last = history[-1]
     prefix = history[:-1]
+    try:
+        runner.reset()
+    except Exception as e:  # target down and not restartable (--target mode)
+        log(f"  cannot reset the servers for replay ({type(e).__name__}: {e}); not shrinking")
+        return history
     if not runner.reproduces(history):
         log("  mismatch did NOT reproduce when replaying the full prefix from a clean state "
             "(timing-dependent?) -- reporting the unshrunk prefix")
@@ -1104,7 +1109,7 @@ def report_mismatch(runner: Runner, env: Environment, history: list[Cmd], ref, t
     opts = runner.opts
     cmd = history[-1]
     print("\n" + "=" * 78)
-    print(f"MISMATCH at command #{len(history)} ({meta.get('where', '')})")
+    print(f"MISMATCH at {meta.get('where', f'step #{len(history)}')}")
     print(f"  command:   {cmd.display()}")
     print(f"  reason:    {reason}")
     print("  reference:\n" + fmt_any(ref).replace("\n", "\n    ").join(["    ", ""]))
@@ -1123,10 +1128,13 @@ def report_mismatch(runner: Runner, env: Environment, history: list[Cmd], ref, t
         repro = shrink(runner, history, opts.shrink_budget, lambda s: print(s, flush=True))
     min_path = os.path.join(out_dir, f"repro-{tag}-min.json")
     save_repro(min_path, repro, {**meta, "reason": reason})
-    print(f"\nMinimal reproducer ({len(repro)} commands"
+    print(f"\nMinimal reproducer ({len(repro)} steps"
           f"{'' if repro is history else f', shrunk from {len(history)}'}); "
           f"start from empty DBs, connections c0..c{len(CONN_PROTOCOLS) - 1} all fresh RESP2, db 0:")
-    for c in repro:
+    shown = repro if len(repro) <= 200 else repro[-200:]
+    if shown is not repro:
+        print(f"  ... {len(repro) - 200} earlier commands omitted here, see {min_path}")
+    for c in shown:
         print("  " + c.display())
     print(f"\nSaved full prefix:  {full_path}")
     print(f"Saved reproducer:   {min_path}")
@@ -1236,7 +1244,7 @@ def main(argv=None) -> int:
                     r, t, diff = runner.exec_one(cmd)
                     if diff:
                         report_mismatch(runner, env, cmds[: i + 1], r, t, diff,
-                                        {"where": f"replay of {opts.replay}", "tag": "replay"})
+                                        {"where": f"step #{i + 1} of replay {opts.replay}", "tag": "replay"})
                         return 1
                 print(f"replay of {len(cmds)} commands: no mismatch")
                 return 0

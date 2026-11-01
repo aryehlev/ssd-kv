@@ -2,3 +2,4 @@
 /operator/operator
 tests/compat/.venv/
 __pycache__/
+tests/compat/.pytest_cache/

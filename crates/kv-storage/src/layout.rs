@@ -193,9 +193,9 @@ pub const AG_TABLE_PAGE: u64 = 4;
 pub const AG_TABLE_ENTRIES: u32 = 2032;
 /// Pages reserved for partition metas (`2 x MAX_PARTITIONS`).
 pub const PMETA_PAGES: u64 = 2 * MAX_PARTITIONS as u64;
-/// Intent slots and the pages reserved for them (one `lba` sector per slot copy).
-pub const INTENT_SLOTS: u32 = 64;
+/// Pages reserved for the intent slots (one `lba` sector per slot copy, §10.7).
 pub const INTENT_SLOT_PAGES: u64 = 128;
+const _: () = assert!(2 * crate::intent::INTENT_SLOTS as u64 <= INTENT_SLOT_PAGES);
 /// Pages of the device-0 metadata area that follows the AG table:
 /// partition metas, node meta A/B, intent header A/B, intent slots.
 pub const DEV0_META_PAGES: u64 = PMETA_PAGES + 2 + 2 + INTENT_SLOT_PAGES;
@@ -403,7 +403,7 @@ impl DeviceLayout {
     /// Byte offset on device 0 of copy `c` of intent slot `slot`: `(2s + c) * lba` past
     /// `intent_slot_page` (§10.7).
     pub fn intent_slot_copy_offset(&self, lba: u32, slot: u32, c: AbCopy) -> u64 {
-        debug_assert!(slot < INTENT_SLOTS);
+        debug_assert!((slot as usize) < crate::intent::INTENT_SLOTS);
         self.intent_slot_page * PAGE as u64 + (2 * u64::from(slot) + c.index() as u64) * u64::from(lba)
     }
 }

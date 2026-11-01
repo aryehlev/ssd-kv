@@ -42,6 +42,8 @@ pub mod txn;
 #[cfg(test)]
 mod oracle;
 #[cfg(test)]
+mod pagestore_tests;
+#[cfg(test)]
 mod props;
 #[cfg(test)]
 mod testkit;

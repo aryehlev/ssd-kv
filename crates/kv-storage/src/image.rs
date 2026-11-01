@@ -357,6 +357,9 @@ pub(crate) struct Built {
     pub(crate) relocate: SmallVec<[EncodedRecord; 1]>,
     /// Keys whose tracked copies elsewhere must be zeroed by foreground writes now (D1, E14).
     pub(crate) foreground: SmallVec<[(u8, Box<[u8]>); 1]>,
+    /// Keys whose newest copy in M is durable and committed while copies elsewhere are still
+    /// tracked as protected sources: those sources are superseded (E2 holds) and go stale.
+    pub(crate) sources_durable: SmallVec<[(u8, Box<[u8]>); 1]>,
     /// Tracked copies in this page that N zeroes.
     pub(crate) cleared: SmallVec<[(u8, Box<[u8]>); 1]>,
     /// Records zeroed and placed (counters).
@@ -487,6 +490,7 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
         applied: SmallVec::new(),
         relocate: SmallVec::new(),
         foreground: SmallVec::new(),
+        sources_durable: SmallVec::new(),
         cleared: SmallVec::new(),
         zeroed: 0,
         placed: 0,
@@ -609,6 +613,11 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     // E14: a further copy waits until the older tracked copy is durably zeroed
                     if others > 0 {
                         out.foreground.push((db, rec.key().into()));
+                        if kept_newest && !newest_txn_open && env.tracked_here(db, rec.key()).is_none() {
+                            // the copy in M is durable, committed and not itself an older
+                            // tracked copy: every tracked copy elsewhere is older and superseded
+                            out.sources_durable.push((db, rec.key().into()));
+                        }
                     }
                     st.pending.push(Pending::Put(rec));
                     continue;

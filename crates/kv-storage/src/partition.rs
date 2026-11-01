@@ -3637,7 +3637,7 @@ impl PartitionStore {
         };
         let scrubbed = st.scrub;
         st.scrub = false;
-        let image::Built { spans, atomic, recs, applied, relocate, foreground, cleared, zeroed, placed, user_bytes } = built;
+        let image::Built { spans, atomic, recs, applied, relocate, foreground, sources_durable, cleared, zeroed, placed, user_bytes } = built;
         self.core.fg_keys.extend(foreground);
         if !spans.is_empty() {
             let wid = self.core.new_wid();
@@ -3698,6 +3698,9 @@ impl PartitionStore {
             }
         }
         cx.cache.put_state(f, st);
+        for (db, key) in sources_durable {
+            self.sources_superseded(cx, db, &key, true);
+        }
         for rec in relocate {
             self.relocate(cx, page, rec);
         }

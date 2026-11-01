@@ -21,8 +21,9 @@
 //! * a **block device stack**, walked through `slaves/` from the device down to every member:
 //!   no device of the stack may be zoned; a dm device's table (`DM_TABLE_STATUS`) may hold only
 //!   `linear` and `crypt` targets; an md device must be raid0/raid1/raid10 without a journal
-//!   member; a loop device's backing file must pass the file rules. A partition is checked
-//!   through its disk. Anything that cannot be read is refused (never assumed safe).
+//!   member; a loop device's backing file must pass the file rules; any other driver stacked on
+//!   member devices (a caching layer such as bcache) is refused. A partition is checked through
+//!   its disk. Anything that cannot be read is refused (never assumed safe).
 //!
 //! The system is reached through the [`Host`] trait so that the rules are unit-tested over
 //! captured `mountinfo`/sysfs trees; the system calls themselves are in `io::sys`.
@@ -74,6 +75,9 @@ pub enum SubstrateRefusal {
     DmTarget(String),
     MdLevel(String),
     LoopBacking(Box<SubstrateRefusal>),
+    /// A block driver stacked on other devices that is neither device-mapper nor md (for
+    /// example a caching layer such as bcache).
+    Stacked(String),
     /// The path is neither a regular file nor a block device.
     NotFileOrBlock,
     /// Direct-I/O alignment other than 512 or 4096 bytes.
@@ -92,6 +96,7 @@ impl core::fmt::Display for SubstrateRefusal {
             SubstrateRefusal::DmTarget(t) => write!(f, "device-mapper target {t} is not supported"),
             SubstrateRefusal::MdLevel(l) => write!(f, "md level {l} is not supported"),
             SubstrateRefusal::LoopBacking(inner) => write!(f, "loop device backing file refused: {inner}"),
+            SubstrateRefusal::Stacked(d) => write!(f, "stacked block driver {d} is not supported"),
             SubstrateRefusal::NotFileOrBlock => f.write_str("not a regular file or a block device"),
             SubstrateRefusal::Alignment(a) => write!(f, "direct I/O alignment {a} is not supported (512 or 4096 required)"),
             SubstrateRefusal::Probe { what, errno: 0 } => write!(f, "cannot verify the storage substrate: {what}"),
@@ -484,7 +489,11 @@ impl Prober<'_> {
         {
             return Err(SubstrateRefusal::Zoned);
         }
+        let slaves = self.host.list(&format!("{disk}/slaves")).unwrap_or_default();
         let mut top = Top::Plain;
+        if self.host.list(&format!("{disk}/bcache")).is_some() || name.starts_with("bcache") {
+            return Err(SubstrateRefusal::Stacked(name.to_string()));
+        }
         if self.host.list(&format!("{disk}/dm")).is_some() || name.starts_with("dm-") {
             let dev = self
                 .host
@@ -523,8 +532,10 @@ impl Prober<'_> {
                 .ok_or(SubstrateRefusal::Probe { what: "loop device backing file", errno: 0 })?;
             self.probe(Path::new(backing.trim()), depth + 1).map_err(|e| SubstrateRefusal::LoopBacking(Box::new(e)))?;
             top = Top::Loop;
+        } else if !slaves.is_empty() {
+            return Err(SubstrateRefusal::Stacked(name.to_string()));
         }
-        for s in self.host.list(&format!("{disk}/slaves")).unwrap_or_default() {
+        for s in slaves {
             let sdir = self
                 .host
                 .resolve(&format!("/sys/class/block/{s}"))
@@ -831,6 +842,28 @@ mod tests {
         );
         h.files.remove("/sys/block/loop0/loop/backing_file");
         assert!(matches!(run(&h, "/dev/loop0"), Err(SubstrateRefusal::Probe { .. })));
+    }
+
+    #[test]
+    fn other_stacked_drivers() {
+        let mut h = base();
+        h.disk("sda", 8, 0);
+        h.disk("sdb", 8, 16);
+        h.disk("bcache0", 252, 0);
+        h.file("/sys/block/bcache0/bcache/cache_mode", "writeback\n");
+        h.slave("bcache0", "sda");
+        h.slave("bcache0", "sdb");
+        h.bdev("/dev/bcache0", (252, 0), 512);
+        assert_eq!(run(&h, "/dev/bcache0").unwrap_err(), SubstrateRefusal::Stacked("bcache0".to_string()));
+        // Any unknown driver with member devices.
+        h.disk("drbd0", 147, 0);
+        h.slave("drbd0", "sda");
+        h.bdev("/dev/drbd0", (147, 0), 512);
+        assert_eq!(run(&h, "/dev/drbd0").unwrap_err(), SubstrateRefusal::Stacked("drbd0".to_string()));
+        // A plain network block device (the power-cut test device) has no members.
+        h.disk("nbd0", 43, 0);
+        h.bdev("/dev/nbd0", (43, 0), 4096);
+        assert_eq!(run(&h, "/dev/nbd0").unwrap().substrate, Substrate::RawBlock);
     }
 
     #[test]

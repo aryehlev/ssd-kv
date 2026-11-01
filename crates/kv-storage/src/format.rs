@@ -601,6 +601,30 @@ mod tests {
     }
 
     #[test]
+    fn public_format_uses_fresh_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        if !substrate_ok(dir.path()) {
+            return;
+        }
+        let d0 = dir.path().join("p.img");
+        let opts = FormatOpts {
+            devices: vec![(d0.clone(), Some(40 << 20))],
+            partitions: 32,
+            cluster: false,
+            snapshot_region: SnapshotRegionSize::Bytes(0),
+        };
+        format(&opts).unwrap();
+        let (_, a) = Superblock::decode(&read_page(&d0, 0)).unwrap();
+        a.validate().unwrap();
+        assert!(a.created_unix_ms > 1_700_000_000_000);
+        assert_eq!(a.clock_floor_unix_ms, a.created_unix_ms);
+        format(&opts).unwrap();
+        let (_, b) = Superblock::decode(&read_page(&d0, 0)).unwrap();
+        assert_ne!((a.set_uuid, a.hash_seed), (b.set_uuid, b.hash_seed));
+        assert_eq!(b.member_uuids[0], b.device_uuid);
+    }
+
+    #[test]
     fn uuid_bits() {
         let u = uuid_v4([0xFF; 16]);
         assert_eq!(u[6] >> 4, 4);

@@ -185,11 +185,11 @@ impl SimDevice {
         let subs = core::mem::take(&mut self.in_flight);
         for s in subs {
             if mode == TearMode::None {
-                self.complete(s, false);
+                self.complete(s, true);
                 continue;
             }
             match self.rng.below(3) {
-                0 => self.complete(s, false),
+                0 => self.complete(s, true),
                 1 => {}
                 _ => self.tear_in_flight(s, mode, false),
             }
@@ -307,7 +307,8 @@ impl SimDevice {
         a
     }
 
-    /// Completes one request normally; queues its completion unless `quiet`.
+    /// Completes one request normally; queues its completion unless `quiet` (the submitting
+    /// process is gone).
     fn complete(&mut self, s: Submitted, quiet: bool) {
         let Submitted { mut req, covers } = s;
         let fail = self.error_ppm > 0 && self.rng.below(1_000_000) < u64::from(self.error_ppm);
@@ -323,9 +324,7 @@ impl SimDevice {
                 IoOp::Write { buf, buf_off, dsync, atomic } => {
                     let atom = self.atom_for(*atomic);
                     let o = *buf_off as usize;
-                    let (dsync, offset) = (*dsync, req.offset);
-                    let data = buf.as_slice()[o..o + len].to_vec();
-                    self.apply_write(offset, &data, dsync, atom);
+                    self.apply_write(req.offset, &buf.as_slice()[o..o + len], *dsync, atom);
                     Ok(req.len)
                 }
                 IoOp::Flush => {
@@ -731,6 +730,64 @@ mod tests {
         d.set_error_rate(0);
         d.submit(IoReq::discard(tag(4), 0, 0, 512));
         assert_eq!(drain(&mut d)[0].res, Ok(512));
+    }
+
+    /// SimDevice + tiling parser: image N keeps M's records byte-identical (R1) and adds one;
+    /// whatever a power cut leaves while N is in flight or unflushed, every record parses as
+    /// written and M's records survive (§17.3, two-image mode). With RWF_ATOMIC the page is M or
+    /// N whole (atomic mode).
+    #[test]
+    fn torn_page_images_parse_old_or_new() {
+        use crate::layout::{PageId, Seq};
+        use crate::page::{PageParse, parse_small_page, write_small_header};
+        use crate::record::{REC_KIND_STRING, RecHeader, encode_small};
+        use kv_common::RecordCrc;
+
+        let crc = RecordCrc::new(0x1357);
+        let page = PageId(3);
+        let rec = |b: &mut [u8; PAGE], key: &[u8], val: &[u8], off: u16, seq: u64| {
+            let h = RecHeader {
+                kind: REC_KIND_STRING,
+                db: 0,
+                flags: 0,
+                seq: Seq(seq),
+                expire_at_ms: 0,
+                key_len: key.len() as u16,
+                val_len: val.len() as u16,
+                h32: seq as u32,
+                txn: None,
+            };
+            encode_small(&h, key, val, page, off, crc, &mut b[usize::from(off)..]);
+        };
+        let mut m = [0u8; PAGE];
+        write_small_header(&mut m, page, 1);
+        rec(&mut m, b"k1", &[1u8; 700], 0x20, 1);
+        rec(&mut m, b"k2", &[2u8; 900], 0x900, 2);
+        let mut n = m;
+        rec(&mut n, b"k3", &[3u8; 1000], 0x400, 3);
+        for seed in 0..60u64 {
+            let atomic = seed.is_multiple_of(4);
+            let lba = if seed.is_multiple_of(3) { 4096 } else { 512 };
+            let mut d = SimDevice::new(8, lba, atomic.then_some(4096), seed);
+            d.submit(IoReq::write(tag(1), 0, 3 * PAGE as u64, AlignedBuf::from_slice(&m)));
+            drain(&mut d);
+            d.submit(IoReq::flush(tag(2), 0));
+            drain(&mut d);
+            d.submit(IoReq::write_span(tag(3), 0, 3 * PAGE as u64, AlignedBuf::from_slice(&n), 0, PAGE as u32, false, atomic));
+            if seed.is_multiple_of(2) {
+                drain(&mut d); // completed but not flushed
+            }
+            let mode = [TearMode::Bytes, TearMode::Sectors, TearMode::Prefix, TearMode::None][(seed % 4) as usize];
+            d.power_cut(mode);
+            let img: [u8; PAGE] = d.durable_image()[3 * PAGE..4 * PAGE].try_into().unwrap();
+            let mut out = Vec::new();
+            assert_eq!(parse_small_page(&img, page, 1, crc, &mut out), PageParse::Ok);
+            let keys: Vec<&[u8]> = out.iter().map(|v| v.key).collect();
+            assert!(keys == [b"k1".as_slice(), b"k2"] || keys == [b"k1".as_slice(), b"k3", b"k2"], "seed {seed}: {keys:?}");
+            if atomic {
+                assert!(img == m || img == n, "seed {seed}: atomic write torn");
+            }
+        }
     }
 
     #[test]

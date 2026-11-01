@@ -912,11 +912,11 @@ mod tests {
         assert!(r.unique_states > 10_000);
     }
 
-    /// Five members, two terms, two versions, at most two messages in flight (one in debug
-    /// builds): the whole state space within the bounds.
+    /// Five members, two terms (one in debug builds), two versions, at most two messages in
+    /// flight: the whole state space within the bounds.
     #[test]
     fn five_members_complete() {
-        let m = cfg(5, 2, 2, false, 0, if release() { 2 } else { 1 }, false);
+        let m = cfg(5, if release() { 2 } else { 1 }, 2, false, 0, 2, false);
         let r = run("5 members (complete)", &m, 900);
         assert!(r.complete);
         assert!(r.examples >= 1);

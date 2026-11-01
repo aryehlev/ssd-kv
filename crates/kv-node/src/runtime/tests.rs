@@ -216,6 +216,47 @@ fn cross_partition_writes_run_as_transactions() {
     assert_eq!(got[0], got[1], "every MSET applied both keys together");
 }
 
+/// Commands of one connection that reach the same partition execute in request order (§6.6),
+/// also behind a cross-partition transaction still waiting for the gate and behind a FLUSHDB.
+#[test]
+fn pipelined_commands_keep_order_behind_transactions_and_flushes() {
+    let n = TestNode::start(2, |_| {});
+    let mut c = n.client();
+    let (a, b) = keys_on_two_workers();
+    // a second connection keeps the transaction gate busy
+    let port = n.port;
+    let (a2, b2) = (a.clone(), b.clone());
+    let noise = std::thread::spawn(move || {
+        let mut c = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap().get_connection().unwrap();
+        for i in 0..300 {
+            let _: () = redis::cmd("MSET").arg(&a2).arg(i).arg(&b2).arg(i).query(&mut c).unwrap();
+        }
+    });
+    for round in 0..20 {
+        let mut p = redis::pipe();
+        for i in 0..50 {
+            p.cmd("MSET").arg(&a).arg(i).arg(&b).arg(i).ignore();
+            p.cmd("DEL").arg(&a);
+            p.cmd("GET").arg(&b);
+        }
+        p.cmd("FLUSHDB").ignore();
+        p.cmd("SET").arg(&a).arg("after").ignore();
+        p.cmd("GET").arg(&a);
+        let got: Vec<redis::Value> = p.query(&mut c).unwrap();
+        assert_eq!(got.len(), 101);
+        for i in 0..50 {
+            let del: i64 = redis::from_redis_value(got[2 * i].clone()).unwrap();
+            assert_eq!(del, 1, "round {round}: DEL {i} ran before the MSET it follows");
+            let v: Option<String> = redis::from_redis_value(got[2 * i + 1].clone()).unwrap();
+            // the other connection's MSETs may interleave, never an older or missing value
+            assert!(v.is_some(), "round {round}: GET {i} ran before the MSET it follows");
+        }
+        let last: String = redis::from_redis_value(got[100].clone()).unwrap();
+        assert_eq!(last, "after", "round {round}: the SET after FLUSHDB was flushed");
+    }
+    noise.join().unwrap();
+}
+
 #[test]
 fn scan_keys_and_randomkey_walk_every_partition() {
     let n = TestNode::start(2, |_| {});

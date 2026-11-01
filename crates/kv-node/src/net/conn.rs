@@ -69,6 +69,10 @@ pub enum Hold {
     TxnCredit,
     /// The worker's staged-write memory is at its share of `max-dirty-bytes`.
     Dirty,
+    /// An ordering wait, not a limit: the connection's cross-partition transaction waits for
+    /// the transaction gate, and later commands must not reach its partitions before its locks
+    /// (§6.6, §6.8). Lifted when the locks are sent.
+    Order,
 }
 
 /// A fan-out reply being gathered (§6.8).

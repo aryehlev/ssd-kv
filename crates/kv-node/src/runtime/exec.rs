@@ -108,6 +108,10 @@ struct Coord {
     start_ns: u64,
     /// Spent once the transaction takes a txn id; given back when it ends without one.
     credit: Option<CreditGuard>,
+    /// The `Lock` messages went out (the gate served the transaction).
+    started: bool,
+    /// The connection stopped parsing until then (`Hold::Order`).
+    holds_conn: bool,
 }
 
 /// A result produced by an executed request, released after the partition ticks of the same
@@ -122,7 +126,15 @@ enum Held {
 struct PartHold {
     xtxn: u64,
     coord: u16,
-    queue: VecDeque<(Request, Job)>,
+    queue: VecDeque<HoldItem>,
+}
+
+/// What waits behind a partition hold, in arrival order.
+enum HoldItem {
+    Job(Request, Job),
+    /// The `Lock` of the next transaction (it arrived before the current one's `Commit` or
+    /// `Unlock`): it takes the partition when its turn in the queue comes.
+    Lock(XTxnMsg),
 }
 
 /// A node operation on its home worker.
@@ -713,7 +725,9 @@ impl<B: Backend> Worker<B> {
                 drop(argv);
                 let seq = conn.reserve_slot();
                 let to = ReplyTo { conn: self.conn_ref(slot), seq, part: None };
-                self.start_xtxn(to, cmd, env, credit.take());
+                if !self.start_xtxn(to, cmd, env, credit.take()) {
+                    conn.hold = Some(Hold::Order);
+                }
             }
             Route::Home => {
                 drop(argv);
@@ -990,7 +1004,7 @@ impl<B: Backend> Worker<B> {
                 _ => false,
             };
             if !own {
-                h.queue.push_back((req, job));
+                h.queue.push_back(HoldItem::Job(req, job));
                 return;
             }
         }
@@ -1223,7 +1237,11 @@ impl<B: Backend> Worker<B> {
     // -----------------------------------------------------------------------------------------
     // cross-partition transactions (§6.8)
 
-    fn start_xtxn(&mut self, to: ReplyTo, cmd: OwnedCmd, env: ExecEnv, credit: Option<CreditGuard>) {
+    /// Plans and queues a cross-partition transaction at the gate. Returns whether its `Lock`
+    /// messages already went out (or it ended); otherwise the caller holds the connection
+    /// (`Hold::Order`) until they do, so that no later command of the connection reaches one
+    /// of its partitions first (§6.6).
+    fn start_xtxn(&mut self, to: ReplyTo, cmd: OwnedCmd, env: ExecEnv, credit: Option<CreditGuard>) -> bool {
         self.x.next_xtxn += 1;
         let xtxn = (u64::from(self.id) << 40) | self.x.next_xtxn;
         let router = self.router;
@@ -1233,14 +1251,21 @@ impl<B: Backend> Worker<B> {
             ReplyWriter::new(&mut b, env.proto).error(b"ERR internal: not a cross-partition transaction command");
             self.record(id, self.now.mono_ns, true);
             self.deliver(to, ReplyBody::Bytes(b));
-            return;
+            return true;
         };
         // the gate ticket is taken only for a transaction that will run (it must be released
         // in turn)
         coord.ticket = self.shared.xtxn.ticket();
-        self.x.coords.insert(xtxn, Coord { coord, to, start_ns: self.now.mono_ns, credit });
+        self.x.coords.insert(xtxn, Coord { coord, to, start_ns: self.now.mono_ns, credit, started: false, holds_conn: false });
         self.x.gate_q.push_back(xtxn);
         self.poll_gate();
+        match self.x.coords.get_mut(&xtxn) {
+            Some(c) if !c.started => {
+                c.holds_conn = true;
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Starts the transaction at the head of this worker's gate queue when the gate serves it.
@@ -1257,9 +1282,39 @@ impl<B: Backend> Worker<B> {
             let me = self.id;
             if c.coord.partitions().next().is_none() {
                 self.xtxn_step(xtxn, |c| c.abort(b"ERR internal: empty transaction"));
-            } else {
-                self.xtxn_step(xtxn, |c| c.start(me));
+                continue;
             }
+            self.xtxn_step(xtxn, |c| c.start(me));
+            // the locks are on their way: the connection's later commands queue behind them
+            if let Some(c) = self.x.coords.get_mut(&xtxn) {
+                c.started = true;
+                if std::mem::take(&mut c.holds_conn) {
+                    let conn = c.to.conn;
+                    self.lift_hold(conn, Hold::Order);
+                }
+            }
+        }
+    }
+
+    /// Lifts hold `h` of a connection of this worker (if it still holds it).
+    fn lift_hold(&mut self, conn: ConnRef, h: Hold) {
+        let slot = conn.slot;
+        let Some(c) = self.conn_mut(slot, conn.generation) else { return };
+        if c.hold == Some(h) {
+            c.hold = None;
+            self.queue_parse(slot);
+        }
+    }
+
+    /// Carries a participant-side transaction message to partition `p`: at once when this
+    /// worker owns `p` (so that the partition is locked before any later command of the
+    /// coordinating connection is submitted to it), otherwise through the worker's queue.
+    fn xtxn_send(&mut self, p: u16, m: XTxnMsg) {
+        let dst = p % self.router.workers;
+        if dst == self.id {
+            self.on_xtxn(m);
+        } else {
+            self.send(dst, XMsg::XTxn(m));
         }
     }
 
@@ -1272,7 +1327,7 @@ impl<B: Backend> Worker<B> {
                 Step::Wait => return,
                 Step::Send(msgs) => {
                     for (p, m) in msgs {
-                        self.send(p % self.router.workers, XMsg::XTxn(m));
+                        self.xtxn_send(p, m);
                     }
                     return;
                 }
@@ -1297,7 +1352,7 @@ impl<B: Backend> Worker<B> {
                 }
                 Step::Finish { msgs, reply } => {
                     for (p, m) in msgs {
-                        self.send(p % self.router.workers, XMsg::XTxn(m));
+                        self.xtxn_send(p, m);
                     }
                     let Some(c) = self.x.coords.remove(&xtxn) else { return };
                     self.shared.xtxn.release(c.coord.ticket);
@@ -1313,6 +1368,13 @@ impl<B: Backend> Worker<B> {
     fn on_xtxn(&mut self, m: XTxnMsg) {
         match m {
             XTxnMsg::Lock { xtxn, from, partition, db, keys } => {
+                if let Some(h) = self.x.holds.get_mut(&partition)
+                    && h.xtxn != xtxn
+                {
+                    // the previous transaction still holds the partition
+                    h.queue.push_back(HoldItem::Lock(XTxnMsg::Lock { xtxn, from, partition, db, keys }));
+                    return;
+                }
                 self.x.holds.insert(partition, PartHold { xtxn, coord: from, queue: VecDeque::new() });
                 let req = Request {
                     db,
@@ -1334,24 +1396,26 @@ impl<B: Backend> Worker<B> {
                 self.submit_job(partition, req, job);
             }
             XTxnMsg::Commit { xtxn, txn_id, partition } => {
-                let _ = xtxn;
                 self.backend.on_meta(partition, self.now, MetaDone::Committed { txn: txn_id });
-                self.release_hold(partition);
+                self.release_hold(partition, xtxn);
             }
-            XTxnMsg::Unlock { xtxn, partition } => {
-                let _ = xtxn;
-                self.release_hold(partition);
-            }
+            XTxnMsg::Unlock { xtxn, partition } => self.release_hold(partition, xtxn),
             XTxnMsg::Locked { xtxn, partition, reads } => self.xtxn_step(xtxn, |c| c.on_locked(partition, reads)),
             XTxnMsg::Applied { xtxn, partition, res } => self.xtxn_step(xtxn, |c| c.on_applied(partition, res)),
         }
     }
 
-    /// Ends a transaction's hold of `p`: the requests that arrived meanwhile go in, in order.
-    fn release_hold(&mut self, p: u16) {
-        if let Some(h) = self.x.holds.remove(&p) {
-            for (req, job) in h.queue {
-                self.submit_job(p, req, job);
+    /// Ends transaction `xtxn`'s hold of `p`: what arrived meanwhile goes in, in order (a
+    /// later transaction's `Lock` takes the partition at its place in that order).
+    fn release_hold(&mut self, p: u16, xtxn: u64) {
+        if self.x.holds.get(&p).is_none_or(|h| h.xtxn != xtxn) {
+            return;
+        }
+        let Some(h) = self.x.holds.remove(&p) else { return };
+        for item in h.queue {
+            match item {
+                HoldItem::Job(req, job) => self.submit_job(p, req, job),
+                HoldItem::Lock(m) => self.on_xtxn(m),
             }
         }
     }
@@ -1380,12 +1444,18 @@ impl<B: Backend> Worker<B> {
         let shared_op = Arc::new(op.clone());
         self.x.gathers[id as usize] = Some(HomeGather { op, to, remaining: workers, err: None, lines: Vec::new(), killed: 0 });
         for w in 0..workers {
-            let msg = match &*shared_op {
-                NodeOp::Flush { db } => XMsg::Flush { db: *db, gather },
-                NodeOp::Barrier(_) | NodeOp::Shutdown { .. } => XMsg::Barrier { gather },
-                NodeOp::ClientList(_) | NodeOp::ClientKill { .. } => XMsg::Clients { gather, op: shared_op.clone(), caller },
+            let (msg, ordered) = match &*shared_op {
+                NodeOp::Flush { db } => (XMsg::Flush { db: *db, gather }, true),
+                NodeOp::Barrier(_) | NodeOp::Shutdown { .. } => (XMsg::Barrier { gather }, true),
+                NodeOp::ClientList(_) | NodeOp::ClientKill { .. } => (XMsg::Clients { gather, op: shared_op.clone(), caller }, false),
             };
-            self.send(w, msg);
+            if w == self.id && ordered {
+                // this worker's partitions take their part before any later command of the
+                // connection (other workers receive it ahead of them in their queues, §6.6)
+                self.handle_message(msg);
+            } else {
+                self.send(w, msg);
+            }
         }
     }
 

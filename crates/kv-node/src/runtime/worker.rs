@@ -76,6 +76,8 @@ pub struct Worker<B: Backend> {
     pub(super) counters: WorkerCounters,
     pub(super) now: Now,
     last_publish: u64,
+    /// Connections held on a node-wide limit (re-checked every millisecond).
+    shared_held: Vec<u32>,
     /// The connection [`parse_conn`](Self::parse_conn) took out of the table.
     pub(super) checked_out: Option<u32>,
     /// Results for the checked-out connection, delivered when it is back.
@@ -130,6 +132,7 @@ impl<B: Backend> Worker<B> {
             last_publish: 0,
             publish_due: false,
             checked_out: None,
+            shared_held: Vec::new(),
             deferred: Vec::new(),
             recovering,
             recovery: init.recovery,
@@ -170,6 +173,7 @@ impl<B: Backend> Worker<B> {
             self.submit_io();
             self.flush_sends();
             self.publish(false);
+            self.recheck_shared_holds();
             if let Some(since) = self.stopping {
                 if self.now.mono_ns.saturating_sub(since) > SHUTDOWN_DRAIN_NS {
                     tracing::warn!(worker = self.id, "shutdown drain timed out: the next start takes the full scan");
@@ -448,21 +452,43 @@ impl<B: Backend> Worker<B> {
         self.counters.connected_clients = self.counters.connected_clients.saturating_sub(1);
     }
 
-    /// Lifts a hold when its limit no longer applies (same threshold, §6.7) and resumes parsing.
+    /// Lifts a hold when its limit no longer applies (the same threshold that set it, §6.7)
+    /// and resumes parsing.
     pub(super) fn reconsider(&mut self, slot: u32) {
         let max_pending = self.cfg.max_pending_per_conn as usize;
         let max_out = self.cfg.client_output_buffer_limit;
+        let queues_free = self.x.outbox.iter().all(VecDeque::is_empty);
         let Some(c) = self.conns[slot as usize].as_mut() else { return };
         let lift = match c.hold {
+            None => false,
             Some(Hold::Pending) => c.pending() < max_pending,
             Some(Hold::Output) => c.output_bytes() < max_out,
-            Some(_) => true,
-            None => false,
+            Some(Hold::Queue) => queues_free,
+            Some(Hold::LargeValue) => self.shared.budget.may_start(),
+            Some(Hold::TxnCredit) => self.shared.txn_credits.load(Ordering::Acquire) > 0,
+            Some(Hold::Dirty) => !self.dirty_full,
+            // lifted by the transaction when its locks are sent
+            Some(Hold::Order) => false,
         };
         if lift {
             c.hold = None;
             self.queue_parse(slot);
         }
+    }
+
+    /// Connections held on a node-wide limit (large-value budget, txn credits) are released by
+    /// other workers' progress, which sends them nothing: re-check them (at most once per
+    /// millisecond while any is held; the worker keeps its timer armed for that).
+    fn recheck_shared_holds(&mut self) {
+        if self.shared_held.is_empty() {
+            return;
+        }
+        let mut held = std::mem::take(&mut self.shared_held);
+        for &slot in &held {
+            self.reconsider(slot);
+        }
+        held.retain(|&s| self.conns.get(s as usize).and_then(Option::as_ref).is_some_and(|c| matches!(c.hold, Some(Hold::LargeValue | Hold::TxnCredit))));
+        self.shared_held = held;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -493,7 +519,7 @@ impl<B: Backend> Worker<B> {
         let max_pending = self.cfg.max_pending_per_conn as usize;
         let max_out = self.cfg.client_output_buffer_limit;
         loop {
-            if conn.closing() || conn.hold == Some(Hold::Queue) {
+            if conn.closing() || conn.hold.is_some() {
                 break;
             }
             if conn.pending() >= max_pending {
@@ -547,6 +573,9 @@ impl<B: Backend> Worker<B> {
         }
         if conn.hold.is_some() {
             conn.flags |= flags::BACKPRESSURED;
+            if matches!(conn.hold, Some(Hold::LargeValue | Hold::TxnCredit)) && !self.shared_held.contains(&slot) {
+                self.shared_held.push(slot);
+            }
         } else {
             conn.flags &= !flags::BACKPRESSURED;
         }
@@ -780,7 +809,8 @@ impl<B: Backend> Worker<B> {
             || !self.recovering.is_empty()
             || self.stopping.is_some()
             || self.x.waiting_on_gate()
-            || self.publish_due;
+            || self.publish_due
+            || !self.shared_held.is_empty();
         let timer = if busy {
             Some(BUSY_TIMER_NS)
         } else if !self.conns.is_empty() && self.cfg.timeout > 0 {

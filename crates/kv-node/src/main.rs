@@ -30,6 +30,10 @@ use clap::Parser;
 
 use crate::config::{CheckArgs, Cli, Command, Config, FormatArgs, InspectArgs};
 
+/// Whether `cluster::agent` and `cluster::ownership` are implemented (M2); until then cluster
+/// mode is refused at startup with a one-line reason (§22).
+const CLUSTER_AGENT_AVAILABLE: bool = false;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -76,6 +80,12 @@ fn serve(args: &config::ServeArgs) -> i32 {
         return 1;
     }
     let cluster = cfg.cluster_enabled;
+    if cluster && !CLUSTER_AGENT_AVAILABLE {
+        // The node cluster agent and the ownership gate (src/cluster/*) are M2 work that this
+        // build does not contain yet: refuse cluster mode instead of starting half of it.
+        eprintln!("kvd: cluster-enabled yes needs the node cluster agent (M2), which this build does not include");
+        return 1;
+    }
     let node = match runtime::node::start(cfg) {
         Ok(n) => n,
         Err(e) => {

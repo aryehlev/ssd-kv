@@ -17,3 +17,9 @@ libc.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 hashbrown.workspace = true
+criterion.workspace = true
+
+# probe/insert micro-benchmark (criterion provides its own harness)
+[[bench]]
+name = "index"
+harness = false

@@ -355,7 +355,71 @@ impl TxnIds {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::prelude::*;
     use smallvec::smallvec;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn prop_slot_round_trip(copy_seq in any::<u64>(), ids in proptest::collection::vec(any::<u64>(), 0..=IDS_PER_COPY)) {
+            let s = IntentSlot { copy_seq, txn_ids: ids.into_iter().collect() };
+            let mut b = [0u8; INTENT_SLOT_COPY_BYTES];
+            s.encode(&mut b);
+            prop_assert_eq!(IntentSlot::decode(&b), Some(s));
+        }
+
+        #[test]
+        fn prop_header_round_trip(floor in any::<u64>(), w in any::<u64>(), seq in any::<u64>()) {
+            let h = IntentHeader { txn_floor: floor, resolved_w: w };
+            let mut b = [0u8; PAGE];
+            h.encode(seq, &mut b);
+            prop_assert_eq!(IntentHeader::decode(&b), Some((seq, h)));
+        }
+
+        #[test]
+        fn prop_random_copies_never_decode(b in proptest::collection::vec(any::<u8>(), INTENT_SLOT_COPY_BYTES)) {
+            prop_assert!(IntentSlot::decode(&b).is_none());
+        }
+
+        /// A torn slot write (§17.5): the copy being overwritten holds any byte mix of its old and
+        /// new image; the slot then reads as the new copy only if it is whole, else as the
+        /// previous newest copy, so a batch is either committed whole or not at all.
+        #[test]
+        fn prop_torn_slot_copy(
+            old_ids in proptest::collection::vec(1u64..1000, 0..30),
+            batch in proptest::collection::vec(1000u64..2000, 1..30),
+            mask in proptest::collection::vec(any::<bool>(), INTENT_SLOT_COPY_BYTES),
+            target_b in any::<bool>(),
+        ) {
+            let newest = IntentSlot { copy_seq: 10, txn_ids: old_ids.iter().copied().collect() };
+            let older = IntentSlot { copy_seq: 9, txn_ids: smallvec![] };
+            let mut pair = if target_b {
+                SlotPair { a: Some(newest.clone()), b: Some(older.clone()) }
+            } else {
+                SlotPair { a: Some(older.clone()), b: Some(newest.clone()) }
+            };
+            let (c, next) = pair.next_copy(0, &batch).unwrap();
+            prop_assert_eq!(c, if target_b { AbCopy::B } else { AbCopy::A });
+            let (mut img_old, mut img_new) = ([0u8; INTENT_SLOT_COPY_BYTES], [0u8; INTENT_SLOT_COPY_BYTES]);
+            older.encode(&mut img_old);
+            next.encode(&mut img_new);
+            let mut torn = img_old;
+            for (i, &m) in mask.iter().enumerate() {
+                if m { torn[i] = img_new[i]; }
+            }
+            let decoded = IntentSlot::decode(&torn);
+            match c { AbCopy::A => pair.a = decoded, AbCopy::B => pair.b = decoded }
+            let open: Vec<u64> = pair.open_ids(0).collect();
+            if torn == img_new {
+                let mut want = old_ids.clone();
+                want.extend(&batch);
+                prop_assert_eq!(open, want);
+            } else {
+                prop_assert_eq!(open, old_ids);
+            }
+        }
+    }
 
     pub(crate) fn sample_slot() -> IntentSlot {
         IntentSlot { copy_seq: 77, txn_ids: smallvec![5, 6, 1 << 40, 9] }

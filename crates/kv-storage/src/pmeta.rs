@@ -207,6 +207,52 @@ impl NodeMeta {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn prop_pmeta_round_trip(
+            pp in (0u32..4).prop_flat_map(|e| { let n = 16u16 << e; (Just(n), 0..n) }),
+            flags in any::<u32>(),
+            seqs in any::<(u64, u64, u64)>(),
+            term in any::<u32>(),
+            cut in any::<[u64; 16]>(),
+            hist in any::<[(u32, u64); 4]>(),
+            seq in any::<u64>(),
+        ) {
+            let (partitions, partition) = pp;
+            let m = PartitionMeta {
+                partition,
+                flags,
+                seq_floor: Seq(seqs.0),
+                term,
+                flush_cutoff: cut,
+                repl_durable: Seq(seqs.1),
+                repl_commit: Seq(seqs.2),
+                history: hist,
+            };
+            let mut b = [0u8; PAGE];
+            m.encode(partitions, seq, &mut b);
+            prop_assert_eq!(PartitionMeta::decode_with_partitions(&b), Some((seq, partitions, m)));
+        }
+
+        #[test]
+        fn prop_nmeta_round_trip(
+            ids in any::<([u8; 16], [u8; 20])>(),
+            shard in any::<u16>(),
+            role in 0u8..=2,
+            fence in any::<u32>(),
+            ver in any::<u64>(),
+            seq in any::<u64>(),
+        ) {
+            let m = NodeMeta { cluster_id: ids.0, node_id: ids.1, shard, role, fence_term: fence, assignment_version: ver };
+            let mut b = [0u8; PAGE];
+            m.encode(seq, &mut b);
+            prop_assert_eq!(NodeMeta::decode(&b), Some((seq, m)));
+        }
+    }
 
     pub(crate) fn sample_pmeta() -> PartitionMeta {
         let mut m = PartitionMeta::initial(5);

@@ -456,7 +456,7 @@ impl BlockDevice for SyncFileDevice {
     }
 
     fn poll(&mut self, out: &mut Vec<IoDone>, _wait: bool) {
-        out.extend(self.done.drain(..));
+        out.append(&mut self.done);
     }
 }
 

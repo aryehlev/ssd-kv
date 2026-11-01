@@ -352,7 +352,7 @@ mod tests {
             // A second image N of the same page with the records shifted (as a rebuild might
             // place them), mixed byte-wise into M: every accepted record must be a record
             // written at that offset in M or in N.
-            let shifted: Vec<Rec> = recs.iter().cloned().skip(shift).collect();
+            let shifted: Vec<Rec> = recs.iter().skip(shift).cloned().collect();
             let (n, placed_n) = build(page, crc, &shifted, seed.wrapping_add(1));
             for &(pos, mask) in &tears {
                 b[pos] = (b[pos] & !mask) | (n[pos] & mask);

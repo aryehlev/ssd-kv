@@ -124,6 +124,32 @@ impl AgTableBlock {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn prop_round_trip(
+            index in any::<u32>(),
+            entries in proptest::collection::vec((0u8..3, any::<u8>()), 0..=AG_TABLE_ENTRIES),
+            seq in any::<u64>(),
+        ) {
+            let entries: Vec<(AgKind, u8)> = entries
+                .into_iter()
+                .map(|(k, o)| { let k = AgKind::from_code(k).unwrap(); (k, if k == AgKind::Free { OWNER_NONE } else { o }) })
+                .collect();
+            let t = AgTableBlock { index, entries };
+            let mut b = [0u8; PAGE];
+            t.encode(seq, &mut b);
+            prop_assert_eq!(AgTableBlock::decode(&b), Some((seq, t)));
+        }
+
+        #[test]
+        fn prop_random_blocks_never_decode(b in proptest::collection::vec(any::<u8>(), PAGE)) {
+            prop_assert!(AgTableBlock::decode(&b).is_none());
+        }
+    }
 
     pub(crate) fn sample() -> AgTableBlock {
         let mut t = AgTableBlock::free(1, 2032 + 100);

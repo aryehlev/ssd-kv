@@ -381,6 +381,7 @@ pub struct SnapshotMark {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// A fully populated device-0 superblock used by the codec and golden tests.
     pub(crate) fn sample() -> Superblock {
@@ -514,6 +515,118 @@ pub(crate) mod tests {
         assert!(s.is_clean() && !s.snapshot_valid());
         assert_eq!(s.snapshot(), None);
         assert!(s.same_set(&sample()));
+    }
+
+    /// Test-only wrapper: proptest prints failing inputs, the superblock itself has no `Debug`.
+    #[derive(Clone)]
+    struct ArbSb(Superblock);
+
+    impl core::fmt::Debug for ArbSb {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "Superblock(device {}/{}, P {}, flags {:#x})", self.0.device_index, self.0.device_count, self.0.partitions, self.0.flags)
+        }
+    }
+
+    fn arb_sb() -> impl Strategy<Value = ArbSb> {
+        (
+            (any::<[u8; 16]>(), any::<[u8; 16]>(), any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()),
+            (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u64>(), any::<u64>(), any::<u32>()),
+            (any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>(), any::<u32>(), any::<u32>()),
+            (any::<u64>(), any::<u64>(), any::<u64>(), any::<u32>(), any::<u8>(), any::<u64>(), any::<u16>()),
+            (any::<[u64; 2]>(), any::<u64>(), any::<[[u8; 16]; 16]>()),
+        )
+            .prop_map(|(a, b, c, d, e)| ArbSb(Superblock {
+                set_uuid: a.0,
+                device_uuid: a.1,
+                device_index: a.2,
+                device_count: a.3,
+                partitions: a.4,
+                flags: a.5,
+                page_size: b.0,
+                ag_pages: b.1,
+                lba: b.2,
+                n_ags: b.3,
+                device_pages: b.4,
+                ag_table_page: b.5,
+                ag_table_blocks: b.6,
+                ag_area_page: c.0,
+                pmeta_page: c.1,
+                nmeta_page: c.2,
+                intent_page: c.3,
+                intent_slot_page: c.4,
+                hash_seed: c.5,
+                record_crc_salt: c.6,
+                boot_gen: c.7,
+                clock_floor_unix_ms: d.0,
+                created_unix_ms: d.1,
+                snap_seq: d.2,
+                snap_header_crc: d.3,
+                snap_region: d.4,
+                snap_bytes: d.5,
+                databases: d.6,
+                snap_region_page: e.0,
+                snap_region_pages: e.1,
+                member_uuids: e.2,
+            }))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn prop_round_trip(sb in arb_sb(), seq in any::<u64>()) {
+            let sb = sb.0;
+            let mut b = [0u8; PAGE];
+            sb.encode(seq, &mut b);
+            let (s, d) = Superblock::decode(&b).unwrap();
+            prop_assert_eq!(s, seq);
+            prop_assert!(d == sb);
+        }
+
+        /// A/B selection with torn copies (§10.2, §17.6): the writer overwrites the copy that
+        /// does not hold the newest state; whatever byte mix of its old and new image a power
+        /// cut leaves, the pick is the new state (only if the copy is whole) or the previous one.
+        #[test]
+        fn prop_torn_copy_selection(
+            boots in (any::<u32>(), any::<u32>(), any::<u32>()),
+            seq in 1u64..u64::MAX - 2,
+            write_b in any::<bool>(),
+            mix in proptest::collection::vec(any::<u8>(), PAGE),
+            mix_kind in 0u8..3,
+        ) {
+            let state = |boot| { let mut s = sample(); s.boot_gen = boot; s };
+            let (older, newest, next) = (state(boots.0), state(boots.1), state(boots.2));
+            let (mut img_old, mut img_newest, mut img_next) = ([0u8; PAGE], [0u8; PAGE], [0u8; PAGE]);
+            older.encode(seq, &mut img_old);
+            newest.encode(seq + 1, &mut img_newest);
+            next.encode(seq + 2, &mut img_next);
+            // Torn image of the copy being overwritten: per-byte, per-512-sector or prefix mix.
+            let mut torn = img_old;
+            for i in 0..PAGE {
+                let take_new = match mix_kind {
+                    0 => mix[i] & 1 == 1,
+                    1 => mix[i / 512 * 512] & 1 == 1,
+                    _ => i < usize::from(mix[0]) * 16,
+                };
+                if take_new { torn[i] = img_next[i]; }
+            }
+            let (a, b) = if write_b { (img_newest, torn) } else { (torn, img_newest) };
+            let (copy, s, got) = Superblock::pick(&a, &b).unwrap();
+            if torn == img_next {
+                prop_assert_eq!(s, seq + 2);
+                prop_assert!(got == next);
+                prop_assert_eq!(copy, if write_b { AbCopy::B } else { AbCopy::A });
+            } else {
+                prop_assert_eq!(s, seq + 1);
+                prop_assert!(got == newest);
+                prop_assert_eq!(copy, if write_b { AbCopy::A } else { AbCopy::B });
+            }
+        }
+
+        #[test]
+        fn prop_random_blocks_never_decode(b in proptest::collection::vec(any::<u8>(), PAGE)) {
+            prop_assert!(Superblock::decode(&b).is_none());
+        }
     }
 
     #[test]

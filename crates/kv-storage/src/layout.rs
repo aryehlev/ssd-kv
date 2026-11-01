@@ -65,7 +65,7 @@ impl PageId {
     }
 
     /// The page `n` pages after this one on the same device.
-    pub fn add(self, n: u32) -> Self {
+    pub fn advance(self, n: u32) -> Self {
         debug_assert!(self.page().checked_add(n).is_some());
         PageId(self.0 + u64::from(n))
     }
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(p.page(), 123_456);
         assert_eq!(PageId::from36(p.to36()), p);
         assert_eq!(p.byte_offset(), 123_456 * 4096);
-        assert_eq!(p.add(10).page(), 123_466);
+        assert_eq!(p.advance(10).page(), 123_466);
         // 36 bits: 4 device bits above the 32-bit page index.
         let max = PageId((15u64 << 32) | u64::from(u32::MAX));
         assert_eq!(max.to36(), (1u64 << 36) - 1);

@@ -129,7 +129,7 @@ impl SimDevice {
             pages: (image.len() / PAGE) as u64,
             lba,
             atomic_unit,
-            rng: Rng(seed ^ 0x5EED_0F_D15C),
+            rng: Rng(seed ^ 0x005E_ED0F_D15C),
             durable: image,
             volatile: HashMap::with_hasher(FixedState::default()),
             in_flight: Vec::new(),
@@ -500,7 +500,7 @@ impl BlockDevice for SimDevice {
             let s = self.in_flight.swap_remove(i);
             self.complete(s, false);
         }
-        out.extend(self.done.drain(..));
+        out.append(&mut self.done);
     }
 }
 

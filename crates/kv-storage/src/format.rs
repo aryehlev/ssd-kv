@@ -229,6 +229,7 @@ fn prepare(i: usize, path: &Path, size: Option<u64>, created: bool, block: bool,
         };
         let want = want / PAGE as u64 * PAGE as u64;
         // The one place a data file is ever sized (LC-02); the zero fill follows.
+        #[allow(clippy::disallowed_methods)]
         std::fs::OpenOptions::new().write(true).open(path)?.set_len(want)?;
         want
     };

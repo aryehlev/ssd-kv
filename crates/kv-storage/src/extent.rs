@@ -25,6 +25,8 @@
 use kv_common::RecordCrc;
 
 use crate::layout::{EXT_HDR, EXT_MAX_PAGES, PAGE, PageId, Seq, class_exact, le};
+#[cfg(test)]
+use crate::layout::class_pages;
 
 /// `"KVX1"`
 pub const EXT_MAGIC: u32 = u32::from_le_bytes(*b"KVX1");
@@ -339,6 +341,72 @@ pub fn decode_chunkmap(body: &[u8]) -> Option<Vec<ChunkRef>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// VALUE extents of random sizes: encode -> parse -> verify, bound to their run.
+        #[test]
+        fn prop_value_round_trip(
+            key in proptest::collection::vec(any::<u8>(), 0..300),
+            vlen in 0usize..20_000,
+            meta in (any::<u8>(), any::<u8>(), any::<u64>(), proptest::option::of(1u64..u64::MAX), proptest::option::of(1u64..u64::MAX), any::<u32>()),
+            twin in proptest::option::of(1u64..u64::MAX),
+            page in 1u64..u64::MAX,
+            salt in any::<u32>(),
+        ) {
+            let (vt, db, seq, expire, txn, h32) = meta;
+            let val: Vec<u8> = (0..vlen).map(|i| (i as u8) ^ vt).collect();
+            let need = value_pages(key.len(), val.len() as u64) as u32;
+            let n_pages = class_pages(crate::layout::class_for(need).unwrap());
+            let h = ExtHeader {
+                kind: EXT_KIND_VALUE,
+                vtype: 1 + (vt & 1),
+                db,
+                flags: if expire.is_some() { EXT_FLAG_HAS_EXPIRE } else { 0 } | if txn.is_some() { EXT_FLAG_TXN } else { 0 },
+                page: PageId(page),
+                seq: Seq(seq),
+                expire_at_ms: expire.unwrap_or(0),
+                n_pages,
+                key_len: key.len() as u32,
+                val_len: val.len() as u64,
+                txn: txn.unwrap_or(0),
+                h32,
+                twin: twin.map(PageId),
+            };
+            let crc = RecordCrc::new(salt);
+            let mut buf = vec![0u8; n_pages as usize * PAGE];
+            let split = val.len() / 3;
+            encode_extent(&h, &key, &[&val[..split], &val[split..]], crc, &mut buf);
+            let p = parse_extent_header(&buf, PageId(page)).unwrap();
+            prop_assert_eq!(p, h);
+            prop_assert!(verify_extent(&buf, &p, crc));
+            prop_assert_eq!(value_parts(&buf, &p), Some((key.as_slice(), val.as_slice())));
+            prop_assert!(parse_extent_header(&buf, PageId(page ^ 1)).is_none());
+            prop_assert!(!verify_extent(&buf, &p, RecordCrc::new(salt ^ 1)));
+        }
+
+        #[test]
+        fn prop_random_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..9000), page in any::<u64>()) {
+            if let Some(h) = parse_extent_header(&bytes, PageId(page)) {
+                let _ = verify_extent(&bytes, &h, RecordCrc::new(3));
+                let _ = body_len(&bytes, &h);
+                let _ = value_parts(&bytes, &h);
+                let _ = chunkmap_parts(&bytes, &h);
+                let _ = chunk_payload(&bytes, &h);
+            }
+            let _ = decode_chunkmap(&bytes);
+            // A plausible header around random bytes: the checksum is the barrier.
+            let mut b = bytes.clone();
+            b.resize(PAGE, 0);
+            b[..4].copy_from_slice(b"KVX1");
+            b[8..16].copy_from_slice(&page.to_le_bytes());
+            if let Some(h) = parse_extent_header(&b, PageId(page)) {
+                prop_assert!(!verify_extent(&b, &h, RecordCrc::new(3)));
+            }
+        }
+    }
 
     pub(crate) const SALT: u32 = 0x00E1_7E47;
 

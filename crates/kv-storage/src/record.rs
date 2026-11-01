@@ -65,8 +65,8 @@ impl RecHeader {
         self.hdr_len() + usize::from(self.key_len) + usize::from(self.val_len)
     }
 
-    /// Encoded (padded) record length.
-    pub fn len(&self) -> usize {
+    /// Encoded (padded) record length: the record's tile in its page.
+    pub fn tile_len(&self) -> usize {
         self.len_unpadded().next_multiple_of(REC_ALIGN)
     }
 
@@ -222,6 +222,68 @@ pub fn read_small<'a>(buf: &'a [u8], page: PageId, off: u16, crc: RecordCrc) -> 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// encode -> read round trip at any legal location, and the record is valid only there.
+        #[test]
+        fn prop_round_trip(
+            kind in prop_oneof![Just(REC_KIND_STRING), Just(REC_KIND_HASH), Just(REC_KIND_TXN_DELETE_MARKER)],
+            db in any::<u8>(),
+            seq in any::<u64>(),
+            expire in proptest::option::of(1u64..u64::MAX),
+            txn in proptest::option::of(1u64..u64::MAX),
+            h32 in any::<u32>(),
+            key in proptest::collection::vec(any::<u8>(), 0..64),
+            val in proptest::collection::vec(any::<u8>(), 0..2000),
+            slot in 0usize..254,
+            page in any::<u64>(),
+            salt in any::<u32>(),
+        ) {
+            let marker = kind == REC_KIND_TXN_DELETE_MARKER;
+            let txn = if marker { Some(txn.unwrap_or(1)) } else { txn };
+            let expire = if marker { None } else { expire };
+            let val: Vec<u8> = if marker { Vec::new() } else { val };
+            prop_assume!(fits_small(key.len(), val.len(), txn.is_some()));
+            let len = small_len(key.len(), val.len(), txn.is_some());
+            let off = (crate::layout::SMALL_HDR + 16 * slot).min(PAGE - len);
+            let off = off - off % 16;
+            let h = RecHeader {
+                kind,
+                db,
+                flags: u8::from(expire.is_some()) | if txn.is_some() { REC_FLAG_TXN } else { 0 },
+                seq: Seq(seq),
+                expire_at_ms: expire.unwrap_or(0),
+                key_len: key.len() as u16,
+                val_len: val.len() as u16,
+                h32,
+                txn,
+            };
+            let crc = RecordCrc::new(salt);
+            let mut buf = [0u8; PAGE];
+            encode_small(&h, &key, &val, PageId(page), off as u16, crc, &mut buf[off..]);
+            let v = read_small(&buf, PageId(page), off as u16, crc).unwrap();
+            prop_assert_eq!(v.hdr, h);
+            prop_assert_eq!(v.key, key.as_slice());
+            prop_assert_eq!(v.val, val.as_slice());
+            prop_assert_eq!(usize::from(v.len), len);
+            prop_assert_eq!(v.hdr.tile_len(), len);
+            prop_assert!(read_small(&buf, PageId(page ^ 1), off as u16, crc).is_none());
+            prop_assert!(read_small(&buf, PageId(page), off as u16, RecordCrc::new(salt ^ 0x8000_0000)).is_none());
+        }
+
+        #[test]
+        fn prop_random_headers_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..3000), off in 0u16..4200) {
+            let _ = decode_small_header(&bytes);
+            let mut page = [0u8; PAGE];
+            let n = bytes.len().min(PAGE);
+            page[..n].copy_from_slice(&bytes[..n]);
+            let _ = read_small(&page, PageId(1), off, RecordCrc::new(1));
+            let _ = read_small(&bytes, PageId(1), off, RecordCrc::new(1));
+        }
+    }
 
     pub(crate) const SALT: u32 = 0x5EED_5A17;
 

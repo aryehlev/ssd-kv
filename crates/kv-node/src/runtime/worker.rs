@@ -163,6 +163,7 @@ impl<B: Backend> Worker<B> {
             // 4. execute ready requests, partition ticks
             self.execute_ready();
             self.backend.tick(self.now);
+            self.release_executed();
             // 5./6. tickets, replies, flushes, sends
             self.release_tickets();
             self.flush_outbox();
@@ -170,7 +171,13 @@ impl<B: Backend> Worker<B> {
             self.flush_sends();
             self.publish(false);
             if let Some(since) = self.stopping {
-                if self.drained() || self.now.mono_ns.saturating_sub(since) > SHUTDOWN_DRAIN_NS {
+                if self.now.mono_ns.saturating_sub(since) > SHUTDOWN_DRAIN_NS {
+                    tracing::warn!(worker = self.id, "shutdown drain timed out: the next start takes the full scan");
+                    break;
+                }
+                // drained, then (unless NOSAVE) every partition's snapshot section handed in
+                // while the partitions keep ticking their remaining background work (§10.10)
+                if self.drained() && (!self.shared.shutdown_snapshot.load(Ordering::Acquire) || self.backend.snapshot_sections(self.now)) {
                     break;
                 }
             }
@@ -663,6 +670,8 @@ impl<B: Backend> Worker<B> {
                 RecoveryProgress::Done { bytes_scanned } => {
                     self.shared.recovery.bytes_scanned.fetch_add(bytes_scanned, Ordering::Relaxed);
                     self.recovering.swap_remove(i);
+                    // counts first: DBSIZE is right as soon as the partition serves
+                    self.shared.counters[usize::from(p)].publish(self.backend.counters(p));
                     let st = self.backend.state(p);
                     self.shared.set_partition_state(p, if st == PartState::Loading { PartState::Ready } else { st });
                     if self.shared.partitions_recovered.fetch_add(1, Ordering::AcqRel) + 1 == u32::from(self.shared.partitions) {
@@ -733,10 +742,9 @@ impl<B: Backend> Worker<B> {
         let mut c = self.counters;
         c.backpressured_clients = self.conns.iter().flatten().filter(|c| c.hold.is_some()).count() as u64;
         self.shared.worker_counters[usize::from(self.id)].publish(&c);
-        let mut dirty = 0u64;
+        let dirty = self.backend.staged_bytes();
         for &p in self.backend.owned() {
             let pc = self.backend.counters(p);
-            dirty += pc.dirty_bytes;
             self.shared.counters[usize::from(p)].publish(pc);
             let st = self.backend.state(p);
             if st != PartState::Loading && self.shared.partition_state(p) != st {

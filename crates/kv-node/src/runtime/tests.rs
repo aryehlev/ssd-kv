@@ -365,3 +365,76 @@ fn serve_mem_node() {
     eprintln!("serving the in-RAM node on 127.0.0.1:{port}");
     node.wait();
 }
+
+/// `kvd` over the page store on a fresh data directory (formatted on first start, §20.1):
+/// PING/SET/GET and friends through the `redis` client, a clean SHUTDOWN, and a restart that
+/// serves the same data from the snapshot (§18.2).
+#[test]
+fn kvd_on_a_temp_dir_serves_and_restarts() {
+    use crate::runtime::node;
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut cfg = Config { port, threads: Some(2), ..Config::default() };
+    cfg.data_dir = dir.path().to_path_buf();
+    cfg.data_size = 1 << 30;
+    cfg.format_partitions = 16;
+    cfg.cache_size = Some(64 << 20);
+
+    let wait_ready = |n: &NodeHandle| {
+        for _ in 0..2000 {
+            if !n.shared.loading() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("partitions did not become ready");
+    };
+    let client = || redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap().get_connection().unwrap();
+
+    let n = node::start(cfg.clone()).expect("kvd starts on a new data directory");
+    assert!(dir.path().join("kvd.data").exists(), "the data file was formatted");
+    wait_ready(&n);
+    let mut c = client();
+    let pong: String = redis::cmd("PING").query(&mut c).unwrap();
+    assert_eq!(pong, "PONG");
+    let _: () = redis::cmd("SET").arg("k").arg("v1").query(&mut c).unwrap();
+    let v: String = redis::cmd("GET").arg("k").query(&mut c).unwrap();
+    assert_eq!(v, "v1");
+    let missing: Option<String> = redis::cmd("GET").arg("missing").query(&mut c).unwrap();
+    assert_eq!(missing, None);
+    // keys on many partitions (cross-partition MSET is a transaction, MGET a fan-out)
+    let mut m = redis::cmd("MSET");
+    for i in 0..50 {
+        m.arg(format!("m:{i}")).arg(i);
+    }
+    let _: () = m.query(&mut c).unwrap();
+    let got: Vec<i64> = redis::cmd("MGET").arg("m:0").arg("m:17").arg("m:49").query(&mut c).unwrap();
+    assert_eq!(got, vec![0, 17, 49]);
+    let big = vec![b'z'; 300 << 10];
+    let _: () = redis::cmd("SET").arg("big").arg(&big).query(&mut c).unwrap();
+    let n_incr: i64 = redis::cmd("INCRBY").arg("counter").arg(41).query(&mut c).unwrap();
+    assert_eq!(n_incr, 41);
+    let del: i64 = redis::cmd("DEL").arg("m:0").arg("m:1").query(&mut c).unwrap();
+    assert_eq!(del, 2);
+    let size: i64 = redis::cmd("DBSIZE").query(&mut c).unwrap();
+    assert_eq!(size, 1 + 48 + 1 + 1);
+    let _: redis::RedisResult<()> = redis::cmd("SHUTDOWN").query(&mut c);
+    assert_eq!(n.wait(), 0, "clean shutdown");
+
+    let n = node::start(cfg).expect("kvd restarts on its data directory");
+    wait_ready(&n);
+    assert!(!n.shared.recovery.scanned.load(Ordering::Relaxed), "a clean restart uses the snapshot");
+    let mut c = client();
+    let v: String = redis::cmd("GET").arg("k").query(&mut c).unwrap();
+    assert_eq!(v, "v1");
+    let back: Vec<u8> = redis::cmd("GET").arg("big").query(&mut c).unwrap();
+    assert!(back == big, "the extent value survives the restart");
+    let got: Vec<Option<i64>> = redis::cmd("MGET").arg("m:0").arg("m:2").arg("counter").query(&mut c).unwrap();
+    assert_eq!(got, vec![None, Some(2), Some(41)]);
+    let size: i64 = redis::cmd("DBSIZE").query(&mut c).unwrap();
+    assert_eq!(size, 51);
+    n.shared.request_shutdown();
+    assert_eq!(n.wait(), 0);
+}

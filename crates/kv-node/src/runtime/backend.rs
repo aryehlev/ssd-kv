@@ -147,6 +147,13 @@ pub trait Backend {
     /// How many multi-key txns partition `p` has opened (monotonic): a request whose exec
     /// moved it spent its txn credit (§14.6 step 0).
     fn txns_opened(&self, p: u16) -> u64;
+    /// Bytes of staged records of this worker's partitions not yet in a page image (the
+    /// `max-dirty-bytes` limit, §6.7).
+    fn staged_bytes(&self) -> u64;
+    /// Shutdown: hands every drained partition's clean-shutdown section to the snapshot
+    /// writer (§10.10); `true` once every owned partition handed its section in (keep ticking
+    /// until then).
+    fn snapshot_sections(&mut self, now: Now) -> bool;
 }
 
 /// Storage resources of one worker for the page store.
@@ -162,10 +169,20 @@ pub struct PageBackend {
     dev_fds: Vec<RawFd>,
     io: Vec<IoReq>,
     txn_ids: Option<std::sync::Arc<kv_storage::intent::TxnIds>>,
+    /// Clean-shutdown sections go here (`None`: no snapshot is written).
+    snapshot: Option<kv_storage::snapshot::SnapshotWriter>,
+    /// Owned partitions whose section was handed in.
+    sections_done: Vec<bool>,
+    durable: Vec<kv_storage::flush::WriteId>,
+    /// By partition id: something reached the partition since its last tick (a request, an
+    /// I/O or meta completion, durable writes). Idle partitions with no background work are
+    /// not ticked: their tick would find nothing to build.
+    touched: Vec<bool>,
 }
 
 impl PageBackend {
     /// `parts`: this worker's partitions (by id); `dev_fds`/`flush`: one per device.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parts: Vec<(u16, PartitionStore)>,
         partitions: u16,
@@ -174,6 +191,7 @@ impl PageBackend {
         meta: MetaClient,
         dev_fds: Vec<RawFd>,
         txn_ids: Option<std::sync::Arc<kv_storage::intent::TxnIds>>,
+        snapshot: Option<kv_storage::snapshot::SnapshotWriter>,
     ) -> Self {
         let mut slots: Vec<Option<PartitionStore>> = (0..partitions).map(|_| None).collect();
         let mut owned = Vec::with_capacity(parts.len());
@@ -181,11 +199,26 @@ impl PageBackend {
             owned.push(id);
             slots[usize::from(id)] = Some(p);
         }
-        PageBackend { owned, parts: slots, cache, flush, meta, dev_fds, io: Vec::new(), txn_ids }
+        let sections_done = vec![false; owned.len()];
+        PageBackend {
+            owned,
+            parts: slots,
+            cache,
+            flush,
+            meta,
+            dev_fds,
+            io: Vec::new(),
+            txn_ids,
+            snapshot,
+            sections_done,
+            durable: Vec::new(),
+            touched: vec![true; usize::from(partitions)],
+        }
     }
 
     #[inline]
     fn split(&mut self, p: u16, now: Now) -> (&mut PartitionStore, StorageCtx<'_>) {
+        self.touched[usize::from(p)] = true;
         let part = self.parts[usize::from(p)].as_mut().expect("partition owned by this worker");
         let cx = StorageCtx { cache: &mut self.cache, io: &mut self.io, flush: &mut self.flush, meta: &self.meta, now };
         (part, cx)
@@ -246,8 +279,13 @@ impl Backend for PageBackend {
     fn tick(&mut self, now: Now) {
         for i in 0..self.owned.len() {
             let p = self.owned[i];
+            let pi = usize::from(p);
+            if !self.touched[pi] && !self.parts[pi].as_ref().is_some_and(PartitionStore::busy) {
+                continue;
+            }
             let (part, mut cx) = self.split(p, now);
             part.tick(&mut cx);
+            self.touched[pi] = false;
         }
         for f in &mut self.flush {
             f.poll(&mut self.io);
@@ -269,15 +307,33 @@ impl Backend for PageBackend {
     fn io_done(&mut self, now: Now, kind: DiskKind, dev: u8, done: IoDone) {
         if kind == DiskKind::Flush {
             // a flush covers every write completed before it was submitted (§13.8); the
-            // writes it made durable belong to any partition of this worker
+            // writes it made durable (or lost) belong to any partition of this worker
             let Some(tracker) = self.flush.get_mut(usize::from(dev)) else { return };
-            let durable = tracker.on_flush_done();
-            if durable.is_empty() {
-                return;
-            }
-            for i in 0..self.owned.len() {
-                if let Some(part) = self.parts[usize::from(self.owned[i])].as_mut() {
-                    part.on_durable(&durable);
+            match done.res {
+                Ok(_) => {
+                    self.durable.clear();
+                    tracker.on_flush_done_into(&mut self.durable);
+                    if self.durable.is_empty() {
+                        return;
+                    }
+                    for i in 0..self.owned.len() {
+                        let pi = usize::from(self.owned[i]);
+                        if let Some(part) = self.parts[pi].as_mut() {
+                            part.on_durable(&self.durable);
+                            self.touched[pi] = true;
+                        }
+                    }
+                }
+                Err(errno) => {
+                    tracing::error!(dev, errno = -errno, "device flush failed");
+                    let lost = tracker.on_flush_failed();
+                    for i in 0..self.owned.len() {
+                        let pi = usize::from(self.owned[i]);
+                        if let Some(part) = self.parts[pi].as_mut() {
+                            part.on_flush_failed(&lost, errno);
+                            self.touched[pi] = true;
+                        }
+                    }
                 }
             }
             return;
@@ -298,9 +354,7 @@ impl Backend for PageBackend {
     }
 
     fn busy(&self) -> bool {
-        // The engine exposes no "background work pending" query yet: keep the 1 ms tick
-        // whenever this worker owns partitions (background pacing needs it).
-        !self.owned.is_empty()
+        self.owned.iter().any(|&p| self.parts[usize::from(p)].as_ref().is_some_and(PartitionStore::busy))
     }
 
     fn next_txn_id(&mut self) -> Option<u64> {
@@ -311,6 +365,32 @@ impl Backend for PageBackend {
         // The engine reports no per-request txn flag (ExecOut has none): every opened txn
         // stages TXN-flagged records, which `page_writes_txn` counts once per txn at exec.
         self.parts[usize::from(p)].as_ref().map_or(0, |part| part.counters().page_writes_txn)
+    }
+
+    fn staged_bytes(&self) -> u64 {
+        let cache = &self.cache;
+        self.owned.iter().filter_map(|&p| self.parts[usize::from(p)].as_ref()).map(|part| part.staged_bytes(cache) as u64).sum()
+    }
+
+    fn snapshot_sections(&mut self, now: Now) -> bool {
+        let Some(mut w) = self.snapshot.take() else { return true };
+        let mut all = true;
+        for i in 0..self.owned.len() {
+            if self.sections_done[i] {
+                continue;
+            }
+            let p = self.owned[i];
+            let (part, mut cx) = self.split(p, now);
+            if part.state() == PartState::Loading {
+                // never recovered: no section, the next start takes the full scan
+                self.sections_done[i] = true;
+                continue;
+            }
+            self.sections_done[i] = part.snapshot_section(&mut cx, &mut w);
+            all &= self.sections_done[i];
+        }
+        self.snapshot = Some(w);
+        all
     }
 }
 
@@ -600,6 +680,12 @@ pub mod mem {
         fn txns_opened(&self, _p: u16) -> u64 {
             // every effect is final at exec: no txn is ever left open
             0
+        }
+        fn staged_bytes(&self) -> u64 {
+            0
+        }
+        fn snapshot_sections(&mut self, _now: Now) -> bool {
+            true
         }
     }
 }

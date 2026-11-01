@@ -66,6 +66,19 @@ impl NodeHandle {
         if let Some(s) = self.service.take() {
             let _ = s.join();
         }
+        // the meta thread ends once every partition (its last client) is gone; its queued
+        // metadata writes land before the final superblock
+        if let Some(m) = self.meta.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !m.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if m.is_finished() {
+                let _ = m.join();
+            } else {
+                tracing::warn!("the meta thread did not stop in time");
+            }
+        }
         let mut code = 0;
         if let Some(mut e) = self.engine.take() {
             let clean = self.shared.shutdown_snapshot.load(Ordering::Acquire);
@@ -75,7 +88,6 @@ impl NodeHandle {
             }
             drop(e);
         }
-        drop(self.meta.take());
         tracing::info!("kvd stopped");
         code
     }
@@ -317,11 +329,15 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
     for p in &paths {
         let probe = kv_storage::devprobe::probe(p).map_err(|r| fail(&format!("refused {}", p.display()), r))?;
         lbas.push(probe.lba);
-        write_through.push(match cfg.device_cache {
-            kv_storage::engine::DeviceCachePolicy::WriteThrough => true,
-            kv_storage::engine::DeviceCachePolicy::WriteBack => false,
-            kv_storage::engine::DeviceCachePolicy::Auto => !probe.write_cache,
-        });
+        // the engine's rule (`flush-method none` or a write-through cache: no flushes, §13.8)
+        write_through.push(
+            cfg.flush_method == kv_storage::engine::FlushMethod::None
+                || match cfg.device_cache {
+                    kv_storage::engine::DeviceCachePolicy::WriteThrough => true,
+                    kv_storage::engine::DeviceCachePolicy::WriteBack => false,
+                    kv_storage::engine::DeviceCachePolicy::Auto => !probe.write_cache,
+                },
+        );
         use std::os::unix::fs::OpenOptionsExt;
         let f = std::fs::OpenOptions::new()
             .read(true)
@@ -355,13 +371,15 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
     }
     let shared = Arc::new(NodeShared::new(cfg.clone(), partitions, workers).map_err(|e| fail("node state", e))?);
     shared.recovery.last_shutdown_clean.store(fmt.clean, Ordering::Relaxed);
+    shared.shutdown_snapshot.store(cfg.snapshot_on_shutdown, Ordering::Release);
     shared.recovery.scanned.store(!fmt.snapshot, Ordering::Relaxed);
 
     // the meta thread owns all fixed-location metadata I/O (§6.1)
     let mut meta_devs: Vec<Box<dyn kv_storage::io::BlockDevice + Send>> = Vec::new();
     for (i, p) in paths.iter().enumerate() {
         let bytes = kv_storage::io::device_size(&device_files[i]).map_err(|e| fail("stat", e))?;
-        let info = kv_storage::io::DevInfo::new(bytes / kv_storage::layout::PAGE as u64, lbas[i]);
+        let mut info = kv_storage::io::DevInfo::new(bytes / kv_storage::layout::PAGE as u64, lbas[i]);
+        info.write_through = write_through[i];
         let opts = kv_storage::io::SyncOpen { direct: true, exclusive: false, read_only: false };
         let d = kv_storage::SyncFileDevice::open_with(p, info, opts).map_err(|e| fail("meta device", e))?;
         meta_devs.push(Box::new(d));
@@ -374,7 +392,7 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
             f
         })
         .collect();
-    let (meta_client, meta_thread) = kv_storage::metastore::MetaStore::start(meta_devs, hooks);
+    let (meta_client, meta_thread) = kv_storage::metastore::MetaStore::start_with_fill(meta_devs, hooks, cfg.max_storage_fill);
 
     let listeners = bind_listeners(&cfg, workers)?;
     // partitions go to their owner worker (p % W)
@@ -386,12 +404,14 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
     let fds: Vec<RawFd> = device_files.iter().map(AsRawFd::as_raw_fd).collect();
     let per_worker_cache = cache / usize::from(workers);
     let recovery = if fmt.snapshot { RecoveryMode::Snapshot } else { RecoveryMode::FullScan };
+    let txn_ids = meta_client.txn_ids();
+    let snapshot = engine.snapshot_writer();
     let make = move |w: u16| {
         let parts = slots[usize::from(w)].lock().take().unwrap_or_default();
         debug_assert!(parts.iter().map(|(p, _)| *p).eq(partitions_of(w, workers, partitions)));
         let flush = write_through.iter().enumerate().map(|(d, &wt)| kv_storage::flush::FlushTracker::new(d as u8, wt)).collect();
         let cache = kv_storage::cache::PageCache::new(per_worker_cache, true);
-        PageBackend::new(parts, partitions, cache, flush, meta_client.clone(), fds.clone(), None)
+        PageBackend::new(parts, partitions, cache, flush, meta_client.clone(), fds.clone(), Some(txn_ids.clone()), Some(snapshot.clone()))
     };
     let worker_threads = spawn_workers(&shared, listeners, make, recovery)?;
     let service = spawn_service(&shared)?;

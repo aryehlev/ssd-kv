@@ -110,6 +110,13 @@ struct Coord {
     credit: Option<CreditGuard>,
 }
 
+/// A result produced by an executed request, released after the partition ticks of the same
+/// loop turn (the engine updates its key counts there).
+enum Held {
+    Reply(ReplyTo, ReplyBody),
+    NodePart(GatherRef),
+}
+
 /// A partition locked by a cross-partition transaction (participant side): new requests wait
 /// in FIFO order until it ends.
 struct PartHold {
@@ -155,6 +162,9 @@ pub struct ExecState {
     lat: Vec<(CmdId, u32)>,
     reply: Vec<u8>,
     rng: u64,
+    /// Partitions that executed a request this loop turn.
+    executed: SmallVec<[u16; 8]>,
+    held: Vec<Held>,
 }
 
 impl ExecState {
@@ -177,12 +187,15 @@ impl ExecState {
             lat: Vec::new(),
             reply: Vec::new(),
             rng: 0x9e37_79b9_7f4a_7c15 ^ u64::from(workers),
+            executed: SmallVec::new(),
+            held: Vec::new(),
         }
     }
 
     /// Nothing in flight on this worker's side.
     pub fn idle(&self) -> bool {
-        self.jobs.is_empty()
+        self.held.is_empty()
+            && self.jobs.is_empty()
             && self.waits.is_empty()
             && self.coords.is_empty()
             && self.holds.is_empty()
@@ -1062,12 +1075,8 @@ impl<B: Backend> Worker<B> {
 
     fn job_done(&mut self, p: u16, job: Job, out: WorkOut, ticket: Option<kv_storage::ticket::TicketId>, reply: &mut Vec<u8>) {
         let mode = self.cfg.effective_durability();
-        // key counts are visible before the reply is (DBSIZE right after a write counts it)
-        let mirror = &self.shared.counters[usize::from(p)];
-        match &job.kind {
-            JobKind::Cmd(c) if c.id != CmdId::Copy => mirror.publish_db_keys(self.backend.counters(p), job.env.db),
-            JobKind::Scan { .. } => {}
-            _ => mirror.publish_keys(self.backend.counters(p)),
+        if !self.x.executed.contains(&p) {
+            self.x.executed.push(p);
         }
         match job.kind {
             JobKind::Cmd(_) | JobKind::Multi(_) => {
@@ -1076,7 +1085,8 @@ impl<B: Backend> Worker<B> {
                 let body = ReplyBody::Bytes(std::mem::take(reply));
                 match (ticket_need(mode, job.id, ticket.is_some()), ticket) {
                     (Some(need), Some(t)) => self.wait(p, t.0, Waiter { what: WaitFor::Reply { to, body }, need }),
-                    _ => self.deliver(to, body),
+                    // released after this tick's partition ticks (see `release_executed`)
+                    _ => self.x.held.push(Held::Reply(to, body)),
                 }
             }
             JobKind::Lock { xtxn, coord, .. } => {
@@ -1096,9 +1106,30 @@ impl<B: Backend> Worker<B> {
             JobKind::Node { gather } => match ticket {
                 // FLUSH replies after the cutoff is durable (E5); barriers after every effect is
                 Some(t) => self.wait(p, t.0, Waiter { what: WaitFor::Node { gather }, need: Need::Durable }),
-                None => self.node_part_done(gather, None),
+                None => self.x.held.push(Held::NodePart(gather)),
             },
             JobKind::Scan { .. } => {}
+        }
+    }
+
+    /// After the partitions' ticks of this loop turn (§6.4 step 4): publishes the key counts of
+    /// every partition that executed a request, then releases the results held for it, so
+    /// that a DBSIZE issued after a reply always counts that reply's write.
+    pub(super) fn release_executed(&mut self) {
+        for i in 0..self.x.executed.len() {
+            let p = self.x.executed[i];
+            self.shared.counters[usize::from(p)].publish_keys(self.backend.counters(p));
+        }
+        self.x.executed.clear();
+        let mut held = std::mem::take(&mut self.x.held);
+        for h in held.drain(..) {
+            match h {
+                Held::Reply(to, body) => self.deliver(to, body),
+                Held::NodePart(gather) => self.node_part_done(gather, None),
+            }
+        }
+        if self.x.held.is_empty() {
+            self.x.held = held;
         }
     }
 
@@ -1476,7 +1507,10 @@ impl<B: Backend> Worker<B> {
         }
         if shutdown && g.err.is_none() {
             if let NodeOp::Shutdown { save, .. } = g.op {
-                self.shared.shutdown_snapshot.store(save != Some(false), std::sync::atomic::Ordering::Release);
+                // SAVE / NOSAVE override `snapshot-on-shutdown`
+                if let Some(save) = save {
+                    self.shared.shutdown_snapshot.store(save, std::sync::atomic::Ordering::Release);
+                }
             }
             self.shared.request_shutdown();
         }

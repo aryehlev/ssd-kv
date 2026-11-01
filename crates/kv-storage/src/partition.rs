@@ -241,6 +241,8 @@ const EXPIRY_BUDGET: usize = 64 * 1024;
 const SCAN_EMPTY_TABLES: u16 = 4096;
 /// Hint rebase period (§9.5).
 const REBASE_PERIOD_S: u64 = 3600;
+/// Records the page writer moves to another page per tick (§14.3); more wait for the next.
+const RELOCATIONS_PER_TICK: u32 = 64;
 /// Slot tables the expiry sweep visits per tick (empty ones cost little but are bounded too).
 const SWEEP_TABLES_PER_TICK: u32 = 256;
 
@@ -576,6 +578,8 @@ pub(crate) struct Core {
     pub(crate) snapshot_done: bool,
     /// Ticks run (cheap periodic work).
     ticks: u64,
+    /// Relocations in the current tick.
+    relocations: u32,
     /// The local txn the last commit opened (its request keeps its key queues, see `hold`).
     last_local_txn: Option<u64>,
     /// Tracked locations that also hold an older copy of their key: `(page, db, key)`.
@@ -675,7 +679,7 @@ impl Core {
     pub(crate) fn note_page_space(&mut self, cache: &PageCache, page: PageId) {
         let Some(st) = cache.page_state(page) else { return };
         if st.corrupt {
-            self.alloc.note_cached(page, 0, PAGE_ROOM);
+            self.alloc.note_cached(page, 0, PAGE_ROOM, 0);
             return;
         }
         if st.fresh && st.pending.is_empty() && st.inflight.is_none() {
@@ -683,7 +687,9 @@ impl Core {
         }
         let used = st.used_bytes();
         let largest = st.largest();
-        self.alloc.note_cached(page, PAGE_ROOM.saturating_sub(used), largest);
+        // a record needs one gap; the slack rule counts every free byte (§11.3)
+        let free = PAGE_ROOM.saturating_sub(used);
+        self.alloc.note_cached(page, free, largest, st.largest_gap());
     }
 
     // ---------------------------------------------------------------------------------------
@@ -899,6 +905,7 @@ impl PartitionStore {
             prior_txn_pages: HashSet::with_hasher(Default::default()),
             snapshot_done: false,
             ticks: 0,
+            relocations: 0,
             last_local_txn: None,
             older_pages: Vec::new(),
             scratch_pos: Vec::new(),
@@ -1062,6 +1069,12 @@ impl PartitionStore {
 
     pub fn next_seq(&self) -> Seq {
         self.core.next_seq
+    }
+
+    /// Produce replication groups (`ExecOut::group`) from now on: the partition became a
+    /// cluster primary (§23.7). Members stop producing them and stop lazy expiry (§16.4).
+    pub fn set_produce_groups(&mut self, on: bool) {
+        self.core.cfg.produce_groups = on;
     }
 
     /// Starts a new term (cluster promotion): the counter restarts at 1 (§10.11).
@@ -3511,6 +3524,7 @@ impl PartitionStore {
         self.foreground_scrubs(cx);
         if self.core.state == PartState::Ready {
             // builds may stage relocations onto other pages: run until no page is left
+            self.core.relocations = 0;
             while let Some(page) = self.core.dirty.pop() {
                 self.build_page(cx, page);
             }
@@ -3691,8 +3705,17 @@ impl PartitionStore {
         Core::maybe_unpin(cx.cache, page);
     }
 
-    /// A staged record that does not fit its page moves to another one (§14.3).
+    /// A staged record that does not fit its page moves to another one (§14.3). At most
+    /// `RELOCATIONS_PER_TICK` moves happen per tick; the rest wait for the next one.
     fn relocate(&mut self, cx: &mut StorageCtx<'_>, from: PageId, rec: EncodedRecord) {
+        self.core.relocations += 1;
+        if self.core.relocations > RELOCATIONS_PER_TICK {
+            if let Some(st) = cx.cache.page_state_mut(from) {
+                st.pending.push(Pending::Put(rec));
+            }
+            self.core.retry.push(from);
+            return;
+        }
         let key: Box<[u8]> = rec.key().into();
         let db = rec.desc.db;
         let kh = KeyHash::of(self.core.cfg.hash_seed, &key);

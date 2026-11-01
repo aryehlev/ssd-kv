@@ -280,15 +280,16 @@ fn insert_run(runs: &mut Vec<(u16, u16)>, r: (u16, u16)) {
 struct CachedSpace {
     classes: [Vec<PageId>; CACHED_CLASSES],
     at: HashMap<PageId, (u8, u32), foldhash::fast::FixedState>,
-    info: HashMap<PageId, (u16, u16), foldhash::fast::FixedState>,
+    /// `(free bytes, largest record, largest gap)`.
+    info: HashMap<PageId, (u16, u16, u16), foldhash::fast::FixedState>,
 }
 
 impl CachedSpace {
-    fn set(&mut self, p: PageId, free: u16, largest: u16) {
+    fn set(&mut self, p: PageId, free: u16, largest: u16, gap: u16) {
         let class = ((free / 128) as usize).min(CACHED_CLASSES - 1) as u8;
         if let Some(&(c, _)) = self.at.get(&p) {
             if c == class {
-                self.info.insert(p, (free, largest));
+                self.info.insert(p, (free, largest, gap));
                 return;
             }
             self.remove(p);
@@ -296,7 +297,7 @@ impl CachedSpace {
         let v = &mut self.classes[usize::from(class)];
         self.at.insert(p, (class, v.len() as u32));
         v.push(p);
-        self.info.insert(p, (free, largest));
+        self.info.insert(p, (free, largest, gap));
     }
 
     fn remove(&mut self, p: PageId) {
@@ -517,13 +518,14 @@ impl Alloc {
         }
     }
 
-    /// Exact free bytes and largest record of a cached page (§11.3 step 1 and the slack rule).
-    pub(crate) fn note_cached(&mut self, page: PageId, free: u16, largest: u16) {
+    /// Exact free bytes, largest record and largest contiguous gap of a cached page (§11.3
+    /// step 1 and the slack rule; a record is placed into one gap, R2).
+    pub(crate) fn note_cached(&mut self, page: PageId, free: u16, largest: u16, gap: u16) {
         if !self.owns_small(page) {
             return;
         }
         self.set_page_free(page, free_code(free));
-        self.cached.set(page, free, largest);
+        self.cached.set(page, free, largest, gap);
     }
 
     /// A cached page holds nothing any more: it is fresh again (its next write is a full page).
@@ -614,8 +616,8 @@ impl Alloc {
                     self.cached.remove(p);
                     continue;
                 }
-                let (free, largest) = self.cached.info.get(&p).copied().unwrap_or((0, 0));
-                if self.qualifies(need, free, largest) && !exclude(p) {
+                let (free, largest, gap) = self.cached.info.get(&p).copied().unwrap_or((0, 0, 0));
+                if gap >= need && self.qualifies(need, free, largest) && !exclude(p) {
                     return Some(p);
                 }
             }
@@ -1286,7 +1288,7 @@ mod tests {
         a.add_small_ag(AgId { dev: 0, idx: 0 });
         let p = a.page_of(AgId { dev: 0, idx: 0 }, 7).unwrap();
         cache.alloc(p).unwrap();
-        a.note_cached(p, 900, 400);
+        a.note_cached(p, 900, 400, 900);
         // 900 - 352 = 548 >= min(max(352, 400), 1024) = 400
         assert_eq!(a.place_small(352, &cache, 0, &|_| false), SmallPlace::Cached(p));
         // 900 - 500 = 400 < 500: no

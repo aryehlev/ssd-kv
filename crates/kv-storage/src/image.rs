@@ -280,6 +280,27 @@ impl PageState {
         (img + staged).min(u32::from(PAGE_ROOM)) as u16
     }
 
+    /// The longest run of bytes no live or protected record of the current image occupies,
+    /// less the bytes of staged puts: what one more record can count on finding as one gap
+    /// (placement is first-fit, R2, so free bytes split into small gaps do not help).
+    pub fn largest_gap(&self) -> u16 {
+        let (recs, _) = self.image();
+        let mut spans: SmallVec<[(u16, u16); 24]> =
+            recs.iter().filter(|r| matches!(r.status, RecStatus::Live | RecStatus::Protected)).map(|r| (r.off, r.end())).collect();
+        spans.sort_unstable();
+        let mut at = SMALL_HDR as u16;
+        let mut best = 0u16;
+        for (a, b) in spans {
+            if a > at {
+                best = best.max(a - at);
+            }
+            at = at.max(b);
+        }
+        best = best.max(PAGE as u16 - at);
+        let staged: u16 = self.pending.iter().map(|p| if let Pending::Put(r) = p { r.desc.len } else { 0 }).sum();
+        best.saturating_sub(staged)
+    }
+
     /// Largest record of the page (slack rule, §11.3).
     pub fn largest(&self) -> u16 {
         let (recs, _) = self.image();

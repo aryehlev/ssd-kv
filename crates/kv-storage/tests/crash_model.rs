@@ -183,7 +183,8 @@ fn verify<D: BlockDevice>(db: &mut Db<D>, model: &mut Model, keys: u64, seed: u6
 #[test]
 fn kill9_random_sequences_never_lose_acked_writes() {
     let seeds = std::env::var("KVSSD_CRASH_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(6u64);
-    for seed in 0..seeds {
+    let from = std::env::var("KVSSD_SEED_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(0u64);
+    for seed in from..seeds {
         let mut r = Rng(seed ^ 0xC0FFEE);
         let lba = if seed % 2 == 0 { 512 } else { 4096 };
         let mut dev = RamDev::new(96 * 4096, lba, seed);

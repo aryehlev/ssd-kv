@@ -9,7 +9,7 @@
 //! Redis. Every handler validates its arguments, the key's type and the stored encoding before
 //! it stages a write. Reads keep the TTL untouched; writes carry it over unchanged.
 
-use kv_common::ldouble::{self, LdError};
+use kv_common::ldouble::LdError;
 use kv_index::VType;
 use kv_resp::ReplyWriter;
 use kv_storage::keyspace::{KeyMeta, StoreError};
@@ -515,13 +515,13 @@ fn incr_int(cur: Option<&[u8]>, incr: &[u8]) -> Result<Vec<u8>, &'static [u8]> {
 
 fn incr_float(cur: Option<&[u8]>, incr: &[u8]) -> Result<Vec<u8>, &'static [u8]> {
     // the increment alone first: not a float, then NaN or infinite
-    match ldouble::incrbyfloat(None, incr) {
+    match super::strings::ld_add(None, incr) {
         Err(LdError::NotFloat) => return Err(err::NOT_FLOAT),
         Err(LdError::NanOrInf) => return Err(b"ERR value is NaN or Infinity"),
         Ok(v) if cur.is_none() => return Ok(v),
         Ok(_) => {}
     }
-    ldouble::incrbyfloat(cur, incr).map_err(|e| match e {
+    super::strings::ld_add(cur, incr).map_err(|e| match e {
         LdError::NotFloat => &b"ERR hash value is not a float"[..],
         LdError::NanOrInf => err::NAN_OR_INF,
     })
@@ -632,6 +632,17 @@ mod tests {
         );
         check(&mut m, "HINCRBYFLOAT h b 1.5", "$3\r\n8.5\r\n");
         check(&mut m, "HINCRBYFLOAT h f 0.25", "$4\r\n0.25\r\n");
+        let argv: [&[u8]; 4] = [b"HSET", b"h", b"z", b"2\0"];
+        assert_eq!(
+            crate::cmd::testkit::run_argv(&mut m, &argv, kv_resp::Proto::Resp2),
+            b":1\r\n"
+        );
+        check(
+            &mut m,
+            "HINCRBYFLOAT h z 1",
+            "-ERR hash value is not a float\r\n",
+        );
+        check(&mut m, "HDEL h z", ":1\r\n");
         check(
             &mut m,
             "HKEYS h",

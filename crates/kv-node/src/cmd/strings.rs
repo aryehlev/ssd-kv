@@ -672,6 +672,17 @@ pub fn decrby<S: Store + ?Sized>(
     }
 }
 
+/// `current + incr` in long double (Redis `string2ld` on both, then `ld2string`). Redis also
+/// requires `strtold` to consume the whole argument, so a NUL byte anywhere makes an argument
+/// not a float; that rule is applied here before the shim is called.
+pub(crate) fn ld_add(current: Option<&[u8]>, incr: &[u8]) -> Result<Vec<u8>, LdError> {
+    let has_nul = |s: &[u8]| s.contains(&0);
+    if current.is_some_and(has_nul) || has_nul(incr) {
+        return Err(LdError::NotFloat);
+    }
+    ldouble::incrbyfloat(current, incr)
+}
+
 /// INCRBYFLOAT k f: long double arithmetic through the C shim; the formatted result is stored
 /// (and replicated as a Put of it) and returned as a bulk. The TTL is kept.
 pub fn incrbyfloat<S: Store + ?Sized>(
@@ -682,13 +693,13 @@ pub fn incrbyfloat<S: Store + ?Sized>(
 ) -> Result<(), StoreError> {
     let key = a.arg(1);
     let (result, expire_at) = match ks.get(key)? {
-        None => (ldouble::incrbyfloat(None, a.arg(2)), None),
+        None => (ld_add(None, a.arg(2)), None),
         Some((m, _)) if m.vtype != VType::String => {
             w.error(err::WRONGTYPE);
             return Ok(());
         }
         Some((m, v)) => match store::contig(&v) {
-            Some(cur) => (ldouble::incrbyfloat(Some(cur), a.arg(2)), m.expire_at_ms),
+            Some(cur) => (ld_add(Some(cur), a.arg(2)), m.expire_at_ms),
             // a chunked value is far longer than any float literal
             None => (Err(LdError::NotFloat), None),
         },
@@ -1161,6 +1172,20 @@ mod tests {
             "-ERR value is not a valid float\r\n",
         );
         check(&mut m, "INCRBYFLOAT g 0x10", "$2\r\n16\r\n");
+        // a NUL byte anywhere makes an argument not a float (strtold must consume it all)
+        let argv: [&[u8]; 3] = [b"INCRBYFLOAT", b"g", b"1\0"];
+        assert_eq!(
+            run_argv(&mut m, &argv, Proto::Resp2),
+            b"-ERR value is not a valid float\r\n"
+        );
+        let mut zeros = vec![0u8; 54];
+        zeros.extend_from_slice(b"nil");
+        m.set_str(b"z", &zeros, None);
+        check(
+            &mut m,
+            "INCRBYFLOAT z 1",
+            "-ERR value is not a valid float\r\n",
+        );
         check(&mut m, "GET f", "$3\r\n4.5\r\n");
         let _ = run(&mut m, "GET f");
     }

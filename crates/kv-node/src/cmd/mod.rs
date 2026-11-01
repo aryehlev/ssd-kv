@@ -40,6 +40,8 @@ pub mod strings;
 pub mod txn;
 
 #[cfg(test)]
+mod oracle;
+#[cfg(test)]
 mod testkit;
 
 use kv_cmd::CmdId;

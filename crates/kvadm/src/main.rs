@@ -17,6 +17,20 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use kv_resp::Value;
 
+/// `println!` that ignores a closed stdout (e.g. `kvadm status | head`).
+macro_rules! outln {
+    ($($t:tt)*) => {{
+        let _ = writeln!(std::io::stdout(), $($t)*);
+    }};
+}
+
+/// `print!` that ignores a closed stdout.
+macro_rules! out {
+    ($($t:tt)*) => {{
+        let _ = write!(std::io::stdout(), $($t)*);
+    }};
+}
+
 #[derive(Parser)]
 #[command(name = "kvadm", version, about = "kvssd operator CLI (talks to a coordinator's admin port)")]
 struct Cli {
@@ -274,28 +288,28 @@ fn print(v: &Value) -> Result<(), String> {
     match v {
         Value::Error(e) => Err(String::from_utf8_lossy(e).into_owned()),
         Value::Simple(s) => {
-            println!("{}", String::from_utf8_lossy(s));
+            outln!("{}", String::from_utf8_lossy(s));
             Ok(())
         }
         Value::Bulk(Some(b)) => {
             let t = String::from_utf8_lossy(b);
-            print!("{t}");
+            out!("{t}");
             if !t.ends_with('\n') {
-                println!();
+                outln!();
             }
             Ok(())
         }
         Value::Bulk(None) | Value::Null => {
-            println!("(nil)");
+            outln!("(nil)");
             Ok(())
         }
         Value::Int(i) => {
-            println!("{i}");
+            outln!("{i}");
             Ok(())
         }
         Value::Array(Some(items)) => items.iter().try_for_each(print),
         other => {
-            println!("{other:?}");
+            outln!("{other:?}");
             Ok(())
         }
     }
@@ -350,43 +364,56 @@ fn peers_of(addr: SocketAddr, token: &str) -> Result<(u64, String), String> {
     Ok((g, list.to_owned()))
 }
 
-/// The SETPEERS sequence (§23.3): every coordinator of the current list must report the
-/// current generation; the new list goes to each coordinator of both lists in turn; then every
+/// The SETPEERS sequence (§23.3). Before anything is sent: every coordinator of the current
+/// list reports the current generation (one that leaves the list may be unreachable: removing a
+/// dead coordinator is the usual reason for a removal), and every coordinator of the new list
+/// answers (a coordinator being added reports the joining generation 0 or the current one). The
+/// new list then goes to each reachable coordinator of both lists in turn, and every
 /// coordinator of the new list must report the new generation.
 fn setpeers(coords: &[String], token: &str, new_gen: Option<u64>, make: &dyn Fn(&[Entry]) -> Result<String, String>) -> Result<(), String> {
     let mut a = connect_any(coords, token)?;
     let t = text(a.kvadm(&["COORD".into(), "PEERS".into()])?)?;
     let (g, cur) = t.trim().split_once(' ').unwrap_or((t.trim(), ""));
     let g: u64 = g.parse().map_err(|_| "malformed peer list reply".to_owned())?;
-    let cur_list = parse_list(cur)?;
-    for e in &cur_list {
-        let (eg, _) = peers_of(e.admin, token)?;
-        if eg != g {
-            return Err(format!(
-                "coordinator {} reports peer generation {eg}, not {g}: finish the previous change first",
-                e.id
-            ));
-        }
-    }
     let target = new_gen.unwrap_or(g + 1);
     if target != g + 1 {
         return Err(format!("the next generation is {}, not {target}", g + 1));
     }
+    let cur_list = parse_list(cur)?;
     let new = make(&cur_list)?;
     let new_list = parse_list(&new)?;
-    let mut all: Vec<&Entry> = cur_list.iter().collect();
-    for e in &new_list {
-        if !all.iter().any(|x| x.id == e.id) {
-            all.push(e);
+    let stays = |id: &str| new_list.iter().any(|x| x.id == id);
+    let mut reachable: Vec<&Entry> = Vec::new();
+    for e in &cur_list {
+        match peers_of(e.admin, token) {
+            Ok((eg, _)) if eg == g => reachable.push(e),
+            Ok((eg, _)) => {
+                return Err(format!(
+                    "coordinator {} reports peer generation {eg}, not {g}: finish the previous change first",
+                    e.id
+                ));
+            }
+            Err(err) if stays(&e.id) => return Err(format!("coordinator {}: {err}", e.id)),
+            Err(err) => outln!("coordinator {} (leaving the list) is unreachable: {err}", e.id),
         }
     }
-    for e in &all {
+    for e in new_list.iter().filter(|e| !cur_list.iter().any(|x| x.id == e.id)) {
+        match peers_of(e.admin, token) {
+            Ok((0, _)) => reachable.push(e),
+            Ok((eg, _)) if eg == g => reachable.push(e),
+            Ok((eg, _)) => {
+                return Err(format!("coordinator {} to add reports peer generation {eg}", e.id));
+            }
+            Err(err) => return Err(format!("coordinator {} to add: {err}", e.id)),
+        }
+    }
+    for e in &reachable {
         let mut c = Admin::connect(e.admin, token)?;
         let r = c.kvadm(&["COORD".into(), "SETPEERS".into(), target.to_string(), new.clone()])?;
         if let Value::Error(m) = r {
             return Err(format!("coordinator {}: {}", e.id, String::from_utf8_lossy(&m)));
         }
-        println!("coordinator {}: peer generation {target}", e.id);
+        outln!("coordinator {}: peer generation {target}", e.id);
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     for e in &new_list {
@@ -400,7 +427,7 @@ fn setpeers(coords: &[String], token: &str, new_gen: Option<u64>, make: &dyn Fn(
             }
         }
     }
-    println!("peer generation {target} in force: {new}");
+    outln!("peer generation {target} in force: {new}");
     Ok(())
 }
 
@@ -561,11 +588,11 @@ fn run(cli: Cli) -> Result<(), String> {
             let mut a = connect_any(&coords, &token)?;
             let t = text(a.kvadm(&["COORD".into(), "PEERS".into()])?)?;
             let (g, list) = t.trim().split_once(' ').unwrap_or((t.trim(), ""));
-            println!("generation {g}: {list}");
+            outln!("generation {g}: {list}");
             for e in parse_list(list)? {
                 match peers_of(e.admin, &token) {
-                    Ok((eg, _)) => println!("  {} admin {} reports generation {eg}", e.id, e.admin),
-                    Err(err) => println!("  {} admin {} unreachable: {err}", e.id, e.admin),
+                    Ok((eg, _)) => outln!("  {} admin {} reports generation {eg}", e.id, e.admin),
+                    Err(err) => outln!("  {} admin {} unreachable: {err}", e.id, e.admin),
                 }
             }
             Ok(())
@@ -600,7 +627,7 @@ fn run(cli: Cli) -> Result<(), String> {
             match a.kvadm(&["COORD".into(), "EXPORT".into()])? {
                 Value::Bulk(Some(b)) => {
                     let p = write_export(&file, ab, &b)?;
-                    println!("exported {} bytes to {}", b.len(), p.display());
+                    outln!("exported {} bytes to {}", b.len(), p.display());
                     Ok(())
                 }
                 Value::Error(e) => Err(String::from_utf8_lossy(&e).into_owned()),

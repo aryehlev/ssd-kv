@@ -165,6 +165,25 @@ impl PartitionCountersAtomic {
         c
     }
 
+    /// Publishes the key counts of every database at once, so that DBSIZE and INFO keyspace
+    /// already count a write when its reply is released (the other counters follow at tick
+    /// granularity).
+    #[inline]
+    pub fn publish_keys(&self, c: &PartitionCounters) {
+        for db in 0..16 {
+            self.keys[db].store(c.keys[db], Ordering::Relaxed);
+            self.expires[db].store(c.expires[db], Ordering::Relaxed);
+        }
+    }
+
+    /// [`publish_keys`](Self::publish_keys) for one database.
+    #[inline]
+    pub fn publish_db_keys(&self, c: &PartitionCounters, db: u8) {
+        let db = usize::from(db) & 15;
+        self.keys[db].store(c.keys[db], Ordering::Relaxed);
+        self.expires[db].store(c.expires[db], Ordering::Relaxed);
+    }
+
     /// Keys of `db` (DBSIZE contribution).
     pub fn keys(&self, db: u8) -> u64 {
         self.keys[usize::from(db)].load(Ordering::Relaxed)

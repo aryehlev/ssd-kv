@@ -67,7 +67,7 @@ pub struct Worker<B: Backend> {
     pub(super) backend: B,
     listeners: Vec<Listener>,
     pub(super) conns: Vec<Option<Conn>>,
-    gens: Vec<u32>,
+    pub(super) gens: Vec<u32>,
     free_slots: Vec<u32>,
     pub(super) parse_q: Vec<u32>,
     pub(super) send_q: Vec<u32>,
@@ -76,6 +76,12 @@ pub struct Worker<B: Backend> {
     pub(super) counters: WorkerCounters,
     pub(super) now: Now,
     last_publish: u64,
+    /// The connection [`parse_conn`](Self::parse_conn) took out of the table.
+    pub(super) checked_out: Option<u32>,
+    /// Results for the checked-out connection, delivered when it is back.
+    pub(super) deferred: Vec<(crate::runtime::exec::ReplyTo, crate::runtime::xmsg::ReplyBody)>,
+    /// Counters changed since the last publication (rate-limited to one per millisecond).
+    publish_due: bool,
     recovering: Vec<u16>,
     recovery: RecoveryMode,
     stopping: Option<u64>,
@@ -122,6 +128,9 @@ impl<B: Backend> Worker<B> {
             counters: WorkerCounters::default(),
             now: Now::read(),
             last_publish: 0,
+            publish_due: false,
+            checked_out: None,
+            deferred: Vec::new(),
             recovering,
             recovery: init.recovery,
             stopping: None,
@@ -472,6 +481,7 @@ impl<B: Backend> Worker<B> {
     /// Parses and dispatches every complete command of `slot` that the single limits allow.
     fn parse_conn(&mut self, slot: u32) {
         let Some(mut conn) = self.conns[slot as usize].take() else { return };
+        self.checked_out = Some(slot);
         let mut args: Vec<(u32, u32)> = Vec::with_capacity(8);
         let max_pending = self.cfg.max_pending_per_conn as usize;
         let max_out = self.cfg.client_output_buffer_limit;
@@ -533,9 +543,13 @@ impl<B: Backend> Worker<B> {
         } else {
             conn.flags &= !flags::BACKPRESSURED;
         }
-        let has_out = conn.has_output();
         self.conns[slot as usize] = Some(conn);
-        if has_out {
+        self.checked_out = None;
+        // results produced for this connection while it was out of the table
+        while let Some((to, body)) = self.deferred.pop() {
+            self.deliver(to, body);
+        }
+        if self.conns[slot as usize].as_ref().is_some_and(Conn::has_output) {
             self.queue_send(slot);
         }
         self.arm_recv(slot);
@@ -574,6 +588,12 @@ impl<B: Backend> Worker<B> {
     // 3. inbound messages
 
     fn drain_inbound(&mut self) {
+        // messages this worker addressed to itself, in order; the ones they produce wait for
+        // the next drain (never handled re-entrantly)
+        for _ in 0..self.x.local.len() {
+            let Some(m) = self.x.local.pop_front() else { break };
+            self.on_message(m);
+        }
         let shared = self.shared.clone();
         let me = &shared.workers[usize::from(self.id)];
         while let Some(m) = me.side.pop() {
@@ -704,8 +724,11 @@ impl<B: Backend> Worker<B> {
 
     fn publish(&mut self, force: bool) {
         if !force && self.now.mono_ns.saturating_sub(self.last_publish) < PUBLISH_EVERY_NS {
+            // published by a later tick; a parking worker arms the timer for it
+            self.publish_due = true;
             return;
         }
+        self.publish_due = false;
         self.last_publish = self.now.mono_ns;
         let mut c = self.counters;
         c.backpressured_clients = self.conns.iter().flatten().filter(|c| c.hold.is_some()).count() as u64;
@@ -744,7 +767,11 @@ impl<B: Backend> Worker<B> {
     }
 
     fn enter(&mut self) {
-        let busy = self.backend.busy() || !self.recovering.is_empty() || self.stopping.is_some() || self.x.waiting_on_gate();
+        let busy = self.backend.busy()
+            || !self.recovering.is_empty()
+            || self.stopping.is_some()
+            || self.x.waiting_on_gate()
+            || self.publish_due;
         let timer = if busy {
             Some(BUSY_TIMER_NS)
         } else if !self.conns.is_empty() && self.cfg.timeout > 0 {

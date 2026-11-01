@@ -421,6 +421,13 @@ impl<B: Backend> Worker<B> {
             return;
         }
         let slot = to.conn.slot;
+        if self.checked_out == Some(slot) {
+            // the connection is being parsed (a result produced during its own dispatch)
+            if self.gens.get(slot as usize) == Some(&to.conn.generation) {
+                self.deferred.push((to, body));
+            }
+            return;
+        }
         let Some(conn) = self.conn_mut(slot, to.conn.generation) else { return };
         let proto = conn.proto;
         let ready = match to.part {
@@ -1031,6 +1038,13 @@ impl<B: Backend> Worker<B> {
 
     fn job_done(&mut self, p: u16, job: Job, out: WorkOut, ticket: Option<kv_storage::ticket::TicketId>, reply: &mut Vec<u8>) {
         let mode = self.cfg.effective_durability();
+        // key counts are visible before the reply is (DBSIZE right after a write counts it)
+        let mirror = &self.shared.counters[usize::from(p)];
+        match &job.kind {
+            JobKind::Cmd(c) if c.id != CmdId::Copy => mirror.publish_db_keys(self.backend.counters(p), job.env.db),
+            JobKind::Scan { .. } => {}
+            _ => mirror.publish_keys(self.backend.counters(p)),
+        }
         match job.kind {
             JobKind::Cmd(_) | JobKind::Multi(_) => {
                 self.record(job.id, job.start_ns, reply.first() == Some(&b'-'));

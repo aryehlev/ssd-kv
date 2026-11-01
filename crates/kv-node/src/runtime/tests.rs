@@ -337,3 +337,25 @@ fn large_values_round_trip() {
     assert!(back == big);
     assert_eq!(n.node.as_ref().unwrap().shared.budget.used(), 0, "large-value reservations are released");
 }
+
+/// A node over the in-RAM backend for the black-box harness in `tests/compat` (the runtime,
+/// protocol and handlers under test; no devices):
+/// `KVD_MEM_PORT=7777 cargo test -p kv-node serve_mem_node -- --ignored --nocapture`.
+#[test]
+#[ignore = "serves RESP on $KVD_MEM_PORT until killed (run with --ignored)"]
+fn serve_mem_node() {
+    let port: u16 = std::env::var("KVD_MEM_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+    let threads: u16 = std::env::var("KVD_MEM_THREADS").ok().and_then(|p| p.parse().ok()).unwrap_or(2);
+    let cfg = Config { port, threads: Some(threads), ..Config::default() };
+    let node = start_with(cfg, PARTITIONS, move |w, shared: &Arc<NodeShared>| {
+        let s = shared.clone();
+        MemBackend::new(w, threads, PARTITIONS).with_meta(Box::new(move |p, token, r| {
+            if let MetaReq::CommitTxn { txn } = r {
+                s.workers[usize::from(w)].send_side(XMsg::Meta { partition: p, token, done: MetaDone::Committed { txn } });
+            }
+        }))
+    })
+    .expect("node starts");
+    eprintln!("serving the in-RAM node on 127.0.0.1:{port}");
+    node.wait();
+}

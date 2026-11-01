@@ -22,8 +22,6 @@ use crate::runtime::xmsg::ExecEnv;
 pub const NOAUTH: &[u8] = b"NOAUTH Authentication required.";
 /// `-LOADING` text (§18.1).
 pub const LOADING: &[u8] = b"LOADING Redis is loading the dataset in memory";
-/// NO_MULTI commands inside MULTI (Redis 7.0).
-pub const NOT_IN_MULTI: &[u8] = b"ERR Command not allowed inside a transaction";
 
 /// Where a command goes.
 pub enum Route {
@@ -121,12 +119,6 @@ pub fn allowed_while_loading(spec: &CommandSpec) -> bool {
     spec.flags.contains(CmdFlags::LOADING_OK)
 }
 
-/// Commands executed immediately inside MULTI instead of being queued (Redis 7.0).
-pub fn runs_inside_multi(id: kv_cmd::CmdId) -> bool {
-    use kv_cmd::CmdId::*;
-    matches!(id, Exec | Discard | Multi | Watch | Quit | Reset)
-}
-
 /// Writes the reply of a gate refusal.
 pub fn write_gate(g: Gate, w: &mut kv_resp::ReplyWriter<'_>) {
     match g {
@@ -215,6 +207,5 @@ mod tests {
         assert!(allowed_before_auth(CmdId::Auth.spec()) && allowed_before_auth(CmdId::Hello.spec()));
         assert!(!allowed_before_auth(CmdId::Get.spec()));
         assert!(allowed_while_loading(CmdId::Info.spec()) && !allowed_while_loading(CmdId::Get.spec()));
-        assert!(runs_inside_multi(CmdId::Exec) && !runs_inside_multi(CmdId::Get));
     }
 }

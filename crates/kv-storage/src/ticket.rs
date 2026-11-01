@@ -6,7 +6,16 @@
 //! durably, meta writes durable). Reply release per durability mode: `async` after exec
 //! (deletes, FLUSH and txn commits after Written), `written` after Written, `flushed` after
 //! Durable; in cluster mode additionally after the shard commit (§23.8).
+//!
+//! Implementation: every staged effect of a command (a page `Put`/`Remove`, an extent write or
+//! zeroing) carries the ids of the tickets waiting for it and counts as one dependency of each.
+//! When the image or extent write that materializes the effect completes, each of its tickets
+//! has one dependency written; when that write is durable, one dependency durable. A staged
+//! effect superseded by a later effect of the same key hands its tickets to the survivor (D2),
+//! so the count is preserved. Metadata dependencies (FLUSH cutoffs, txn commits) count towards
+//! both states: a ticket is `Written` only once its metadata is durable too (E5, E6).
 
+use hashbrown::HashMap;
 use smallvec::SmallVec;
 
 use crate::layout::PageId;
@@ -28,11 +37,251 @@ pub(crate) const TICKET_HAS_DELETE: u8 = 1;
 pub(crate) const TICKET_HAS_META: u8 = 2;
 
 pub(crate) struct Ticket {
-    /// `(page, gen)` image dependencies.
+    /// `(page, gen)` image dependencies (diagnostics: the pages the command touched).
     pub(crate) deps: SmallVec<[(PageId, u32); 2]>,
     /// Extent writes (first page).
     pub(crate) extent_deps: SmallVec<[PageId; 1]>,
     pub(crate) txn: Option<u64>,
     pub(crate) flags: u8,
     pub(crate) state: TicketState,
+    /// Effect dependencies whose write has not completed.
+    unwritten: u32,
+    /// Effect dependencies whose write is not durable.
+    undurable: u32,
+    /// Metadata dependencies not durable.
+    meta: u32,
+    /// Still being assembled by the executing command (no state is reported before `seal`).
+    open: bool,
+}
+
+/// The partition's live tickets.
+#[derive(Default)]
+pub(crate) struct Tickets {
+    map: HashMap<u64, Ticket, foldhash::fast::FixedState>,
+    next: u64,
+    changes: Vec<(TicketId, TicketState)>,
+}
+
+impl Tickets {
+    pub(crate) fn new() -> Self {
+        Tickets { map: HashMap::with_hasher(foldhash::fast::FixedState::default()), next: 1, changes: Vec::new() }
+    }
+
+    /// A new open ticket (dependencies are added while the command commits; see `seal`).
+    pub(crate) fn create(&mut self, flags: u8) -> TicketId {
+        let id = self.next;
+        self.next += 1;
+        self.map.insert(
+            id,
+            Ticket {
+                deps: SmallVec::new(),
+                extent_deps: SmallVec::new(),
+                txn: None,
+                flags,
+                state: TicketState::Executed,
+                unwritten: 0,
+                undurable: 0,
+                meta: 0,
+                open: true,
+            },
+        );
+        TicketId(id)
+    }
+
+    pub(crate) fn get_mut(&mut self, t: TicketId) -> Option<&mut Ticket> {
+        self.map.get_mut(&t.0)
+    }
+
+    pub(crate) fn contains(&self, t: TicketId) -> bool {
+        self.map.contains_key(&t.0)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// One more effect dependency (one write to complete, one durability to reach).
+    pub(crate) fn add_effect(&mut self, t: TicketId) {
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.unwritten += 1;
+            k.undurable += 1;
+        }
+    }
+
+    /// One more metadata dependency.
+    pub(crate) fn add_meta(&mut self, t: TicketId) {
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.meta += 1;
+            k.flags |= TICKET_HAS_META;
+        }
+    }
+
+    pub(crate) fn note_page(&mut self, t: TicketId, page: PageId, r#gen: u32) {
+        if let Some(k) = self.map.get_mut(&t.0)
+            && k.deps.len() < 8
+            && !k.deps.iter().any(|d| d.0 == page)
+        {
+            k.deps.push((page, r#gen));
+        }
+    }
+
+    pub(crate) fn note_extent(&mut self, t: TicketId, page: PageId) {
+        if let Some(k) = self.map.get_mut(&t.0)
+            && k.extent_deps.len() < 8
+        {
+            k.extent_deps.push(page);
+        }
+    }
+
+    /// The command finished assembling the ticket: report what is already satisfied.
+    pub(crate) fn seal(&mut self, t: TicketId) {
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.open = false;
+        }
+        self.evaluate(t);
+    }
+
+    /// One effect dependency's write completed.
+    pub(crate) fn effect_written(&mut self, t: TicketId) {
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.unwritten = k.unwritten.saturating_sub(1);
+        }
+        self.evaluate(t);
+    }
+
+    /// One effect dependency's write is durable (implies written).
+    pub(crate) fn effect_durable(&mut self, t: TicketId) {
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.undurable = k.undurable.saturating_sub(1);
+            k.unwritten = k.unwritten.min(k.undurable);
+        }
+        self.evaluate(t);
+    }
+
+    /// An effect dependency resolved without any write (nothing on media to change).
+    pub(crate) fn effect_resolved(&mut self, t: TicketId) {
+        self.effect_written(t);
+        self.effect_durable(t);
+    }
+
+    /// One metadata dependency is durable.
+    pub(crate) fn meta_done(&mut self, t: TicketId) {
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.meta = k.meta.saturating_sub(1);
+        }
+        self.evaluate(t);
+    }
+
+    /// The ticket failed (write I/O error); later dependency events for it are ignored.
+    pub(crate) fn fail(&mut self, t: TicketId, errno: i32) {
+        if let Some(k) = self.map.remove(&t.0) {
+            debug_assert!(!matches!(k.state, TicketState::Durable));
+            self.changes.push((t, TicketState::Failed(errno)));
+        }
+    }
+
+    /// Fails every live ticket (the partition entered ReadOnly after a write error).
+    pub(crate) fn fail_all(&mut self, errno: i32) {
+        let ids: Vec<u64> = self.map.keys().copied().collect();
+        for id in ids {
+            self.fail(TicketId(id), errno);
+        }
+    }
+
+    fn evaluate(&mut self, t: TicketId) {
+        let Some(k) = self.map.get_mut(&t.0) else { return };
+        if k.open || k.meta > 0 {
+            return;
+        }
+        if k.unwritten == 0 && k.state == TicketState::Executed {
+            k.state = TicketState::Written;
+            self.changes.push((t, TicketState::Written));
+        }
+        if k.undurable == 0 {
+            self.map.remove(&t.0);
+            self.changes.push((t, TicketState::Durable));
+        }
+    }
+
+    /// Drains the state changes since the last call (in the order they happened).
+    pub(crate) fn take(&mut self, out: &mut Vec<(TicketId, TicketState)>) {
+        out.append(&mut self.changes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain(t: &mut Tickets) -> Vec<(TicketId, TicketState)> {
+        let mut v = Vec::new();
+        t.take(&mut v);
+        v
+    }
+
+    #[test]
+    fn effects_move_written_then_durable() {
+        let mut t = Tickets::new();
+        let a = t.create(0);
+        t.add_effect(a);
+        t.add_effect(a);
+        t.seal(a);
+        assert!(drain(&mut t).is_empty());
+        t.effect_written(a);
+        assert!(drain(&mut t).is_empty());
+        t.effect_written(a);
+        assert_eq!(drain(&mut t), vec![(a, TicketState::Written)]);
+        t.effect_durable(a);
+        t.effect_durable(a);
+        assert_eq!(drain(&mut t), vec![(a, TicketState::Durable)]);
+        assert!(!t.contains(a));
+    }
+
+    #[test]
+    fn empty_ticket_is_durable_at_seal() {
+        let mut t = Tickets::new();
+        let a = t.create(TICKET_HAS_DELETE);
+        t.seal(a);
+        assert_eq!(drain(&mut t), vec![(a, TicketState::Written), (a, TicketState::Durable)]);
+    }
+
+    #[test]
+    fn durable_without_written_event_reports_both() {
+        let mut t = Tickets::new();
+        let a = t.create(0);
+        t.add_effect(a);
+        t.seal(a);
+        t.effect_durable(a);
+        assert_eq!(drain(&mut t), vec![(a, TicketState::Written), (a, TicketState::Durable)]);
+    }
+
+    #[test]
+    fn meta_dependency_gates_both_states() {
+        let mut t = Tickets::new();
+        let a = t.create(0);
+        t.add_effect(a);
+        t.add_meta(a);
+        t.seal(a);
+        t.effect_resolved(a);
+        assert!(drain(&mut t).is_empty());
+        t.meta_done(a);
+        assert_eq!(drain(&mut t), vec![(a, TicketState::Written), (a, TicketState::Durable)]);
+    }
+
+    #[test]
+    fn failure_is_terminal() {
+        let mut t = Tickets::new();
+        let a = t.create(0);
+        t.add_effect(a);
+        t.seal(a);
+        t.fail(a, -5);
+        t.effect_resolved(a);
+        assert_eq!(drain(&mut t), vec![(a, TicketState::Failed(-5))]);
+        let b = t.create(0);
+        t.add_effect(b);
+        t.seal(b);
+        t.fail_all(-5);
+        assert_eq!(drain(&mut t), vec![(b, TicketState::Failed(-5))]);
+        assert_eq!(t.len(), 0);
+    }
 }

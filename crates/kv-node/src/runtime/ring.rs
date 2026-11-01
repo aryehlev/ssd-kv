@@ -93,8 +93,8 @@ pub enum DiskKind {
 pub enum Completion {
     /// One accepted socket (`res` = fd or `-errno`); `more` = the multishot accept stays armed.
     Accept { listener: u32, res: i32, more: bool },
-    /// A receive into `buf` (its length already covers the received bytes); `res` = bytes or
-    /// `-errno` (0 = end of stream).
+    /// A receive into the buffer given to [`Ring::recv`] (returned as is); `res` = bytes
+    /// written after the offset given there, or `-errno` (0 = end of stream).
     Recv { token: u64, res: i32, buf: Vec<u8> },
     /// A sendmsg of `segs` (not yet advanced); `res` = bytes sent or `-errno`.
     Send { token: u64, res: i32, segs: Vec<OutSeg> },
@@ -168,7 +168,7 @@ impl Ring {
     }
 
     /// Operations in flight.
-    #[inline]
+    #[cfg(test)]
     pub fn inflight(&self) -> usize {
         self.inflight
     }
@@ -212,16 +212,15 @@ impl Ring {
         self.push(e)
     }
 
-    /// Receives into the spare capacity of `buf` (`buf.len()..buf.capacity()`, which must be
-    /// non-empty).
-    pub fn recv(&mut self, fd: RawFd, token: u64, mut buf: Vec<u8>) -> io::Result<()> {
-        assert!(buf.capacity() > buf.len(), "recv needs spare capacity");
-        let spare = buf.capacity() - buf.len();
-        let len = u32::try_from(spare).unwrap_or(u32::MAX);
-        // SAFETY: the pointer is to the spare capacity of a live allocation of at least `len`
-        // bytes; the Vec is moved into the in-flight table below, so its heap buffer stays put
-        // until the completion.
-        let ptr = unsafe { buf.as_mut_ptr().add(buf.len()) };
+    /// Receives into `buf[at..]` (`at < buf.len()`; the buffer is fully initialized, so no
+    /// length bookkeeping is needed when the kernel fills part of it).
+    pub fn recv(&mut self, fd: RawFd, token: u64, mut buf: Vec<u8>, at: usize) -> io::Result<()> {
+        assert!(at < buf.len(), "recv needs room after the received bytes");
+        let len = u32::try_from(buf.len() - at).unwrap_or(u32::MAX);
+        // SAFETY: `at < buf.len()`, so the pointer and the `len` bytes after it are inside the
+        // live, initialized buffer; the Vec moves into the in-flight table below, so its heap
+        // buffer stays put until the completion.
+        let ptr = unsafe { buf.as_mut_ptr().add(at) };
         let ud = self.slot(Op::Recv { token, buf });
         self.push(opcode::Recv::new(types::Fd(fd), ptr, len).build().user_data(ud))
     }
@@ -318,7 +317,7 @@ impl Ring {
         self.push(opcode::Timeout::new(ptr).build().user_data(ud))
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn timer_armed(&self) -> bool {
         self.timer_armed
     }
@@ -353,16 +352,7 @@ impl Ring {
             self.inflight -= 1;
             match op {
                 Op::Accept { listener } => out.push(Completion::Accept { listener, res, more: false }),
-                Op::Recv { token, mut buf } => {
-                    if res > 0 {
-                        let n = buf.len() + res as usize;
-                        debug_assert!(n <= buf.capacity());
-                        // SAFETY: the kernel initialized `res` bytes of the spare capacity the
-                        // receive was given (`res` never exceeds the length passed in `recv`).
-                        unsafe { buf.set_len(n) };
-                    }
-                    out.push(Completion::Recv { token, res, buf });
-                }
+                Op::Recv { token, buf } => out.push(Completion::Recv { token, res, buf }),
                 Op::Send { token, segs, .. } => out.push(Completion::Send { token, res, segs }),
                 Op::Disk { kind, req } => {
                     let (tag, dev, len) = (req.tag, req.dev, req.len);
@@ -394,7 +384,7 @@ impl Ring {
 /// Plain system calls behind safe wrappers (sockets, eventfd, process flags).
 pub mod sys {
     use std::io;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::fd::RawFd;
 
     fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
@@ -561,12 +551,6 @@ pub mod sys {
         // SAFETY: reads `bytes.len()` bytes from a live slice.
         let _ = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
     }
-
-    /// The unspecified address of a family (helper for binding).
-    pub fn any(v6: bool, port: u16) -> SocketAddr {
-        let ip = if v6 { IpAddr::V6(Ipv6Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
-        SocketAddr::new(ip, port)
-    }
 }
 
 #[cfg(test)]
@@ -655,12 +639,14 @@ mod tests {
         sys::tune_accepted(cfd, 300);
         assert_eq!(sys::peer_addr(cfd).unwrap(), client.local_addr().unwrap());
         client.write_all(b"PING\r\n").unwrap();
-        ring.recv(cfd, 42, Vec::with_capacity(64)).unwrap();
+        let mut b = vec![0u8; 64];
+        b[..2].copy_from_slice(b"ab");
+        ring.recv(cfd, 42, b, 2).unwrap();
         let Completion::Recv { token, res, buf } = wait_for(&mut ring, &mut out, |c| matches!(c, Completion::Recv { .. })) else {
             unreachable!()
         };
         assert_eq!((token, res), (42, 6));
-        assert_eq!(buf, b"PING\r\n");
+        assert_eq!(&buf[..8], b"abPING\r\n");
         let body = SharedBuf::new(vec![b'x'; 100_000]);
         let segs = vec![OutSeg::Bytes(b"$100000\r\n".to_vec(), 0), OutSeg::Shared(body, 0), OutSeg::Bytes(b"\r\n".to_vec(), 0)];
         let mut segs = segs;

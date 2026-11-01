@@ -458,7 +458,16 @@ impl XTxnCoord {
         Step::Finish { msgs, reply }
     }
 
+    /// Ends the transaction without writing (e.g. no txn id could be taken): unlock every part
+    /// and answer `-<msg>`.
+    pub fn abort(&mut self, msg: &[u8]) -> Step {
+        let mut out = Vec::new();
+        kv_resp::ReplyWriter::new(&mut out, self.env.proto).error(msg);
+        self.finish_unlocked(out)
+    }
+
     /// Whether the transaction finished.
+    #[cfg(test)]
     pub fn done(&self) -> bool {
         self.phase == Phase::Done
     }

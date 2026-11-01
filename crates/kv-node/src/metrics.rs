@@ -169,11 +169,6 @@ impl PartitionCountersAtomic {
     pub fn keys(&self, db: u8) -> u64 {
         self.keys[usize::from(db)].load(Ordering::Relaxed)
     }
-
-    /// Keys with a TTL in `db`.
-    pub fn expires(&self, db: u8) -> u64 {
-        self.expires[usize::from(db)].load(Ordering::Relaxed)
-    }
 }
 
 /// Field-wise sum of partition counters (node totals for INFO).
@@ -418,7 +413,7 @@ mod tests {
         let a = PartitionCountersAtomic::default();
         a.publish(&c);
         assert_eq!(a.keys(3), 7);
-        assert_eq!(a.expires(3), 2);
+        assert_eq!(a.expires[3].load(Ordering::Relaxed), 2);
         assert_eq!(a.page_writes.load(Ordering::Relaxed), 6);
         let s = a.snapshot();
         assert_eq!(s.corrupt_pages, 9);

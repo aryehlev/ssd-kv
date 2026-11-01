@@ -66,6 +66,13 @@ pub enum XMsg {
     Barrier { gather: GatherRef },
     /// One worker's answer to a [`XMsg::Flush`] or [`XMsg::Barrier`].
     GatherDone { gather: GatherRef, from: u16, res: Result<(), StoreError> },
+    /// An EXEC body whose keys share `partition` (§8.5), run as one partition request.
+    Exec { from: u16, conn: ConnRef, req_seq: u64, partition: u16, cmds: Vec<OwnedCmd>, env: ExecEnv },
+    /// CLIENT LIST / CLIENT KILL over the destination's connections (`caller` = the asking
+    /// client's id).
+    Clients { gather: GatherRef, op: std::sync::Arc<crate::cmd::NodeOp>, caller: u64 },
+    /// One worker's answer to [`XMsg::Clients`]: CLIENT LIST lines, connections killed.
+    ClientsDone { gather: GatherRef, lines: Vec<u8>, killed: u64 },
 }
 
 /// A parsed command moved to its owner worker: argument `(offset, len)` pairs into `buf`.
@@ -127,13 +134,6 @@ impl ReplyBody {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Whether this reply is an error reply.
-    pub fn is_error(&self) -> bool {
-        match self {
-            ReplyBody::Bytes(b) | ReplyBody::Shared(b, _) => b.first() == Some(&b'-'),
-        }
     }
 
     /// A contiguous view (copies a shared body; used for gathers of small part replies).

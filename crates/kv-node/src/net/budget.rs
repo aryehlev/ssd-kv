@@ -77,10 +77,6 @@ impl Reservation {
         shared.budget.reserve(bytes);
         Reservation { owner: Some(shared.clone()), bytes }
     }
-
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
 }
 
 impl Drop for Reservation {
@@ -123,11 +119,10 @@ mod tests {
     fn reservations_release_on_drop() {
         let s = std::sync::Arc::new(crate::shared::NodeShared::new(crate::config::Config::default(), 4, 1).unwrap());
         {
-            let r = Reservation::take(&s, 8192);
-            assert_eq!(r.bytes(), 8192);
+            let _r = Reservation::take(&s, 8192);
             assert_eq!(s.budget.used(), 8192);
-            let n = Reservation::take(&s, 0);
-            assert_eq!(n.bytes(), 0);
+            let _n = Reservation::take(&s, 0);
+            assert_eq!(s.budget.used(), 8192);
         }
         assert_eq!(s.budget.used(), 0);
     }

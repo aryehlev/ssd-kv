@@ -23,7 +23,6 @@ use kv_cmd::CmdId;
 use kv_resp::{Limits, Parser, Proto};
 
 use crate::cmd::FanOutSplit;
-use crate::net::budget::Reservation;
 use crate::runtime::ring::OutSeg;
 use crate::runtime::xmsg::{OwnedCmd, ReplyBody};
 
@@ -31,8 +30,6 @@ use crate::runtime::xmsg::{OwnedCmd, ReplyBody};
 pub const READ_BUF_INITIAL: usize = 16 * 1024;
 /// An idle `read_buf` larger than this shrinks back to [`READ_BUF_INITIAL`].
 pub const READ_BUF_SHRINK: usize = 1024 * 1024;
-/// Value bodies of at least this size are sent from shared buffers as iovecs (§7.1).
-pub const SHARED_BODY_MIN: usize = 64 * 1024;
 
 /// MULTI state: queued commands and whether a queue-time error occurred (EXECABORT).
 pub struct MultiState {
@@ -107,6 +104,7 @@ pub struct Conn {
     pub created: u64,
     pub last_cmd: u64,
     pub flags: u32,
+    /// Receive buffer, fully initialized: `read_buf[..filled]` holds received bytes.
     pub read_buf: Vec<u8>,
     pub out: Vec<u8>,
     pub next_req_seq: u64,
@@ -119,6 +117,8 @@ pub struct Conn {
     pub parser: Parser,
     /// Slot generation in the worker's connection table.
     pub generation: u32,
+    /// Bytes of `read_buf` received.
+    pub(crate) filled: usize,
     /// Bytes of `read_buf` already consumed by parsed commands.
     pub(crate) consumed: usize,
     /// Reorder buffer: `slots[i]` is the reply of `req_seq == base_seq + i`.
@@ -132,23 +132,12 @@ pub struct Conn {
     pub(crate) send_inflight: bool,
     /// The command being received passed the large-value check (§6.9).
     pub(crate) lv_admitted: bool,
-    /// The large-value reservation of the command being received.
-    pub(crate) lv_reservation: Reservation,
     /// Why reading stopped, if it did.
     pub(crate) hold: Option<Hold>,
-    /// A command that was parsed but could not be handed over yet (full XMsg queue); it keeps
-    /// its place: nothing after it is parsed until it is sent.
-    pub(crate) stalled: Option<Stalled>,
     /// The connection is on the worker's "has bytes to parse" list.
     pub(crate) queued_for_parse: bool,
     /// The connection is on the worker's "has output to send" list.
     pub(crate) queued_for_send: bool,
-}
-
-/// A parsed command waiting for room in a full destination queue (§6.3).
-pub struct Stalled {
-    pub worker: u16,
-    pub msg: crate::runtime::xmsg::XMsg,
 }
 
 impl Conn {
@@ -169,7 +158,7 @@ impl Conn {
             created: now,
             last_cmd: now,
             flags: 0,
-            read_buf: Vec::with_capacity(READ_BUF_INITIAL),
+            read_buf: vec![0; READ_BUF_INITIAL],
             out: Vec::new(),
             next_req_seq: 0,
             addr: None,
@@ -177,6 +166,7 @@ impl Conn {
             last_cmd_id: None,
             parser: Parser::new(limits),
             generation: 0,
+            filled: 0,
             consumed: 0,
             slots: VecDeque::new(),
             base_seq: 0,
@@ -185,9 +175,7 @@ impl Conn {
             recv_inflight: false,
             send_inflight: false,
             lv_admitted: false,
-            lv_reservation: Reservation::NONE,
             hold: None,
-            stalled: None,
             queued_for_parse: false,
             queued_for_send: false,
         }
@@ -208,7 +196,7 @@ impl Conn {
     /// Unparsed input bytes (CLIENT LIST `qbuf=`).
     #[inline]
     pub fn query_buffer_len(&self) -> usize {
-        self.read_buf.len() - self.consumed
+        self.filled - self.consumed
     }
 
     /// Whether a close was requested (QUIT, protocol error, CLIENT KILL).
@@ -217,16 +205,22 @@ impl Conn {
         self.flags & (flags::CLOSE_AFTER_REPLY | flags::KILLED) != 0
     }
 
-    /// Whether reading is held back.
-    #[inline]
-    pub fn held(&self) -> Option<Hold> {
-        self.hold
-    }
-
     /// The unparsed input.
     #[inline]
     pub fn unparsed(&self) -> &[u8] {
-        &self.read_buf[self.consumed..]
+        &self.read_buf[self.consumed..self.filled]
+    }
+
+    /// Received bytes (`read_buf[..filled]`).
+    #[inline]
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    /// Records `n` bytes received at `read_buf[filled..]`.
+    #[inline]
+    pub fn received(&mut self, n: usize) {
+        self.filled = (self.filled + n).min(self.read_buf.len());
     }
 
     /// Reserves the next request sequence number with a `Pending` slot (its reply comes later).
@@ -371,29 +365,19 @@ impl Conn {
     /// oversized buffer.
     pub fn prepare_read(&mut self, want: usize) {
         if self.consumed > 0 {
-            self.read_buf.drain(..self.consumed);
+            self.read_buf.copy_within(self.consumed..self.filled, 0);
+            self.filled -= self.consumed;
             self.consumed = 0;
         }
-        if self.read_buf.is_empty() && self.read_buf.capacity() > READ_BUF_SHRINK {
-            self.read_buf = Vec::with_capacity(READ_BUF_INITIAL);
+        if self.filled == 0 && self.read_buf.len() > READ_BUF_SHRINK {
+            self.read_buf = vec![0; READ_BUF_INITIAL];
         }
         let want = want.max(READ_BUF_INITIAL / 4);
-        if self.read_buf.capacity() - self.read_buf.len() < want {
-            self.read_buf.reserve(want);
+        if self.read_buf.len() - self.filled < want {
+            // zero-filled once per growth (amortized), never per receive
+            let new_len = (self.filled + want).next_power_of_two().max(READ_BUF_INITIAL);
+            self.read_buf.resize(new_len, 0);
         }
-    }
-
-    /// RESET (§8.2): db 0, RESP2, no name, no MULTI/WATCH/READONLY, de-authenticated when a
-    /// password is set (`authed_after`).
-    pub fn reset(&mut self, authed_after: bool) {
-        self.db = 0;
-        self.proto = Proto::Resp2;
-        self.name = None;
-        self.multi = None;
-        self.watch.clear();
-        self.readonly = false;
-        self.flags &= !(flags::NO_EVICT | flags::NO_TOUCH | flags::WATCH_DIRTY);
-        self.authed = authed_after;
     }
 }
 
@@ -494,29 +478,18 @@ mod tests {
     #[test]
     fn read_buffer_compacts_grows_and_shrinks() {
         let mut c = conn();
-        c.read_buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPI");
+        let input = b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPI";
+        c.read_buf[..input.len()].copy_from_slice(input);
+        c.received(input.len());
         c.consumed = 14;
         c.prepare_read(100);
-        assert_eq!(c.read_buf, b"*1\r\n$4\r\nPI");
+        assert_eq!(c.unparsed(), b"*1\r\n$4\r\nPI");
         assert_eq!(c.consumed, 0);
         c.prepare_read(4 * 1024 * 1024);
-        assert!(c.read_buf.capacity() - c.read_buf.len() >= 4 * 1024 * 1024);
-        c.consumed = c.read_buf.len();
+        assert!(c.read_buf.len() - c.filled() >= 4 * 1024 * 1024);
+        c.consumed = c.filled();
         c.prepare_read(0);
-        assert!(c.read_buf.capacity() <= READ_BUF_SHRINK, "an idle large buffer shrinks");
+        assert!(c.read_buf.len() <= READ_BUF_SHRINK, "an idle large buffer shrinks");
     }
 
-    #[test]
-    fn reset_clears_connection_state() {
-        let mut c = conn();
-        c.db = 3;
-        c.proto = Proto::Resp3;
-        c.name = Some(b"n".to_vec().into());
-        c.readonly = true;
-        c.authed = true;
-        c.multi = Some(MultiState { queued: Vec::new(), errored: false });
-        c.reset(false);
-        assert_eq!((c.db, c.proto, c.readonly, c.authed), (0, Proto::Resp2, false, false));
-        assert!(c.name.is_none() && c.multi.is_none());
-    }
 }

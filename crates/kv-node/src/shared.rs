@@ -26,6 +26,9 @@ use crate::net::budget::LargeValueBudget;
 use crate::runtime::ring::sys;
 use crate::runtime::xmsg::{XMSG_QUEUE_CAP, XMsg};
 
+/// Commit positions of the intent table (64 slots x 60 ids, §14.6).
+pub const TXN_CREDITS: u32 = (kv_storage::intent::INTENT_SLOTS * kv_storage::intent::IDS_PER_COPY) as u32;
+
 pub struct NodeShared {
     pub cfg: parking_lot::RwLock<Arc<Config>>,
     pub counters: Vec<PartitionCountersAtomic>,
@@ -59,6 +62,15 @@ pub struct NodeShared {
     pub recovery: RecoveryInfo,
     /// One cross-partition transaction at a time (§6.8; taken without blocking).
     pub xtxn: XTxnGate,
+    /// Txn credits not in use (§14.6: one per consumed multi-key write; returned when the
+    /// meta thread reports the txn resolved).
+    pub txn_credits: AtomicU32,
+    /// A snapshot section failed: every partition takes the full scan (§18.2).
+    pub recovery_fallback: AtomicBool,
+    /// Partitions whose recovery finished.
+    pub partitions_recovered: AtomicU32,
+    /// Whether the shutdown writes the index snapshot (`SHUTDOWN NOSAVE` clears it).
+    pub shutdown_snapshot: AtomicBool,
     shutdown: AtomicBool,
 }
 
@@ -137,6 +149,10 @@ impl NodeShared {
             lastsave_unix: AtomicU64::new(start.unix_ms / 1000),
             recovery: RecoveryInfo::default(),
             xtxn: XTxnGate::new(),
+            txn_credits: AtomicU32::new(TXN_CREDITS),
+            recovery_fallback: AtomicBool::new(false),
+            partitions_recovered: AtomicU32::new(0),
+            shutdown_snapshot: AtomicBool::new(true),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -200,11 +216,6 @@ impl NodeShared {
         self.counters.iter().map(|c| c.keys(db)).sum()
     }
 
-    /// Keys with a TTL in `db`.
-    pub fn db_expires(&self, db: u8) -> u64 {
-        self.counters.iter().map(|c| c.expires(db)).sum()
-    }
-
     /// Asks every worker to stop (SHUTDOWN, SIGTERM/SIGINT); idempotent.
     pub fn request_shutdown(&self) {
         if !self.shutdown.swap(true, Ordering::AcqRel) {
@@ -219,10 +230,23 @@ impl NodeShared {
         self.shutdown.load(Ordering::Acquire)
     }
 
-    /// Worker owning partition `p` (`p % W`, §6.2).
-    #[inline]
-    pub fn worker_of(&self, p: u16) -> u16 {
-        p % self.workers.len() as u16
+    /// Takes a txn credit before a multi-key write is consumed (§6.7, §14.6).
+    pub fn take_txn_credit(&self) -> bool {
+        self.txn_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
+    }
+
+    /// Returns txn credits (resolved transactions, or a command answered before it reached a
+    /// partition).
+    pub fn give_back_txn_credits(&self, n: u32) {
+        let after = self.txn_credits.fetch_add(n, Ordering::AcqRel) + n;
+        debug_assert!(after <= TXN_CREDITS, "more txn credits returned than taken");
+    }
+
+    /// Wakes every parked worker (the transaction gate moved on).
+    pub fn wake_all(&self) {
+        for w in &self.workers {
+            w.wake();
+        }
     }
 }
 
@@ -255,7 +279,6 @@ mod tests {
         s.set_partition_state(1, PartState::ReadOnly);
         assert!(!s.loading());
         assert_eq!(s.partition_state(1), PartState::ReadOnly);
-        assert_eq!(s.worker_of(3), 1);
         assert_eq!(s.run_id.len(), 40);
         assert_eq!(s.next_client_id(), 1);
         assert_eq!(s.next_client_id(), 2);

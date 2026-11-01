@@ -33,8 +33,11 @@ pub struct ScanReq {
 
 /// The answer to a step: the next cursor and the keys found.
 pub struct ScanOutcome {
-    pub res: Result<(u64, Vec<Box<[u8]>>), StoreError>,
+    pub res: Result<ScanStepResult, StoreError>,
 }
+
+/// A step's next cursor and the keys it found.
+pub type ScanStepResult = (u64, Vec<Box<[u8]>>);
 
 /// The state of a SCAN-family call on its home worker.
 pub enum ScanCall {

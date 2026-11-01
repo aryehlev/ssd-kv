@@ -51,6 +51,7 @@ pub fn init(level: LogLevel, logfile: &str) -> std::io::Result<()> {
             .try_init()
     } else {
         // The one diagnostic file opened for appending (LC-02 named exemption).
+        #[allow(clippy::disallowed_methods)]
         let file = std::fs::OpenOptions::new().create(true).append(true).open(logfile)?;
         tracing_subscriber::registry()
             .with(filter)

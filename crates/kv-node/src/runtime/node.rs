@@ -30,6 +30,11 @@ use crate::runtime::worker::{Worker, WorkerInit};
 use crate::runtime::xmsg::XMsg;
 use crate::shared::NodeShared;
 
+/// Delivers the meta thread's replies to one worker.
+type MetaHook = Box<dyn Fn(u16, u64, kv_storage::metastore::MetaDone) + Send>;
+/// One worker's partitions, by id.
+type OwnedParts = Vec<(u16, PartitionStore)>;
+
 /// A startup failure: one line for the operator, exit code 1 (§22).
 #[derive(Debug)]
 pub struct StartError(pub String);
@@ -288,7 +293,7 @@ async fn service(shared: Arc<NodeShared>) {
                 }
                 if let (Some(first), Some(last)) = (samples.front(), samples.back()) {
                     let secs = (samples.len().saturating_sub(1)) as u64;
-                    let ops = if secs == 0 { 0 } else { (last - first) * 10 / secs };
+                    let ops = ((last - first) * 10).checked_div(secs).unwrap_or(0);
                     shared.ops_per_sec.store(ops, Ordering::Relaxed);
                 }
                 if shared.shutdown_requested() && shared.workers.iter().all(|w| w.side.is_empty()) {
@@ -384,11 +389,10 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
         let d = kv_storage::SyncFileDevice::open_with(p, info, opts).map_err(|e| fail("meta device", e))?;
         meta_devs.push(Box::new(d));
     }
-    let hooks: Vec<Box<dyn Fn(u16, u64, kv_storage::metastore::MetaDone) + Send>> = (0..workers)
+    let hooks: Vec<MetaHook> = (0..workers)
         .map(|w| {
             let shared = shared.clone();
-            let f: Box<dyn Fn(u16, u64, kv_storage::metastore::MetaDone) + Send> =
-                Box::new(move |partition, token, done| shared.workers[usize::from(w)].send_side(XMsg::Meta { partition, token, done }));
+            let f: MetaHook = Box::new(move |partition, token, done| shared.workers[usize::from(w)].send_side(XMsg::Meta { partition, token, done }));
             f
         })
         .collect();
@@ -396,11 +400,12 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
 
     let listeners = bind_listeners(&cfg, workers)?;
     // partitions go to their owner worker (p % W)
-    let mut by_worker: Vec<Vec<(u16, PartitionStore)>> = (0..workers).map(|_| Vec::new()).collect();
+    let mut by_worker: Vec<OwnedParts> = (0..workers).map(|_| Vec::new()).collect();
     for (p, part) in parts.into_iter().enumerate() {
         by_worker[p % usize::from(workers)].push((p as u16, part));
     }
-    let slots: Vec<parking_lot::Mutex<Option<Vec<(u16, PartitionStore)>>>> = by_worker.into_iter().map(|v| parking_lot::Mutex::new(Some(v))).collect();
+    // each worker thread takes its partitions once (so their memory is first touched there)
+    let slots: Vec<parking_lot::Mutex<Option<OwnedParts>>> = by_worker.into_iter().map(|v| parking_lot::Mutex::new(Some(v))).collect();
     let fds: Vec<RawFd> = device_files.iter().map(AsRawFd::as_raw_fd).collect();
     let per_worker_cache = cache / usize::from(workers);
     let recovery = if fmt.snapshot { RecoveryMode::Snapshot } else { RecoveryMode::FullScan };
@@ -459,8 +464,7 @@ mod tests {
     fn auto_cache_is_bounded_by_the_devices() {
         let cfg = Config::default();
         assert_eq!(cache_bytes(&cfg, 128 << 20), 128 << 20);
-        let mut c = Config::default();
-        c.cache_size = Some(1 << 20);
+        let c = Config { cache_size: Some(1 << 20), ..Config::default() };
         assert_eq!(cache_bytes(&c, 1 << 40), 1 << 20);
         assert!(cache_bytes(&cfg, 1 << 50) >= 64 << 20);
     }
@@ -468,11 +472,13 @@ mod tests {
     #[test]
     fn auto_format_creates_a_formatted_data_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.data_dir = dir.path().join("sub");
-        cfg.data_size = 64 << 20;
-        cfg.format_partitions = 16;
-        cfg.snapshot_region = kv_storage::format::SnapshotRegionSize::Percent(0.0);
+        let cfg = Config {
+            data_dir: dir.path().join("sub"),
+            data_size: 64 << 20,
+            format_partitions: 16,
+            snapshot_region: kv_storage::format::SnapshotRegionSize::Percent(0.0),
+            ..Config::default()
+        };
         let devs = prepare_devices(&cfg).unwrap();
         assert_eq!(devs, vec![dir.path().join("sub/kvd.data")]);
         let f = read_format(&devs[0]).unwrap();

@@ -246,12 +246,12 @@ impl<B: Backend> Worker<B> {
     }
 
     fn on_accept(&mut self, listener: u32, res: i32, more: bool) {
-        if !more && self.stopping.is_none() {
-            if let Some(l) = self.listeners.get(listener as usize) {
-                if let Err(e) = self.ring.accept(l.fd, listener) {
-                    tracing::error!(worker = self.id, "accept re-arm failed: {e}");
-                }
-            }
+        if !more
+            && self.stopping.is_none()
+            && let Some(l) = self.listeners.get(listener as usize)
+            && let Err(e) = self.ring.accept(l.fd, listener)
+        {
+            tracing::error!(worker = self.id, "accept re-arm failed: {e}");
         }
         if res < 0 {
             if res != -libc::ECANCELED {
@@ -386,20 +386,20 @@ impl<B: Backend> Worker<B> {
     // connection lifecycle
 
     pub(super) fn queue_parse(&mut self, slot: u32) {
-        if let Some(c) = self.conns[slot as usize].as_mut() {
-            if !c.queued_for_parse {
-                c.queued_for_parse = true;
-                self.parse_q.push(slot);
-            }
+        if let Some(c) = self.conns[slot as usize].as_mut()
+            && !c.queued_for_parse
+        {
+            c.queued_for_parse = true;
+            self.parse_q.push(slot);
         }
     }
 
     pub(super) fn queue_send(&mut self, slot: u32) {
-        if let Some(c) = self.conns[slot as usize].as_mut() {
-            if !c.queued_for_send {
-                c.queued_for_send = true;
-                self.send_q.push(slot);
-            }
+        if let Some(c) = self.conns[slot as usize].as_mut()
+            && !c.queued_for_send
+        {
+            c.queued_for_send = true;
+            self.send_q.push(slot);
         }
     }
 
@@ -567,15 +567,16 @@ impl<B: Backend> Worker<B> {
     /// (§6.9). Returns whether reading may go on.
     fn admit_incomplete(&mut self, conn: &mut Conn) -> bool {
         let Some(ip) = conn.parser.in_progress(conn.unparsed()) else { return true };
-        if let Some(len) = ip.bulk_len {
-            if crate::net::budget::is_large(len) && !conn.lv_admitted {
-                if self.shared.budget.may_start() {
-                    conn.lv_admitted = true;
-                } else {
-                    conn.hold = Some(Hold::LargeValue);
-                    self.counters.large_value_backpressured_conns += 1;
-                    return false;
-                }
+        if let Some(len) = ip.bulk_len
+            && crate::net::budget::is_large(len)
+            && !conn.lv_admitted
+        {
+            if self.shared.budget.may_start() {
+                conn.lv_admitted = true;
+            } else {
+                conn.hold = Some(Hold::LargeValue);
+                self.counters.large_value_backpressured_conns += 1;
+                return false;
             }
         }
         true
@@ -787,10 +788,10 @@ impl<B: Backend> Worker<B> {
         } else {
             None
         };
-        if let Some(ns) = timer {
-            if let Err(e) = self.ring.arm_timer(ns) {
-                tracing::error!(worker = self.id, "timer arm failed: {e}");
-            }
+        if let Some(ns) = timer
+            && let Err(e) = self.ring.arm_timer(ns)
+        {
+            tracing::error!(worker = self.id, "timer arm failed: {e}");
         }
         if self.runnable() {
             if let Err(e) = self.ring.submit_and_wait(0) {

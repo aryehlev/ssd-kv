@@ -1,6 +1,6 @@
 # KVSSD: implementation specification (single source of truth)
 
-Status: APPROVED FOR IMPLEMENTATION (architecture freeze v1.2, 2026-11-01; v1.2 = expired-newest-copy recovery fix in §13.3, §16.2, §18.3; v1.1 = design-review
+Status: APPROVED FOR IMPLEMENTATION (architecture freeze v1.3, 2026-11-01; v1.3 = coordinator peer-change sync step in §23.3; v1.2 = expired-newest-copy recovery fix in §13.3, §16.2, §18.3; v1.1 = design-review
 revision: placement order, in-place/bounded-copy updates, fixed snapshot regions, substrate checks, page-reference SCAN,
 position barriers, unilateral failover, coordinator peer lists outside the voted state, merge sync).
 Audience: the implementation team (parallel workstreams), test/QA, and operations.
@@ -1725,7 +1725,12 @@ state; one accepted proposal is held in the inactive half of two fixed state hal
   keeps `{peer_gen, peers}` in its own `coord.meta`, written only by the operator admin call
   `KVADM COORD SETPEERS <gen> <list>`, which kvadm sends to each coordinator in turn. A change adds or removes exactly
   one coordinator relative to generation `gen - 1`, and kvadm refuses the next change until every coordinator in the
-  new list reports the new `gen` (`KVADM COORD PEERS`). WSR messages carry `peer_gen`; a coordinator grants votes to and
+  new list reports the new `gen` (`KVADM COORD PEERS`) **and** (v1.3, found by the model checker) a value has been
+  committed under the new generation and every coordinator staying in the list has committed it: kvadm first asks the
+  leader to commit a no-op value under the current generation (`KVADM COORD SYNC`) and then polls `KVADM COORD STATE`
+  until each remaining coordinator reports that version. Without this step a 3 -> 4 -> 3 sequence can leave the
+  majorities of generations 1 and 3 disjoint and elect two leaders in one term (regression test
+  `generation_only_rule_is_unsafe`). WSR messages carry `peer_gen`; a coordinator grants votes to and
   accepts proposals from peers of its own `peer_gen` only, and counts majorities over its own list. With single-server
   deltas and at most two generations coexisting, the two generations cannot both assemble a majority (an added server
   is always in the newer generation; a quorum of each needs more servers than exist), so safety follows the

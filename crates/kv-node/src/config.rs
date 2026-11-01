@@ -1350,8 +1350,7 @@ mod tests {
 
     #[test]
     fn worker_count_is_clamped_to_partitions() {
-        let mut c = Config::default();
-        c.threads = Some(200);
+        let mut c = Config { threads: Some(200), ..Config::default() };
         assert_eq!(c.worker_count(64), 64);
         c.threads = None;
         let n = c.worker_count(128);

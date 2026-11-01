@@ -272,10 +272,10 @@ impl Conn {
 
     /// Installs a gather in the slot of `req_seq`.
     pub fn set_gather(&mut self, req_seq: u64, g: GatherSlot) {
-        if let Some(i) = req_seq.checked_sub(self.base_seq) {
-            if let Some(s) = self.slots.get_mut(i as usize) {
-                *s = Slot::Gather(Box::new(g));
-            }
+        if let Some(i) = req_seq.checked_sub(self.base_seq)
+            && let Some(s) = self.slots.get_mut(i as usize)
+        {
+            *s = Slot::Gather(Box::new(g));
         }
     }
 

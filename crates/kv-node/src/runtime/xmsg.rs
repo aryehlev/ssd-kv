@@ -176,6 +176,7 @@ impl WorkerHandle {
     /// Sends from worker `from` over its SPSC queue to this worker; gives the message back when
     /// the queue is full (the sender keeps it and stops parsing that connection, §6.3).
     #[inline]
+    #[allow(clippy::result_large_err)] // the message itself comes back; nothing is dropped
     pub fn try_send(&self, from: u16, msg: XMsg) -> Result<(), XMsg> {
         self.inbox[usize::from(from)].push(msg)?;
         self.wake();
@@ -227,6 +228,14 @@ mod tests {
 
     fn reply(n: u8) -> XMsg {
         XMsg::Reply { conn: ConnRef { worker: 0, slot: 0, generation: 0 }, req_seq: u64::from(n), reply: ReplyBody::Bytes(vec![n]) }
+    }
+
+    /// Every queue slot holds one `XMsg` (W^2 queues of 4096 slots are allocated up front):
+    /// keep the message small, larger payloads go behind a box.
+    #[test]
+    fn messages_stay_small() {
+        assert!(std::mem::size_of::<XMsg>() <= 176, "XMsg is {} bytes", std::mem::size_of::<XMsg>());
+        assert!(std::mem::size_of::<OwnedCmd>() <= 96);
     }
 
     #[test]

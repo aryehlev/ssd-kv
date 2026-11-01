@@ -366,7 +366,7 @@ fn db_after(cmds: &[OwnedCmd], db: u8, databases: u8) -> u8 {
         .filter(|c| c.id == CmdId::Select && c.argc() == 2)
         .filter_map(|c| kv_common::num::string2ll(c.arg(1)))
         .filter(|&n| n >= 0 && n < i64::from(databases))
-        .last()
+        .next_back()
         .map_or(db, |n| n as u8)
 }
 
@@ -611,23 +611,13 @@ impl<B: Backend> Worker<B> {
         }
         let started = self.now.mono_ns;
         match crate::cmd::handler(spec.id) {
-            Handler::Keyed(_) => {
-                drop(w);
-                self.dispatch_keyed(slot, conn, spec, cmd, &mut credit, lv, &mut out);
-            }
+            Handler::Keyed(_) => self.dispatch_keyed(slot, conn, spec, cmd, &mut credit, lv, &mut out),
             Handler::Conn(f) | Handler::Cluster(f) => {
-                drop(w);
                 self.run_conn_cmd(slot, conn, spec, &cmd, f, &mut out);
                 self.record(spec.id, started, out.first() == Some(&b'-'));
             }
-            Handler::Scan => {
-                drop(w);
-                self.dispatch_scan(slot, conn, spec, &cmd, &mut out);
-            }
-            Handler::Txn => {
-                drop(w);
-                self.dispatch_txn(slot, conn, spec, cmd, &mut credit, &mut out);
-            }
+            Handler::Scan => self.dispatch_scan(slot, conn, spec, &cmd, &mut out),
+            Handler::Txn => self.dispatch_txn(slot, conn, spec, cmd, &mut credit, &mut out),
         }
         self.x.reply = out;
     }
@@ -1372,12 +1362,12 @@ impl<B: Backend> Worker<B> {
 
     fn start_node_op(&mut self, to: Option<ReplyTo>, op: NodeOp, proto: kv_resp::Proto, caller: u64) {
         let mut to = to;
-        if op.replies_at_start() {
-            if let Some(t) = to.take() {
-                let mut b = Vec::new();
-                crate::cmd::server::write_node_op_reply(&op, NodeOpDone::Ok, &mut ReplyWriter::new(&mut b, proto));
-                self.deliver(t, ReplyBody::Bytes(b));
-            }
+        if op.replies_at_start()
+            && let Some(t) = to.take()
+        {
+            let mut b = Vec::new();
+            crate::cmd::server::write_node_op_reply(&op, NodeOpDone::Ok, &mut ReplyWriter::new(&mut b, proto));
+            self.deliver(t, ReplyBody::Bytes(b));
         }
         let workers = self.router.workers;
         let id = match self.x.free_gathers.pop() {
@@ -1506,11 +1496,9 @@ impl<B: Backend> Worker<B> {
             }
         }
         if shutdown && g.err.is_none() {
-            if let NodeOp::Shutdown { save, .. } = g.op {
-                // SAVE / NOSAVE override `snapshot-on-shutdown`
-                if let Some(save) = save {
-                    self.shared.shutdown_snapshot.store(save, std::sync::atomic::Ordering::Release);
-                }
+            // SAVE / NOSAVE override `snapshot-on-shutdown`
+            if let NodeOp::Shutdown { save: Some(save), .. } = g.op {
+                self.shared.shutdown_snapshot.store(save, std::sync::atomic::Ordering::Release);
             }
             self.shared.request_shutdown();
         }

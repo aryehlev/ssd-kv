@@ -471,11 +471,10 @@ async fn coordinator_group_end_to_end() {
     .await;
     for _ in 0..50 {
         slots = client(fc, &["CLUSTER", "SLOTS"]).await;
-        if let Value::Array(Some(r)) = &slots {
-            if r.len() == 1 && matches!(&r[0], Value::Array(Some(e)) if e.len() == 4) {
+        if let Value::Array(Some(r)) = &slots
+            && r.len() == 1 && matches!(&r[0], Value::Array(Some(e)) if e.len() == 4) {
                 break;
             }
-        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(slots_reply_primary_port(&slots, 0), Some(i64::from(n1.client.port())));
@@ -681,9 +680,9 @@ async fn followers_without_a_leader_answer_clusterdown() {
     let l = leader_of(&cs).unwrap();
     let f = (l + 1) % 3;
     wait_for("follower contact", 10, || cs[f].as_ref().unwrap().wsr.serving_topology()).await;
-    for i in 0..3 {
+    for (i, c) in cs.iter_mut().enumerate() {
         if i != f {
-            cs[i].take().unwrap().shutdown().await;
+            c.take().unwrap().shutdown().await;
         }
     }
     let c = cs[f].take().unwrap();

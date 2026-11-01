@@ -198,11 +198,10 @@ impl fmt::Display for PeerList {
 /// Parses a coordinator id: 40 hex digits, or a name of 1 to 20 characters `[A-Za-z0-9._-]`
 /// stored zero padded.
 pub fn parse_coord_id(s: &str) -> Option<CoordId> {
-    if s.len() == 40 {
-        if let Some(id) = CoordId::parse_hex40(s) {
+    if s.len() == 40
+        && let Some(id) = CoordId::parse_hex40(s) {
             return Some(id);
         }
-    }
     let ok = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-');
     if s.is_empty() || s.len() > MAX_NAME_LEN || !s.bytes().all(ok) {
         return None;
@@ -299,11 +298,10 @@ pub fn set_peers(cur: &PeerList, new: &PeerList) -> Result<(), PeerChangeError> 
         return Err(PeerChangeError::NotSingleServer);
     }
     for p in &new.peers {
-        if let Some(old) = cur.record(&p.id) {
-            if old != p {
+        if let Some(old) = cur.record(&p.id)
+            && old != p {
                 return Err(PeerChangeError::AddressChanged);
             }
-        }
     }
     Ok(())
 }

@@ -54,7 +54,7 @@ const ALIGN: usize = 4096;
 /// Bytes of the state-half header; the committed value follows, then the accepted value.
 const HEADER: usize = 0x80;
 
-const _: () = assert!(STATE_HALF_BYTES % ALIGN == 0 && MIN_HALF_BYTES % ALIGN == 0);
+const _: () = assert!(STATE_HALF_BYTES.is_multiple_of(ALIGN) && MIN_HALF_BYTES.is_multiple_of(ALIGN));
 const _: () = assert!(2 * STATE_MAX_BYTES + HEADER <= STATE_HALF_BYTES);
 const _: () = assert!(STATE_MAX_BYTES == kv_topo::state::MAX_STATE_BYTES);
 
@@ -173,7 +173,7 @@ impl StateFiles {
         me: Option<&CoordRecord>,
         peers: &PeerList,
     ) -> std::io::Result<()> {
-        if half_bytes < MIN_HALF_BYTES || half_bytes % ALIGN != 0 {
+        if half_bytes < MIN_HALF_BYTES || !half_bytes.is_multiple_of(ALIGN) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "state half size must be a multiple of 4 KiB and at least 64 KiB",
@@ -266,11 +266,10 @@ impl StateFiles {
         let mut sf = File::open(self.dir.join(STATE_FILE))?;
         let mut best: Option<(AbCopy, u64, Vec<u8>)> = None;
         for copy in [AbCopy::A, AbCopy::B] {
-            if let Some((seq, img)) = read_half(&mut sf, self.half_bytes, copy)? {
-                if best.as_ref().is_none_or(|(_, s, _)| seq > *s) {
+            if let Some((seq, img)) = read_half(&mut sf, self.half_bytes, copy)?
+                && best.as_ref().is_none_or(|(_, s, _)| seq > *s) {
                     best = Some((copy, seq, img));
                 }
-            }
         }
         let (committed, accepted) = match &best {
             Some((copy, seq, img)) => {
@@ -531,29 +530,26 @@ impl Export {
         let mut best: Option<(u64, &[u8])> = None;
         for c in [AbCopy::A, AbCopy::B] {
             let img = &data[c.index() * half..(c.index() + 1) * half];
-            if let Some((seq, total)) = valid_half_image(img, half) {
-                if best.is_none_or(|(s, _)| seq > s) {
+            if let Some((seq, total)) = valid_half_image(img, half)
+                && best.is_none_or(|(s, _)| seq > s) {
                     best = Some((seq, &img[..total]));
                 }
-            }
         }
         let (_, img) = best.ok_or_else(|| invalid("the state file has no valid half"))?;
         let (committed, _) = parse_half(img)?;
         let (mut coord_term, mut peer_gen) = (committed.term, 0);
         if let Some(dir) = path.parent() {
             let meta = dir.join(META_FILE);
-            if let Ok(raw) = std::fs::read(&meta) {
-                if raw.len() == 2 * AB_BLOCK {
+            if let Ok(raw) = std::fs::read(&meta)
+                && raw.len() == 2 * AB_BLOCK {
                     let a = ab_decode(META_MAGIC, &raw[..AB_BLOCK]);
                     let b = ab_decode(META_MAGIC, &raw[AB_BLOCK..]);
-                    if let Some((_, _, payload)) = ab_pick(a, b) {
-                        if let Ok((m, _)) = postcard::take_from_bytes::<MetaPayload>(payload) {
+                    if let Some((_, _, payload)) = ab_pick(a, b)
+                        && let Ok((m, _)) = postcard::take_from_bytes::<MetaPayload>(payload) {
                             coord_term = coord_term.max(m.term);
                             peer_gen = m.peers.r#gen;
                         }
-                    }
                 }
-            }
         }
         Ok(Export {
             version: committed.version,

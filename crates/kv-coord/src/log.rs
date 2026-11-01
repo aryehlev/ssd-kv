@@ -30,6 +30,7 @@ pub fn init(loglevel: &str, logfile: Option<&std::path::Path>) -> std::io::Resul
     let r = match logfile {
         Some(path) if !path.as_os_str().is_empty() => {
             // The one appended file of this process (LC-02 exemption).
+            #[allow(clippy::disallowed_methods)]
             let f = OpenOptions::new().create(true).append(true).open(path)?;
             builder.with_ansi(false).with_writer(Mutex::new(f)).try_init()
         }

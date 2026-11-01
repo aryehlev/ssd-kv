@@ -53,16 +53,16 @@ fn corrupt(path: &Path, off: usize, len: usize) {
 fn create_open_write_reload() {
     let dir = tmp("basic");
     let r = me("c1", 7100);
-    StateFiles::create_with_identity(&dir, MIN_HALF_BYTES, Some(&r), &list(&[r.clone()])).unwrap();
+    StateFiles::create_with_identity(&dir, MIN_HALF_BYTES, Some(&r), &list(std::slice::from_ref(&r))).unwrap();
     // creating twice is refused
-    assert!(StateFiles::create(&dir, MIN_HALF_BYTES, &list(&[r.clone()])).is_err());
+    assert!(StateFiles::create(&dir, MIN_HALF_BYTES, &list(std::slice::from_ref(&r))).is_err());
     let (mut f, p) = StateFiles::open(&dir).unwrap();
     assert_eq!(p.me.as_ref(), Some(&r));
     assert_eq!(p.term, 0);
     assert_eq!(p.committed.version, 0, "no valid half yet");
     f.write_state(&v(1, 0, 1, 100), None).unwrap();
     f.write_state(&v(1, 0, 1, 100), Some(&v(2, 3, 2, 50))).unwrap();
-    f.write_meta(3, Some(r.id), &list(&[r.clone()])).unwrap();
+    f.write_meta(3, Some(r.id), &list(std::slice::from_ref(&r))).unwrap();
     let (_, p) = StateFiles::open(&dir).unwrap();
     assert_eq!(p.term, 3);
     assert_eq!(p.voted_for, Some(r.id));
@@ -78,7 +78,7 @@ fn torn_state_write_keeps_the_previous_value() {
     let dir = tmp("torn");
     let r = me("c1", 7100);
     let half = MIN_HALF_BYTES;
-    StateFiles::create_with_identity(&dir, half, Some(&r), &list(&[r.clone()])).unwrap();
+    StateFiles::create_with_identity(&dir, half, Some(&r), &list(std::slice::from_ref(&r))).unwrap();
     let (mut f, _) = StateFiles::open(&dir).unwrap();
     f.write_state(&v(5, 1, 5, 20_000), None).unwrap();
     f.write_state(&v(6, 1, 6, 20_000), None).unwrap();
@@ -95,8 +95,8 @@ fn torn_state_write_keeps_the_previous_value() {
     assert_eq!(p.committed.version, 5, "torn header: the older half wins");
     // A torn meta copy falls back to the other copy.
     let (mut f, _) = StateFiles::open(&dir).unwrap();
-    f.write_meta(8, None, &list(&[r.clone()])).unwrap();
-    f.write_meta(9, None, &list(&[r.clone()])).unwrap();
+    f.write_meta(8, None, &list(std::slice::from_ref(&r))).unwrap();
+    f.write_meta(9, None, &list(std::slice::from_ref(&r))).unwrap();
     drop(f);
     let meta = std::fs::read(dir.join(META_FILE)).unwrap();
     let seq = |i: usize| u64::from_le_bytes(meta[i * 4096 + 0x10..i * 4096 + 0x18].try_into().unwrap());
@@ -122,7 +122,7 @@ fn ab_files_constant_size_long() {
 fn constant_size(commits: u64) {
     let dir = tmp(&format!("size{commits}"));
     let r = me("c1", 7100);
-    StateFiles::create_with_identity(&dir, MIN_HALF_BYTES, Some(&r), &list(&[r.clone()])).unwrap();
+    StateFiles::create_with_identity(&dir, MIN_HALF_BYTES, Some(&r), &list(std::slice::from_ref(&r))).unwrap();
     let len = |f: &str| std::fs::metadata(dir.join(f)).unwrap().len();
     let (m0, s0) = (len(META_FILE), len(STATE_FILE));
     let (mut f, _) = StateFiles::open(&dir).unwrap();
@@ -131,7 +131,7 @@ fn constant_size(commits: u64) {
         f.write_state(&v(i, i / 10, i as u8, size), (i % 3 == 0).then(|| v(i + 1, i, 1, size / 2)).as_ref())
             .unwrap();
         if i % 10 == 0 {
-            f.write_meta(i / 10, None, &list(&[r.clone()])).unwrap();
+            f.write_meta(i / 10, None, &list(std::slice::from_ref(&r))).unwrap();
         }
     }
     assert_eq!((len(META_FILE), len(STATE_FILE)), (m0, s0));
@@ -157,10 +157,10 @@ fn export_round_trip_and_state_file_import() {
 
     let dir = tmp("import");
     let r = me("c1", 7100);
-    StateFiles::create_with_identity(&dir, MIN_HALF_BYTES, Some(&r), &list(&[r.clone()])).unwrap();
+    StateFiles::create_with_identity(&dir, MIN_HALF_BYTES, Some(&r), &list(std::slice::from_ref(&r))).unwrap();
     let (mut f, _) = StateFiles::open(&dir).unwrap();
     f.write_state(&v(10, 4, 3, 500), None).unwrap();
-    f.write_meta(5, None, &list(&[r.clone()])).unwrap();
+    f.write_meta(5, None, &list(std::slice::from_ref(&r))).unwrap();
     let file = dir.join("x.export");
     std::fs::write(&file, &enc).unwrap();
     assert_eq!(Export::read_any(&file).unwrap(), x);

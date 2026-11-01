@@ -507,14 +507,13 @@ impl Driver {
             self.core.step(i, &mut out);
         }
         self.absorb(&out);
-        if self.core.can_propose() && !self.pending.is_empty() {
-            if let Some(value) = self.build_proposal() {
+        if self.core.can_propose() && !self.pending.is_empty()
+            && let Some(value) = self.build_proposal() {
                 let mut more = Vec::new();
                 self.core.step(Input::Propose { value }, &mut more);
                 self.absorb(&more);
                 out.extend(more);
             }
-        }
         let meta = out.iter().any(|o| matches!(o, Output::PersistMeta));
         let state = out.iter().any(|o| matches!(o, Output::PersistState));
         if meta || state {

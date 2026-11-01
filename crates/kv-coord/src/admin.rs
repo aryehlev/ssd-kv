@@ -228,12 +228,11 @@ impl Controllers {
             .pusher
             .with_lease(|ls| ls.detector.tick(&s, &ls.leases, now_ns, since));
         for t in health {
-            if let Transition::Health { node, fail } = t {
-                if lock(&self.jobs).health.insert((node, fail)) {
+            if let Transition::Health { node, fail } = t
+                && lock(&self.jobs).health.insert((node, fail)) {
                     tracing::info!(node = %node.hex40(), fail, "node health change");
                     self.submit("health", vec![t], Some((node, fail)));
                 }
-            }
         }
         let now = Instant::now();
         for sh in &s.shards {
@@ -664,7 +663,7 @@ async fn run_verb(ctl: &Arc<Controllers>, verb: &str, sub: &str, words: &[String
                 return Err("the cluster already has registered nodes".into());
             }
             let kv = &words[1..];
-            if kv.len() % 2 != 0 {
+            if !kv.len().is_multiple_of(2) {
                 return Err("INIT takes key value pairs".into());
             }
             let batch = kv

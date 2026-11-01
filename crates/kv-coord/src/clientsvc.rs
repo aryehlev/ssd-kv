@@ -140,11 +140,10 @@ impl Svc {
     fn topology(&self, s: &ClusterState) -> Arc<RenderedTopology> {
         let peers = self.wsr.peers();
         let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((v, g, t)) = c.as_ref() {
-            if *v == s.version && *g == peers.r#gen {
+        if let Some((v, g, t)) = c.as_ref()
+            && *v == s.version && *g == peers.r#gen {
                 return t.clone();
             }
-        }
         let t = Arc::new(RenderedTopology::build(
             s,
             &peers.endpoints(),

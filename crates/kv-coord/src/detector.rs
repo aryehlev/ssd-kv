@@ -105,11 +105,10 @@ impl Detector {
                 // Committed: nothing pending any more.
                 self.fail_pending.remove(&n);
                 let healthy = leases.health(&n).is_some_and(|h| !h.failed);
-                if !self.pfail.contains(&n) && healthy && leases.last_renew(&n).is_some() {
-                    if !awaiting_promotion(s, &n) {
+                if !self.pfail.contains(&n) && healthy && leases.last_renew(&n).is_some()
+                    && !awaiting_promotion(s, &n) {
                         out.push(Transition::Health { node: n, fail: false });
                     }
-                }
             } else if silent >= fail_after || self.fail_pending.contains(&n) {
                 out.push(Transition::Health { node: n, fail: true });
             }

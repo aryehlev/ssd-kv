@@ -802,13 +802,11 @@ impl<V: Clone + PartialEq> Core<V> {
             .accepted
             .as_ref()
             .is_some_and(|a| a.version == version && a.term == term)
-        {
-            if let Some(e) = self.accepted.take() {
+            && let Some(e) = self.accepted.take() {
                 self.committed = e;
                 out.push(Output::PersistState);
                 out.push(Output::Commit { version });
             }
-        }
     }
 
     /// Adopts the leader's committed value when it is newer than the local committed one.
@@ -817,11 +815,10 @@ impl<V: Clone + PartialEq> Core<V> {
             return;
         }
         let mut term = value_term;
-        if let Some(a) = &self.accepted {
-            if a.version == version {
+        if let Some(a) = &self.accepted
+            && a.version == version {
                 term = term.max(a.term);
             }
-        }
         self.committed = Entry {
             version,
             term,
@@ -997,11 +994,10 @@ mod tests {
         g[1].step(Input::ElectionTimeout, &mut out);
         let mut inbox = Vec::new();
         for o in out {
-            if let Output::Send { to, msg } = o {
-                if to == id(2) {
+            if let Output::Send { to, msg } = o
+                && to == id(2) {
                     inbox.push((2usize, id(1), msg));
                 }
-            }
         }
         // deliver only between 1 and 2
         let mut queue = inbox;
@@ -1084,11 +1080,10 @@ mod tests {
             g[0].step(Input::Propose { value: v }, &mut out);
             let mut inbox = Vec::new();
             for o in out {
-                if let Output::Send { to, msg } = o {
-                    if to == id(1) {
+                if let Output::Send { to, msg } = o
+                    && to == id(1) {
                         inbox.push((1usize, id(0), msg));
                     }
-                }
             }
             let mut q = inbox;
             while let Some((to, from, msg)) = (!q.is_empty()).then(|| q.remove(0)) {

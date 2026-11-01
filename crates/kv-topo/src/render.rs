@@ -240,7 +240,10 @@ fn push_coord_line(out: &mut String, c: &CoordEndpoint, me: bool, style: CoordLi
     out.push_str(" - 0 0 0 connected\n");
 }
 
-/// CLUSTER NODES text (send with [`write_text`]).
+/// CLUSTER NODES text (send with [`write_text`]): for each shard (state order) its primary with
+/// the slot ranges, then its advertised replicas; then one line per entry of `peers`, the
+/// coordinators' operator-set list in list order. The entry whose id is `myself` (the answering
+/// coordinator; it must be in `peers`) carries the `myself` flag, which Lettuce requires.
 pub fn cluster_nodes(
     s: &ClusterState,
     peers: &[CoordEndpoint], /* static list */

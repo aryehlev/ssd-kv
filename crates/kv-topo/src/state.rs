@@ -59,6 +59,11 @@ pub const MAX_BARRIERS: u8 = 16;
 /// Partition counts a cluster may use (P, §5).
 pub const PARTITION_CHOICES: [u16; 4] = [16, 32, 64, 128];
 
+// The slot array covers exactly the 16384 hash slots, and a state fits one 8 MiB half with
+// header room (§23.3).
+const _: () = assert!(SLOTS == 16384 && SLOT_UNASSIGNED as usize >= SLOTS);
+const _: () = assert!(MAX_STATE_BYTES + 64 * 1024 == 8 * 1024 * 1024);
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterState {
     /// +1 per committed batch of transitions; the only map version

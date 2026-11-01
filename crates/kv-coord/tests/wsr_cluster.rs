@@ -17,12 +17,18 @@ struct Member {
     wsr: Option<Arc<Wsr>>,
 }
 
+/// A port below the kernel's ephemeral range (so no `:0` bind can take it meanwhile), unique
+/// in this process and free right now.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let start = (std::process::id() % 400) * 30;
+    loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = (20_000 + (start + n) % 12_000) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
 }
 
 fn group(name: &str, n: usize) -> Vec<Member> {

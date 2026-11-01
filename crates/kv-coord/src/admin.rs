@@ -515,7 +515,7 @@ async fn relay_to(addr: SocketAddr, token: &[u8], argv: &[Vec<u8>]) -> std::io::
     let mut buf = Vec::new();
     let mut replies = Vec::new();
     while replies.len() < 2 {
-        let mut chunk = [0u8; 16 * 1024];
+        let mut chunk = vec![0u8; 16 * 1024];
         let n = tokio::time::timeout(Duration::from_secs(60), s.read(&mut chunk))
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "reply"))??;

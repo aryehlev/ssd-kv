@@ -28,6 +28,8 @@ const MAX_LONG_DOUBLE_CHARS: usize = 5 * 1024;
 const KV_LD_OK: c_int = 0;
 const KV_LD_NOT_FLOAT: c_int = 1;
 
+// SAFETY: these declarations match the definitions in c/ldouble.c (C11, `size_t` == `usize` on
+// every supported target); the function only reads and writes the buffers it is given.
 unsafe extern "C" {
     fn kv_incrbyfloat(
         cur: *const c_uchar,

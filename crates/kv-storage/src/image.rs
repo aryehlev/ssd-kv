@@ -35,8 +35,9 @@ pub struct PageState {
     /// N frame, its recs, sub-I/O count, state Writing|AwaitFlush
     pub inflight: Option<Inflight>,
     pub fresh: bool,
-    /// +1 per durable build (tickets reference (page, gen))
-    pub gen: u32,
+    /// +1 per durable build (tickets reference (page, gen)); `gen` is reserved in edition 2024,
+    /// hence the raw identifier.
+    pub r#gen: u32,
 }
 
 /// A record of an image.

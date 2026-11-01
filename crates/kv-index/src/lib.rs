@@ -13,8 +13,8 @@
 //! * [`segment`]: the ordered linear-probing segment and its capacity sequence (LC-09).
 //! * [`table`]: `SlotTable`, the page-reference SCAN walk (LC-18), bulk build and the snapshot
 //!   iterator (snapshot writer only).
-//! * [`hint`], [`cursor`]: TTL hint and SCAN cursor encodings.
-//! * [`partition_index`]: `PartitionIndex`.
+//! * TTL hint and SCAN cursor encodings: [`hint`], [`cursor`].
+//! * `PartitionIndex`: [`partition_index`].
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
 #![allow(dead_code, unused_variables)]

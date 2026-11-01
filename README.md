@@ -1,340 +1,74 @@
-# ssd-kv
+# kvssd
 
-A string key-value store written in Rust that speaks the Redis RESP protocol,
-so any Redis client can talk to it. The hot index lives in RAM, values live
-on SSD. Ships with a Go-based Kubernetes operator for clustered deployments.
+A Redis-protocol compatible key-value database (RESP2 and RESP3). The index lives in RAM; keys
+and values live on SSD/NVMe in fixed-location 4 KiB pages and extents that are updated in place,
+with crash consistency from the page-update rules rather than from a second copy of the data.
+A small coordinator service owns the cluster map, routes cluster-aware clients, grants leases
+and drives replication, failover and operator-initiated slot migration.
 
-```
-                                  ┌─▶ WAL files (durability log: fsync
-                                  │    per batch, trimmed once records
-                                  │    are in a data file)
-client ──RESP──▶ ssd-kv ──┬─▶ in-memory index (RAM)
-                          │
-                          ├─▶ WriteBuffer: 1 MiB WBlock staging in RAM
-                          │    (rotates to a pending queue when full)
-                          │
-                          └─▶ data files: 1023 × 1 MiB WBlocks per file
-                               (≈ 1 GiB, O_DIRECT aligned sequential
-                               append; unlinked when fully reclaimed)
-```
+> **Status: under construction.** The project is being rebuilt from scratch as a Cargo
+> workspace. The crates currently contain their frozen public interfaces with stub bodies
+> (`todo!()`); nothing serves traffic yet. The black-box compatibility harness in
+> `tests/compat/` is complete and is the acceptance test for the server.
 
-Writes go to the WAL first for durability, then accumulate in the in-RAM
-WriteBuffer, then flush to a data file as one 4 KiB-aligned `pwrite`.
-Reads take one index lookup → one positioned read from a data file (or
-from the optional read-side cache, or directly out of the WriteBuffer if
-the record hasn't flushed yet).
+## Workspace
 
----
-
-## Build & run
-
-```bash
-# Build
-cargo build --release
-
-# Run standalone (default: 127.0.0.1:7777, data in ./data,
-# --wal-mode odirect with fsync per batch)
-./target/release/ssd-kv
-
-# Then talk to it with any Redis client
-redis-cli -p 7777 SET hello world
-redis-cli -p 7777 GET hello
-```
-
-Docker:
-
-```bash
-docker compose up ssd-kv
-```
-
-Kubernetes (Go operator):
-
-```bash
-kubectl apply -f operator/deploy/crd.yaml
-kubectl apply -f operator/deploy/rbac.yaml
-kubectl apply -f operator/deploy/operator.yaml
-kubectl apply -f operator/deploy/sample-cluster.yaml
-```
-
-The operator forces every `SsdkvCluster` pod into the **Guaranteed** QoS class
-(requests == limits) and rejects fractional CPU. Combined with a kubelet
-started with `--cpu-manager-policy=static` and a non-zero `--reserved-cpus`,
-each pod gets exclusive whole cores from the static CPU manager, so worker
-threads aren't preempted by neighbours. Without static CPU manager the cluster
-still runs — it just doesn't get pinning.
-
-`spec.resources` therefore takes a single `cpu` (whole cores) and `memory`,
-not the usual `requests`/`limits` pair:
-
-```yaml
-spec:
-  resources:
-    cpu: "2"
-    memory: 2Gi
-```
-
----
-
-## Server flags
-
-### Storage & durability
-| Flag                              | Default          | Meaning                                                       |
-| --------------------------------- | ---------------- | ------------------------------------------------------------- |
-| `--data-dir <path>`               | `./data`         | Where data files live (repeat flag for multi-device striping) |
-| `--wal-mode <mode>`               | `odirect`        | `buffered`, `odirect`, or `odirect-trust-device`. `odirect` bypasses the page cache + fsyncs per batch. `odirect-trust-device` drops the fsync entirely — only safe on PLP-class NVMe. |
-| `--reactor-threads <n>`           | CPU-derived      | Number of network threads; also drives WAL shard count (one shard per reactor for independent fsync pipelines). |
-| `--wblock-cache-mb <n>`           | `0`              | RAM budget for the read-side WBlock cache (0 = off)           |
-| `--wal-trim-interval-secs <s>`    | `30`             | How often old WAL files get unlinked once their records are in a data file |
-| `--io-workers <n>`                | `2`              | io_uring workers serving cache-miss reads                     |
-| `--wblocks-per-file <1..1023>`    | `1023`           | 1 MB blocks per data file (1023 → ~1 GB files)                |
-
-### Compaction & eviction
-| Flag                          | Default           | Meaning                                                       |
-| ----------------------------- | ----------------- | ------------------------------------------------------------- |
-| `--no-compaction`             | off               | Disable background compaction                                 |
-| `--compaction-threshold <f>`  | `0.5`             | Compact blocks below this live-data ratio                     |
-| `--compaction-interval <s>`   | `60`              | Compaction check interval                                     |
-| `--eviction-policy <p>`       | `noeviction`      | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-random`, `volatile-ttl` |
-| `--max-entries <n>`           | `0`               | Index size cap (0 = unlimited)                                |
-| `--max-data-mb <n>`           | `0`               | Data size cap (0 = unlimited)                                 |
-| `--eviction-interval <s>`     | `1`               | Eviction check interval                                       |
-
-### Server & cluster
-| Flag                          | Default           | Meaning                                                       |
-| ----------------------------- | ----------------- | ------------------------------------------------------------- |
-| `--bind <addr>`               | `127.0.0.1:7777`  | Listen address                                                |
-| `--num-dbs <1..16>`           | `16`              | Number of logical DBs (`SELECT 0..N-1`)                       |
-| `--memory-dbs <list>`         | —                 | DB indices that are memory-only (e.g. `--memory-dbs 1,2`)     |
-| `--cluster-mode`              | off               | Run as a cluster member                                       |
-| `--node-id <n>`               | —                 | This node's ordinal (required in cluster mode)                |
-| `--total-nodes <n>`           | —                 | Cluster size                                                  |
-| `--replication-factor <n>`    | `2`               | Copies per key (including primary)                            |
-| `--cluster-port <p>`          | `7780`            | Inter-node port                                               |
-| `--cluster-peers <list>`      | —                 | `host:port,host:port,...` of peers                            |
-| `--health-check-interval-ms`  | `1000`            | Heartbeat interval                                            |
-| `--health-check-threshold`    | `3`               | Missed heartbeats before a node is marked dead                |
-| `--replica-read`              | off               | Allow `READONLY` reads from replicas                          |
-| `--log-level <lvl>`           | `info`            | `trace`, `debug`, `info`, `warn`, `error`                     |
-| `--verbose`                   | off               | Shortcut for `--log-level debug`                              |
-
----
-
-## Supported commands
-
-All commands speak RESP-2; clients pipeline freely.
-
-**Strings / generic**
-`GET`, `SET` (`EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`, `KEEPTTL`, `GET`),
-`SETNX`, `SETEX`, `PSETEX`, `GETDEL`, `GETEX`, `GETRANGE`, `SETRANGE`,
-`APPEND`, `STRLEN`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`,
-`MGET`, `MSET`, `DEL`, `UNLINK` (alias of `DEL`), `EXISTS`, `TYPE`,
-`RENAME`, `RENAMENX`, `COPY`, `RANDOMKEY`, `KEYS`, `SCAN`,
-`OBJECT ENCODING`.
-
-**TTL**
-`TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`.
-
-**Connection / server**
-`PING`, `ECHO`, `TIME`, `DBSIZE`, `SELECT`, `READONLY`, `READWRITE`,
-`INFO`, `CONFIG GET`, `CONFIG RESETSTAT`, `WAIT`.
-
-`INFO` exposes `# Server`, `# Memory` (`used_memory`, peak, `maxmemory`,
-eviction policy, wblock cache hit ratio), `# Replication` (per-replica
-`sent`/`acked`/`failed`/`lag`/`diverged` counters), `# Latencystats`
-(p50/p99/p999 per SET/GET/DEL), and `# Wal` (per-shard entries, bytes,
-syncs, flushes, current file size, durable position).
-
-`CONFIG GET` returns a read-only view of `maxmemory`, `maxmemory-policy`,
-`max-entries`, `appendonly`, `appendfsync`, `save`. `CONFIG SET` returns
-an error — every knob is a startup-only CLI flag.
-
-**Transactions**
-`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`. `WATCH` snapshots the
-per-key generation counter; `EXEC` aborts and returns nil if any watched
-key's generation changed.
-
-**Pub/sub**
-`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`.
-In-process only — no cross-node fan-out in cluster mode.
-
-**Cluster**
-`CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SLOTS`,
-`CLUSTER KEYSLOT`. All return live topology data.
-
----
-
-## Storage model
-
-- **Index in RAM.** 256 shards, each a `HashMap<u64, Vec<IndexEntry>>`
-  keyed by `xxh3(key)` behind its own `parking_lot::RwLock`. Each entry
-  holds the key (inline if ≤ 23 bytes, else heap), the on-disk location
-  (file id, block, offset), value length, generation, and a flag byte.
-  TTL lives in the on-disk record header, not in the in-memory entry.
-- **Write-ahead log.** Every write first goes to a WAL shard (one per
-  reactor thread) with an xxh3-framed record. `odirect` mode fsyncs per
-  batch; `odirect-trust-device` drops the fsync for PLP hardware. Once
-  all records in a WAL file are durable in a data file, the WAL file is
-  unlinked by the trim thread.
-- **WriteBuffer (staging).** After WAL commit, records append into a
-  1 MiB in-RAM WBlock. When it fills, it rotates into a pending queue
-  (bounded — returns `OOM command not allowed` under sustained overload
-  so clients can back off rather than the server getting OOM-killed)
-  and a background flush writes it to a data file as one aligned
-  `pwrite`.
-- **Data files.** Each file is 1023 × 1 MiB WBlocks ≈ 1 GiB. Writes are
-  sequential-append; reads are a single positioned read. Each WBlock
-  carries an xxh3 integrity footer checked on recovery — sufficient to
-  distinguish clean shutdown from torn flush on top of the per-record
-  CRC.
-- **Read path.** Index → WriteBuffer (unflushed records) → optional
-  WBlock cache (`--wblock-cache-mb`) → positioned read from the data
-  file. Cache misses can be served by io_uring workers.
-- **Recovery.** Scan data files to rebuild the index, then replay any
-  WAL entries past the highest durable generation. Records that fail
-  per-record CRC are skipped; each WBlock's footer match/miss/corrupt
-  is surfaced in recovery stats.
-- **Compaction.** A background thread copies live records out of blocks
-  whose live-data ratio falls below `--compaction-threshold`, marks the
-  source blocks reclaimed, and **unlinks the whole 1 GiB data file**
-  once every block in it is reclaimed and the file is sealed. Read-side
-  cache entries are invalidated before unlink.
-- **Eviction.** Optional LRU / TTL / random sampler runs in the
-  background once any of `--max-entries`, `--max-data-mb`, or a
-  non-`noeviction` policy is set.
-- **Cluster.** Keys are mapped to one of 16,384 slots, slots are split
-  across `--total-nodes` nodes, and `--replication-factor` copies per
-  key are stored. Replication is async — the primary doesn't block on
-  replica ack — but per-replica `sent`/`acked`/`failed`/`lag` counters
-  surface divergence in `INFO`. Heartbeats fire every
-  `--health-check-interval-ms`.
-
----
-
-## Resource usage
-
-The design point is **index in RAM, values on SSD**, so RAM scales with
-*number of keys* and SSD scales with *total value bytes*. That is the
-trade-off vs an all-in-memory store like Redis (which keeps values in
-RAM too).
-
-### Benchmarks
-
-#### Read latency: cold SSD vs warm page cache vs in-memory
-
-Measurements on a single VM (ext4/virtio-blk), 1 client, 1 reactor thread.
-"Cold" = OS page cache dropped via `/proc/sys/vm/drop_caches` before **each**
-individual GET so every B-Tree traversal and value-log read must reach the SSD.
-"Warm" = page cache already populated (DRAM-speed reads).
-
-| System | Condition | p50 | p95 | p99 |
-|---|---|---|---|---|
-| **ssd-kv** | cold (SSD read) | **353 µs** | 631 µs | 635 µs |
-| **ssd-kv** | warm (OS page cache) | 61 µs | 138 µs | 221 µs |
-| Redis 7.0 | in-memory, no persistence | 54 µs | 90 µs | 148 µs |
-| Aerospike CE ¹ | SSD (NVMe, published) | ~500 µs | ~1.5 ms | ~2 ms |
-
-¹ Aerospike Community Edition numbers are from Aerospike's published
-benchmark reports on a single NVMe SSD node; actual results vary by
-hardware and record size.
-
-Key takeaways:
-- **Cold ssd-kv (353 µs p50) is competitive with Aerospike on NVMe SSD.**
-  This VM uses a virtualised block device, so bare-metal NVMe would be faster.
-- **Warm ssd-kv ≈ Redis** once the OS page cache is hot, because both end up
-  serving reads from DRAM. The difference is that ssd-kv's working set
-  is not bounded by available RAM.
-- **The old warm-only benchmark was misleading** — it was essentially
-  measuring DRAM speed, not SSD speed.
-
-#### Criterion micro-benchmarks (engine API, no network)
-
-Run with `cargo bench`:
-
-| Benchmark | Result |
-|---|---|
-| `latency/warm_get` | 3.2 µs |
-| `latency/cold_get` | 281 µs |
-| `latency/put` | 743 µs |
-| `latency/delete` | 14 µs |
-| `get_warm/1000` | ~268 K ops/s |
-| `get_cold/1000` | ~15 K ops/s |
-
-The `get_cold` benchmarks use `iter_batched(PerIteration)` to drop the OS
-page cache before every single timed iteration, so the numbers reflect
-genuine SSD reads, not cached ones.
-
-#### Write throughput comparison
-
-SET throughput is bounded by fdatasync per write (durable by default).
-A pipelined multi-client run (`-c 50`):
-
-| System | SET ops/s | avg latency |
+| Crate | Binary | Purpose |
 |---|---|---|
-| Redis 7.0 (`appendonly no`) | ~87 K | 0.31 ms |
-| **ssd-kv** (1 reactor thread) | ~1.3 K | 7.4 ms |
-| Redis 7.0 (`appendfsync=always`) | ~17 K | ~3 ms |
+| `crates/kv-common` | | slots, key hashes, checksums, clocks, pacing, A/B blocks, number formats, INCRBYFLOAT arithmetic |
+| `crates/kv-resp` | | RESP2/RESP3 parser, reply writer, client-side decoder |
+| `crates/kv-cmd` | | command table: arity, flags, key specs, COMMAND INFO/DOCS |
+| `crates/kv-index` | | RAM index: per-slot hash tables of ordered linear-probing segments |
+| `crates/kv-storage` | | in-place SSD page store: formats, allocator, page writer, recovery |
+| `crates/kv-repl` | | per-partition replication streams and migration endpoints |
+| `crates/kv-ctrl` | | coordinator <-> data node control messages |
+| `crates/kv-topo` | | versioned cluster state, topology replies, redirects |
+| `crates/kv-node` | `kvd` | data node |
+| `crates/kv-coord` | `kvc` | coordinator |
+| `crates/kvadm` | `kvadm` | operator CLI |
+| `crates/kv-sim` | | deterministic simulators (test only) |
+| `crates/kvbench` | `kvbench` | benchmark client |
+| `tests/crash/faultdev` | `faultdev` | RAM-only fault-injection block device (test only) |
 
-ssd-kv's write throughput is bounded by one fdatasync per `PUT` call.
-Batched group-commit (amortising one fsync across many concurrent writes)
-is the standard fix and is on the roadmap.
+Workstream ownership of each file is in [`crates/OWNERSHIP.md`](crates/OWNERSHIP.md).
 
----
+## Build
 
-## Why it's fast
+Linux with io_uring (kernel 6.1 or newer), Rust 1.97 (`rust-toolchain.toml`) and a C compiler.
 
-- **O_DIRECT WAL with batched group commit.** The WAL path bypasses the
-  kernel page cache and fsyncs per *batch* rather than per *write*, so
-  many concurrent clients amortise a single sync. An opt-in
-  `odirect-trust-device` mode skips the fsync entirely — safe only on
-  PLP-class NVMe, but lands another 40-290% throughput in exchange.
-- **Parallel WAL shards.** One WAL shard per reactor thread → N
-  independent fsync pipelines running concurrently instead of serialising
-  through a single log. Each shard keeps its own durable-position cursor;
-  there's no cross-shard ordering dependency.
-- **Sequential writes, random reads.** Writes hit the WriteBuffer, then
-  go to disk as one big aligned append. SSDs love this pattern. Reads
-  are one positioned read per hit.
-- **One hash lookup per GET.** The index is 256 sharded `HashMap`s keyed
-  by `xxh3`. No B-tree, no LSM read amplification.
-- **No copies on the hot path.** The RESP parser reuses a per-connection
-  buffer; responses are built into a contiguous output buffer and flushed
-  once per pipeline batch.
-- **Pipelining.** Up to 128 commands per connection are processed before
-  the socket is flushed, amortising syscalls.
-- **io_uring async reader** for cache-miss reads so the reactor doesn't
-  block on slow SSD reads.
-- **mimalloc.** Replaces the system allocator; cheaper small allocations.
-- **CPU pinning delegated to Kubernetes.** Pinning is done by the
-  kubelet's static CPU manager (Guaranteed QoS + integer cores, enforced
-  by the operator), instead of `sched_setaffinity` calls that would
-  silently no-op inside a restricted cpuset.
-- **Append-only log + real background compaction.** Deletes and
-  overwrites are free at write time; reclamation happens off the hot
-  path, and fully-reclaimed 1 GiB files are actually unlinked so disk
-  usage doesn't grow forever.
-- **Tight RESP fast path.** Common commands (`GET`/`SET`/`PING`/`DEL`)
-  match early in the dispatch and skip most argument validation.
-
----
-
-## Repository layout
-
+```bash
+cargo build --workspace
+cargo test --workspace
+bash ci/check_graph.sh      # crate dependency graph (docs/DESIGN.md §24.2)
+bash ci/invariant_lint.sh   # grep-able engineering invariants (docs/DESIGN.md §3, §25.7)
 ```
-src/
-  server/        # RESP server, command dispatch, multi-DB
-  engine/        # In-memory index, recovery
-  storage/       # WAL, write buffer, file manager, compaction, eviction,
-                 # wblock cache
-  cluster/       # Topology, replication, routing, health
-  io/            # io_uring helpers, aligned buffers
-  perf/          # Tuning helpers (CPU pinning, NUMA, prefetch, ...)
-  config.rs      # CLI flags
-  main.rs
 
-operator/        # Go controller-runtime operator (SsdkvCluster CRD)
-  deploy/        # CRD + RBAC + operator + sample CR
+## Run (target interface)
 
-benches/         # Criterion benchmarks
-benchmark/       # Comparison scripts
-tests/           # Integration tests
+```bash
+# single node: formats {dir}/kvd.data on first start
+target/release/kvd --port 6379 --data-dir /var/lib/kvssd
+redis-cli -p 6379 PING
+
+# dedicated devices
+target/release/kvd format --device /dev/nvme0n1 --partitions 64
+target/release/kvd /etc/kvssd/kvd.conf
+
+# compatibility harness against a running build
+python3 tests/compat/differential.py --help
 ```
+
+Cluster mode adds `kvc` coordinators (`kvc init`, then `kvc`) and is operated with `kvadm`;
+see docs/DESIGN.md §23. Systemd units are in `dist/`. `kvd --version` works today; every other
+command currently exits with "not yet implemented".
+
+## Documentation
+
+* [`docs/DESIGN.md`](docs/DESIGN.md): the implementation specification (architecture, on-media
+  format, crate interfaces, test strategy, milestones).
+* [`tests/compat/README.md`](tests/compat/README.md): the compatibility harness.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Third-party attributions are in [NOTICE](NOTICE).

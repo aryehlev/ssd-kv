@@ -25,7 +25,10 @@ pub enum StaleRef {
     Extent { page: PageId, n_pages: u32 },
 }
 
+/// `(db, exact key) -> older copies`.
+type StaleMap = hashbrown::HashMap<(u8, Box<[u8]>), SmallVec<[StaleRef; 1]>, foldhash::fast::RandomState>;
+
 /// The partition's tracked stale copies (exact keys).
 pub(crate) struct StaleCopies {
-    map: hashbrown::HashMap<(u8, Box<[u8]>), SmallVec<[StaleRef; 1]>, foldhash::fast::RandomState>,
+    map: StaleMap,
 }

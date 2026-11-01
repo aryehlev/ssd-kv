@@ -1,0 +1,24 @@
+# kvssd coordinator (DESIGN §20.1, §23.1). Install the binary as /usr/local/bin/kvc and the
+# configuration as /etc/kvssd/kvc.conf; create the state files once with `kvc init`.
+[Unit]
+Description=kvssd coordinator (kvc)
+Documentation=https://github.com/aryehlev/ssd-kv/blob/main/docs/DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kvssd
+Group=kvssd
+ExecStart=/usr/local/bin/kvc /etc/kvssd/kvc.conf
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=1
+LimitMEMLOCK=infinity
+MemorySwapMax=0
+LimitCORE=0
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

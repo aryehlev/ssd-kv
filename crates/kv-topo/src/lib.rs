@@ -17,5 +17,6 @@ pub mod render;
 pub mod state;
 pub mod transition;
 
-pub use state::{ClusterParams, ClusterState, Member, MigPhase, Migration, NodeRecord, ShardRecord}; // no CoordRecord in the state (LC-38)
+// The state holds no coordinator records (LC-38).
+pub use state::{ClusterParams, ClusterState, Member, MigPhase, Migration, NodeRecord, ShardRecord};
 pub use transition::{AdminOp, Reject, Transition};

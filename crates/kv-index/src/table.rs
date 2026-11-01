@@ -62,6 +62,12 @@ pub struct SlotTable {
     ttl_len: usize,
 }
 
+impl Default for SlotTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlotTable {
     pub fn new() -> Self {
         todo!("DESIGN §9.4: empty table")

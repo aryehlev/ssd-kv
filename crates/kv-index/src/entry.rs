@@ -13,8 +13,8 @@
 //! ```
 //! An entry holds no pointer, no seq, no expiry, no key bytes and no digest (LC-13, LC-20).
 
-/// Where the record lives.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Where the record lives. (`Hash` is needed by `PageRef`'s derive.)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
     Small = 0,
     Extent = 1,
@@ -22,7 +22,7 @@ pub enum Kind {
 }
 
 /// Value type of the key.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum VType {
     String = 0,
     Hash = 1,

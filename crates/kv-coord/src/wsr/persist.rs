@@ -15,10 +15,13 @@
 //! The files stay constant in size forever (test `ab_files_constant_size`): only the used prefix
 //! of a half is rewritten, rounded up to 4 KiB.
 //!
-//! Substrate (LC-34): the directory must be on XFS or ext4, and ext4 must not be mounted
-//! `data=journal` (read from `/proc/self/mountinfo`). The per-file data-journaling attribute and
-//! the backing block device's stacking are not inspected here: that probing lives in
-//! kv-storage's `devprobe.rs`, which this crate must not link (LC-38; open point 11).
+//! `coord.meta` also records which coordinator of the list this one is (`me`, set by `kvc
+//! init`), so a coordinator that is still joining a group (empty list) knows its own addresses.
+//!
+//! Substrate (LC-34): the directory must be on XFS, or on ext4 in the `ordered` or `writeback`
+//! data mode (read from `/proc/self/mountinfo`; any other mode is refused). The per-file data
+//! mode attribute and the backing block device's stacking are not inspected here: that probing
+//! lives in kv-storage's `devprobe.rs`, which this crate must not link (LC-38; open point 11).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -30,7 +33,7 @@ use kv_common::crc::crc32c;
 use kv_ctrl::CoordId;
 use serde::{Deserialize, Serialize};
 
-use super::peers::PeerList;
+use super::peers::{CoordRecord, PeerList};
 
 /// Bytes of one `coord.state` half: room for a committed and an accepted value of
 /// [`STATE_MAX_BYTES`] each plus the header.
@@ -76,6 +79,8 @@ impl core::fmt::Debug for Versioned {
 
 /// Everything loaded at startup.
 pub struct Persisted {
+    /// This coordinator's own record (`None` for files made with [`StateFiles::create`] alone).
+    pub me: Option<CoordRecord>,
     pub term: u64,
     pub voted_for: Option<CoordId>,
     pub peers: PeerList,
@@ -86,6 +91,7 @@ pub struct Persisted {
 /// `coord.meta` payload.
 #[derive(Serialize, Deserialize)]
 struct MetaPayload {
+    me: Option<CoordRecord>,
     term: u64,
     voted_for: Option<CoordId>,
     peers: PeerList,
@@ -96,6 +102,8 @@ pub struct StateFiles {
     meta: File,
     state: File,
     half_bytes: usize,
+    /// This coordinator's record, rewritten with every meta copy.
+    me: Option<CoordRecord>,
     /// Newest valid meta copy and its sequence number.
     meta_newest: Option<(AbCopy, u64)>,
     /// Newest valid state half and its `half_seq`.
@@ -154,6 +162,17 @@ impl StateFiles {
     /// zero bytes: no valid half yet) in `dir`, which must not hold them already. The files are
     /// written in full here and never change size afterwards.
     pub fn create(dir: &Path, half_bytes: usize, peers: &PeerList) -> std::io::Result<()> {
+        Self::create_with_identity(dir, half_bytes, None, peers)
+    }
+
+    /// [`StateFiles::create`] that also records this coordinator's own record in `coord.meta`
+    /// (`kvc init`).
+    pub fn create_with_identity(
+        dir: &Path,
+        half_bytes: usize,
+        me: Option<&CoordRecord>,
+        peers: &PeerList,
+    ) -> std::io::Result<()> {
         if half_bytes < MIN_HALF_BYTES || half_bytes % ALIGN != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -188,7 +207,8 @@ impl StateFiles {
             f.sync_all()?;
         }
         sync_dir(dir)?;
-        let (mut files, _) = Self::open(dir)?;
+        let mut files = Self::open_files(dir)?;
+        files.me = me.cloned();
         files.write_meta(0, None, peers)?;
         Ok(())
     }
@@ -196,6 +216,12 @@ impl StateFiles {
     /// Opens the files of `dir` and loads the newest valid meta copy and state half. A state
     /// file with no valid half (right after [`StateFiles::create`]) loads as version 0.
     pub fn open(dir: &Path) -> std::io::Result<(Self, Persisted)> {
+        let mut files = Self::open_files(dir)?;
+        let p = files.load()?;
+        Ok((files, p))
+    }
+
+    fn open_files(dir: &Path) -> std::io::Result<Self> {
         check_substrate(dir)?;
         let meta_path = dir.join(META_FILE);
         let state_path = dir.join(STATE_FILE);
@@ -209,17 +235,17 @@ impl StateFiles {
         }
         let half_bytes = usize::try_from(state_len / 2)
             .map_err(|_| invalid("state file too large"))?;
-        let mut files = StateFiles {
+        let files = StateFiles {
             dir: dir.to_path_buf(),
             meta: open_direct(&meta_path)?,
             state: open_direct(&state_path)?,
             half_bytes,
+            me: None,
             meta_newest: None,
             state_newest: None,
             buf: AlignedBuf::new(),
         };
-        let p = files.load()?;
-        Ok((files, p))
+        Ok(files)
     }
 
     /// Re-reads both files (also updates which copies are the newest valid ones).
@@ -235,6 +261,7 @@ impl StateFiles {
             .map(|(m, _)| m)
             .map_err(|_| invalid("coord.meta payload does not decode"))?;
         self.meta_newest = Some((copy, seq));
+        self.me = meta.me.clone();
 
         let mut sf = File::open(self.dir.join(STATE_FILE))?;
         let mut best: Option<(AbCopy, u64, Vec<u8>)> = None;
@@ -263,6 +290,7 @@ impl StateFiles {
             }
         };
         Ok(Persisted {
+            me: meta.me,
             term: meta.term,
             voted_for: meta.voted_for,
             peers: meta.peers,
@@ -273,6 +301,7 @@ impl StateFiles {
 
     pub fn write_meta(&mut self, term: u64, voted_for: Option<CoordId>, peers: &PeerList) -> std::io::Result<()> {
         let payload = postcard::to_stdvec(&MetaPayload {
+            me: self.me.clone(),
             term,
             voted_for,
             peers: peers.clone(),
@@ -416,6 +445,144 @@ fn parse_half(img: &[u8]) -> io::Result<(Versioned, Option<Versioned>)> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// `kvadm coord export` files (DESIGN §23.3 disaster recovery).
+
+const EXPORT_MAGIC: u64 = magic(b"KVCEXPT1");
+const EXPORT_HEADER: usize = 0x40;
+
+/// A committed state as `kvadm coord export` writes it: `{magic, version, coord_term,
+/// value_term, peer_gen, len, crc32c}` then the encoded state. `kvc recover` reads it (or a
+/// `coord.state` file) to start a new single-member group.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Export {
+    pub version: u64,
+    /// The exporting coordinator's term.
+    pub coord_term: u64,
+    /// The term of the proposal that carried the value.
+    pub value_term: u64,
+    pub peer_gen: u64,
+    /// Encoded `ClusterState`.
+    pub bytes: Vec<u8>,
+}
+
+impl core::fmt::Debug for Export {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Export")
+            .field("version", &self.version)
+            .field("coord_term", &self.coord_term)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl Export {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; EXPORT_HEADER];
+        let put = |w: &mut [u8], off: usize, v: u64| w[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put(&mut out, 0x00, EXPORT_MAGIC);
+        put(&mut out, 0x08, self.version);
+        put(&mut out, 0x10, self.coord_term);
+        put(&mut out, 0x18, self.value_term);
+        put(&mut out, 0x20, self.peer_gen);
+        put(&mut out, 0x28, self.bytes.len() as u64);
+        out.extend_from_slice(&self.bytes);
+        let crc = crc32c(&self.bytes) ^ crc32c(&out[..0x30]);
+        out[0x30..0x34].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> io::Result<Self> {
+        if b.len() < EXPORT_HEADER {
+            return Err(invalid("export file too short"));
+        }
+        let u = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
+        if u(0) != EXPORT_MAGIC {
+            return Err(invalid("not a coordinator export file"));
+        }
+        let len = usize::try_from(u(0x28)).map_err(|_| invalid("export length"))?;
+        if b.len() != EXPORT_HEADER + len {
+            return Err(invalid("export file length mismatch"));
+        }
+        let bytes = &b[EXPORT_HEADER..];
+        let crc = u32::from_le_bytes([b[0x30], b[0x31], b[0x32], b[0x33]]);
+        if crc != crc32c(bytes) ^ crc32c(&b[..0x30]) {
+            return Err(invalid("export file checksum mismatch"));
+        }
+        Ok(Export {
+            version: u(0x08),
+            coord_term: u(0x10),
+            value_term: u(0x18),
+            peer_gen: u(0x20),
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Reads an export file, or the newest valid half of a `coord.state` file (whose
+    /// `coord.meta`, when next to it, supplies the term and peer generation).
+    pub fn read_any(path: &Path) -> io::Result<Self> {
+        let data = std::fs::read(path)?;
+        if data.len() >= 8 && data[..8] == EXPORT_MAGIC.to_le_bytes() {
+            return Self::decode(&data);
+        }
+        if data.is_empty() || data.len() % (2 * ALIGN) != 0 {
+            return Err(invalid("neither an export file nor a coord.state file"));
+        }
+        let half = data.len() / 2;
+        let mut best: Option<(u64, &[u8])> = None;
+        for c in [AbCopy::A, AbCopy::B] {
+            let img = &data[c.index() * half..(c.index() + 1) * half];
+            if let Some((seq, total)) = valid_half_image(img, half) {
+                if best.is_none_or(|(s, _)| seq > s) {
+                    best = Some((seq, &img[..total]));
+                }
+            }
+        }
+        let (_, img) = best.ok_or_else(|| invalid("the state file has no valid half"))?;
+        let (committed, _) = parse_half(img)?;
+        let (mut coord_term, mut peer_gen) = (committed.term, 0);
+        if let Some(dir) = path.parent() {
+            let meta = dir.join(META_FILE);
+            if let Ok(raw) = std::fs::read(&meta) {
+                if raw.len() == 2 * AB_BLOCK {
+                    let a = ab_decode(META_MAGIC, &raw[..AB_BLOCK]);
+                    let b = ab_decode(META_MAGIC, &raw[AB_BLOCK..]);
+                    if let Some((_, _, payload)) = ab_pick(a, b) {
+                        if let Ok((m, _)) = postcard::take_from_bytes::<MetaPayload>(payload) {
+                            coord_term = coord_term.max(m.term);
+                            peer_gen = m.peers.r#gen;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Export {
+            version: committed.version,
+            coord_term,
+            value_term: committed.term,
+            peer_gen,
+            bytes: committed.bytes,
+        })
+    }
+}
+
+/// `(half_seq, total length)` of a valid half image.
+fn valid_half_image(img: &[u8], half_bytes: usize) -> Option<(u64, usize)> {
+    let u64_at = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap_or([0; 8]));
+    if img.len() < HEADER
+        || u64_at(0) != STATE_MAGIC
+        || u32::from_le_bytes([img[0x0C], img[0x0D], img[0x0E], img[0x0F]]) != STATE_FORMAT
+    {
+        return None;
+    }
+    let total = usize::try_from(u64_at(0x18)).ok()?;
+    if total < HEADER || total > half_bytes || total > img.len() {
+        return None;
+    }
+    let crc = u32::from_le_bytes([img[8], img[9], img[10], img[11]]);
+    (crc == crc32c(&img[0x0C..total])).then(|| (u64_at(0x10), total))
+}
+
+// ---------------------------------------------------------------------------------------------
 // LC-34 substrate check (file-system type and ext4 data mode).
 
 /// One `/proc/self/mountinfo` line: mount point, file-system type, super options.
@@ -479,10 +646,18 @@ fn substrate_verdict(path: &Path, mounts: &[Mount]) -> Result<(), String> {
     match m.fstype.as_str() {
         "xfs" => Ok(()),
         "ext4" => {
-            if m.super_opts.split(',').any(|o| o == "data=journal") {
-                Err("ext4 mounted with data=journal is not an allowed substrate".into())
-            } else {
+            // Allow-list of data modes; the default (no `data=` option) is `ordered`.
+            let mode = m
+                .super_opts
+                .split(',')
+                .find_map(|o| o.strip_prefix("data="))
+                .unwrap_or("ordered");
+            if matches!(mode, "ordered" | "writeback") {
                 Ok(())
+            } else {
+                Err(format!(
+                    "ext4 data mode '{mode}' is not an allowed substrate (ordered or writeback only)"
+                ))
             }
         }
         other => Err(format!(
@@ -492,7 +667,7 @@ fn substrate_verdict(path: &Path, mounts: &[Mount]) -> Result<(), String> {
 }
 
 /// Refuses a state directory outside the allowed substrates (LC-34): the file system must be
-/// XFS or ext4 in its default ordered data mode.
+/// XFS, or ext4 in the ordered or writeback data mode.
 pub fn check_substrate(dir: &Path) -> io::Result<()> {
     let path = std::fs::canonicalize(dir)?;
     let text = std::fs::read_to_string("/proc/self/mountinfo")?;
@@ -513,7 +688,8 @@ mod tests {
 28 1 254:0 / / rw,relatime - ext4 /dev/vda rw,discard
 40 28 0:40 / /tmp rw,relatime - tmpfs tmpfs rw,size=1g
 41 28 254:16 / /data rw,relatime - xfs /dev/vdb rw,attr2
-42 28 254:32 / /mnt/j\\040k rw,relatime - ext4 /dev/vdc rw,data=journal
+42 28 254:32 / /mnt/j\\040k rw,relatime - ext4 /dev/vdc rw,data=other
+45 28 254:64 / /wb rw - ext4 /dev/vde rw,data=writeback
 43 28 0:41 / /var/lib/docker/x rw - overlay overlay rw,lowerdir=a
 44 28 254:48 / /srv rw - btrfs /dev/vdd rw
 ";
@@ -521,7 +697,7 @@ mod tests {
     #[test]
     fn substrate_rules() {
         let m = parse_mountinfo(MOUNTINFO);
-        assert_eq!(m.len(), 7);
+        assert_eq!(m.len(), 8);
         assert_eq!(m[4].point, PathBuf::from("/mnt/j k"));
         let v = |p: &str| substrate_verdict(Path::new(p), &m);
         assert!(v("/home/user/coord").is_ok());
@@ -530,6 +706,7 @@ mod tests {
         assert!(v("/mnt/j k/coord").is_err());
         assert!(v("/var/lib/docker/x/c").is_err());
         assert!(v("/srv/c").is_err());
+        assert!(v("/wb/c").is_ok());
         // a path that merely shares a string prefix with a mount point is not under it
         assert!(v("/database/c").is_ok());
     }

@@ -49,11 +49,19 @@ pub enum Role {
 }
 
 /// One state value with the term of the proposal that carried it.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Entry<V> {
     pub version: u64,
     pub term: u64,
     pub value: V,
+}
+
+/// `Debug` shows the value through its own `Debug` (a [`super::rpc::Blob`] prints its length
+/// only).
+impl<V: core::fmt::Debug> core::fmt::Debug for Entry<V> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Entry(v{} t{} {:?})", self.version, self.term, self.value)
+    }
 }
 
 impl<V> Entry<V> {
@@ -1051,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn single_member_group_commits_alone() {
+    fn single_member_commits_alone() {
         let mut g = group(1);
         g[0].leader_recent = false;
         let mut out = Vec::new();

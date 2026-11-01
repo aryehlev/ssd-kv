@@ -156,7 +156,13 @@ impl Wsr {
         mut persist: persist::StateFiles,
         listener: tokio::net::TcpListener,
     ) -> std::io::Result<Arc<Self>> {
-        let p = tokio::task::block_in_place(|| persist.load())?;
+        let (persist, p) = tokio::task::spawn_blocking(move || {
+            let p = persist.load();
+            (persist, p)
+        })
+        .await
+        .map_err(|e| io_err(format!("state file reader stopped: {e}")))?;
+        let p = p?;
         if p.committed.version == 0 {
             return Err(io_err(
                 "the state files hold no committed state (run `kvc init` first)",
@@ -225,6 +231,16 @@ impl Wsr {
     /// Proposes `batch` (applied as one all-or-nothing unit, possibly batched with others into
     /// the next version) and waits until it commits.
     pub async fn propose(&self, batch: Vec<Transition>) -> Result<u64 /*committed version*/, ProposeError> {
+        let rx = self.submit(batch)?;
+        rx.await.unwrap_or(Err(ProposeError::LostLeadership))
+    }
+
+    /// Queues `batch` at once (batches queue in call order) and returns the receiver of its
+    /// outcome; [`Wsr::propose`] is `submit` plus the wait.
+    pub fn submit(
+        &self,
+        batch: Vec<Transition>,
+    ) -> Result<oneshot::Receiver<Result<u64, ProposeError>>, ProposeError> {
         if !self.is_leader() {
             return Err(ProposeError::NotLeader);
         }
@@ -232,7 +248,7 @@ impl Wsr {
         self.tx
             .send(Cmd::Propose(batch, tx))
             .map_err(|_| ProposeError::NotLeader)?;
-        rx.await.unwrap_or(Err(ProposeError::LostLeadership))
+        Ok(rx)
     }
 
     pub fn committed(&self) -> Arc<ClusterState> {
@@ -466,13 +482,21 @@ impl Driver {
 
     async fn set_peers(&mut self, new: PeerList) -> Result<(), String> {
         let cur = self.core.peers().clone();
+        if cur == new {
+            return Ok(()); // a repeated operator call (kvadm retries) changes nothing
+        }
         peers::set_peers(&cur, &new).map_err(|e| e.to_string())?;
         if !new.contains(&self.core.id()) && !cur.contains(&self.core.id()) {
             return Err("this coordinator is in neither the current nor the new list".into());
         }
-        self.process(Some(Input::SetPeers(Arc::new(new))))
+        let new = Arc::new(new);
+        self.process(Some(Input::SetPeers(new.clone())))
             .await
-            .map_err(|e| format!("coord.meta write failed: {e}"))
+            .map_err(|e| format!("coord.meta write failed: {e}"))?;
+        tracing::info!(peer_gen = new.r#gen, peers = new.peers.len(), "peer list changed by the operator");
+        self.wsr.net.set_peers(&new);
+        self.wsr.shared().peers = new;
+        Ok(())
     }
 
     /// One core step (or none, to flush queued proposals), then its effects in the required
@@ -637,7 +661,9 @@ impl Driver {
         let mut acc: Option<(ClusterState, Vec<u8>)> = None;
         let mut waiters = Vec::new();
         let max = self.files.as_ref().map_or(persist::STATE_MAX_BYTES, |f| {
-            (f.half_bytes() - 4096 - self.core.committed().value.as_slice().len()).min(persist::STATE_MAX_BYTES)
+            f.half_bytes()
+                .saturating_sub(4096 + self.core.committed().value.as_slice().len())
+                .min(persist::STATE_MAX_BYTES)
         });
         for (batch, tx) in self.pending.drain(..) {
             let mut b = acc.as_ref().map_or_else(|| (*base).clone(), |(s, _)| s.clone());

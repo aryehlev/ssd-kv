@@ -58,7 +58,7 @@ impl Rng {
         Rng(seed ^ 0x6A09_E667_F3BC_C908)
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -71,7 +71,7 @@ impl Rng {
         if n == 0 {
             return 0;
         }
-        ((u128::from(self.next()) * u128::from(n)) >> 64) as u64
+        ((u128::from(self.next_u64()) * u128::from(n)) >> 64) as u64
     }
 
     /// Uniform in `lo..=hi`.
@@ -112,7 +112,7 @@ pub fn value(uid: u64, j: u32, len: usize) -> Vec<u8> {
     out.extend_from_slice(&tag.to_le_bytes()[..len.min(8)]);
     let mut r = Rng::new(tag.wrapping_mul(0xD6E8_FEB8_6659_FD93));
     while out.len() < len {
-        let w = r.next().to_le_bytes();
+        let w = r.next_u64().to_le_bytes();
         let n = (len - out.len()).min(8);
         out.extend_from_slice(&w[..n]);
     }
@@ -2447,7 +2447,7 @@ impl<'c> Sim<'c> {
         let mut devs = eng.into_devices();
         let crc = boot.record_crc();
         // (db, key) -> [(page, seq, small, txn id, expiry)]
-        let mut copies: BTreeMap<(u8, Vec<u8>), Vec<(u64, u64, bool, u64, Option<u64>)>> = BTreeMap::new();
+        let mut copies: MediaCopies = BTreeMap::new();
         let mut views = Vec::new();
         for (d, dev) in devs.iter_mut().enumerate() {
             dev.inner.flush_now();
@@ -2555,6 +2555,9 @@ impl<'c> Sim<'c> {
         Ok(())
     }
 }
+
+/// Valid copies on media: `(db, key) -> [(page, seq, small, txn id, expiry)]`.
+type MediaCopies = BTreeMap<(u8, Vec<u8>), Vec<(u64, u64, bool, u64, Option<u64>)>>;
 
 fn scan_req(db: u8, cursor: u64, count: u32) -> Request {
     Request { db, keys: Default::default(), kind: ReqKind::ScanStep { db, cursor, count, vtype: None }, origin: Origin::Client }

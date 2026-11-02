@@ -67,6 +67,9 @@ struct MemberSlot {
     /// While counted: the commit point when counting started (every write committed before it
     /// did not need this member's ack).
     counted_from: Option<Seq>,
+    /// While counted: boot-clock time counting started (the age of groups produced while
+    /// nobody was counted runs from here, see `lagging`).
+    counted_since_ns: u64,
 }
 
 impl MemberSlot {
@@ -82,6 +85,7 @@ impl MemberSlot {
             overrun: false,
             barrier: None,
             counted_from: None,
+            counted_since_ns: 0,
         }
     }
 
@@ -257,6 +261,11 @@ impl ReplSender {
 
     /// Members whose acks count toward `commit_seq` (the committed ISR minus the primary).
     pub fn set_isr(&mut self, counted: &[MemberId]) {
+        self.set_isr_at(counted, kv_common::clock::boot_ns());
+    }
+
+    /// [`ReplSender::set_isr`] with the caller's clock (boot ns).
+    pub fn set_isr_at(&mut self, counted: &[MemberId], now_ns: u64) {
         let dropped: SmallVec<[MemberId; 4]> = self
             .isr
             .iter()
@@ -276,11 +285,14 @@ impl ReplSender {
             self.slot_mut(m);
         }
         for m in added {
-            self.slot_mut(m).counted_from = Some(before);
+            let s = self.slot_mut(m);
+            s.counted_from = Some(before);
+            s.counted_since_ns = now_ns;
         }
         for &m in &dropped {
             if let Some(s) = self.members.iter_mut().find(|s| s.id == m) {
                 s.counted_from = None;
+                s.counted_since_ns = 0;
             }
         }
         // a member that stops counting (it lagged, or the ISR dropped it) catches up again
@@ -478,17 +490,24 @@ impl ReplSender {
         }
     }
 
-    /// Members whose oldest unacknowledged group is older than `timeout_ns`.
+    /// Counted members whose oldest unacknowledged group is older than `timeout_ns`. Groups
+    /// produced while nobody was counted have no time of their own: for a member that started
+    /// counting below them (its commit point then moved back to its acknowledged position)
+    /// their age runs from when it started counting, so it is reported like any other.
     pub fn lagging(&self, now_ns: u64, timeout_ns: u64) -> SmallVec<[MemberId; 2]> {
         let mut out = SmallVec::new();
         for &m in &self.isr {
-            let acked = self.slot(m).map_or(Seq::ZERO, |s| s.acked_durable);
+            let (acked, since) = self
+                .slot(m)
+                .map_or((Seq::ZERO, 0), |s| (s.acked_durable, s.counted_since_ns));
+            if acked >= self.last {
+                continue;
+            }
             // the produced list is in seq order: the first entry above `acked` is the oldest
-            // group this member has not acknowledged
+            // group this member has not acknowledged that was produced while it counted
             let i = self.produced.partition_point(|&(s, _)| s <= acked);
-            if let Some(&(_, t)) = self.produced.get(i)
-                && now_ns.saturating_sub(t) > timeout_ns
-            {
+            let t = self.produced.get(i).map_or(since, |&(_, t)| t.max(since));
+            if now_ns.saturating_sub(t) > timeout_ns {
                 out.push(m);
             }
         }
@@ -692,7 +711,7 @@ mod tests {
     #[test]
     fn lagging_is_an_age_test_and_overrun_restarts_the_stream() {
         let mut r = ReplSender::new(0, 1, 512);
-        r.set_isr(&[1]);
+        r.set_isr_at(&[1], 0);
         r.attach(
             1,
             &AcceptMode::Continue {
@@ -722,5 +741,39 @@ mod tests {
         }
         assert!(!r.fill_send_at(2, &mut Vec::new(), 1 << 20, 0));
         assert!(r.overrun(2));
+    }
+
+    #[test]
+    fn a_member_counted_below_groups_produced_alone_is_reported_when_it_stops_acking() {
+        // the primary served alone (nobody counted: no group has an age entry), then a
+        // member that acknowledged up to (1, 3) starts counting: the commit point moves back
+        // to (1, 3) and the replies of (1, 4) and (1, 5) wait for it
+        let mut r = ReplSender::new(0, 1, 1 << 16);
+        r.attach(
+            1,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 1),
+            },
+        );
+        for i in 1..=5 {
+            r.on_group_at(&enc(Seq::new(1, i)), Seq::new(1, i), 1_000);
+        }
+        r.set_local_durable(Seq::new(1, 5));
+        r.on_ack(1, Seq::new(1, 3), 2_000);
+        r.set_isr_at(&[1], 10_000);
+        assert_eq!(r.commit_seq(), Seq::new(1, 3));
+        assert!(r.lagging(200_000, 250_000).is_empty(), "within the timeout");
+        // it never acknowledges (1, 4) and no other group is produced: reported all the same,
+        // the age running from when it started counting
+        assert_eq!(r.lagging(260_001, 250_000).as_slice(), &[1]);
+        r.on_ack(1, Seq::new(1, 5), 270_000);
+        assert!(r.lagging(u64::MAX, 250_000).is_empty(), "everything acknowledged");
+        // dropped and counted again later: the age restarts then
+        r.on_group_at(&enc(Seq::new(1, 6)), Seq::new(1, 6), 280_000);
+        r.set_isr_at(&[], 290_000);
+        r.on_group_at(&enc(Seq::new(1, 7)), Seq::new(1, 7), 300_000);
+        r.set_isr_at(&[1], 1_000_000);
+        assert!(r.lagging(1_200_000, 250_000).is_empty());
+        assert_eq!(r.lagging(1_250_001, 250_000).as_slice(), &[1]);
     }
 }

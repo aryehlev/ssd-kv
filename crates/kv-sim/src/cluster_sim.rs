@@ -2306,7 +2306,7 @@ impl Node {
                 let mut counted = committed.clone();
                 counted.extend(expanding.iter().copied());
                 for pp in parts.iter_mut() {
-                    pp.sender.set_isr(&counted);
+                    pp.sender.set_isr_at(&counted, fx.now_l);
                 }
             }
             return;
@@ -2755,7 +2755,7 @@ impl Node {
                     .collect();
                 counted.extend(expanding.iter().copied());
                 for pp in parts.iter_mut() {
-                    pp.sender.set_isr(&counted);
+                    pp.sender.set_isr_at(&counted, fx.now_l);
                 }
             }
         }

@@ -201,11 +201,50 @@ struct Peer {
     last_shrink_ns: u64,
 }
 
+/// The members whose acks count toward the commit point: the committed ISR and the members
+/// counted ahead of their `IsrExpand` (by index, the sender's member ids).
+fn counted_members(peers: &[Peer]) -> Vec<MemberId> {
+    peers
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.present && (x.in_isr || x.expanding))
+        .map(|(i, _)| i as MemberId)
+        .collect()
+}
+
+type RepairQueued = hashbrown::HashSet<(u8, Box<[u8]>), foldhash::fast::RandomState>;
+
+/// Appends the keys not queued before to a Repair feed.
+fn queue_repair_keys(
+    q: &mut VecDeque<(u8, Box<[u8]>)>,
+    queued: &mut RepairQueued,
+    keys: impl IntoIterator<Item = (u8, Box<[u8]>)>,
+) {
+    for k in keys {
+        if !queued.contains(&k) {
+            queued.insert(k.clone());
+            q.push_back(k);
+        }
+    }
+}
+
+/// The next batch of a Repair feed: at most `max` keys, all of the first key's database (one
+/// read request reads one database).
+fn repair_batch(q: &mut VecDeque<(u8, Box<[u8]>)>, max: usize) -> Option<(u8, Vec<Box<[u8]>>)> {
+    let db = q.front()?.0;
+    let n = q.iter().take(max).take_while(|(d, _)| *d == db).count();
+    Some((db, q.drain(..n).map(|(_, k)| k).collect()))
+}
+
 /// A member fed directly in execution order.
 enum Direct {
     Repair {
         at: Seq,
         keys: VecDeque<(u8, Box<[u8]>)>,
+        /// Every key queued so far: a key in both key sets is imaged once (two images of one
+        /// key carry the same seq `at`, and the member must never store a key twice at one
+        /// seq).
+        queued: RepairQueued,
         member_keys: bool,
         reading: bool,
     },
@@ -853,6 +892,7 @@ impl<B: Backend> Worker<B> {
     fn apply_role(&mut self, cw: &mut ClusterWorker, p: u16, a: &NodeAssignment) {
         let backlog_bytes = cw.backlog_bytes;
         let heartbeat_ns = cw.heartbeat_ns;
+        let boot_now = self.now.boot_ns;
         let cs = cw.cs.clone();
         let Some(pr) = cw.part(p) else { return };
         let want = a.role.as_ref();
@@ -1050,14 +1090,7 @@ impl<B: Backend> Worker<B> {
                     pp.sender.detach(i as MemberId);
                 }
             }
-            let counted: Vec<MemberId> = pp
-                .peers
-                .iter()
-                .enumerate()
-                .filter(|(_, x)| x.present && (x.in_isr || x.expanding))
-                .map(|(i, _)| i as MemberId)
-                .collect();
-            pp.sender.set_isr(&counted);
+            pp.sender.set_isr_at(&counted_members(&pp.peers), boot_now);
             let tasks = r.migrations.clone();
             self.sync_migrations(cw, p, &tasks);
         }
@@ -1303,9 +1336,13 @@ impl<B: Backend> Worker<B> {
                 want_member_keys,
             } => {
                 let x = &mut pp.peers[mi];
+                let mut keys = VecDeque::new();
+                let mut queued = RepairQueued::default();
+                queue_repair_keys(&mut keys, &mut queued, primary_keys);
                 x.direct = Some(Direct::Repair {
                     at,
-                    keys: primary_keys.into_iter().collect(),
+                    keys,
+                    queued,
                     member_keys: !want_member_keys,
                     reading: false,
                 });
@@ -1372,11 +1409,12 @@ impl<B: Backend> Worker<B> {
             Frame::RepairKeys(keys) => {
                 if let Some(Direct::Repair {
                     keys: q,
+                    queued,
                     member_keys,
                     ..
                 }) = &mut x.direct
                 {
-                    q.extend(keys);
+                    queue_repair_keys(q, queued, keys);
                     *member_keys = true;
                 }
             }
@@ -1415,6 +1453,7 @@ impl<B: Backend> Worker<B> {
                         keys,
                         member_keys,
                         reading,
+                        ..
                     } => {
                         if *reading {
                             continue;
@@ -1429,10 +1468,9 @@ impl<B: Backend> Worker<B> {
                             }
                             continue;
                         }
-                        let n = keys.len().min(WALK_KEYS as usize);
-                        let batch: Vec<(u8, Box<[u8]>)> = keys.drain(..n).collect();
-                        let db = batch[0].0;
-                        let ks: Vec<Box<[u8]>> = batch.into_iter().map(|(_, k)| k).collect();
+                        let Some((db, ks)) = repair_batch(keys, WALK_KEYS as usize) else {
+                            continue;
+                        };
                         let req = Request {
                             db,
                             keys: ks.iter().map(|k| (k.clone(), Access::Read)).collect(),
@@ -1824,10 +1862,16 @@ impl<B: Backend> Worker<B> {
             p,
             req,
             ReplJob {
+                // ordered: a key the member already holds at `at` or later took a group the
+                // primary executed (and sent) before it read this image, which already shows
+                // that group's effect; overwriting it would store the key at an older seq than
+                // a copy it replaced (the storage engine never lets an older copy outlive a
+                // newer one), and an image of a key imaged before at the same `at` is the same
+                // record again
                 work: ReplWork::Apply {
                     ops,
                     seq: at,
-                    mode: ApplyMode::Image,
+                    mode: ApplyMode::Ordered,
                 },
                 then: Then::MemberImage {
                     epoch,
@@ -2828,6 +2872,12 @@ impl<B: Backend> Worker<B> {
                             recount = true;
                         }
                     }
+                    if recount {
+                        // at once: dropping it restarts its barrier chain, so the pass below
+                        // cannot count it again on the chain it finished before it lagged
+                        pp.sender.set_isr_at(&counted_members(&pp.peers), now);
+                        recount = false;
+                    }
                     for (i, x) in pp.peers.iter_mut().enumerate() {
                         let m = i as MemberId;
                         let eligible = x.present
@@ -2869,14 +2919,7 @@ impl<B: Backend> Worker<B> {
                         }
                     }
                     if recount {
-                        let counted: Vec<MemberId> = pp
-                            .peers
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, x)| x.present && (x.in_isr || x.expanding))
-                            .map(|(i, _)| i as MemberId)
-                            .collect();
-                        pp.sender.set_isr(&counted);
+                        pp.sender.set_isr_at(&counted_members(&pp.peers), now);
                     }
                     // committed replies
                     let commit = pp.sender.commit_seq();
@@ -3207,5 +3250,23 @@ mod tests {
             },
         ];
         assert_eq!(op_keys(&ops, false).len(), 1, "one entry per key");
+    }
+
+    #[test]
+    fn a_repair_feed_images_each_key_once_and_reads_one_database_per_batch() {
+        let k = |db: u8, s: &str| (db, Box::<[u8]>::from(s.as_bytes()));
+        let mut q = VecDeque::new();
+        let mut queued = RepairQueued::default();
+        // the primary's key set (b), then the member's own set (a) that shares keys with it
+        queue_repair_keys(&mut q, &mut queued, vec![k(0, "a"), k(0, "b"), k(3, "c")]);
+        queue_repair_keys(&mut q, &mut queued, vec![k(0, "b"), k(3, "c"), k(0, "d"), k(0, "a")]);
+        assert_eq!(q.len(), 4, "every key once");
+        // a key already sent is not queued again either
+        let first = repair_batch(&mut q, 64).unwrap();
+        assert_eq!(first, (0, vec![k(0, "a").1, k(0, "b").1]), "stops at another database");
+        queue_repair_keys(&mut q, &mut queued, vec![k(0, "a")]);
+        assert_eq!(repair_batch(&mut q, 64).unwrap(), (3, vec![k(3, "c").1]));
+        assert_eq!(repair_batch(&mut q, 1).unwrap(), (0, vec![k(0, "d").1]));
+        assert!(repair_batch(&mut q, 64).is_none());
     }
 }

@@ -334,6 +334,11 @@ impl StorageSimCfg {
             max_len: 0,
             unit_cap: 0,
         };
+        if f.smoke {
+            // small runs: tighter bounds keep the debug-build smoke fast
+            c.hang_ticks = 4_000;
+            c.settle_ticks = 6_000;
+        }
         // drawn last: the parameters above stay those of earlier generator versions
         if !f.smoke && r.chance(10) {
             c.error_ppm = [200u32, 2000, 20_000][r.weighted(&[50, 35, 15])];
@@ -2459,7 +2464,7 @@ impl<'c> Sim<'c> {
             while page < end {
                 let at = page as usize * PAGE;
                 let Ok(buf) = <&[u8; PAGE]>::try_from(&img[at..at + PAGE]) else { break };
-                if buf.iter().all(|&b| b == 0) {
+                if buf[..] == ZERO_PAGE[..] {
                     page += 1;
                     continue;
                 }
@@ -2555,6 +2560,9 @@ impl<'c> Sim<'c> {
         Ok(())
     }
 }
+
+/// A page of zeros (never-written pages are skipped by one comparison).
+static ZERO_PAGE: [u8; 4096] = [0; 4096];
 
 /// Valid copies on media: `(db, key) -> [(page, seq, small, txn id, expiry)]`.
 type MediaCopies = BTreeMap<(u8, Vec<u8>), Vec<(u64, u64, bool, u64, Option<u64>)>>;

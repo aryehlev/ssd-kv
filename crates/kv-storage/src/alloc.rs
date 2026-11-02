@@ -1117,6 +1117,23 @@ impl Alloc {
         s.asked || s.want
     }
 
+    /// An idle spare AG to give back under AG pressure (§11.1): only one whose kind the
+    /// partition already writes in (its first AG of a kind is never given back) and that no
+    /// request is waiting for. The slot stops wanting a spare until a placement needs one.
+    pub(crate) fn take_idle_spare(&mut self) -> Option<AgId> {
+        for ki in 0..2 {
+            let owned = if ki == 0 { !self.small.is_empty() } else { !self.extent.is_empty() };
+            let s = &mut self.slots[ki];
+            if owned && !s.asked && s.class != AgClass::Need && s.class != AgClass::Reserved {
+                if let Some(ag) = s.spare.take() {
+                    s.want = false;
+                    return Some(ag);
+                }
+            }
+        }
+        None
+    }
+
     /// The spare AGs (owned per the AG table but holding nothing).
     pub(crate) fn spares(&self) -> impl Iterator<Item = (AgId, AgKind)> + '_ {
         self.slots[0]

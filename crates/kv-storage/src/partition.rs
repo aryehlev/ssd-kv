@@ -4469,6 +4469,16 @@ impl PartitionStore {
         if self.core.state != PartState::Ready {
             return;
         }
+        // AG pressure (§11.1): a write of some partition was refused an AG; an idle spare goes
+        // back to the pool (never one a request of this partition waits for)
+        if cx.meta.ag_pressure()
+            && self.core.space_wait.is_empty()
+            && self.reqs.ready.is_empty()
+            && let Some(ag) = self.core.alloc.take_idle_spare()
+        {
+            self.forget_ag(cx.cache, ag);
+            self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
+        }
         // AG release (§11.7)
         if self.core.buckets.release.try_take(now_ns, 1) {
             let busy = |p: PageId| -> bool {

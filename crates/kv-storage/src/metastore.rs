@@ -92,11 +92,14 @@ impl MetaMsg {
 pub struct MetaShared {
     txn_ids: Arc<TxnIds>,
     resolved_w: AtomicU64,
+    /// A write needed an AG and was refused (fill limit or no free AG), and no AG has been
+    /// released since: partitions give their idle spare AGs back (§11.1).
+    ag_pressure: std::sync::atomic::AtomicBool,
 }
 
 impl MetaShared {
     fn new(txn_ids: Arc<TxnIds>, resolved_w: u64) -> Self {
-        MetaShared { txn_ids, resolved_w: AtomicU64::new(resolved_w) }
+        MetaShared { txn_ids, resolved_w: AtomicU64::new(resolved_w), ag_pressure: std::sync::atomic::AtomicBool::new(false) }
     }
 }
 
@@ -147,6 +150,14 @@ impl MetaClient {
     /// The durable `resolved_w` (§10.7).
     pub fn resolved_w(&self) -> u64 {
         self.shared.resolved_w.load(Ordering::Acquire)
+    }
+
+    /// True while a write that needed an AG was refused and no AG has been released since: an
+    /// idle spare AG then goes back to the pool (§11.1). Spares are a latency optimization; held
+    /// by partitions that do not need them, they made writes of other partitions fail with
+    /// `-OOM` on a device far from its fill limit.
+    pub(crate) fn ag_pressure(&self) -> bool {
+        self.shared.ag_pressure.load(Ordering::Relaxed)
     }
 }
 
@@ -458,10 +469,19 @@ impl MetaCore {
         let mut sb_updates: SmallVec<[SbUpdate; 1]> = SmallVec::new();
         for m in msgs {
             let done = match m.req {
-                MetaReq::AcquireAg { partition, kind } => MetaDone::Ag(self.acquire(partition, kind, None)),
-                MetaReq::AcquireAgOn { partition, kind, dev } => MetaDone::Ag(self.acquire(partition, kind, Some(dev))),
+                MetaReq::AcquireAg { partition, kind } => {
+                    let ag = self.acquire(partition, kind, None);
+                    MetaDone::Ag(self.needed(ag))
+                }
+                MetaReq::AcquireAgOn { partition, kind, dev } => {
+                    let ag = self.acquire(partition, kind, Some(dev));
+                    MetaDone::Ag(self.needed(ag))
+                }
                 MetaReq::AcquireSpare { partition, kind } => MetaDone::Ag(if self.spare_allowed(partition, kind) { self.acquire(partition, kind, None) } else { None }),
-                MetaReq::AcquireReserved { partition, kind } => MetaDone::Ag(self.acquire_with(partition, kind, None, false)),
+                MetaReq::AcquireReserved { partition, kind } => {
+                    let ag = self.acquire_with(partition, kind, None, false);
+                    MetaDone::Ag(self.needed(ag))
+                }
                 MetaReq::ReleaseAg { ag } => {
                     self.release(ag);
                     MetaDone::Ok
@@ -696,7 +716,16 @@ impl MetaCore {
         Some(AgId { dev: dev as u8, idx })
     }
 
+    /// The answer to an AG request a write needs: a refusal raises the AG pressure.
+    fn needed(&self, ag: Option<AgId>) -> Option<AgId> {
+        if ag.is_none() {
+            self.shared.ag_pressure.store(true, Ordering::Relaxed);
+        }
+        ag
+    }
+
     fn release(&mut self, ag: AgId) {
+        self.shared.ag_pressure.store(false, Ordering::Relaxed);
         let Some(blocks) = self.agt.get_mut(usize::from(ag.dev)) else { return };
         let (blk, e) = AgTableBlock::locate(ag.idx);
         let Some(b) = blocks.get_mut(blk as usize) else { return };

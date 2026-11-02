@@ -233,3 +233,53 @@ fn versioned_write_at_or_below_an_existing_copy_never_waits() {
         }
     }
 }
+
+/// Spare AGs are a latency optimization (§11.1): a partition that needs an AG and is refused
+/// gets the spares other partitions hold idle. They used to stay with their holders, so one
+/// partition's large writes failed with `-OOM` while a sixth of the device sat in idle spares.
+#[test]
+fn idle_spare_ags_go_to_a_partition_refused_space() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    // 16 partitions, 40 AGs (38 under the 0.95 fill limit): two per partition and 6 spares
+    let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 9);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 9).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    // a small write in every partition first (each takes its SMALL and EXTENT AG)
+    for i in 0..400u64 {
+        let k = format!("w{i}");
+        let t = db.set(0, k.as_bytes(), &value(i, if i % 2 == 0 { 5000 } else { 40 }), None).unwrap();
+        db.wait(k.as_bytes(), t, TicketState::Written);
+    }
+    // then 1 MiB values into one partition only (one hash tag)
+    let mut stored = 0u64;
+    let mut refused = 0u32;
+    for i in 0..200u64 {
+        let k = format!("{{hot}}{i}");
+        match db.set(0, k.as_bytes(), &value(1000 + i, 1 << 20), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                stored += 1;
+            }
+            Err(StoreError::OutOfSpace) => {
+                refused += 1;
+                if refused > 12 {
+                    break;
+                }
+                // the refusal latch lasts a second; idle spares go back meanwhile
+                for _ in 0..20 {
+                    db.advance(100);
+                    db.eng.pump();
+                }
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let (used, total) = db.eng.meta().ag_usage();
+    // the partition's own EXTENT AG holds ~15 values; every spare it gets holds ~15 more
+    assert!(stored >= 60, "only {stored} MiB stored in the hot partition before -OOM ({used}/{total} AGs used)");
+    db.quiesce();
+}

@@ -13,8 +13,8 @@
 //!   MATCH and TYPE filter inside the step, RANDOMKEY returns a live key;
 //! * `multi_key_writes_on_page_store`: MSET, MSETNX, RENAME, RENAMENX and COPY in one request.
 //!
-//! The tests marked `ignore` exercise storage paths that do not work yet (named in each
-//! reason); run them with `--ignored` once those land.
+//! A request that never becomes ready, or a ticket that never reaches `Written`, fails the test
+//! after `PUMP_LIMIT` driver iterations with the partition's state dump (`diag_deep`).
 
 use std::path::PathBuf;
 
@@ -219,7 +219,11 @@ impl Store {
             }
             eng.pump();
         }
-        match status.unwrap_or_else(|| panic!("{line} never became ready")) {
+        let Some(status) = status else {
+            let d = eng.partition(p).diag_deep(eng.cache());
+            panic!("{line} never became ready\n{d}");
+        };
+        match status {
             Ok(exec) => {
                 if let Some(t) = exec.ticket {
                     // the reply is released once the command's effects are written (§14.7)
@@ -230,7 +234,8 @@ impl Store {
                             _ => eng.pump(),
                         }
                     }
-                    panic!("{line}: ticket never written");
+                    let d = eng.partition(p).diag_deep(eng.cache());
+                    panic!("{line}: ticket never written\n{d}");
                 }
                 out
             }
@@ -479,16 +484,12 @@ fn page_store_matches_model_single_key() {
 
 /// The full command mix (multi-key writes included) on a write-through device.
 #[test]
-#[ignore = "kv-storage: in this mix a DEL of keys that earlier multi-key writes touched never \
-            reaches Written"]
 fn page_store_matches_model() {
     differential(&[1, 2, 3], 600, true, true);
 }
 
 /// The full command mix on a write-back device (flushes make effects durable).
 #[test]
-#[ignore = "kv-storage: on a write-back device, SET k small; SET k <14 KiB>; SET k small leaves \
-            the third request never ready"]
 fn page_store_matches_model_write_back() {
     differential(&[1, 2, 3], 600, false, true);
 }
@@ -569,7 +570,6 @@ fn restart_keeps_acknowledged_state() {
 }
 
 #[test]
-#[ignore = "kv-storage: see page_store_matches_model_write_back"]
 fn restart_keeps_acknowledged_state_write_back() {
     restarts(false, true);
 }

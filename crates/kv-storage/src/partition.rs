@@ -1831,10 +1831,9 @@ impl PartitionStore {
                         let hdr = ext_header(EXT_KIND_VALUE, ext_vtype, s.db, start, seq, expire_at, n_pages, s.key.len(), value.len() as u64, txn, s.kh.h32(), twin);
                         let mut buf = AlignedBuf::zeroed(n_pages as usize * PAGE);
                         extent::encode_extent(&hdr, &s.key, &[value], self.core.crc(), &mut buf);
-                        let tk = self.move_away(cx, &s, Some(start), inplace);
-                        let mut tks = tickets;
-                        tks.extend(tk);
-                        self.add_ext_write(start, hdr, s.db, s.key.clone(), buf, tks, None, inplace);
+                        // tickets of a cancelled staged write move over with their count (D2)
+                        let inherited = self.move_away(cx, &s, Some(start), inplace);
+                        self.add_ext_write(start, hdr, s.db, s.key.clone(), buf, tickets, inherited, None, inplace);
                         let e = Entry { fp32: s.kh.fp32(), x8: class, page36: start.to36(), kind: Kind::Extent, vtype, sync_mark: false };
                         self.core.index_set(&s, cur36(&s.cur), e, expire_at);
                         if let Some(o) = otx {
@@ -1855,7 +1854,7 @@ impl PartitionStore {
                             let crc = extent::stored_crc(&b).unwrap_or(0);
                             refs.push(ChunkRef { page: cp, n_pages: cn, len: len as u32, crc });
                             *self.core.ext.chunk_rc.entry(cp).or_insert(0) += 1;
-                            self.add_ext_write(cp, ch, 0, Box::default(), b, SmallVec::new(), Some(map), false);
+                            self.add_ext_write(cp, ch, 0, Box::default(), b, SmallVec::new(), SmallVec::new(), Some(map), false);
                         }
                         let mut body = vec![0u8; extent::CHUNKMAP_PREFIX + refs.len() * extent::CHUNK_REF_BYTES];
                         extent::encode_chunk_refs(&refs, &mut body);
@@ -1866,11 +1865,9 @@ impl PartitionStore {
                         let hdr = ext_header(EXT_KIND_CHUNKMAP, ext_vtype, s.db, map, seq, expire_at, map_pages, s.key.len(), value.len() as u64, txn, s.kh.h32(), twin);
                         let mut buf = AlignedBuf::zeroed(map_pages as usize * PAGE);
                         extent::encode_extent(&hdr, &s.key, &[&body], self.core.crc(), &mut buf);
-                        let tk = self.move_away(cx, &s, Some(map), false);
-                        let mut tks = tickets;
-                        tks.extend(tk);
+                        let inherited = self.move_away(cx, &s, Some(map), false);
                         self.core.ext.chunkmaps.insert(map, chunks.iter().copied().collect());
-                        self.add_ext_write(map, hdr, s.db, s.key.clone(), buf, tks, None, false);
+                        self.add_ext_write(map, hdr, s.db, s.key.clone(), buf, tickets, inherited, None, false);
                         if let Some(w) = self.core.ext.writes.get_mut(&map) {
                             w.wait_chunks = chunks.len() as u32;
                         }
@@ -1968,9 +1965,15 @@ impl PartitionStore {
         }
         let marker = rec.desc.kind == REC_KIND_TXN_DELETE_MARKER;
         let same_page = matches!(s.cur, Cur::Small { page: p, .. } if p == page);
+        // this command's tickets gain one dependency: the new record
+        for &t in &rec.tickets {
+            self.core.tickets.add_effect(t);
+        }
         if !same_page {
-            let tk = self.move_away(cx, s, None, false);
-            rec.tickets.extend(tk);
+            // tickets of a staged effect this version cancels move over with the dependency
+            // they already count (D2); counting them again would leave them unwritten forever
+            let inherited = self.move_away(cx, s, None, false);
+            rec.tickets.extend(inherited);
             if !matches!(s.cur, Cur::Absent) {
                 self.core.counters.moves += 1;
             }
@@ -1978,8 +1981,7 @@ impl PartitionStore {
             // a txn version never replaces the copy it supersedes before the commit (13.3 c)
             self.protect_in_page(cx.cache, page, s.db, s.kh.h32(), &s.key);
         }
-        for t in rec.tickets.clone() {
-            self.core.tickets.add_effect(t);
+        for &t in &rec.tickets {
             self.core.tickets.note_page(t, page, 0);
         }
         let seq = rec.desc.seq;
@@ -2163,6 +2165,9 @@ impl PartitionStore {
         }
     }
 
+    /// Stages an extent write. `tickets` (the executing command's) gain one dependency each;
+    /// `inherited` come from a staged effect this write cancels (D2) and keep the dependency
+    /// they already count.
     #[allow(clippy::too_many_arguments)]
     fn add_ext_write(
         &mut self,
@@ -2171,21 +2176,29 @@ impl PartitionStore {
         db: u8,
         key: Box<[u8]>,
         buf: AlignedBuf,
-        tickets: SmallVec<[TicketId; 1]>,
+        mut tickets: SmallVec<[TicketId; 1]>,
+        inherited: SmallVec<[TicketId; 1]>,
         parent: Option<PageId>,
         atomic: bool,
     ) {
         for &t in &tickets {
             self.core.tickets.add_effect(t);
-            self.core.tickets.note_extent(t, start);
         }
+        tickets.extend(inherited);
+        let mut waiters = SmallVec::new();
         if let Some(old) = self.core.ext.writes.remove(&start) {
-            // atomic in-place rewrite over a staged image (the old one never reached media)
+            // a staged image of the same run never reached media (callers cancel it through
+            // `move_away` first); whatever still waits on it moves to the new image
             debug_assert!(old.state == ExtState::Pending);
+            tickets.extend(old.tickets);
+            waiters = old.waiters;
+        }
+        for &t in &tickets {
+            self.core.tickets.note_extent(t, start);
         }
         self.core.ext.writes.insert(
             start,
-            ExtWrite { hdr, db, key, buf: Some(buf), tickets, state: ExtState::Pending, wait_chunks: 0, parent, atomic, waiters: SmallVec::new(), wid: 0 },
+            ExtWrite { hdr, db, key, buf: Some(buf), tickets, state: ExtState::Pending, wait_chunks: 0, parent, atomic, waiters, wid: 0 },
         );
     }
 
@@ -2277,13 +2290,21 @@ impl PartitionStore {
                     return;
                 }
                 if let Some(mut st) = cx.cache.take_state(f) {
-                    {
-                        let img = cx.cache.frame(st.m_frame);
-                        for r in st.recs.iter_mut() {
+                    // both images: the record list of an image in flight becomes M's when it
+                    // is durable, and a copy left Live there would come back as the key's
+                    // current version although the index no longer names it (it then counted
+                    // as a third copy of the next write of the key, which waited forever on a
+                    // copy whose hand-off only that write could bring)
+                    let mark = |recs: &mut [RecDesc], img: &[u8; PAGE]| {
+                        for r in recs.iter_mut() {
                             if r.status == RecStatus::Live && r.db == s.db && r.h32 == h32 && r.key(img) == &*s.key {
                                 r.status = RecStatus::Droppable;
                             }
                         }
+                    };
+                    mark(&mut st.recs, cx.cache.frame(st.m_frame));
+                    if let Some(inf) = st.inflight.as_mut() {
+                        mark(&mut inf.recs, cx.cache.frame(inf.n_frame));
                     }
                     cx.cache.put_state(f, st);
                 }

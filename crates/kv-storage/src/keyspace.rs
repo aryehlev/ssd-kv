@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 
 use crate::cache::{FrameIdx, PageCache};
 use crate::effect::Op;
-use crate::extent::{self, EXT_KIND_CHUNKMAP, EXT_KIND_VALUE, EXT_VTYPE_HASH};
+use crate::extent::{self, EXT_KIND_CHUNKMAP, EXT_KIND_VALUE, EXT_VTYPE_HASH, EXT_VTYPE_STRING};
 use crate::layout::EXT_HDR;
 use crate::image::{Pending, RecDesc, RecStatus};
 use crate::io::AlignedBuf;
@@ -652,10 +652,22 @@ impl<'p> Keyspace<'p> {
             // one change per key: the newest wins, the location found first stays
             let s = &mut self.staged[i];
             s.change = change;
-            s.op = match (s.op.take(), op) {
-                (_, Some(o)) => Some(o),
-                (o, None) => o,
-            };
+            if op.is_some() {
+                // the group carries one op per key, so a key changed twice by one request
+                // replicates as its final state: a relative op (APPEND, SETRANGE, EXPIRE) alone
+                // would apply to the member's version from before the request's first change
+                s.op = match &s.change {
+                    Change::Put { vtype, expire_at, value } => Some(Op::Put {
+                        db,
+                        vtype: if *vtype == VType::Hash { EXT_VTYPE_HASH } else { EXT_VTYPE_STRING },
+                        expire_at: expire_at.unwrap_or(0),
+                        key: key.into(),
+                        value: value.clone(),
+                    }),
+                    Change::Delete | Change::Expired => Some(Op::Del { db, key: key.into() }),
+                    Change::Confirm => s.op.take(),
+                };
+            }
             return;
         }
         self.staged.push(Staged {
@@ -753,6 +765,15 @@ impl<'p> Keyspace<'p> {
         }
         self.stage(db, key, cur, Change::Delete, Some(Op::Del { db, key: key.into() }));
         Ok(true)
+    }
+
+    /// The highest seq of any copy of `key` in the selected db that the partition holds: the
+    /// current version (staged, in flight or durable), tracked older copies and an absent newest
+    /// copy (an unretired txn delete marker).
+    fn newest_copy_seq(&mut self, key: &[u8]) -> Result<Seq, StoreError> {
+        let db = self.db;
+        let stored = self.stored_seq(key)?;
+        Ok(stored.max(self.core.tracked_copy_seq(db, key)))
     }
 
     /// The stored version of a key (`Seq::ZERO` when absent), for ordered replication.
@@ -861,7 +882,12 @@ impl<'p> Keyspace<'p> {
             _ => self.db,
         };
         self.db = db;
-        if mode == ApplyMode::Ordered && self.stored_seq(key)? >= seq {
+        // a version never replaces a copy of its key at the same or a later version, in any mode:
+        // recovery would prefer that copy to the write, and the copy (protected until a durable
+        // copy with a higher seq exists) would never be released, so the write's effect would
+        // wait forever behind it. The stored copy is already as new as the op.
+        let newest = self.newest_copy_seq(key)?;
+        if mode == ApplyMode::Ordered && newest >= seq {
             return Ok(ApplyOutcome::Skipped);
         }
         match op {
@@ -878,8 +904,12 @@ impl<'p> Keyspace<'p> {
                     self.stage(db, key, cur, Change::Confirm, None);
                     return Ok(ApplyOutcome::Confirmed);
                 }
+                if newest >= seq {
+                    return Ok(ApplyOutcome::Skipped);
+                }
                 self.put(key, value, vt, exp)?;
             }
+            _ if newest >= seq => return Ok(ApplyOutcome::Skipped),
             Op::Del { .. } | Op::Expired { .. } => {
                 self.delete(key)?;
             }

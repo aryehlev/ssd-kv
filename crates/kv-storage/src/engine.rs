@@ -1325,3 +1325,122 @@ pub(crate) mod testdev {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effect::Op;
+    use crate::partition::{Origin, ReqKind, Request};
+    use crate::ticket::TicketState;
+    use kv_common::Access;
+    use kv_index::VType;
+
+    const T0: u64 = 1_800_000_000_000;
+
+    fn engine() -> LocalEngine<testdev::MemDev> {
+        let mut d = testdev::MemDev::new(64 * 4096, 512);
+        format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 1).unwrap();
+        let mut c = EngineCfg::defaults(Vec::new());
+        c.cache_bytes = 8 << 20;
+        let mut eng = LocalEngine::open(vec![d], &c).unwrap();
+        eng.recover().unwrap();
+        for p in eng.parts.iter_mut() {
+            p.set_produce_groups(true);
+        }
+        eng
+    }
+
+    fn at(eng: &mut LocalEngine<testdev::MemDev>, ms: u64) {
+        eng.set_now(Now { mono_ns: ms * 1_000_000, boot_ns: ms * 1_000_000, unix_ms: ms });
+    }
+
+    fn req(k: &[u8]) -> Request {
+        Request { db: 0, keys: smallvec::smallvec![(Box::<[u8]>::from(k), Access::ReadWrite)], kind: ReqKind::Keyed, origin: Origin::Client }
+    }
+
+    /// A request that changes one key twice (MULTI: SET then APPEND; an expired key appended
+    /// to) replicates the key's final state: the group carries one op per key, and the second
+    /// change's relative op alone would apply to the member's version from before the request.
+    #[test]
+    fn a_key_changed_twice_in_one_request_replicates_its_final_state() {
+        let mut eng = engine();
+        at(&mut eng, T0);
+        let k: &[u8] = b"twice";
+        let p = eng.partition_of(k);
+        let (_, out) = eng
+            .run(p, req(k), &mut |ks| {
+                ks.put(k, b"a", VType::String, None)?;
+                ks.append(k, b"b")?;
+                ks.set_expire(k, Some(T0 + 50_000)).map(|_| ())
+            })
+            .unwrap();
+        let g = out.group.expect("group");
+        assert_eq!(g.ops.len(), 1);
+        assert!(matches!(&g.ops[0], Op::Put { value, expire_at, .. } if value == b"ab" && *expire_at == T0 + 50_000));
+        assert_eq!(eng.wait_ticket(p, out.ticket.unwrap(), TicketState::Durable), TicketState::Durable);
+        // the key expires; an APPEND starts from nothing on the primary (lazy expiry first)
+        at(&mut eng, T0 + 60_000);
+        let (_, out) = eng.run(p, req(k), &mut |ks| ks.append(k, b"c")).unwrap();
+        let g = out.group.expect("group");
+        assert_eq!(g.ops.len(), 1);
+        assert!(matches!(&g.ops[0], Op::Put { value, expire_at: 0, .. } if value == b"c"), "an append to an expired key replicates as a put");
+        assert_eq!(eng.wait_ticket(p, out.ticket.unwrap(), TicketState::Durable), TicketState::Durable);
+        // one change per key: the op is the change itself
+        let (_, out) = eng.run(p, req(k), &mut |ks| ks.append(k, b"d")).unwrap();
+        assert!(matches!(&out.group.expect("group").ops[0], Op::Append { data, .. } if data == b"d"));
+        eng.assert_quiescent_complete(100_000);
+    }
+
+    /// WATCH: every committed change of a watched key is reported once, whatever made it (a
+    /// write, a delete, a lazy or active expiry, FLUSHDB); unwatched keys and reads are not.
+    #[test]
+    fn watched_keys_report_every_committed_change() {
+        let mut eng = engine();
+        at(&mut eng, T0);
+        let (k, other): (&[u8], &[u8]) = (b"{w}k", b"{w}other");
+        let p = eng.partition_of(k);
+        let mut got = Vec::new();
+        let mut touched = |eng: &mut LocalEngine<testdev::MemDev>| {
+            got.clear();
+            eng.parts[usize::from(p)].take_touched(&mut got);
+            got.iter().filter(|(d, x)| *d == 0 && **x == *k).count()
+        };
+        eng.run(p, req(k), &mut |ks| ks.put(k, b"v", VType::String, None)).unwrap();
+        assert_eq!(touched(&mut eng), 0, "not watched yet");
+        eng.parts[usize::from(p)].watch_key(0, k);
+        eng.run(p, req(k), &mut |ks| ks.get(k).map(|_| ())).unwrap();
+        eng.run(p, req(other), &mut |ks| ks.put(other, b"x", VType::String, None)).unwrap();
+        assert_eq!(touched(&mut eng), 0, "reads and other keys");
+        eng.run(p, req(k), &mut |ks| ks.put(k, b"v2", VType::String, None)).unwrap();
+        assert_eq!(touched(&mut eng), 1, "write");
+        eng.run(p, req(k), &mut |ks| ks.delete(k).map(|_| ())).unwrap();
+        assert_eq!(touched(&mut eng), 1, "delete");
+        // lazy expiry (a read finds it expired)
+        eng.run(p, req(k), &mut |ks| ks.put(k, b"v3", VType::String, Some(T0 + 10))).unwrap();
+        assert_eq!(touched(&mut eng), 1);
+        at(&mut eng, T0 + 20);
+        eng.run(p, req(k), &mut |ks| ks.get(k).map(|_| ())).unwrap();
+        assert_eq!(touched(&mut eng), 1, "lazy expiry");
+        // active expiry (the sweep removes it without a command)
+        eng.run(p, req(k), &mut |ks| ks.put(k, b"v4", VType::String, Some(T0 + 30))).unwrap();
+        assert_eq!(touched(&mut eng), 1);
+        for i in 0..2_000u64 {
+            at(&mut eng, T0 + 40 + i * 5);
+            eng.pump();
+            if touched(&mut eng) > 0 {
+                break;
+            }
+            assert!(i < 1_999, "active expiry never reported the key");
+        }
+        // FLUSHDB of its db, then unwatch
+        eng.run(p, req(k), &mut |ks| ks.put(k, b"v5", VType::String, None)).unwrap();
+        assert_eq!(touched(&mut eng), 1);
+        let flush = Request { db: 0, keys: smallvec::SmallVec::new(), kind: ReqKind::FlushDb { db: Some(0) }, origin: Origin::Client };
+        eng.run(p, flush, &mut |_| Ok(())).unwrap();
+        assert_eq!(touched(&mut eng), 1, "flushdb");
+        eng.parts[usize::from(p)].unwatch_key(0, k);
+        eng.run(p, req(k), &mut |ks| ks.put(k, b"v6", VType::String, None)).unwrap();
+        assert_eq!(touched(&mut eng), 0, "unwatched");
+        eng.assert_quiescent_complete(100_000);
+    }
+}

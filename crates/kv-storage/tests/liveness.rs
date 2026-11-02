@@ -188,3 +188,48 @@ fn flushall_waits_for_images_awaiting_their_flush() {
         }
     }
 }
+
+/// A versioned write (replica image, snapshot record, migration) whose seq is not above every
+/// copy of its key the partition holds: recovery would pick the older write's copy, and the
+/// hand-off that releases a protected copy (a durable copy with a higher seq) never comes. Such a
+/// write used to stage an effect that waited forever for that copy; it must be refused (or be a
+/// no-op) and never leave anything waiting.
+#[test]
+fn versioned_write_at_or_below_an_existing_copy_never_waits() {
+    use kv_common::Access;
+    use kv_index::VType;
+    use kv_storage::effect::Op;
+    use kv_storage::keyspace::{ApplyMode, ApplyOutcome};
+    use kv_storage::layout::Seq;
+    use kv_storage::partition::{Origin, ReqKind, Request};
+    use smallvec::smallvec;
+    let shapes: [(usize, usize); 5] = [(20, 30), (20, 3000), (6000, 30), (6000, 9000), (30, 0)];
+    for (i, &(a, b)) in shapes.iter().enumerate() {
+        for mode in [ApplyMode::Image, ApplyMode::SnapshotMerge, ApplyMode::Ordered] {
+            let mut db = fresh(64 * 4096, 90 + i as u64);
+            let k: &[u8] = b"img";
+            let p = db.eng.partition_of(k);
+            let t = db.set(0, k, &value(1, a), None).unwrap();
+            db.wait(k, t, TicketState::Durable);
+            // a second version, still in flight for some shapes (the first one is a protected copy)
+            let t2 = db.set(0, k, &value(2, a + 7), None).unwrap();
+            let req = |s: Seq| Request { db: 0, keys: smallvec![(Box::<[u8]>::from(k), Access::Write)], kind: ReqKind::Keyed, origin: Origin::Image(s) };
+            let (cur, _) = db.eng.run(p, req(Seq(1)), &mut |ks| ks.stored_seq(k)).unwrap();
+            assert!(cur > Seq(1));
+            for s in [Seq(1), cur] {
+                let op = if b == 0 { Op::Del { db: 0, key: k.into() } } else { Op::Put { db: 0, vtype: 1, expire_at: 0, key: k.into(), value: value(3, b) } };
+                let (o, out) = db.eng.run(p, req(s), &mut |ks| ks.apply_replicated(&op, s, mode)).unwrap();
+                assert_eq!(o, ApplyOutcome::Skipped, "shape {a}->{b} {mode:?} at {s:?}");
+                assert!(out.ticket.is_none());
+            }
+            // a versioned write that bypasses `apply_replicated` is refused, not staged
+            let r = db.eng.run(p, req(Seq(1)), &mut |ks| ks.put(k, &value(4, b.max(1)), VType::String, None));
+            assert!(matches!(r, Err(kv_storage::keyspace::StoreError::Io(_))), "shape {a}->{b}: low put refused");
+            db.wait(k, t2, TicketState::Durable);
+            db.quiesce();
+            // the newest version is still the client's second write
+            let (_, v) = db.get(0, k).unwrap().expect("present");
+            assert_eq!(v, value(2, a + 7), "shape {a}->{b} {mode:?}: the newer version stays");
+        }
+    }
+}

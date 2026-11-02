@@ -624,6 +624,61 @@ pub(crate) struct Core {
     /// Scratch vectors (no per-tick allocation).
     pub(crate) scratch_pos: Vec<Pos>,
     pub(crate) scratch_txn: Vec<u64>,
+    /// Keys watched by clients (WATCH) and the watched keys changed since the last
+    /// `PartitionStore::take_touched`.
+    pub(crate) watch: WatchSet,
+}
+
+/// Watched keys of a partition (WATCH, §16): `[db] ++ key -> watchers`. Every committed change
+/// of a watched key (a write, a delete, an expiry with or without a write, a FLUSHDB/FLUSHALL
+/// of its db) reports the key once through [`PartitionStore::take_touched`]. Costs one emptiness
+/// test per change while nothing is watched.
+#[derive(Default)]
+pub(crate) struct WatchSet {
+    keys: HashMap<Box<[u8]>, u32, foldhash::fast::FixedState>,
+    touched: Vec<(u8, Box<[u8]>)>,
+}
+
+impl WatchSet {
+    fn tag(db: u8, key: &[u8]) -> Box<[u8]> {
+        let mut t = Vec::with_capacity(key.len() + 1);
+        t.push(db);
+        t.extend_from_slice(key);
+        t.into_boxed_slice()
+    }
+
+    fn watch(&mut self, db: u8, key: &[u8]) {
+        *self.keys.entry(Self::tag(db, key)).or_insert(0) += 1;
+    }
+
+    fn unwatch(&mut self, db: u8, key: &[u8]) {
+        let t = Self::tag(db, key);
+        if let Some(n) = self.keys.get_mut(&t) {
+            *n -= 1;
+            if *n == 0 {
+                self.keys.remove(&t);
+            }
+        }
+    }
+
+    /// A committed change of `(db, key)`.
+    pub(crate) fn touch(&mut self, db: u8, key: &[u8]) {
+        if self.keys.is_empty() {
+            return;
+        }
+        if self.keys.contains_key(&Self::tag(db, key)) {
+            self.touched.push((db, key.into()));
+        }
+    }
+
+    /// Every watched key of the dbs in `mask` (bit i = db i) changed (FLUSHDB / FLUSHALL).
+    fn touch_dbs(&mut self, mask: u16) {
+        for t in self.keys.keys() {
+            if mask & (1 << (t[0] & 15)) != 0 {
+                self.touched.push((t[0], t[1..].into()));
+            }
+        }
+    }
 }
 
 impl Core {
@@ -731,6 +786,13 @@ impl Core {
 
     // ---------------------------------------------------------------------------------------
     // Index helpers
+
+    /// The highest seq among the copies of `(db, key)` that the index does not name: tracked
+    /// older copies and an absent newest copy (`Seq::ZERO` when there is none).
+    pub(crate) fn tracked_copy_seq(&self, db: u8, key: &[u8]) -> Seq {
+        let tracked = self.stale.get(db, key).iter().map(|e| e.seq).max().unwrap_or(Seq::ZERO);
+        tracked.max(self.stale.absent_of(db, key).map_or(Seq::ZERO, |a| a.seq))
+    }
 
     /// The position of the entry of `(db, slot, kh)` naming `page36`.
     pub(crate) fn find_entry(&self, db: u8, slot: u16, kh: KeyHash, page36: u64) -> Option<Pos> {
@@ -967,6 +1029,7 @@ impl PartitionStore {
             txn_inherit: Vec::new(),
             scratch_pos: Vec::new(),
             scratch_txn: Vec::new(),
+            watch: WatchSet { keys: HashMap::with_hasher(Default::default()), touched: Vec::new() },
             boot,
             state: PartState::Loading,
             cfg,
@@ -1140,6 +1203,26 @@ impl PartitionStore {
 
     /// Produce replication groups (`ExecOut::group`) from now on: the partition became a
     /// cluster primary (§23.7). Members stop producing them and stop lazy expiry (§16.4).
+    /// Registers one watcher of `(db, key)` (WATCH). Changes of the key committed from now on
+    /// are reported by [`PartitionStore::take_touched`] until the matching
+    /// [`PartitionStore::unwatch_key`].
+    pub fn watch_key(&mut self, db: u8, key: &[u8]) {
+        self.core.watch.watch(db, key);
+    }
+
+    /// Removes one watcher of `(db, key)` (UNWATCH, EXEC, DISCARD, connection close).
+    pub fn unwatch_key(&mut self, db: u8, key: &[u8]) {
+        self.core.watch.unwatch(db, key);
+    }
+
+    /// Moves the watched keys changed since the last call into `out` (a key changed several
+    /// times may appear several times): writes, deletes, expiries (lazy, active, replicated) and
+    /// FLUSHDB/FLUSHALL of its db, in commit order. The caller flags the connections watching
+    /// them (`WATCH_DIRTY`).
+    pub fn take_touched(&mut self, out: &mut Vec<(u8, Box<[u8]>)>) {
+        out.append(&mut self.core.watch.touched);
+    }
+
     pub fn set_produce_groups(&mut self, on: bool) {
         self.core.cfg.produce_groups = on;
     }
@@ -1647,6 +1730,22 @@ impl PartitionStore {
             }
             self.core.next_seq
         };
+        // a versioned write (replicated, image, snapshot, migration) never goes below a copy of
+        // its key at the same or a later version: recovery would prefer that copy to the write,
+        // and the copy, protected until a durable copy with a higher seq exists, would never be
+        // released, so the write's effect would wait behind it forever. `apply_replicated`
+        // skips such ops; anything else is refused here.
+        if seqo.is_some() {
+            for s in staged.iter().filter(|s| matches!(s.change, Change::Put { .. } | Change::Delete)) {
+                let cur = match s.cur {
+                    Cur::Absent => Seq::ZERO,
+                    Cur::Small { seq, .. } | Cur::Extent { seq, .. } => seq,
+                };
+                if cur.max(self.core.tracked_copy_seq(s.db, &s.key)) >= seq {
+                    return Commit::Err(StoreError::Io(-libc::ESTALE));
+                }
+            }
+        }
         // a cross-partition part carries its txn id; a local multi-key write takes one (§14.6)
         let is_txn = txn.is_some() || writes >= 2;
         // 1. plan every placement; nothing changes unless all succeed
@@ -1932,6 +2031,7 @@ impl PartitionStore {
         if matches!(s.change, Change::Put { .. } | Change::Delete) {
             tickets.extend(ticket);
             tickets.extend(fx);
+            self.core.watch.touch(s.db, &s.key);
         }
         match s.change {
             Change::Confirm => {
@@ -2466,6 +2566,7 @@ impl PartitionStore {
     /// staged, is removed like a delete (its older copies first, D1, v1.2).
     fn apply_expired(&mut self, cx: &mut StorageCtx<'_>, s: &Staged) {
         self.core.counters.expired_keys += 1;
+        self.core.watch.touch(s.db, &s.key);
         let others = self.core.stale.count(s.db, &s.key) > 0;
         if others {
             self.core.stale.require(s.db, &s.key, true);
@@ -2667,6 +2768,7 @@ impl PartitionStore {
             self.core.index.drop_db(d);
             self.core.stale.drop_db(d);
         }
+        self.core.watch.touch_dbs(mask);
         // effects deferred behind copies of the flushed dbs go ahead (those copies are dead
         // by the cutoff; nothing else would wake them)
         let deferred: Vec<PageId> = self.core.deferred.drain().collect();

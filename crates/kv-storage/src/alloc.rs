@@ -344,20 +344,34 @@ struct SpareSlot {
     spare: Option<AgId>,
     /// An `AcquireAg` should be sent.
     want: bool,
-    /// The wanted AG is needed now (a placement found no space), not a spare to keep ahead.
-    need: bool,
+    /// Why the wanted AG is wanted (the most urgent reason since the last request).
+    class: AgClass,
     /// The AG is wanted on this device (the chunks of a large value, LC-08).
     want_dev: Option<u8>,
     /// An `AcquireAg` is in flight.
     asked: bool,
     /// The last acquisition was refused (fill limit); retried after `RETRY_NS`.
     refused_at_ns: Option<u64>,
-    /// The request in flight is a spare request.
-    asked_spare: bool,
+    /// Class of the request in flight.
+    asked_class: AgClass,
 }
 
-/// An AG request to send: `(kind, wanted device, spare)`.
-pub(crate) type AgRequest = (AgKind, Option<u8>, bool);
+/// Why an AG is requested, least urgent first.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum AgClass {
+    /// A spare kept ahead (§11.1): granted only from headroom, a denial is no refusal.
+    #[default]
+    Spare,
+    /// Space a command's placement needs now: refused at the fill limit (`-OOM`, §11.6).
+    Need,
+    /// Space an already accepted write needs to complete (a record its page could not hold
+    /// moves, §14.3): served from the headroom above the fill limit, so that a write the node
+    /// acknowledged as accepted never waits for space that the limit keeps back.
+    Reserved,
+}
+
+/// An AG request to send: `(kind, wanted device, class)`.
+pub(crate) type AgRequest = (AgKind, Option<u8>, AgClass);
 
 const RETRY_NS: u64 = 1_000_000_000;
 
@@ -601,7 +615,7 @@ impl Alloc {
             slot.refused_at_ns = None;
         }
         slot.want = true;
-        slot.need = true;
+        slot.class = slot.class.max(AgClass::Need);
         if dev.is_some() {
             slot.want_dev = dev;
         }
@@ -963,13 +977,13 @@ impl Alloc {
                 (Some(ag), Some(d)) => ag.dev != d,
                 (Some(_), None) => false,
             };
-            if s.want && !s.asked && spare_ok && s.refused_at_ns.is_none() {
+            if s.want && !s.asked && spare_ok && (s.refused_at_ns.is_none() || s.class == AgClass::Reserved) {
                 s.want = false;
                 s.asked = true;
-                let spare = !s.need && s.want_dev.is_none();
-                s.asked_spare = spare;
-                s.need = false;
-                out.push((kind, s.want_dev.take(), spare));
+                let class = if s.want_dev.is_some() { s.class.max(AgClass::Need) } else { s.class };
+                s.asked_class = class;
+                s.class = AgClass::Spare;
+                out.push((kind, s.want_dev.take(), class));
             }
         }
     }
@@ -979,7 +993,7 @@ impl Alloc {
     pub(crate) fn ag_granted(&mut self, kind: AgKind, ag: Option<AgId>, now_ns: u64) {
         let ki = kind_slot(kind);
         self.slots[ki].asked = false;
-        let spare = core::mem::take(&mut self.slots[ki].asked_spare);
+        let spare = core::mem::take(&mut self.slots[ki].asked_class) == AgClass::Spare;
         match ag {
             Some(ag) => {
                 // a spare already held (on another device) becomes an owned AG
@@ -1010,7 +1024,17 @@ impl Alloc {
     /// True while some AG is wanted or requested and not answered: a request parked on space
     /// is woken by that answer (liveness).
     pub(crate) fn ag_outstanding(&self) -> bool {
-        self.slots.iter().any(|s| s.asked || (s.want && s.refused_at_ns.is_none()))
+        self.slots.iter().any(|s| s.asked || (s.want && (s.refused_at_ns.is_none() || s.class == AgClass::Reserved)))
+    }
+
+    /// An accepted write needs an AG of `kind` to complete (a staged record moves, §14.3): the
+    /// request is served above the fill limit and is sent even while a refusal is latched.
+    pub(crate) fn want_reserved(&mut self, kind: AgKind) {
+        let s = &mut self.slots[kind_slot(kind)];
+        if s.spare.is_none() {
+            s.want = true;
+            s.class = AgClass::Reserved;
+        }
     }
 
     /// True while an AG of `kind` is requested and not answered.
@@ -1251,7 +1275,7 @@ mod tests {
         assert_eq!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::NeedAg);
         let mut req = SmallVec::new();
         a.take_ag_requests(&mut req);
-        assert_eq!(req.as_slice(), &[(AgKind::Small, None, false)], "space needed now");
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None, AgClass::Need)], "space needed now");
         req.clear();
         a.take_ag_requests(&mut req);
         assert!(req.is_empty(), "one request in flight");
@@ -1259,7 +1283,7 @@ mod tests {
         a.ag_granted(AgKind::Small, Some(AgId { dev: 0, idx: 2 }), 0);
         assert!(matches!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::Fresh(_)));
         a.take_ag_requests(&mut req);
-        assert_eq!(req.as_slice(), &[(AgKind::Small, None, true)], "consumed spare is replaced by a spare request");
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None, AgClass::Spare)], "consumed spare is replaced by a spare request");
         // a denied spare is no fill-limit refusal: the next need asks again
         a.ag_granted(AgKind::Small, None, 10);
         assert!(!a.ag_pending(AgKind::Small));
@@ -1269,10 +1293,18 @@ mod tests {
         assert_eq!(a.place_small(4000, &cache, 20, &|_| false), SmallPlace::NeedAg);
         req.clear();
         a.take_ag_requests(&mut req);
-        assert_eq!(req.as_slice(), &[(AgKind::Small, None, false)]);
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None, AgClass::Need)]);
         // a refused need is the fill limit: -OOM until the retry interval passed
         a.ag_granted(AgKind::Small, None, 30);
         assert_eq!(a.place_small(4000, &cache, 40, &|_| false), SmallPlace::Full);
+        req.clear();
+        a.take_ag_requests(&mut req);
+        assert!(req.is_empty(), "the refusal is latched");
+        // an accepted write that must move still asks, above the fill limit
+        a.want_reserved(AgKind::Small);
+        assert!(a.ag_outstanding());
+        a.take_ag_requests(&mut req);
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None, AgClass::Reserved)]);
     }
 
     #[test]

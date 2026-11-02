@@ -47,6 +47,9 @@ pub enum MetaReq {
     /// partition that owns none yet, so that spares never take the space a first write of
     /// another partition needs. A denial (`Ag(None)`) is not a fill-limit refusal.
     AcquireSpare { partition: u16, kind: AgKind },
+    /// An AG an already accepted write needs to complete (a record that moves, §14.3): served
+    /// from the headroom above `max-storage-fill`, refused only when no AG is free at all.
+    AcquireReserved { partition: u16, kind: AgKind },
     ReleaseAg { ag: AgId },
     PartitionMeta { m: PartitionMeta },
     NodeMeta { m: NodeMeta },
@@ -447,6 +450,7 @@ impl MetaCore {
                 MetaReq::AcquireAg { partition, kind } => MetaDone::Ag(self.acquire(partition, kind, None)),
                 MetaReq::AcquireAgOn { partition, kind, dev } => MetaDone::Ag(self.acquire(partition, kind, Some(dev))),
                 MetaReq::AcquireSpare { partition, kind } => MetaDone::Ag(if self.spare_allowed(partition, kind) { self.acquire(partition, kind, None) } else { None }),
+                MetaReq::AcquireReserved { partition, kind } => MetaDone::Ag(self.acquire_with(partition, kind, None, false)),
                 MetaReq::ReleaseAg { ag } => {
                     self.release(ag);
                     MetaDone::Ok
@@ -630,11 +634,17 @@ impl MetaCore {
     }
 
     fn acquire(&mut self, partition: u16, kind: AgKind, want_dev: Option<u8>) -> Option<AgId> {
+        self.acquire_with(partition, kind, want_dev, true)
+    }
+
+    /// [`MetaCore::acquire`]; `limit` applies the fill limit (an accepted write's reserved
+    /// request does not).
+    fn acquire_with(&mut self, partition: u16, kind: AgKind, want_dev: Option<u8>, limit: bool) -> Option<AgId> {
         if kind == AgKind::Free || partition >= self.partitions {
             return None;
         }
         // fill limit (§11.6): an immediate refusal, never a wait
-        if self.headroom() == 0 {
+        if limit && self.headroom() == 0 {
             return None;
         }
         // the device with the most free AGs; ties by a keyed draw (LC-01, LC-08)
@@ -1007,6 +1017,12 @@ mod tests {
         }
         assert_eq!(core.ag_usage().0, limit);
         assert!(ask(&mut core, &mut io, MetaReq::AcquireAg { partition: 3, kind: AgKind::Small }).is_none(), "fill limit");
+        // an accepted write that must move is served above the limit, while AGs are free
+        let mut reserved = 0;
+        while ask(&mut core, &mut io, MetaReq::AcquireReserved { partition: 3, kind: AgKind::Small }).is_some() {
+            reserved += 1;
+        }
+        assert_eq!(limit + reserved, total, "every free AG");
     }
 
     fn credits(r: &MetaReplies) -> u32 {

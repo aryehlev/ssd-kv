@@ -389,7 +389,7 @@ pub(crate) enum HeaderWhy {
     Reclaim,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Durable {
     Page(PageId),
     Ext(PageId),
@@ -563,6 +563,8 @@ pub(crate) struct Core {
     pub(crate) deferred: HashSet<PageId, foldhash::fast::FixedState>,
     /// Pages to build in the next tick (their build could not run in this one).
     pub(crate) retry: Vec<PageId>,
+    /// Pages whose read completed when no cache frame could be had: read again next tick.
+    pub(crate) load_retry: Vec<PageId>,
     pub(crate) txns: HashMap<u64, OpenTxn, foldhash::fast::FixedState>,
     /// Txns committed this boot whose ids may still be above the durable `resolved_w`.
     pub(crate) committed: HashSet<u64, foldhash::fast::FixedState>,
@@ -917,6 +919,7 @@ impl PartitionStore {
             fg_keys: Vec::new(),
             deferred: HashSet::with_hasher(Default::default()),
             retry: Vec::new(),
+            load_retry: Vec::new(),
             txns: HashMap::with_hasher(Default::default()),
             committed: HashSet::with_hasher(Default::default()),
             resolved_w: boot.committed.resolved_w,
@@ -1277,9 +1280,19 @@ impl PartitionStore {
                 if r.fetched.iter().any(|f| f.start == start && f.pages >= pages && (!chunks || f.want_chunks) && f.err.is_none()) {
                     return;
                 }
-                r.fetched.retain(|f| f.start != start);
-                r.fetched.push(ExtFetch { start, pages, buf: None, err: None, chunks: None, want_chunks: chunks });
-                let idx = r.fetched.len() - 1;
+                // reads in flight name their fetch by index: an entry is replaced in place,
+                // never removed, so that the other entries keep their indexes
+                let fresh = ExtFetch { start, pages, buf: None, err: None, chunks: None, want_chunks: chunks };
+                let idx = match r.fetched.iter().position(|f| f.start == start) {
+                    Some(i) => {
+                        r.fetched[i] = fresh;
+                        i
+                    }
+                    None => {
+                        r.fetched.push(fresh);
+                        r.fetched.len() - 1
+                    }
+                };
                 r.io += 1;
                 let buf = AlignedBuf::zeroed(pages as usize * PAGE);
                 let tag = self.core.tag(IoKind::ExtRead { req: id, generation, idx, chunk: None });
@@ -1714,6 +1727,11 @@ impl PartitionStore {
                 SmallPlace::Cached(q) => Ok(Plan::Small { page: q, fresh: false }),
                 SmallPlace::Fresh(q) => {
                     undo.fresh.push(q);
+                    // the frame is taken now: applying the plan cannot fail any more
+                    self.init_fresh(cx.cache, q);
+                    if cx.cache.page_state(q).is_none() {
+                        return Err(Commit::Err(StoreError::Io(-libc::ENOMEM)));
+                    }
                     Ok(Plan::Small { page: q, fresh: true })
                 }
                 SmallPlace::Uncached(q) => {
@@ -2479,6 +2497,12 @@ impl PartitionStore {
             self.core.index.drop_db(d);
             self.core.stale.drop_db(d);
         }
+        // effects deferred behind copies of the flushed dbs go ahead (those copies are dead
+        // by the cutoff; nothing else would wake them)
+        let deferred: Vec<PageId> = self.core.deferred.drain().collect();
+        for p in deferred {
+            self.core.mark_dirty(cx.cache, p);
+        }
         self.core.fg_keys.retain(|(d, _)| mask & (1 << d) == 0);
         self.core.retire.retain(|r| mask & (1 << r.db) == 0);
         let t = self.core.tickets.create(TICKET_HAS_META | TICKET_HAS_DELETE);
@@ -2901,6 +2925,11 @@ impl PartitionStore {
                     self.reqs.check_ready(id);
                 }
             }
+            if l.scrub || self.core.stale.at_page(page) > 0 {
+                // a tracked copy that cannot be read cannot be zeroed: the deletes and writes
+                // waiting for it could never complete, so they fail now (read-only, §22)
+                self.write_failed(e);
+            }
             return;
         }
         let Some(l) = self.core.loads.remove(&page) else {
@@ -2909,10 +2938,19 @@ impl PartitionStore {
             }
             return;
         };
-        let Some(buf) = d.buf else { return };
+        let Some(buf) = d.buf else {
+            // a read reported without its buffer: read again (the waiters stay registered)
+            self.core.loads.insert(page, l);
+            self.core.load_retry.push(page);
+            return;
+        };
         if cx.cache.page_state(page).is_none() {
             let Some(f) = cx.cache.alloc(page) else {
+                // no frame (the mapping of a new cache chunk failed): the waiters stay
+                // registered and the page is read again at the next tick
                 self.core.give_buf(buf);
+                self.core.loads.insert(page, l);
+                self.core.load_retry.push(page);
                 return;
             };
             cx.cache.frame_mut(f).copy_from_slice(buf.page(0));
@@ -3578,6 +3616,13 @@ impl PartitionStore {
             return;
         }
         self.process_durable(cx);
+        for page in core::mem::take(&mut self.core.load_retry) {
+            if self.core.loads.contains_key(&page) {
+                let buf = self.core.take_buf(PAGE);
+                let tag = self.core.tag(IoKind::PageRead { page, retried: true });
+                cx.io.push(IoReq::read(tag, page.dev(), page.byte_offset(), buf));
+            }
+        }
         let retry = core::mem::take(&mut self.core.retry);
         for p in retry {
             self.core.mark_dirty(cx.cache, p);
@@ -3609,6 +3654,11 @@ impl PartitionStore {
         self.background(cx);
         self.finish_barriers();
         self.update_counters(cx);
+        if crate::progress::self_check()
+            && let Err(e) = self.check_progress(cx.cache)
+        {
+            panic!("{e}");
+        }
     }
 
     fn txn_progress(&mut self, cx: &mut StorageCtx<'_>) {
@@ -3811,13 +3861,22 @@ impl PartitionStore {
             SmallPlace::Cached(q) => Some(q),
             SmallPlace::Fresh(q) => {
                 self.init_fresh(cx.cache, q);
-                Some(q)
+                if cx.cache.page_state(q).is_some() {
+                    Some(q)
+                } else {
+                    self.core.alloc.unplace_fresh(q);
+                    None
+                }
             }
             SmallPlace::Uncached(q) => {
                 self.load_page(cx, q, None, false);
                 None
             }
-            SmallPlace::NeedAg | SmallPlace::Full => None,
+            SmallPlace::NeedAg | SmallPlace::Full => {
+                // the write was accepted: its space comes from above the fill limit
+                self.core.alloc.want_reserved(AgKind::Small);
+                None
+            }
         };
         let Some(q) = target else {
             // no room yet (an AG or a page read is on its way): try again next tick
@@ -3926,12 +3985,13 @@ impl PartitionStore {
     fn meta_requests(&mut self, cx: &mut StorageCtx<'_>) {
         let mut kinds: SmallVec<[crate::alloc::AgRequest; 2]> = SmallVec::new();
         self.core.alloc.take_ag_requests(&mut kinds);
-        for (kind, dev, spare) in kinds {
+        for (kind, dev, class) in kinds {
             let partition = self.core.cfg.id;
-            let r = match dev {
-                Some(dev) => MetaReq::AcquireAgOn { partition, kind, dev },
-                None if spare => MetaReq::AcquireSpare { partition, kind },
-                None => MetaReq::AcquireAg { partition, kind },
+            let r = match (dev, class) {
+                (Some(dev), _) => MetaReq::AcquireAgOn { partition, kind, dev },
+                (None, crate::alloc::AgClass::Spare) => MetaReq::AcquireSpare { partition, kind },
+                (None, crate::alloc::AgClass::Need) => MetaReq::AcquireAg { partition, kind },
+                (None, crate::alloc::AgClass::Reserved) => MetaReq::AcquireReserved { partition, kind },
             };
             self.core.meta_req(cx.meta, r, MetaWait::Ag(kind));
         }
@@ -3942,10 +4002,16 @@ impl PartitionStore {
         {
             self.ask_seq(cx.meta);
         }
-        // FLUSHALL: release the old AGs when nothing is in flight to them any more
+        // FLUSHALL: release the old AGs when nothing is staged, in flight or waiting for a
+        // flush in them any more (forgetting a page whose image awaits its flush would lose
+        // the image's tickets: its durability event finds no page state)
         if self.core.flushall_wait
             && self.core.writes_in_flight == 0
             && self.core.dirty.is_empty()
+            && self.core.retry.is_empty()
+            && self.core.deferred.is_empty()
+            && self.core.durable_wait.is_empty()
+            && self.core.durable_q.is_empty()
             && self.core.ext.writes.is_empty()
             && self.core.ext.zeros.is_empty()
             && self.core.loads.is_empty()

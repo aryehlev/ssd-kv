@@ -154,8 +154,9 @@ impl PartitionStore {
             w.push(WaitFor::Exec);
             return w;
         }
+        // one entry per registration (a request may register twice for one read)
         for (page, l) in &self.core.loads {
-            if l.waiters.contains(&(id, generation)) {
+            for _ in l.waiters.iter().filter(|x| **x == (id, generation)) {
                 w.push(WaitFor::PageRead { page: *page });
             }
         }
@@ -168,7 +169,7 @@ impl PartitionStore {
             }
         }
         for (start, x) in &self.core.ext.writes {
-            if x.waiters.contains(&(id, generation)) {
+            for _ in x.waiters.iter().filter(|w| **w == (id, generation)) {
                 w.push(WaitFor::ExtWrite { start: *start });
             }
         }
@@ -327,8 +328,23 @@ impl PartitionStore {
             }
             let h = self.holds(t, &holders);
             if k.undurable() != h.undurable || k.unwritten() != h.unwritten || k.meta() != h.meta {
+                let pages: Vec<String> = k
+                    .deps
+                    .iter()
+                    .map(|(p, _)| match cache.page_state(*p) {
+                        None => format!("{:#x}: not cached", p.0),
+                        Some(st) => format!(
+                            "{:#x}: owned={} pending={} inflight={:?} dirty={}",
+                            p.0,
+                            c.alloc.owns_small(*p),
+                            st.pending.len(),
+                            st.inflight.as_ref().map(|i| (i.state, i.applied.iter().map(|e| e.tickets().len()).sum::<usize>())),
+                            st.dirty
+                        ),
+                    })
+                    .collect();
                 return fail(format!(
-                    "ticket {} counts unwritten={} undurable={} meta={} (txn effects {:?}), the partition holds unwritten={} undurable={} meta={}",
+                    "ticket {} counts unwritten={} undurable={} meta={} (txn effects {:?}), the partition holds unwritten={} undurable={} meta={}; pages [{}] extents {:?}; awaiting flush {:?}",
                     t.0,
                     k.unwritten(),
                     k.undurable(),
@@ -336,7 +352,10 @@ impl PartitionStore {
                     k.txn_effects(),
                     h.unwritten,
                     h.undurable,
-                    h.meta
+                    h.meta,
+                    pages.join(", "),
+                    k.extent_deps.iter().map(|p| p.0).collect::<Vec<_>>(),
+                    c.durable_wait.values().map(|d| format!("{d:?}")).collect::<Vec<_>>()
                 ));
             }
         }
@@ -509,6 +528,14 @@ impl PartitionStore {
         c.oldest_wait_ms = oldest / 1_000_000;
         c.stalled_total += newly;
     }
+}
+
+/// `KVSSD_CHECK_PROGRESS=1` makes every tick run [`PartitionStore::check_progress`] and panic
+/// on a lost wakeup (simulator and test campaigns; the check walks the partition's cached
+/// pages, too slow for production).
+pub(crate) fn self_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KVSSD_CHECK_PROGRESS").is_some_and(|v| v != "0"))
 }
 
 /// Age after which a request or ticket counts as stalled.

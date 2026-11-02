@@ -153,3 +153,38 @@ fn delete_is_not_starved_by_later_writes_of_its_key() {
         db.quiesce();
     }
 }
+
+/// FLUSHALL releases the partition's old AGs once nothing is in flight to them; a page whose
+/// image was written but still waits for its flush (write-back cache) counts as in flight. It
+/// did not: the page was forgotten, the flush's durability event found no page state, and the
+/// write's ticket stayed `Written` forever.
+#[cfg(feature = "sim")]
+#[test]
+fn flushall_waits_for_images_awaiting_their_flush() {
+    use kv_storage::sim::SimDevice;
+    for gap in 0..6u32 {
+        for seed in 0..3u64 {
+            let mut d = SimDevice::new(64 * 4096, 512, None, seed);
+            format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, seed).unwrap();
+            let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+            eng.recover().unwrap();
+            let mut db = Db::new(eng, T0);
+            let mut ts = Vec::new();
+            for i in 0..12u64 {
+                let k = format!("f{i}");
+                ts.push((k.clone(), db.set(0, k.as_bytes(), &value(i, 40 + 500 * (i as usize % 3)), None).unwrap()));
+            }
+            for _ in 0..gap {
+                db.eng.pump();
+            }
+            let flushed = db.flushdb(None);
+            for (k, t) in ts {
+                db.wait(k.as_bytes(), t, TicketState::Durable);
+            }
+            for (p, t) in flushed {
+                db.wait_in(p, t, TicketState::Durable);
+            }
+            db.quiesce();
+        }
+    }
+}

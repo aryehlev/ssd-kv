@@ -1277,8 +1277,9 @@ struct Node {
     incarnation: u64,
     /// The process restarted after a crash (no clean shutdown happens in the simulation).
     scanned: bool,
-    /// After a crash: the persisted fence term; a primary role of a term at or below it is
-    /// never served again (kv-node `ClusterShared::restart_term`).
+    /// After a crash of a node whose persisted role was a primary: the persisted fence term; a
+    /// primary role of a term at or below it is never served again (kv-node
+    /// `ClusterShared::restart_term`).
     restart_term: Option<u32>,
     /// Per partition: the term of the last stream that completed its catch-up (Continue
     /// accepted, Repair done), the handshake's `last_term` (kv-node `PartRepl::last_term`).
@@ -1379,15 +1380,17 @@ impl Node {
         self.up = true;
         self.incarnation = rng.random::<u64>() | 1;
         self.scanned = true;
-        // kv-node: an unclean restart holds every primary role of a term up to the persisted
-        // fence term; renewals report failed while the persisted role is a primary
-        self.restart_term = Some(self.disk.fence_term);
-        self.report_failed = self
+        // kv-node: an unclean restart of a node whose persisted role is a primary holds every
+        // primary role of a term up to the persisted fence term, and renewals report failed
+        // until an assignment shows otherwise
+        let was_primary = self
             .disk
             .assignment
             .as_ref()
             .and_then(|a| a.role.as_ref())
             .is_some_and(|r| r.is_primary);
+        self.restart_term = was_primary.then_some(self.disk.fence_term);
+        self.report_failed = was_primary;
         self.last_term = self.disk.last_term.clone();
         // the first handshake of each partition announces the persisted lower bound
         self.meta_applied = self.disk.repl_durable.iter().map(|s| Some(*s)).collect();

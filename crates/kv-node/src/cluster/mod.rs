@@ -168,11 +168,13 @@ pub struct ClusterShared {
     /// The replication transport (started once the node is up).
     pub net: std::sync::OnceLock<net::ReplNet>,
     next_token: AtomicU64,
-    /// After an unclean restart: the highest term this node may have served as a primary
-    /// before it (its persisted fence term). A primary role of a term at or below it is never
-    /// served again: the recovered partitions may lack groups the previous process produced
-    /// and shipped, so its next seqs could repeat ones a member already holds. Only a newer
-    /// term (a promotion through the normal failover path) makes it a primary again.
+    /// After an unclean restart of a node whose persisted role was a primary: the highest term
+    /// it may have served before it (its persisted fence term). A primary role of a term at or
+    /// below it is never served again: the recovered partitions may lack groups the previous
+    /// process produced and shipped, so its next seqs could repeat ones a member already
+    /// holds. Only a newer term (a promotion through the normal failover path) makes it a
+    /// primary again. A node whose persisted role was not a primary produced no group of any
+    /// term it could be assigned again (a primary role is persisted before it is served).
     pub restart_term: Option<u32>,
     /// The current assignment names this node primary of a term it must not serve (see
     /// `restart_term`), or, before the first assignment, it was a primary when it stopped:
@@ -208,8 +210,8 @@ impl ClusterShared {
     pub fn new(boot: BootMeta, meta: MetaClient, auth: Vec<u8>, partitions: u16) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let joined = boot.node.node_id != [0u8; 20];
-        let restart_term = (joined && !boot.clean).then_some(boot.node.fence_term);
         let was_primary = boot.node.role == kv_storage::pmeta::ROLE_PRIMARY;
+        let restart_term = (joined && !boot.clean && was_primary).then_some(boot.node.fence_term);
         let identity = Identity {
             cluster_id: joined.then_some(boot.node.cluster_id),
             node_id: joined.then_some(NodeId(boot.node.node_id)),
@@ -233,7 +235,7 @@ impl ClusterShared {
             net: std::sync::OnceLock::new(),
             next_token: AtomicU64::new(1),
             restart_term,
-            refusing_primary: AtomicBool::new(restart_term.is_some() && was_primary),
+            refusing_primary: AtomicBool::new(restart_term.is_some()),
             shutdown_handoff: parking_lot::Mutex::new(None),
             links: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
             unserved_keys: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
@@ -471,9 +473,12 @@ mod tests {
         assert_eq!(clean.restart_term, None);
         assert!(!clean.refusing_primary.load(Ordering::Acquire));
         assert!(!clean.refuses_primary(&assignment(true, 5)));
+        // a replica (perhaps fenced for its promotion, whose assignment it never applied)
+        // produced no group of any term it can be assigned: it may serve the promotion
         let replica = shared_after(false, ROLE_REPLICA, 5);
+        assert_eq!(replica.restart_term, None);
         assert!(!replica.refusing_primary.load(Ordering::Acquire));
-        assert!(replica.refuses_primary(&assignment(true, 5)), "fenced for 5 before the crash");
+        assert!(!replica.refuses_primary(&assignment(true, 5)));
     }
 
     #[test]

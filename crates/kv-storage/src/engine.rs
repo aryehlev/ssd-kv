@@ -355,6 +355,11 @@ impl Boot {
         Ok(())
     }
 
+    /// Refuses devices too small for the partition count (see [`check_capacity`]).
+    pub fn check_capacity(&self, max_fill: f32) -> std::io::Result<()> {
+        check_capacity(&self.layouts, self.partitions, max_fill)
+    }
+
     /// The partition configuration of partition `p` under `cfg`.
     pub(crate) fn partition_cfg(&self, p: u16, cfg: &EngineCfg) -> PartitionCfg {
         let lba = self.devs.first().map_or(4096, |d| d.lba);
@@ -1124,6 +1129,32 @@ impl<D: BlockDevice> LocalEngine<D> {
         let plumb = core::mem::replace(&mut self.plumb, Plumbing { devs: Vec::new(), flush: Vec::new(), io: Vec::new() });
         plumb.devs.into_iter().map(|d| d.dev).collect()
     }
+}
+
+/// AGs every partition needs at least: one for small records and one for extents (§11.2).
+pub const MIN_AGS_PER_PARTITION: u64 = 2;
+
+/// Refuses a device set whose AG area cannot give every partition its first SMALL and EXTENT AG
+/// under the fill limit (§11.6): such a node would answer `-OOM` with the devices almost empty.
+/// Spare AGs (§11.1) only come out of the headroom above this minimum. Nothing in the engine
+/// enforces it (the simulator and format tests use nearly full and tiny devices on purpose); a
+/// node calls it, or [`Boot::check_capacity`], to refuse such a device set at startup.
+pub fn check_capacity(layouts: &[DeviceLayout], partitions: u16, max_fill: f32) -> std::io::Result<()> {
+    let total: u64 = layouts.iter().map(|l| u64::from(l.n_ags)).sum();
+    let fill = if max_fill.is_finite() { max_fill.clamp(0.0, 1.0) } else { 0.95 };
+    let usable = (f64::from(fill) * total as f64).floor() as u64;
+    let need = u64::from(partitions) * MIN_AGS_PER_PARTITION;
+    if usable >= need {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "data devices too small for {partitions} partitions: {total} allocation groups of 16 MiB, {usable} under max-storage-fill {fill}; \
+             every partition needs at least {MIN_AGS_PER_PARTITION} (one for small records, one for extents), {need} in all: \
+             format with fewer partitions or larger devices"
+        ),
+    ))
 }
 
 /// A SCAN step's next cursor and the keys it found.

@@ -3907,12 +3907,13 @@ impl PartitionStore {
     }
 
     fn meta_requests(&mut self, cx: &mut StorageCtx<'_>) {
-        let mut kinds: SmallVec<[(AgKind, Option<u8>); 2]> = SmallVec::new();
+        let mut kinds: SmallVec<[crate::alloc::AgRequest; 2]> = SmallVec::new();
         self.core.alloc.take_ag_requests(&mut kinds);
-        for (kind, dev) in kinds {
+        for (kind, dev, spare) in kinds {
             let partition = self.core.cfg.id;
             let r = match dev {
                 Some(dev) => MetaReq::AcquireAgOn { partition, kind, dev },
+                None if spare => MetaReq::AcquireSpare { partition, kind },
                 None => MetaReq::AcquireAg { partition, kind },
             };
             self.core.meta_req(cx.meta, r, MetaWait::Ag(kind));

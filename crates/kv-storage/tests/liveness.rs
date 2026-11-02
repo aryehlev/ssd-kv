@@ -78,3 +78,45 @@ fn expiry_during_an_image_in_flight_does_not_revive_the_record() {
     }
     panic!("no seed put both keys on one page");
 }
+
+/// Spare AGs are a latency optimization (§11.1): on a device with room for two AGs per
+/// partition but not four, every partition must still get its first SMALL and its first EXTENT
+/// AG. Spares used to be granted first come, first served, and partitions that asked late got
+/// `-OOM` (and a one-second refusal latch) with the device almost empty.
+#[test]
+fn spare_ags_never_take_the_space_of_a_first_write() {
+    use kv_storage::layout::AG_PAGES;
+    // 64 partitions, 140 AGs (133 under the 0.95 fill limit): two per partition fit, four do not
+    let pages = 140 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 3);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 64, false, 0, 3).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    let mut parts = std::collections::BTreeSet::new();
+    for i in 0..1200u64 {
+        let k = format!("key:{i}");
+        parts.insert(db.eng.partition_of(k.as_bytes()));
+        let len = if i % 2 == 0 { 2048 + (i as usize * 37) % 14_000 } else { 1 + (i as usize * 13) % 300 };
+        match db.set(0, k.as_bytes(), &value(i, len), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+            }
+            Err(e) => panic!("write {i} ({len} bytes, partition {}): {e:?}", db.eng.partition_of(k.as_bytes())),
+        }
+    }
+    assert_eq!(parts.len(), 64, "every partition wrote");
+    let (used, total) = db.eng.meta().ag_usage();
+    assert!(used <= total, "{used} of {total}");
+    db.quiesce();
+}
+
+/// The capacity floor (two AGs per partition under the fill limit) is reported precisely.
+#[test]
+fn capacity_floor_is_reported() {
+    use kv_storage::layout::{AG_PAGES, DeviceLayout};
+    let small = DeviceLayout::compute(64 * u64::from(AG_PAGES), true, 0).unwrap();
+    let e = kv_storage::engine::check_capacity(&[small], 64, 0.95).unwrap_err();
+    assert!(e.to_string().contains("too small for 64 partitions"), "{e}");
+    assert!(kv_storage::engine::check_capacity(&[small], 16, 0.95).is_ok());
+}

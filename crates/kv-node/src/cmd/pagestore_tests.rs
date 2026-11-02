@@ -33,8 +33,9 @@ use super::testkit::{Model, show};
 use super::{Args, Handler, scan};
 use crate::runtime::xmsg::ExecEnv;
 
-/// Data file size: room for every partition's first AGs, extents and chunked values.
-const FILE_BYTES: u64 = 512 << 20;
+/// Data file size: room for every partition's first SMALL and EXTENT AGs (two 16 MiB AGs per
+/// partition under the fill limit, which `format` checks), extents and chunked values.
+const FILE_BYTES: u64 = 640 << 20;
 const PARTITIONS: u16 = 16;
 /// Driver iterations a request may take to become ready or written (a hang fails the test).
 const PUMP_LIMIT: usize = 20_000;

@@ -344,13 +344,20 @@ struct SpareSlot {
     spare: Option<AgId>,
     /// An `AcquireAg` should be sent.
     want: bool,
+    /// The wanted AG is needed now (a placement found no space), not a spare to keep ahead.
+    need: bool,
     /// The AG is wanted on this device (the chunks of a large value, LC-08).
     want_dev: Option<u8>,
     /// An `AcquireAg` is in flight.
     asked: bool,
     /// The last acquisition was refused (fill limit); retried after `RETRY_NS`.
     refused_at_ns: Option<u64>,
+    /// The request in flight is a spare request.
+    asked_spare: bool,
 }
+
+/// An AG request to send: `(kind, wanted device, spare)`.
+pub(crate) type AgRequest = (AgKind, Option<u8>, bool);
 
 const RETRY_NS: u64 = 1_000_000_000;
 
@@ -594,6 +601,7 @@ impl Alloc {
             slot.refused_at_ns = None;
         }
         slot.want = true;
+        slot.need = true;
         if dev.is_some() {
             slot.want_dev = dev;
         }
@@ -943,9 +951,11 @@ impl Alloc {
         }
     }
 
-    /// Kinds (and a wanted device, if any) to send `AcquireAg` for now. A spare on another
-    /// device than the one wanted does not stop a request for the wanted device.
-    pub(crate) fn take_ag_requests(&mut self, out: &mut SmallVec<[(AgKind, Option<u8>); 2]>) {
+    /// AG requests to send now: `(kind, wanted device, spare)`. A spare request (`spare`) only
+    /// keeps an AG ahead and may be denied without it counting as the fill limit; a request for
+    /// space a placement needs now is a plain `AcquireAg`. A spare on another device than the
+    /// one wanted does not stop a request for the wanted device.
+    pub(crate) fn take_ag_requests(&mut self, out: &mut SmallVec<[AgRequest; 2]>) {
         for (i, kind) in [(0, AgKind::Small), (1, AgKind::Extent)] {
             let s = &mut self.slots[i];
             let spare_ok = match (s.spare, s.want_dev) {
@@ -956,15 +966,20 @@ impl Alloc {
             if s.want && !s.asked && spare_ok && s.refused_at_ns.is_none() {
                 s.want = false;
                 s.asked = true;
-                out.push((kind, s.want_dev.take()));
+                let spare = !s.need && s.want_dev.is_none();
+                s.asked_spare = spare;
+                s.need = false;
+                out.push((kind, s.want_dev.take(), spare));
             }
         }
     }
 
-    /// The meta thread answered an `AcquireAg` of `kind`.
+    /// The meta thread answered an AG request of `kind`. A denied spare request is no
+    /// refusal: the next placement that needs space asks for an AG of its own.
     pub(crate) fn ag_granted(&mut self, kind: AgKind, ag: Option<AgId>, now_ns: u64) {
         let ki = kind_slot(kind);
         self.slots[ki].asked = false;
+        let spare = core::mem::take(&mut self.slots[ki].asked_spare);
         match ag {
             Some(ag) => {
                 // a spare already held (on another device) becomes an owned AG
@@ -980,6 +995,7 @@ impl Alloc {
                 }
                 self.slots[ki].refused_at_ns = None;
             }
+            None if spare => {}
             None => self.slots[ki].refused_at_ns = Some(now_ns.max(1)),
         }
     }
@@ -1235,16 +1251,28 @@ mod tests {
         assert_eq!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::NeedAg);
         let mut req = SmallVec::new();
         a.take_ag_requests(&mut req);
-        assert_eq!(req.as_slice(), &[(AgKind::Small, None)]);
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None, false)], "space needed now");
         req.clear();
         a.take_ag_requests(&mut req);
         assert!(req.is_empty(), "one request in flight");
+        assert!(a.ag_outstanding());
         a.ag_granted(AgKind::Small, Some(AgId { dev: 0, idx: 2 }), 0);
         assert!(matches!(a.place_small(100, &cache, 0, &|_| false), SmallPlace::Fresh(_)));
         a.take_ag_requests(&mut req);
-        assert_eq!(req.as_slice(), &[(AgKind::Small, None)], "consumed spare is replaced");
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None, true)], "consumed spare is replaced by a spare request");
+        // a denied spare is no fill-limit refusal: the next need asks again
         a.ag_granted(AgKind::Small, None, 10);
         assert!(!a.ag_pending(AgKind::Small));
+        for _ in 0..4095 {
+            assert!(matches!(a.place_small(4000, &cache, 20, &|_| false), SmallPlace::Fresh(_)));
+        }
+        assert_eq!(a.place_small(4000, &cache, 20, &|_| false), SmallPlace::NeedAg);
+        req.clear();
+        a.take_ag_requests(&mut req);
+        assert_eq!(req.as_slice(), &[(AgKind::Small, None, false)]);
+        // a refused need is the fill limit: -OOM until the retry interval passed
+        a.ag_granted(AgKind::Small, None, 30);
+        assert_eq!(a.place_small(4000, &cache, 40, &|_| false), SmallPlace::Full);
     }
 
     #[test]

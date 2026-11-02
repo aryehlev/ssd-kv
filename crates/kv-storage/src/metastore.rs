@@ -43,6 +43,10 @@ pub enum MetaReq {
     /// An AG on device `dev` (the chunks of a large value stay on their chunkmap's device,
     /// LC-08); refused when that device has no free AG.
     AcquireAgOn { partition: u16, kind: AgKind, dev: u8 },
+    /// A spare AG (§11.1): granted only while the pool keeps one AG of each kind for every
+    /// partition that owns none yet, so that spares never take the space a first write of
+    /// another partition needs. A denial (`Ag(None)`) is not a fill-limit refusal.
+    AcquireSpare { partition: u16, kind: AgKind },
     ReleaseAg { ag: AgId },
     PartitionMeta { m: PartitionMeta },
     NodeMeta { m: NodeMeta },
@@ -262,6 +266,8 @@ pub struct MetaCore {
     allocated: u64,
     total_ags: u64,
     max_fill: f32,
+    /// AGs owned per partition and kind (`[small, extent]`), from the AG table.
+    owned: Vec<[u32; 2]>,
     pmeta: Vec<Ab<PartitionMeta>>,
     nmeta: Ab<NodeMeta>,
     header: Ab<IntentHeader>,
@@ -281,6 +287,11 @@ pub struct MetaCore {
     owners: HashMap<u64, (u16, u64), foldhash::fast::FixedState>,
     last_clock_ms: u64,
     failed: Option<i32>,
+}
+
+/// Index of an allocated AG kind in [`MetaCore`]'s per-partition counts.
+fn kind_index(kind: AgKind) -> usize {
+    usize::from(kind == AgKind::Extent)
 }
 
 /// Replies of one cycle: `(partition, token, done)` in request order.
@@ -315,6 +326,7 @@ impl MetaCore {
         };
         let mut agt = Vec::with_capacity(n);
         let mut free = Vec::with_capacity(n);
+        let mut owned = vec![[0u32; 2]; usize::from(partitions)];
         let mut allocated = 0u64;
         let mut total = 0u64;
         for (d, l) in layouts.iter().enumerate() {
@@ -324,7 +336,7 @@ impl MetaCore {
                 let a = io.read(d as u8, DeviceLayout::ag_table_copy_page(blk, AbCopy::A) * PAGE as u64, PAGE)?;
                 let b = io.read(d as u8, DeviceLayout::ag_table_copy_page(blk, AbCopy::B) * PAGE as u64, PAGE)?;
                 let (c, s, t) = AgTableBlock::pick(blk, &a, &b).ok_or_else(|| bad(format!("device {d}: AG table block {blk}")))?;
-                for (i, &(kind, _)) in t.entries.iter().enumerate() {
+                for (i, &(kind, owner)) in t.entries.iter().enumerate() {
                     let ag = t.ag_of(i);
                     if ag >= l.n_ags {
                         continue;
@@ -333,6 +345,9 @@ impl MetaCore {
                         bits[(ag / 64) as usize] |= 1 << (ag % 64);
                     } else {
                         allocated += 1;
+                        if let Some(o) = owned.get_mut(usize::from(owner)) {
+                            o[kind_index(kind)] += 1;
+                        }
                     }
                 }
                 blocks.push(Ab::new(t, s, c));
@@ -369,6 +384,7 @@ impl MetaCore {
             agt,
             free,
             allocated,
+            owned,
             total_ags: total,
             max_fill: 0.95,
             pmeta,
@@ -430,6 +446,7 @@ impl MetaCore {
             let done = match m.req {
                 MetaReq::AcquireAg { partition, kind } => MetaDone::Ag(self.acquire(partition, kind, None)),
                 MetaReq::AcquireAgOn { partition, kind, dev } => MetaDone::Ag(self.acquire(partition, kind, Some(dev))),
+                MetaReq::AcquireSpare { partition, kind } => MetaDone::Ag(if self.spare_allowed(partition, kind) { self.acquire(partition, kind, None) } else { None }),
                 MetaReq::ReleaseAg { ag } => {
                     self.release(ag);
                     MetaDone::Ok
@@ -587,12 +604,37 @@ impl MetaCore {
         }
     }
 
+    /// AGs that may still be allocated under the fill limit (§11.6).
+    fn headroom(&self) -> u64 {
+        let limit = (f64::from(self.max_fill) * self.total_ags as f64).floor() as u64;
+        limit.saturating_sub(self.allocated)
+    }
+
+    /// True when granting a spare of `kind` to `partition` leaves an AG of each kind for every
+    /// partition that owns none of that kind yet (spares are a latency optimization, §11.1;
+    /// they must never turn another partition's first write into `-OOM`).
+    fn spare_allowed(&self, partition: u16, kind: AgKind) -> bool {
+        if kind == AgKind::Free || partition >= self.partitions {
+            return false;
+        }
+        let ki = kind_index(kind);
+        let mut reserve = 0u64;
+        for (p, o) in self.owned.iter().enumerate() {
+            for (k, &n) in o.iter().enumerate() {
+                if n == 0 && !(p == usize::from(partition) && k == ki) {
+                    reserve += 1;
+                }
+            }
+        }
+        self.headroom() > reserve
+    }
+
     fn acquire(&mut self, partition: u16, kind: AgKind, want_dev: Option<u8>) -> Option<AgId> {
         if kind == AgKind::Free || partition >= self.partitions {
             return None;
         }
         // fill limit (§11.6): an immediate refusal, never a wait
-        if (self.allocated + 1) as f64 > f64::from(self.max_fill) * self.total_ags as f64 {
+        if self.headroom() == 0 {
             return None;
         }
         // the device with the most free AGs; ties by a keyed draw (LC-01, LC-08)
@@ -622,6 +664,9 @@ impl MetaCore {
         let idx = self.pick.pick(DOMAIN_AG_PICK | u64::from(partition), &self.free[dev])? as u32;
         self.free[dev][(idx / 64) as usize] &= !(1 << (idx % 64));
         self.allocated += 1;
+        if let Some(o) = self.owned.get_mut(usize::from(partition)) {
+            o[kind_index(kind)] += 1;
+        }
         let (blk, e) = AgTableBlock::locate(idx);
         let b = &mut self.agt[dev][blk as usize];
         b.v.entries[e] = (kind, partition as u8);
@@ -635,6 +680,10 @@ impl MetaCore {
         let Some(b) = blocks.get_mut(blk as usize) else { return };
         if e >= b.v.entries.len() || b.v.entries[e].0 == AgKind::Free {
             return;
+        }
+        let (kind, owner) = b.v.entries[e];
+        if let Some(o) = self.owned.get_mut(usize::from(owner)) {
+            o[kind_index(kind)] = o[kind_index(kind)].saturating_sub(1);
         }
         b.v.entries[e] = (AgKind::Free, crate::agtable::OWNER_NONE);
         b.dirty = true;
@@ -929,6 +978,35 @@ mod tests {
         let got = (0..20).filter_map(|_| acquire(&mut core, &mut io, 0)).count();
         assert_eq!(got, 10, "half of 20 AGs");
         assert_eq!(core.ag_usage(), (10, 20));
+    }
+
+    #[test]
+    fn spares_keep_first_ags_for_every_partition() {
+        // 16 partitions, about 40 AGs: 32 of them are first AGs
+        let mut io = devs(40);
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        let ask = |core: &mut MetaCore, io: &mut OwnedDevs, req: MetaReq| match run(core, io, vec![MetaMsg::new(0, 1, req)])[0].2 {
+            MetaDone::Ag(a) => a,
+            other => panic!("{other:?}"),
+        };
+        // partition 0 takes its first SMALL and EXTENT AGs, then spares while headroom lasts
+        assert!(ask(&mut core, &mut io, MetaReq::AcquireAg { partition: 0, kind: AgKind::Small }).is_some());
+        assert!(ask(&mut core, &mut io, MetaReq::AcquireAg { partition: 0, kind: AgKind::Extent }).is_some());
+        let mut spares = 0;
+        while ask(&mut core, &mut io, MetaReq::AcquireSpare { partition: 0, kind: AgKind::Small }).is_some() {
+            spares += 1;
+        }
+        // the headroom left after the two taken, less 30 kept for the other 15 partitions' kinds
+        let (_, total) = core.ag_usage();
+        let limit = (f64::from(0.95f32) * total as f64).floor() as u64;
+        assert_eq!(spares, limit - 2 - 30);
+        // every other partition still gets both first AGs, even as "spares"
+        for p in 1..16u16 {
+            assert!(ask(&mut core, &mut io, MetaReq::AcquireSpare { partition: p, kind: AgKind::Small }).is_some(), "p{p} small");
+            assert!(ask(&mut core, &mut io, MetaReq::AcquireAg { partition: p, kind: AgKind::Extent }).is_some(), "p{p} extent");
+        }
+        assert_eq!(core.ag_usage().0, limit);
+        assert!(ask(&mut core, &mut io, MetaReq::AcquireAg { partition: 3, kind: AgKind::Small }).is_none(), "fill limit");
     }
 
     fn credits(r: &MetaReplies) -> u32 {

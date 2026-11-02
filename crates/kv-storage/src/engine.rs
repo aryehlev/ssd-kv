@@ -594,7 +594,7 @@ fn shutdown_devices(devs: &mut [&mut dyn BlockDevice], boot: &Boot, link: &Arc<S
     }
     cell.closed = true;
     let w = boot.snapshot_writer();
-    if !clean || !w.complete() {
+    if !clean || !w.complete() || cell.failed {
         // not drained: the next start takes the full scan (CLEAN stays unset)
         return Ok(());
     }

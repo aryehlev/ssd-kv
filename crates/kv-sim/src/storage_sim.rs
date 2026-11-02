@@ -2544,8 +2544,9 @@ impl<'c> Sim<'c> {
             // bytes as free space: an older expired copy may stay on media after the key is
             // written again. It loses to every newer copy in recovery and is dead once the
             // durable clock floor passes its deadline (at most one floor interval later); it
-            // is not one of the copies the third-copy rule bounds
-            let leftover = |c: &(u64, u64, bool, u64, Option<u64>)| c.0 != newest.0 && c.1 < newest.1 && c.4.is_some_and(|t| t <= now);
+            // is not one of the copies the third-copy rule bounds (in its own page either: its
+            // bytes are free space there until a placement reuses them)
+            let leftover = |c: &(u64, u64, bool, u64, Option<u64>)| c.1 < newest.1 && c.4.is_some_and(|t| t <= now);
             let counted: Vec<_> = at.iter().filter(|c| !leftover(c)).collect();
             let others_elsewhere = counted.iter().any(|c| c.0 != newest.0);
             let newest_expired = newest.4.is_some_and(|t| t <= now);
@@ -6165,6 +6166,315 @@ step cmd del 0 2,2
 step cmd set 0 8 574 - nx 0 0
 step cmd set 1 31 8278864 - - 0 0
 step crash kill sectors 7
+"#,
+    ),
+    (
+        "expired_unwritten_version_acked_before_older_copies_went",
+        r#"kv-sim storage case 1
+seed 6985
+fail I1 7 kill_-9-Process
+cfg partitions 16
+cfg devices 2
+cfg ags 22
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 49
+cfg groups 49
+cfg dbs 2
+cfg profile churn
+cfg steps 764
+cfg rounds 4
+cfg tick_permille 120
+cfg delay_max 200
+cfg late_pct 50
+cfg skip_pct 0
+cfg per_poll 1
+cfg shuffle 0
+cfg tick_ms 5
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 5 13 - nx 0 0
+step cmd set 0 5 2914 - - 0 0
+step cmd del 0 5
+step ticks 5
+step cmd set 0 5 2082 r10 - 0 0
+step ticks 5
+step cmd get 0 5
+step crash kill sectors 1
+"#,
+    ),
+    (
+        "expired_unwritten_extent_power_cut",
+        r#"kv-sim storage case 1
+seed 8885
+fail I1 17 power_cut-Power
+cfg partitions 16
+cfg devices 1
+cfg ags 41
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 15
+cfg groups 15
+cfg dbs 2
+cfg profile large
+cfg steps 311
+cfg rounds 4
+cfg tick_permille 120
+cfg delay_max 200
+cfg late_pct 38
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 1 11 3058 - - 1 0
+step cmd mset 1 7:18926
+step cmd del 1 11
+step ticks 1
+step cmd set 0 0 2162 r2150 - 0 0
+step cmd msetnx 0 9:11898958,9:785654
+step cmd set 0 14 9 r28250832 - 0 0
+step cmd append 1 0 10
+step cmd setrange 1 4 24 323
+step cmd mset 0 9:3290
+step cmd set 0 6 3891 r105 - 1 0
+step ticks 3
+step cmd set 0 9 3100 r1 - 0 0
+step cmd set 0 14 3787 - - 0 0
+step cmd expire 0 9 r4774 0
+step cmd append 0 7 15
+step ticks 4
+step crash power sectors 0
+"#,
+    ),
+    (
+        "relocated_record_resurrects_flushed_key",
+        r#"kv-sim storage case 1
+seed 1297
+fail RESULT 127 APPEND-result
+cfg partitions 16
+cfg devices 1
+cfg ags 38
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 8192
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 127
+cfg groups 25
+cfg dbs 2
+cfg profile mixed
+cfg steps 1148
+cfg rounds 2
+cfg tick_permille 40
+cfg delay_max 32
+cfg late_pct 12
+cfg skip_pct 0
+cfg per_poll 1
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd get 0 91
+step cmd set 0 73 1478 r148 - 1 1
+step cmd append 1 105 156
+step cmd set 0 39 24 - - 0 0
+step cmd setrange 0 28 313 242
+step cmd setrange 0 0 8386088 104
+step cmd set 0 32 2015551 r93 - 0 0
+step cmd set 0 10 823 past - 0 0
+step cmd expire 0 6 - 0
+step cmd setrange 0 121 424 204
+step cmd set 1 9 894 r3547 - 0 0
+step cmd set 0 10 1944 - - 0 0
+step cmd set 0 6 428 - - 0 0
+step cmd getdel 0 13
+step cmd get 0 29
+step cmd set 0 3 51 r177 - 0 0
+step cmd set 0 85 2503 - - 0 0
+step cmd get 0 11
+step cmd mset 0 1:19,26:1280,51:597
+step cmd set 0 27 27992 - - 0 0
+step cmd get 0 104
+step cmd get 0 91
+step cmd expire 0 68 - 1
+step cmd append 0 3 210
+step cmd getdel 0 10
+step cmd barrier
+step cmd rename 0 2 102 0
+step cmd set 0 79 278335 r4114 - 0 0
+step cmd del 1 5
+step cmd setrange 0 13 1020 410
+step cmd get 0 118
+step cmd set 1 64 451 r183 nx 0 0
+step cmd msetnx 0 11:3878879,86:29
+step cmd expire 0 5 r4953 0
+step cmd msetnx 0 7:1200,82:1091
+step ticks 56
+step cmd set 0 1 2841 r1765 - 0 0
+step cmd setrange 0 6 480 576
+step ticks 4
+step ticks 45
+step cmd get 0 28
+step cmd set 1 29 40419 - xx 0 0
+step cmd meta 0 34
+step cmd msetnx 1 0:751462,0:22
+step cmd mset 0 56:6592,31:1498,31:1493
+step cmd del 0 6,6,56
+step cmd get 0 109
+step cmd scan 0 0 10
+step cmd set 0 9 3719 r1594 - 0 0
+step cmd set 0 9 1343 - nx 0 0
+step cmd flush 0
+step cmd set 0 49 386 - - 0 0
+step cmd set 0 67 1035 - - 0 0
+step cmd rename 0 3 53 0
+step cmd mset 0 3:2547,3:28
+step cmd set 0 6 13 r161 - 0 0
+step cmd setrange 0 88 228 368
+step cmd expire 0 114 - 0
+step cmd set 1 80 29323 - - 0 0
+step cmd mset 0 8:2137,8:2021,58:19
+step cmd msetnx 0 8:123,8:10754056,58:20,58:1053
+step cmd set 0 10 367 - - 0 0
+step cmd get 0 21
+step cmd setrange 1 39 858 580
+step cmd set 0 9 366 - - 0 0
+step cmd getdel 0 7
+step ticks 25
+step cmd set 0 73 34248 - - 0 0
+step cmd set 0 123 330 r81625664 - 0 0
+step cmd append 0 13 198
+step cmd setrange 0 109 5488 561
+step cmd msetnx 0 13:1169,113:987,13:3169,38:500
+step cmd getdel 0 12
+step cmd set 1 14 252 - - 0 1
+step cmd get 0 21
+step cmd setrange 0 30 39415 346
+step cmd set 0 126 2028 - - 0 0
+step cmd set 0 14 293 - - 0 0
+step cmd setrange 0 1 907 455
+step cmd expire 0 56 - 0
+step cmd append 0 5 5
+step cmd scan 0 4 13
+step cmd mset 1 11:1270,111:281547,86:79,61:177
+step cmd expire 0 112 r2853 1
+step cmd set 1 126 400 - nx 0 0
+step cmd rename 0 71 46 1
+step cmd set 0 67 0 - - 0 1
+step cmd rename 1 9 59 0
+step cmd get 0 14
+step cmd append 0 12 160
+step cmd setrange 0 8 655 363
+step cmd set 0 1 1224 - - 1 0
+step cmd set 0 95 276 - - 0 0
+step ticks 6
+step cmd del 0 28,3
+step cmd del 0 4
+step cmd rename 0 5 80 0
+step cmd append 0 12 195
+step cmd set 0 1 17 - nx 0 0
+step cmd get 1 49
+step cmd set 0 101 2065 r68 - 0 0
+step clock 1290
+step cmd setrange 0 13 499 69
+step ticks 4
+step cmd set 0 4 12 - - 0 0
+step cmd del 0 115,40
+step cmd get 1 7
+step cmd get 1 7
+step cmd meta 0 8
+step cmd set 0 1 2216 - nx 0 0
+step ticks 8
+step cmd set 0 7 787 r827 nx 1 0
+step cmd set 0 10 11 r152 - 0 0
+step cmd set 0 14 1178 - - 0 0
+step cmd expire 0 121 - 0
+step cmd msetnx 0 8:744,8:41828,108:1176
+step cmd del 0 9,109
+step cmd msetnx 0 3:9519166,78:5
+step cmd copy 0 14 39 1
+step cmd flush 0
+step cmd set 0 82 2018 - - 0 1
+step cmd expire 0 103 r20 1
+step cmd get 0 105
+step cmd mset 0 102:534,77:1444,27:1146
+step cmd set 0 85 851 - nx 1 0
+step cmd set 1 3 1960 - - 0 0
+step cmd append 0 14 119
+"#,
+    ),
+    (
+        "snapshot_written_after_failed_cutoff",
+        r#"kv-sim storage case 1
+seed 4728
+fail I10 3 ioerr_clean_restart
+cfg partitions 64
+cfg devices 1
+cfg ags 150
+cfg lba 4096
+cfg page_mode atomic
+cfg atomic_unit 8192
+cfg cache wb
+cfg dsync 0
+cfg durability async
+cfg cache_bytes 67108864
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 31
+cfg groups 7
+cfg dbs 1
+cfg profile churn
+cfg steps 1315
+cfg rounds 5
+cfg tick_permille 450
+cfg delay_max 0
+cfg late_pct 24
+cfg skip_pct 10
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 2000
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd mset 0 24:0
+step ticks 1
+step cmd flush 0
+step clean
 "#,
     ),
 ];

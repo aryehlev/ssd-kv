@@ -194,6 +194,9 @@ pub(crate) struct SbCell {
     pub(crate) seq: u64,
     pub(crate) copy: AbCopy,
     pub(crate) closed: bool,
+    /// The meta store failed a write or flush: its metadata may be older than what the
+    /// partitions acted on, so no clean-shutdown snapshot may describe the node.
+    pub(crate) failed: bool,
 }
 
 pub(crate) struct SbLink {
@@ -204,7 +207,7 @@ static SB_LINKS: Mutex<Vec<([u8; 16], std::sync::Weak<SbLink>)>> = parking_lot::
 
 impl SbLink {
     pub(crate) fn new(sb: Superblock, seq: u64, copy: AbCopy) -> Arc<SbLink> {
-        Arc::new(SbLink { cell: Mutex::new(SbCell { sb, seq, copy, closed: false }) })
+        Arc::new(SbLink { cell: Mutex::new(SbCell { sb, seq, copy, closed: false, failed: false }) })
     }
 
     /// Makes `link` the shared superblock state of its set (engine open).
@@ -556,6 +559,7 @@ impl MetaCore {
             Err(e) => {
                 let errno = neg(&e);
                 self.failed = Some(errno);
+                self.link.cell.lock().failed = true;
                 for p in pending.iter_mut() {
                     if !matches!(p.2, MetaDone::Failed(_)) {
                         p.2 = MetaDone::Failed(errno);

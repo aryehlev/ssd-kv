@@ -2526,13 +2526,22 @@ impl PartitionStore {
                     return;
                 }
                 if matches!(self.core.ext.writes.get(&start).map(|w| w.state), Some(ExtState::Pending)) {
+                    // the expired version never reaches media: its writer's tickets complete
+                    // once the older copies it was to shadow are gone (D1, D2), like a delete
+                    // of a version never written. Resolved at once, an older copy still on
+                    // media came back after a crash although the write was acknowledged
                     let w = self.core.ext.writes.remove(&start).expect("present");
-                    for t in w.tickets {
-                        self.core.tickets.effect_resolved(t);
-                    }
+                    let seq = w.hdr.seq;
                     self.wake(w.waiters);
                     self.core.alloc.free_extent(start, w.hdr.n_pages);
                     self.cancel_chunks(start);
+                    if self.core.stale.count_older(s.db, &s.key, seq) == 0 {
+                        for t in w.tickets {
+                            self.core.tickets.effect_resolved(t);
+                        }
+                    } else {
+                        self.core.gone_wait.push((s.db, s.key.clone(), seq, w.tickets));
+                    }
                     return;
                 }
                 if !self.core.ext.zeros.contains_key(&start) {
@@ -4110,6 +4119,15 @@ impl PartitionStore {
     /// A staged record that does not fit its page moves to another one (§14.3). At most
     /// `RELOCATIONS_PER_TICK` moves happen per tick; the rest wait for the next one.
     fn relocate(&mut self, cx: &mut StorageCtx<'_>, from: PageId, rec: EncodedRecord) {
+        if self.core.cutoff.get(usize::from(rec.desc.db)).is_some_and(|&c| rec.desc.seq.0 < c) {
+            // staged before a FLUSHDB of its db: dead by the cutoff, nothing to move (moved,
+            // it was put back into the index the flush had dropped, and the flushed key was
+            // visible again)
+            for t in rec.tickets {
+                self.core.tickets.effect_resolved(t);
+            }
+            return;
+        }
         self.core.relocations += 1;
         if self.core.relocations > RELOCATIONS_PER_TICK {
             if let Some(st) = cx.cache.page_state_mut(from) {
@@ -4173,8 +4191,11 @@ impl PartitionStore {
         }
         self.stage_put(cx.cache, q, rec);
         if !marker {
-            let e = Entry { fp32: kh.fp32(), x8: kh.x8(), page36: q.to36(), kind: Kind::Small, vtype, sync_mark: false };
-            self.core.index_set_at(db, slot, kh, Some(from.to36()), e, expire);
+            // the entry names `from` (a staged version leaves its page only through this move)
+            if self.core.find_entry(db, slot, kh, from.to36()).is_some() {
+                let e = Entry { fp32: kh.fp32(), x8: kh.x8(), page36: q.to36(), kind: Kind::Small, vtype, sync_mark: false };
+                self.core.index_set_at(db, slot, kh, Some(from.to36()), e, expire);
+            }
         } else {
             self.core.stale.note_absent(db, &key, q, seq, txn);
         }
@@ -4631,6 +4652,13 @@ impl PartitionStore {
     /// partition still has work in flight (keep ticking), `true` once handed over.
     pub fn snapshot_section(&mut self, cx: &mut StorageCtx<'_>, w: &mut SnapshotWriter) -> bool {
         let _ = &cx;
+        // a partition that failed a write (read-only) holds RAM state its media may not have:
+        // it hands in no section, so the snapshot stays incomplete and the next start takes
+        // the full scan (a snapshot of it described flushed or written keys whose writes or
+        // cutoffs never became durable). Done as far as the caller's drain is concerned.
+        if self.core.failed.is_some() || self.core.state != PartState::Ready {
+            return true;
+        }
         if !self.is_quiescent() || !self.core.stale.is_empty() {
             return false;
         }

@@ -919,7 +919,6 @@ dependencies = [
  "kv-coord",
  "kv-ctrl",
  "kv-index",
- "kv-repl",
  "kv-storage",
  "kv-topo",
  "rand 0.9.5",

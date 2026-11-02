@@ -73,6 +73,10 @@ pub(crate) struct StaleEntry {
     pub(crate) older: bool,
     /// Seq of the tracked copy (the newest one at the location; `Seq::ZERO` = unknown).
     pub(crate) seq: Seq,
+    /// A delete (or an expiry with older copies) turned this source into a copy to zero: no
+    /// newer copy shadows it, so it is zeroed only once every older tracked copy of the key is
+    /// gone (D1, E9). Zeroed first, a crash could leave an older copy as the key's newest.
+    pub(crate) fenced: bool,
 }
 
 /// Owned map key: `(db, exact key bytes)`.
@@ -214,7 +218,7 @@ impl StaleCopies {
     /// Registers a copy of `(db, key)` with seq `seq` at `at` (no duplicate entries per
     /// location).
     pub(crate) fn add(&mut self, db: u8, key: &[u8], at: StaleRef, state: CopyState, seq: Seq) {
-        let entry = StaleEntry { at, state, foreground: false, older: false, seq };
+        let entry = StaleEntry { at, state, foreground: false, older: false, seq, fenced: false };
         match self.map.get_mut(&KeyRef { db, key }) {
             Some(list) => {
                 if let Some(e) = list.iter_mut().find(|e| e.at == at) {
@@ -283,7 +287,7 @@ impl StaleCopies {
     pub(crate) fn older_than_source_at(&self, db: u8, key: &[u8], at: PageId) -> bool {
         let list = self.get(db, key);
         let Some(here) = list.iter().find(|e| e.at.page() == at) else { return false };
-        here.state == CopyState::Source && list.iter().any(|e| e.at.page() != at && (e.seq < here.seq || e.seq == Seq::ZERO || here.seq == Seq::ZERO))
+        (here.state == CopyState::Source || here.fenced) && list.iter().any(|e| e.at.page() != at && (e.seq < here.seq || e.seq == Seq::ZERO || here.seq == Seq::ZERO))
     }
 
     /// Sets or clears the older-copy flag of the copy of `(db, key)` at `at`.
@@ -317,6 +321,10 @@ impl StaleCopies {
                 e.state = CopyState::Stale;
                 changed += 1;
             }
+            if e.fenced && e.seq < newer {
+                // shadowed by a durable newer copy: the order of the zeroings is free again
+                e.fenced = false;
+            }
         }
         (list.iter().filter(|e| e.state == CopyState::Stale).copied().collect(), changed)
     }
@@ -329,14 +337,26 @@ impl StaleCopies {
         }
         let Some(list) = self.map.get_mut(&KeyRef { db, key }) else { return SmallVec::new() };
         for e in list.iter_mut() {
-            if sources_too {
+            if sources_too && e.state == CopyState::Source {
                 e.state = CopyState::Stale;
+                e.fenced = true;
             }
             if e.state == CopyState::Stale {
                 e.foreground = true;
             }
         }
         list.clone()
+    }
+
+    /// True when the copy of `(db, key)` at `at` is fenced (a deleted key's newest copies) and
+    /// an older tracked copy of the key is still on media: its zeroing waits (D1).
+    pub(crate) fn fenced_by_older(&self, db: u8, key: &[u8], at: PageId) -> bool {
+        if self.entries == 0 {
+            return false;
+        }
+        let list = self.get(db, key);
+        let Some(here) = list.iter().find(|e| e.at.page() == at) else { return false };
+        here.fenced && list.iter().any(|e| e.at.page() != at && (e.seq < here.seq || e.seq == Seq::ZERO || here.seq == Seq::ZERO))
     }
 
     /// The zeroing of the copy at `at` is durable: forget it.

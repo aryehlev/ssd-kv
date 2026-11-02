@@ -442,6 +442,14 @@ impl MetaCore {
     /// Runs one cycle over `msgs` and returns the replies (in request order) after everything
     /// they depend on is durable. `now_ms` drives the clock floor (E13).
     pub fn process(&mut self, io: &mut dyn MetaIo, msgs: Vec<MetaMsg>, now_ms: u64, out: &mut MetaReplies) {
+        if let Some(errno) = self.failed {
+            // read-only after the first write or flush error: nothing is written any more. A
+            // cycle after a failed one wrote the other copy of a block whose last write was
+            // never flushed, so both copies were in flight at once and a power cut could leave
+            // neither readable (the engine then refused to open)
+            out.extend(msgs.into_iter().map(|m| (m.partition, m.token, MetaDone::Failed(errno))));
+            return;
+        }
         let mut pending: Vec<(u16, u64, MetaDone)> = Vec::with_capacity(msgs.len());
         let mut commits: SmallVec<[(usize, u64); 8]> = SmallVec::new();
         let mut sb_updates: SmallVec<[SbUpdate; 1]> = SmallVec::new();

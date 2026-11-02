@@ -5953,6 +5953,220 @@ step cmd expire 0 12 - 1
 step cmd setrange 0 34 778 573
 "#,
     ),
+    (
+        "meta_writes_after_a_failed_cycle_tear_both_copies",
+        r#"kv-sim storage case 1
+seed 1286
+fail RECOVER 3 ioerr_open
+cfg partitions 128
+cfg devices 1
+cfg ags 280
+cfg lba 4096
+cfg page_mode atomic
+cfg atomic_unit 8192
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 46
+cfg groups 46
+cfg dbs 1
+cfg profile churn
+cfg steps 973
+cfg rounds 2
+cfg tick_permille 120
+cfg delay_max 0
+cfg late_pct 41
+cfg skip_pct 0
+cfg per_poll 8
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 20000
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd mset 0 0:15452
+step cmd flush 0
+step ticks 2
+step crash power bytes 0
+"#,
+    ),
+    (
+        "deleted_key_newest_copy_zeroed_before_older",
+        r#"kv-sim storage case 1
+seed 2961
+fail I1 133 kill_-9-Process
+cfg partitions 16
+cfg devices 1
+cfg ags 38
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit 512
+cfg cache wb
+cfg dsync 0
+cfg durability async
+cfg cache_bytes 67108864
+cfg fill_pct 67
+cfg snapshot 0
+cfg keys 36
+cfg groups 36
+cfg dbs 3
+cfg profile full
+cfg steps 694
+cfg rounds 3
+cfg tick_permille 40
+cfg delay_max 32
+cfg late_pct 0
+cfg skip_pct 10
+cfg per_poll 2
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 1 1 698 - - 0 0
+step cmd getdel 1 15
+step cmd set 0 2 1289 - - 0 1
+step cmd set 0 2 1784434 r38399350 - 0 0
+step cmd rename 0 10 10 0
+step cmd set 2 2 928524 r190 - 0 0
+step cmd msetnx 0 10:60163,10:836316,10:63254
+step cmd del 0 0
+step cmd set 0 1 890950 r108 - 0 0
+step quiesce
+step cmd msetnx 0 2:60601,2:1576190
+step cmd get 0 18
+step cmd set 0 2 532 r4259 nx 0 0
+step clock 38
+step cmd meta 0 3
+step cmd set 0 34 270926 - nx 1 0
+step cmd mset 0 5:16792,5:4757,5:998724
+step cmd del 2 3
+step cmd set 2 6 8545 - - 1 0
+step cmd set 0 3 899755 - - 0 0
+step cmd set 0 1 665 - nx 0 0
+step cmd mset 0 3:668477,3:383702
+step cmd set 0 14 251089 - - 0 0
+step cmd set 1 25 1458 - - 0 0
+step cmd set 0 3 9295 r58863488 - 0 0
+step cmd set 0 13 488226 - - 0 0
+step cmd set 2 2 626726 - - 0 0
+step ticks 6
+step cmd del 0 8,8,8
+step cmd set 0 17 43959 r36372600 - 0 1
+step cmd set 2 9 877 - nx 0 0
+step cmd set 0 7 44485 r30042248 nx 0 0
+step ticks 7
+step cmd set 2 33 6116490 r1150 - 0 0
+step cmd set 2 1 971356 - - 1 0
+step cmd set 2 3 1918001 - - 0 0
+step cmd setrange 0 14 10911 25
+step cmd mset 0 12:519876,12:660295,12:824921,12:280476
+step cmd del 0 1
+step cmd get 0 0
+step cmd set 2 2 1476116 r23658041 nx 0 0
+step cmd del 2 1
+step cmd set 1 2 488963 - - 0 0
+step cmd set 1 2 61893 r2428 - 0 0
+step cmd set 0 1 432999 - - 0 0
+step cmd rename 2 34 34 0
+step cmd set 0 0 571830 - - 1 0
+step cmd del 0 3,3
+step cmd mset 0 19:693,19:208807
+step cmd mset 0 0:966444,0:19701,0:938439
+step cmd set 1 0 22526 r1934 - 0 0
+step cmd set 0 14 5613 - - 0 0
+step cmd set 1 0 16378 r785 - 0 0
+step cmd msetnx 2 25:726792,25:7515253
+step cmd append 0 9 72168
+step cmd del 2 0
+step cmd del 0 17,17
+step cmd setrange 1 35 122 526
+step cmd set 2 4 379904 - nx 0 0
+step cmd meta 0 1
+step cmd meta 1 16
+step cmd set 0 14 5890028 - - 0 0
+step cmd append 0 3 2
+step cmd getdel 0 2
+step cmd set 0 2 1276471 r16503204 - 0 0
+step cmd set 0 2 599565 - - 0 0
+step cmd scan 2 2 34
+step cmd setrange 1 4 344 448
+step cmd del 0 30,30
+step cmd set 0 2 103820 - - 0 0
+step cmd set 1 2 1154 - - 0 0
+step cmd append 0 3 75
+step cmd persist 0 1
+step cmd set 2 32 487838 - - 1 0
+step cmd del 0 30,30,30
+step cmd set 1 4 34940 r80942684 nx 0 0
+step cmd meta 2 1
+step cmd getdel 0 34
+step cmd set 0 3 1086 r21847721 - 0 0
+step cmd del 0 0,0,0
+step cmd mset 2 0:476653,0:234042,0:671178,0:14863
+step cmd set 1 16 643 past - 0 0
+step cmd msetnx 0 14:13359,14:574,14:57048
+step cmd msetnx 0 23:7626095,23:23575
+step cmd del 2 11,11,11
+step cmd set 0 30 803171 - - 0 0
+step cmd set 0 15 428 - - 0 0
+step cmd set 0 4 32367 - - 0 0
+step cmd set 0 25 33956 - - 0 0
+step cmd set 0 34 967532 r46194334 - 0 0
+step cmd set 0 27 110898 r40584661 - 0 0
+step cmd del 0 0
+step quiesce
+step cmd set 0 22 160792 - - 0 0
+step cmd del 0 3,3
+step cmd set 0 18 5681 - - 0 0
+step quiesce
+step ticks 3
+step cmd del 2 2,2,2
+step cmd del 0 27
+step cmd msetnx 2 24:943334,24:468653,24:32230,24:37784
+step cmd set 0 14 43469 - - 0 0
+step cmd append 0 11 39
+step ticks 59
+step cmd get 2 18
+step clock 1509
+step cmd set 0 3 1495 r206 - 0 1
+step cmd get 0 1
+step cmd set 0 1 33730 r2237 - 0 0
+step cmd set 2 32 923 r144 - 0 0
+step cmd append 1 1 211
+step quiesce
+step cmd set 0 20 41 r31621343 - 0 0
+step cmd del 0 17
+step cmd append 0 19 46558
+step cmd set 0 31 676669 r3167 - 0 0
+step cmd append 0 2 278
+step cmd set 0 3 849 r61980478 - 1 0
+step cmd getdel 2 33
+step cmd set 0 0 29554 r43919396 - 0 0
+step cmd append 0 3 190
+step cmd set 1 1 198 r74243069 - 0 0
+step cmd expire 0 2 - 1
+step cmd set 0 1 20444 r59360068 - 0 0
+step cmd mset 0 3:699347,3:63258,3:4121301
+step cmd set 0 29 66003 r163 - 1 0
+step cmd set 2 33 817801 past xx 0 0
+step ticks 5
+step cmd del 0 1
+step cmd del 0 3,3,3
+step cmd del 0 2,2
+step cmd set 0 8 574 - nx 0 0
+step cmd set 1 31 8278864 - - 0 0
+step crash kill sectors 7
+"#,
+    ),
 ];
 
 /// Replays a case text.

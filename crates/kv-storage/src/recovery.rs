@@ -706,12 +706,15 @@ fn finish_scan(p: &mut PartitionStore, cx: &mut StorageCtx<'_>, scan: &mut Scan)
                 c.iter().find(|c| c.entry.page36 == a.at.to36()).map(|c| (c.entry.kind, c.entry.x8))
             });
             p.core.index_remove_at(a.db, a.slot, a.kh, a.at.to36());
-            // an absent extent with no older copy: its run is free
+            // an absent (expired) extent with no older copy: its run is free once its first
+            // sector is zeroed. Freed with its header intact, a later recovery found it again:
+            // as a loser of the key's next version it was marked over whatever had been
+            // written into its run's tail meanwhile, and freed with it once zeroed
             if let Some((Kind::Extent | Kind::ChunkMap, x8)) = kind
                 && !a.reserved
                 && !p.core.ext.zeros.contains_key(&a.at)
             {
-                p.core.alloc.free_extent(a.at, class_pages(x8));
+                p.core.ext.zeros.insert(a.at, crate::partition::ExtZero::pending(class_pages(x8), ZeroWhy::Dead));
             }
         }
     }

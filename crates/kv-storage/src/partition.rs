@@ -863,7 +863,11 @@ impl BuildEnv for Env<'_> {
         self.core.stale.count_older_outside(db, key, self.page, seq)
     }
     fn tracked_here(&self, db: u8, key: &[u8]) -> Option<CopyState> {
-        self.core.stale.state_at(db, key, self.page)
+        match self.core.stale.state_at(db, key, self.page) {
+            // a deleted key's newest copy stays until its older copies are gone (D1)
+            Some(CopyState::Stale) if self.core.stale.fenced_by_older(db, key, self.page) => Some(CopyState::Source),
+            s => s,
+        }
     }
     fn tracked_keys(&self) -> SmallVec<[(u8, Box<[u8]>); 2]> {
         self.core.stale.keys_at(self.page)
@@ -3698,6 +3702,14 @@ impl PartitionStore {
     /// A tracked copy of `(db, key)` is durably gone.
     fn stale_gone(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8]) {
         self.resolve_gone(db, key, Seq::ZERO);
+        // the key's fenced copies (a delete's newest ones) may go now that an older one went
+        let fenced: SmallVec<[PageId; 1]> =
+            self.core.stale.get(db, key).iter().filter_map(|e| match e.at { StaleRef::Small { page } if e.fenced => Some(page), _ => None }).collect();
+        for page in fenced {
+            if !self.core.stale.fenced_by_older(db, key, page) {
+                self.ensure_scrub(cx, page);
+            }
+        }
         // effects deferred behind older copies are tried again
         let pages: Vec<PageId> = self.core.deferred.drain().collect();
         for p in pages {
@@ -4207,7 +4219,7 @@ impl PartitionStore {
                 if self.core.ext.writes.contains_key(&start) {
                     continue;
                 }
-                if let ZeroWhy::Delete { db, key, .. } = &self.core.ext.zeros[&start].why
+                if let ZeroWhy::Delete { db, key, .. } | ZeroWhy::Stale { db, key } = &self.core.ext.zeros[&start].why
                     && self.core.stale.older_than_source_at(*db, key, start)
                 {
                     // D1: the newest copy goes after the older ones

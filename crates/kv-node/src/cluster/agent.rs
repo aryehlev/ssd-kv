@@ -387,7 +387,16 @@ impl Agent {
                         self.send(*session, NodeToCoord::Error(NodeError::StaleAssignment));
                         continue;
                     }
-                    if self.current == Some(key) {
+                    // the same state version from the same leader term is acknowledged as it
+                    // is, unless its coordinator list differs: an operator peer-list change
+                    // moves no state version, and the new list must reach the MOVED targets
+                    // (a removed coordinator there would redirect clients to a closed port)
+                    if self.current == Some(key)
+                        && self
+                            .cs
+                            .assignment()
+                            .is_none_or(|c| c.coordinators == a.coordinators)
+                    {
                         self.send(*session, NodeToCoord::AssignAck { version: a.version });
                         continue;
                     }

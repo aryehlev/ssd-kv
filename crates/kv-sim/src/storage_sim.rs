@@ -6477,6 +6477,937 @@ step cmd flush 0
 step clean
 "#,
     ),
+    (
+        "reclaim_header_read_overtaken_by_reuse",
+        r#"kv-sim storage case 1
+seed 219
+fail ENGINE 892 GET-corrupt
+cfg partitions 128
+cfg devices 1
+cfg ags 260
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 1048576
+cfg fill_pct 85
+cfg snapshot 1
+cfg keys 30
+cfg groups 30
+cfg dbs 1
+cfg profile full
+cfg steps 1366
+cfg rounds 1
+cfg tick_permille 250
+cfg delay_max 32
+cfg late_pct 37
+cfg skip_pct 40
+cfg per_poll 8
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 14 1923376 r53 - 0 0
+step cmd set 0 0 1025 r123 - 0 0
+step ticks 3
+step ticks 2
+step ticks 3
+step cmd set 0 2 62245 - - 0 0
+step cmd flush 0
+step ticks 8
+step cmd set 0 1 113087 - - 0 0
+step ticks 17
+step cmd set 0 1 6771336 - - 0 0
+step cmd set 0 1 10241 - - 0 0
+step cmd set 0 25 50003 - xx 0 0
+step cmd append 0 0 197
+step cmd del 0 0,0,0
+step cmd del 0 26,26,26
+step cmd set 0 22 275819 - xx 0 0
+step ticks 8
+step ticks 6
+step cmd get 0 21
+step cmd append 0 18 20
+step ticks 8
+step cmd mset 0 16:7833701,16:785935,16:65473
+step ticks 44
+step cmd copy 0 2 2 0
+step cmd setrange 0 1 1138 79
+step cmd set 0 0 763 - - 0 0
+step ticks 5
+step cmd set 0 0 570911 r94 - 0 0
+step cmd del 0 0,0,0
+step cmd get 0 12
+step ticks 7
+step cmd del 0 1
+step ticks 4
+step ticks 1
+step cmd set 0 2 958430 - - 0 0
+step ticks 1
+step cmd get 0 21
+step cmd del 0 25
+step ticks 5
+step cmd set 0 25 7797667 r142 - 0 0
+step ticks 7
+step cmd expire 0 1 - 1
+step ticks 6
+step cmd expire 0 22 - 1
+step cmd del 0 26
+step ticks 23
+step cmd get 0 9
+step cmd mset 0 23:38211,23:750,23:11795,23:63788
+step cmd set 0 2 39757 r49963202 nx 0 0
+step cmd meta 0 1
+step ticks 5
+step ticks 36
+step ticks 4
+step cmd persist 0 23
+step cmd persist 0 2
+step ticks 2
+step cmd set 0 1 13205 r109 - 0 0
+step cmd set 0 2 451541 r1606 - 1 0
+step cmd set 0 2 109030 - - 0 0
+step cmd del 0 24,24,24
+step cmd set 0 16 5546217 - - 0 0
+step cmd rename 0 1 1 1
+step cmd del 0 1,1,1
+step ticks 5
+step cmd set 0 14 437474 - - 0 0
+step cmd append 0 2 14
+step ticks 8
+step ticks 30
+step cmd msetnx 0 2:192,2:830348,2:1156
+step cmd append 0 1 209
+step ticks 2
+step cmd append 0 5 77
+step cmd set 0 17 1007127 r82690878 - 0 0
+step ticks 5
+step ticks 12
+step cmd set 0 10 52042 past - 0 0
+step ticks 1
+step ticks 3
+step ticks 7
+step ticks 50
+step cmd append 0 1 258
+step cmd del 0 1,1,1
+step cmd del 0 19
+step ticks 4
+step cmd set 0 19 986 r2416 nx 0 0
+step ticks 5
+step cmd get 0 0
+step cmd msetnx 0 1:31401,1:30296,1:638011,1:583
+step cmd set 0 19 596994 r98 - 0 0
+step cmd set 0 15 643497 - - 0 0
+step cmd del 0 0,0,0
+step cmd set 0 27 791 - xx 0 0
+step cmd set 0 1 180 - nx 0 0
+step ticks 2
+step cmd setrange 0 26 898 393
+step cmd set 0 14 28413 - - 1 0
+step cmd expire 0 1 r99 0
+step cmd msetnx 0 13:120877,13:606950,13:60066,13:479
+step cmd setrange 0 15 237 471
+step cmd del 0 12,12,12
+step cmd set 0 24 447383 - - 0 0
+step ticks 4
+step cmd del 0 25,25
+step cmd del 0 2,2,2
+step cmd getdel 0 21
+step cmd del 0 13
+step cmd del 0 6,6
+step cmd persist 0 2
+step ticks 14
+step ticks 2
+step cmd set 0 2 930050 r102 - 0 0
+step cmd barrier
+step cmd set 0 1 671524 - - 0 0
+step cmd set 0 0 1418 - - 0 0
+step cmd setrange 0 29 1151 56
+step cmd del 0 0,0,0
+step cmd set 0 5 875 r64 - 0 0
+step cmd set 0 2 48198 - - 0 0
+step cmd set 0 0 191094 r4 - 0 0
+step cmd set 0 1 993 - - 0 0
+step ticks 3
+step cmd del 0 4,4,4
+step ticks 5
+step cmd set 0 27 8342164 - - 0 0
+step ticks 4
+step cmd set 0 26 753425 - - 0 0
+step cmd del 0 2,2,2
+step cmd get 0 19
+step cmd del 0 10,10
+step clock 33
+step cmd set 0 14 556474 r92 nx 0 0
+step ticks 2
+step ticks 17
+step cmd set 0 27 85668 - nx 0 0
+step cmd mset 0 21:199,21:1328,21:603
+step ticks 7
+step cmd get 0 2
+step ticks 3
+step cmd get 0 24
+step ticks 8
+step cmd get 0 1
+step cmd del 0 24
+step cmd setrange 0 9 316 442
+step ticks 5
+step cmd msetnx 0 5:1473,5:4425237,5:4873528
+step cmd expire 0 17 past 1
+step cmd set 0 0 434736 r4042 - 0 0
+step cmd set 0 6 4121774 - - 0 0
+step cmd del 0 15,15,15
+step ticks 19
+step cmd get 0 12
+step cmd set 0 13 330630 - nx 0 0
+step cmd expire 0 20 r317 0
+step cmd set 0 1 34315 r35322958 - 0 0
+step cmd set 0 1 15010 r152 - 0 1
+step ticks 6
+step ticks 2
+step ticks 26
+step cmd set 0 13 184 r1784 - 0 0
+step cmd set 0 26 651156 r168 - 0 0
+step cmd scan 0 14 16
+step ticks 6
+step cmd set 0 2 7165 - - 0 0
+step cmd mset 0 29:49888,29:4844926,29:246597
+step cmd barrier
+step cmd del 0 2
+step cmd set 0 22 9690 r34731646 - 1 0
+step cmd set 0 2 1301 - - 0 0
+step cmd append 0 28 272
+step ticks 8
+step ticks 53
+step cmd setrange 0 7 320 387
+step cmd get 0 4
+step cmd del 0 7
+step ticks 6
+step ticks 4
+step ticks 8
+step cmd set 0 13 46713 - - 0 0
+step ticks 43
+step ticks 25
+step cmd setrange 0 1 1038 521
+step cmd del 0 2
+step cmd scan 0 14 10
+step cmd del 0 1,1
+step clock 17
+step ticks 42
+step cmd getdel 0 11
+step cmd get 0 0
+step cmd getdel 0 1
+step cmd set 0 20 769051 - - 0 0
+step cmd getdel 0 1
+step ticks 6
+step cmd del 0 11,11,11
+step cmd expire 0 3 r152 1
+step cmd append 0 1 224
+step ticks 8
+step cmd get 0 2
+step cmd set 0 0 490018 r133 nx 0 0
+step cmd set 0 3 10057 - - 0 0
+step cmd get 0 0
+step cmd get 0 6
+step cmd msetnx 0 8:29060,8:465611,8:1326,8:841863
+step ticks 33
+step ticks 4
+step cmd mset 0 1:583355,1:618766,1:907217
+step ticks 2
+step cmd setrange 0 16 825 144
+step ticks 3
+step ticks 4
+step cmd expire 0 1 - 0
+step cmd get 0 22
+step cmd del 0 2
+step cmd set 0 27 268615 r103 xx 0 0
+step cmd rename 0 6 6 0
+step cmd set 0 0 938 - nx 0 0
+step cmd set 0 1 765530 r30140588 nx 0 0
+step ticks 6
+step cmd set 0 2 30968 past xx 1 0
+step ticks 3
+step cmd del 0 0,0,0
+step cmd del 0 0,0,0
+step ticks 57
+step cmd setrange 0 26 1173 173
+step cmd getdel 0 22
+step cmd msetnx 0 2:468,2:1003512,2:1035161,2:48102
+step cmd set 0 1 844 r98 - 1 0
+step cmd set 0 11 6426679 - - 0 0
+step ticks 25
+step cmd append 0 5 209
+step cmd meta 0 2
+step cmd set 0 23 386936 - - 0 0
+step cmd del 0 0,0
+step cmd get 0 0
+step ticks 4
+step cmd setrange 0 1 191 490
+step cmd get 0 20
+step ticks 6
+step cmd del 0 1,1,1
+step cmd append 0 0 271
+step cmd set 0 7 48423 - - 1 0
+step cmd set 0 2 585 r3442 - 0 0
+step cmd barrier
+step cmd del 0 0,0,0
+step cmd del 0 17
+step cmd set 0 27 730737 - - 0 0
+step cmd del 0 1,1,1
+step cmd set 0 18 117 r132 - 0 0
+step cmd del 0 23,23
+step cmd setrange 0 26 1000 440
+step cmd set 0 3 1466 r6449049 - 0 0
+step cmd set 0 4 321 r1409 - 1 0
+step ticks 2
+step cmd set 0 25 1448 - - 0 0
+step cmd set 0 23 4018216 r4668 - 0 0
+step cmd expire 0 6 - 0
+step cmd set 0 11 801 - - 1 0
+step ticks 7
+step cmd set 0 2 522564 r85 - 1 0
+step cmd barrier
+step cmd set 0 1 853799 - - 0 0
+step ticks 25
+step cmd set 0 0 439664 past - 0 0
+step ticks 55
+step cmd msetnx 0 2:1356,2:482714
+step cmd set 0 1 73295 r66 - 0 0
+step cmd set 0 26 52857 r151 - 0 0
+step cmd set 0 4 627 - - 0 0
+step ticks 6
+step ticks 7
+step cmd set 0 15 1450 past xx 0 0
+step cmd set 0 0 1342 - xx 0 0
+step ticks 5
+step ticks 4
+step cmd meta 0 1
+step cmd setrange 0 1 82 508
+step cmd set 0 22 788678 r33 - 0 0
+step ticks 8
+step ticks 31
+step cmd getdel 0 24
+step cmd append 0 10 164
+step cmd set 0 2 838195 - - 0 0
+step ticks 5
+step cmd del 0 4,4
+step cmd get 0 0
+step cmd getdel 0 20
+step cmd set 0 1 1341 - nx 0 0
+step cmd append 0 2 153
+step cmd set 0 1 526006 r54863387 - 1 0
+step cmd msetnx 0 2:241,2:22884,2:816946
+step cmd set 0 7 231197 r179 - 0 0
+step ticks 8
+step cmd append 0 2 22
+step ticks 3
+step ticks 6
+step cmd set 0 21 785440 - nx 0 0
+step ticks 43
+step cmd set 0 18 4112833 - xx 0 0
+step ticks 3
+step cmd set 0 0 39756 - - 0 0
+step ticks 5
+step cmd meta 0 0
+step cmd set 0 15 229706 r39 - 1 0
+step cmd append 0 9 162
+step cmd set 0 5 60751 - - 0 0
+step cmd get 0 1
+step cmd set 0 29 736200 - nx 0 0
+step cmd set 0 29 37709 - xx 0 0
+step cmd del 0 11,11,11
+step ticks 18
+step ticks 8
+step cmd set 0 20 248538 - - 0 0
+step cmd get 0 13
+step cmd persist 0 25
+step ticks 34
+step cmd set 0 1 62465 - - 0 0
+step cmd set 0 2 16582 - - 0 0
+step ticks 5
+step cmd set 0 1 1133 r4575 - 0 0
+step cmd del 0 13
+step cmd set 0 0 339497 - - 1 0
+step cmd rename 0 3 3 0
+step cmd set 0 2 1342464 r3029 - 0 0
+step ticks 4
+step cmd setrange 0 9 597 574
+step cmd del 0 1,1,1
+step ticks 1
+step cmd set 0 4 12408 r42 - 0 0
+step cmd set 0 5 423 - - 0 0
+step cmd del 0 14,14
+step cmd del 0 22,22,22
+step ticks 3
+step ticks 4
+step cmd del 0 25
+step cmd getdel 0 1
+step cmd set 0 23 614 r10675270 - 0 0
+step cmd set 0 3 701208 - nx 0 0
+step cmd set 0 2 7626 r193 - 0 0
+step cmd setrange 0 19 973 364
+step ticks 3
+step ticks 6
+step ticks 2
+step cmd set 0 28 59947 - - 0 0
+step cmd append 0 2 242
+step ticks 5
+step cmd get 0 20
+step ticks 6
+step cmd meta 0 0
+step cmd set 0 26 33018 - - 0 0
+step cmd del 0 0
+step ticks 6
+step cmd set 0 6 6017823 - - 0 0
+step cmd del 0 1,1,1
+step cmd del 0 2,2,2
+step cmd set 0 22 768651 r4905 - 0 0
+step cmd del 0 0
+step cmd expire 0 19 r13 0
+step cmd set 0 29 53127 past - 0 0
+step cmd getdel 0 29
+step cmd setrange 0 18 2187 40
+step cmd set 0 14 1004423 - - 0 0
+step ticks 2
+step ticks 6
+step ticks 1
+step cmd del 0 29
+step cmd del 0 0,0,0
+step cmd set 0 3 52132 r104 - 0 0
+step cmd set 0 17 978122 - - 0 0
+step cmd set 0 17 620627 r94 - 0 0
+step cmd copy 0 22 22 1
+step cmd set 0 1 595358 r4032 - 0 0
+step cmd set 0 2 118057 r170 - 0 0
+step cmd expire 0 1 - 0
+step ticks 1
+step cmd get 0 0
+step cmd get 0 5
+step cmd append 0 13 248
+step ticks 10
+step ticks 3
+step cmd del 0 29,29
+step cmd get 0 1
+step cmd set 0 1 923146 r159 - 0 0
+step cmd expire 0 1 - 0
+step cmd set 0 18 665338 past nx 0 1
+step cmd set 0 13 764 - - 0 0
+step ticks 2
+step ticks 59
+step cmd get 0 2
+step cmd set 0 26 274865 - - 0 0
+step cmd set 0 19 1486 r1038 - 1 0
+step cmd del 0 16
+step ticks 5
+step ticks 8
+step clock 29
+step ticks 5
+step cmd set 0 0 859 - - 1 0
+step cmd del 0 11,11,11
+step cmd get 0 10
+step cmd get 0 12
+step cmd set 0 0 894284 - - 0 0
+step cmd get 0 6
+step cmd get 0 16
+step ticks 4
+step cmd set 0 24 575 - - 0 0
+step cmd set 0 13 181101 - - 1 0
+step cmd set 0 21 430897 r1776 nx 1 0
+step cmd set 0 1 356362 - - 0 0
+step cmd del 0 25,25
+step ticks 1
+step ticks 7
+step cmd del 0 19,19,19
+step cmd set 0 1 2748299 - - 0 0
+step ticks 8
+step cmd del 0 20,20,20
+step cmd set 0 1 32415 - - 0 0
+step cmd msetnx 0 2:16494,2:507642,2:539,2:763266
+step ticks 6
+step cmd getdel 0 0
+step cmd mset 0 0:776057,0:826559,0:1493
+step ticks 7
+step cmd set 0 25 439130 r156 - 0 0
+step cmd del 0 17,17
+step cmd set 0 2 234704 r57 - 0 0
+step cmd set 0 1 47312 - - 0 1
+step cmd flush 0
+step cmd meta 0 16
+step ticks 3
+step ticks 14
+step cmd mset 0 26:312,26:19490,26:886570,26:15235
+step cmd del 0 0,0,0
+step cmd get 0 2
+step cmd msetnx 0 27:318,27:472094,27:21946
+step cmd get 0 9
+step cmd del 0 0,0
+step cmd del 0 2
+step cmd setrange 0 3 174 193
+step ticks 7
+step cmd set 0 2 63701 r766 - 0 0
+step cmd set 0 18 490905 - - 0 0
+step cmd set 0 4 550664 - - 0 0
+step ticks 3
+step ticks 7
+step cmd append 0 1 184
+step cmd set 0 1 28543 - - 0 0
+step ticks 1
+step ticks 31
+step cmd mset 0 2:7852,2:4005492
+step cmd del 0 1,1,1
+step cmd set 0 26 787165 - - 0 0
+step cmd del 0 2,2,2
+step cmd set 0 6 2974472 - - 1 0
+step cmd set 0 2 9827 - nx 0 0
+step cmd set 0 16 2338332 - nx 0 0
+step ticks 2
+step cmd rename 0 17 17 0
+step cmd get 0 16
+step cmd mset 0 3:34180,3:53863
+step cmd expire 0 2 - 0
+step cmd set 0 2 838326 - - 0 0
+step cmd set 0 14 246403 r124 - 0 0
+step cmd set 0 0 53 r32213187 - 0 0
+step cmd set 0 1 279826 r1424 nx 0 0
+step ticks 8
+step cmd get 0 0
+step cmd set 0 0 216487 - nx 0 0
+step cmd get 0 29
+step cmd append 0 21 22
+step cmd getdel 0 2
+step cmd append 0 7 274
+step ticks 5
+step cmd setrange 0 21 710 258
+step cmd setrange 0 28 1037 504
+step cmd set 0 19 561 - nx 0 0
+step cmd del 0 29
+step ticks 55
+step ticks 4
+step cmd del 0 1,1,1
+step ticks 5
+step cmd del 0 27,27
+step cmd set 0 1 527047 - xx 1 0
+step ticks 26
+step cmd getdel 0 5
+step cmd del 0 1,1
+step cmd set 0 9 9224 past - 0 0
+step ticks 3
+step cmd get 0 26
+step cmd copy 0 1 1 1
+step cmd get 0 2
+step cmd get 0 1
+step cmd set 0 0 102403 - nx 0 0
+step cmd del 0 0
+step cmd setrange 0 7 1059 315
+step cmd set 0 1 795427 - xx 0 0
+step ticks 57
+step cmd set 0 0 168 - - 0 0
+step cmd del 0 3,3,3
+step cmd setrange 0 6 941 247
+step cmd set 0 18 32286 past - 0 0
+step cmd meta 0 22
+step cmd get 0 18
+step cmd rename 0 21 21 0
+step cmd set 0 19 45560 - - 0 0
+step cmd expire 0 8 - 1
+step ticks 1
+step ticks 2
+step ticks 18
+step cmd del 0 4,4
+step cmd rename 0 1 1 1
+step cmd set 0 13 785042 - - 0 0
+step ticks 5
+step cmd rename 0 1 1 0
+step ticks 7
+step quiesce
+step cmd del 0 2,2
+step ticks 7
+step cmd set 0 0 1015145 - - 0 0
+step cmd set 0 2 161 - - 0 0
+step quiesce
+step cmd mset 0 15:879875,15:600447,15:752745
+step cmd set 0 2 433901 r121 - 0 0
+step cmd set 0 28 53970 r5716331 - 0 0
+step cmd set 0 20 348575 r4085 - 0 0
+step ticks 7
+step cmd del 0 19,19,19
+step cmd mset 0 19:436408,19:404743
+step cmd append 0 0 22
+step ticks 33
+step cmd rename 0 29 29 0
+step cmd rename 0 0 0 0
+step ticks 58
+step cmd set 0 17 502377 past - 0 0
+step cmd set 0 28 93593 - - 0 1
+step cmd del 0 1,1,1
+step ticks 2
+step cmd set 0 7 847699 r15096351 - 0 0
+step cmd append 0 11 82
+step cmd append 0 0 248
+step cmd rename 0 28 28 0
+step cmd get 0 10
+step cmd del 0 1,1
+step cmd set 0 1 852606 - - 0 0
+step cmd del 0 11,11,11
+step ticks 2
+step cmd mset 0 8:845,8:17120,8:14315,8:11038
+step cmd set 0 3 955 - xx 0 0
+step cmd setrange 0 0 25943 524
+step ticks 5
+step cmd set 0 15 41936 - - 0 0
+step cmd expire 0 7 - 1
+step cmd del 0 0,0,0
+step ticks 37
+step cmd del 0 1,1
+step cmd set 0 17 16304 - - 0 0
+step cmd del 0 1,1
+step ticks 8
+step cmd get 0 11
+step ticks 1
+step ticks 3
+step cmd get 0 0
+step ticks 43
+step cmd expire 0 15 r54 1
+step cmd expire 0 13 - 1
+step ticks 1
+step cmd set 0 24 626570 past - 0 0
+step cmd set 0 4 707 - - 0 0
+step ticks 45
+step cmd append 0 17 293
+step cmd set 0 21 332239 - - 0 0
+step cmd set 0 26 1430 - - 0 0
+step ticks 3
+step cmd set 0 20 151413 - - 0 0
+step ticks 43
+step ticks 7
+step cmd set 0 28 1193 - - 0 0
+step ticks 4
+step cmd get 0 1
+step ticks 8
+step ticks 3
+step ticks 5
+step cmd set 0 2 539910 - - 0 0
+step ticks 29
+step cmd get 0 8
+step ticks 7
+step cmd del 0 25,25,25
+step cmd rename 0 5 5 0
+step cmd set 0 4 4170587 r83 - 0 0
+step ticks 3
+step ticks 8
+step cmd expire 0 0 r37847088 0
+step ticks 6
+step cmd del 0 27
+step cmd set 0 0 14203 r3486 nx 0 0
+step ticks 7
+step cmd rename 0 0 0 0
+step cmd set 0 23 1231 - - 0 0
+step cmd set 0 23 878779 r42 - 1 0
+step ticks 3
+step ticks 2
+step cmd del 0 2
+step cmd set 0 2 7642167 - - 0 0
+step cmd set 0 16 1324814 r148 - 0 0
+step cmd append 0 9 208
+step cmd set 0 1 23227 - - 0 0
+step ticks 4
+step cmd set 0 1 561734 r3742 - 1 0
+step cmd del 0 0,0,0
+step cmd set 0 6 398264 r59629883 - 0 0
+step cmd rename 0 5 5 0
+step cmd meta 0 17
+step cmd set 0 23 52926 - - 0 0
+step ticks 6
+step cmd set 0 1 37285 - xx 1 0
+step ticks 7
+step ticks 5
+step ticks 38
+step cmd msetnx 0 21:1237,21:134565,21:1423,21:827590
+step cmd barrier
+step ticks 5
+step cmd mset 0 14:118,14:48621,14:702
+step cmd set 0 0 989795 - - 0 0
+step cmd getdel 0 14
+step ticks 16
+step cmd del 0 16
+step cmd del 0 17,17,17
+step cmd del 0 17,17
+step cmd del 0 2,2,2
+step cmd copy 0 5 5 1
+step cmd set 0 1 981682 - - 0 0
+step ticks 8
+step cmd rename 0 2 2 0
+step cmd set 0 5 353006 r2901 nx 0 0
+step cmd set 0 26 884677 - - 0 0
+step cmd setrange 0 28 19430 559
+step ticks 7
+step cmd set 0 7 32523 r117 - 0 0
+step cmd set 0 2 259 - - 0 0
+step cmd msetnx 0 1:29958,1:8518
+step cmd del 0 7,7,7
+step cmd set 0 0 967537 - - 0 0
+step cmd scan 0 53 12
+step cmd append 0 7 287
+step ticks 3
+step cmd del 0 28,28,28
+step ticks 5
+step cmd del 0 16,16,16
+step cmd setrange 0 2 37 387
+step cmd set 0 0 12140 r16804819 - 0 0
+step ticks 4
+step ticks 2
+step cmd flush 0
+step cmd get 0 6
+step cmd persist 0 0
+step ticks 2
+step cmd set 0 29 609934 - - 0 0
+step cmd copy 0 3 3 1
+step cmd set 0 10 289 - - 0 0
+step cmd setrange 0 1 280 580
+step ticks 5
+step cmd set 0 2 471 - - 0 0
+step cmd del 0 29
+step cmd msetnx 0 18:865340,18:28176
+step cmd set 0 28 120686 r3331 - 0 0
+step cmd del 0 17
+step cmd set 0 2 250400 - - 0 0
+step cmd scan 0 31 29
+step ticks 6
+step ticks 52
+step cmd meta 0 25
+step cmd del 0 2,2,2
+step cmd set 0 0 40993 r1417 - 0 0
+step cmd get 0 21
+step cmd msetnx 0 0:236,0:698971,0:53577
+step cmd del 0 3,3
+step cmd set 0 20 36603 - - 0 0
+step cmd set 0 10 1335833 - - 0 1
+step cmd del 0 13,13,13
+step cmd set 0 11 593303 r374 nx 0 0
+step cmd set 0 1 523052 - - 0 0
+step cmd set 0 19 578 - - 0 0
+step cmd set 0 25 8601 - - 0 0
+step cmd del 0 2,2,2
+step cmd set 0 7 882306 - - 1 0
+step clock 99201
+step cmd set 0 2 54830 - - 0 0
+step ticks 2
+step cmd set 0 2 509099 r173 - 0 0
+step ticks 3
+step cmd del 0 1,1,1
+step cmd set 0 0 51597 - - 0 0
+step cmd set 0 26 2369820 - - 0 0
+step cmd msetnx 0 2:431,2:33309,2:69736
+step ticks 1
+step ticks 1
+step cmd del 0 1,1
+step cmd set 0 1 188237 - xx 0 0
+step cmd set 0 13 471444 r63520701 - 0 0
+step ticks 6
+step cmd del 0 3,3,3
+step cmd msetnx 0 0:246641,0:5759275
+step cmd set 0 2 935813 - - 0 0
+step ticks 2
+step cmd msetnx 0 20:35400,20:1221
+step ticks 23
+step ticks 8
+step cmd del 0 26
+step cmd del 0 13,13,13
+step cmd append 0 4 191
+step cmd set 0 2 1443 - - 1 1
+step ticks 5
+step ticks 4
+step cmd get 0 1
+step cmd set 0 0 10374 r39 - 0 0
+step cmd set 0 10 416 r120 nx 0 0
+step cmd append 0 6 249
+step cmd msetnx 0 14:861,14:6449407,14:85849
+step cmd set 0 11 649047 - - 0 0
+step cmd set 0 0 359644 - - 0 0
+step cmd set 0 21 245252 - - 0 0
+step cmd set 0 10 631301 - - 0 0
+step cmd set 0 0 366781 - - 0 0
+step cmd mset 0 2:497636,2:41328,2:946460,2:569501
+step ticks 4
+step ticks 36
+step cmd set 0 1 302205 - - 1 0
+step cmd rename 0 2 2 0
+step cmd mset 0 0:13804,0:86314,0:388694
+step ticks 3
+step cmd del 0 2,2
+step ticks 41
+step cmd barrier
+step cmd set 0 2 48974 - - 0 0
+step cmd set 0 29 23047 r60711979 - 0 0
+step cmd meta 0 1
+step cmd get 0 24
+step ticks 4
+step cmd rename 0 0 0 0
+step cmd append 0 10 101
+step cmd getdel 0 3
+step cmd set 0 1 538582 - - 0 0
+step cmd msetnx 0 0:33305,0:1201578,0:858887
+step cmd del 0 0,0,0
+step cmd del 0 0
+step quiesce
+step cmd set 0 1 43072 r92 - 0 0
+step ticks 5
+step cmd append 0 4 33
+step ticks 8
+step cmd set 0 0 25358 - - 0 0
+step cmd expire 0 27 r4506 1
+step cmd set 0 2 427461 r1884 - 0 0
+step cmd msetnx 0 2:4114,2:457,2:956820,2:339385
+step cmd set 0 11 459193 r2091 - 0 0
+step cmd set 0 2 1215 r68595582 - 0 0
+step ticks 6
+step cmd del 0 6,6
+step cmd set 0 28 61897 - xx 0 0
+step ticks 2
+step cmd del 0 0
+step cmd del 0 28,28,28
+step cmd meta 0 1
+step cmd expire 0 2 past 1
+step cmd get 0 17
+step cmd set 0 18 11170 - - 0 0
+step ticks 3
+step cmd set 0 7 733693 - nx 0 0
+step cmd del 0 2
+step cmd del 0 14
+step ticks 3
+step cmd set 0 2 1034 - - 0 0
+step cmd set 0 1 494204 - nx 0 0
+step cmd del 0 0,0
+step cmd get 0 1
+step cmd set 0 0 35732 r3372 - 0 0
+step ticks 1
+step cmd set 0 2 599676 r6 - 0 0
+step cmd del 0 2,2
+step cmd scan 0 66 30
+step cmd set 0 12 313341 - - 0 0
+step cmd copy 0 29 29 1
+step cmd meta 0 7
+step cmd scan 0 6 26
+step cmd scan 0 57 11
+step ticks 5
+step ticks 7
+step ticks 12
+step ticks 1
+step cmd set 0 6 454420 - xx 0 1
+step ticks 7
+step cmd set 0 2 1478 r975 - 0 0
+step cmd set 0 0 14052 - - 0 0
+step cmd scan 0 92 1
+step cmd set 0 6 715998 past - 0 0
+step cmd set 0 1 550198 - - 0 0
+step cmd mset 0 17:1365,17:574679
+step ticks 28
+step ticks 19
+step ticks 6
+step ticks 4
+step cmd getdel 0 12
+step cmd set 0 0 3144231 - - 1 1
+step ticks 3
+step ticks 7
+step cmd del 0 5
+step cmd del 0 22,22,22
+step cmd get 0 0
+step ticks 5
+step ticks 43
+step cmd set 0 13 894676 r195 - 0 1
+step ticks 58
+step cmd del 0 1
+step cmd set 0 0 75949 r123 - 0 0
+step ticks 5
+step cmd del 0 25,25,25
+step cmd set 0 26 29234 - - 1 0
+step ticks 8
+step cmd append 0 9 254
+step ticks 9
+step cmd mset 0 2:89,2:103,2:562
+step cmd set 0 4 572265 - - 0 0
+step ticks 5
+step cmd append 0 3 220
+step cmd set 0 0 41414 - xx 0 0
+step ticks 27
+step cmd set 0 26 881 r17 nx 1 0
+step ticks 3
+step cmd set 0 22 990543 - - 0 0
+step cmd set 0 26 1012535 past - 0 0
+step cmd getdel 0 5
+step ticks 5
+step cmd del 0 25,25
+step ticks 2
+step ticks 4
+step cmd set 0 1 926 r18 - 1 0
+step cmd append 0 3 62
+step ticks 5
+step ticks 5
+step cmd msetnx 0 18:42775,18:267,18:1044281,18:362
+step cmd del 0 1,1
+step cmd set 0 17 768 r169 - 0 0
+step cmd set 0 2 8767 r57460389 - 0 0
+step ticks 2
+step ticks 6
+step cmd set 0 29 7619075 - xx 0 0
+step ticks 56
+step cmd mset 0 1:242313,1:208328,1:4711864
+step cmd setrange 0 1 14969 148
+step cmd get 0 1
+step cmd msetnx 0 12:85,12:52035
+step cmd del 0 2,2
+step cmd set 0 18 6584514 r2383 - 0 0
+step ticks 5
+step cmd mset 0 1:1370,1:52572,1:24046
+step cmd set 0 2 57414 r74 - 0 0
+step cmd set 0 27 2309092 - - 0 0
+step cmd set 0 25 621579 - nx 0 0
+step cmd get 0 0
+step cmd persist 0 2
+step ticks 7
+step cmd get 0 2
+step ticks 13
+step cmd set 0 6 884874 - - 1 0
+step ticks 7
+step cmd set 0 0 44624 - - 0 0
+step cmd set 0 23 6114595 r84415279 - 1 0
+step cmd set 0 0 851338 - - 0 0
+step cmd set 0 19 99487 - xx 0 0
+step ticks 3
+step cmd del 0 20,20
+step cmd set 0 0 4415 - - 0 0
+step cmd set 0 14 10600 - nx 0 0
+step clock 46
+step cmd append 0 1 204
+step cmd append 0 3 153
+step cmd set 0 0 5176 - - 0 0
+step cmd set 0 23 546 r1456 - 0 0
+step cmd set 0 16 1299 - - 0 0
+step ticks 8
+step cmd del 0 0,0,0
+step cmd set 0 1 24229 - - 0 0
+step cmd set 0 14 27345 r751 xx 0 0
+step cmd barrier
+step cmd flush 0
+step ticks 2
+step ticks 1
+step cmd mset 0 2:379512,2:1320
+step cmd append 0 11 237
+step cmd set 0 13 8229862 - - 0 0
+step cmd set 0 27 1026888 - nx 0 0
+step cmd scan 0 22 19
+step cmd expire 0 21 - 1
+step ticks 8
+step cmd mset 0 0:6197174,0:5547,0:481514,0:6469183
+step quiesce
+"#,
+    ),
 ];
 
 /// Replays a case text.

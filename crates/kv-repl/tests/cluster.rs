@@ -15,9 +15,13 @@
 //! * `migration_resume_prunes_keys_deleted_at_the_source`: a migration paused mid-copy leaves
 //!   an inert partial copy on the destination; keys deleted at the source meanwhile are never
 //!   served by the destination after `migrate resume` completes (the copy is a merge).
+//! * `a_removed_coordinator_is_never_a_moved_target`: after `kvadm coord remove` of a follower
+//!   the data nodes take the new coordinator list even when the push that carries it keeps
+//!   the state version they applied already (the SETPEERS sync commit can reach them first):
+//!   their MOVED replies never name the removed coordinator.
 //!
-//! The binaries are taken from `KVD_BIN` / `KVC_BIN`, else from the target directory of this
-//! test (`cargo build -p kv-node -p kv-coord` first). Every wait has a deadline and a watchdog
+//! The binaries are taken from `KVD_BIN` / `KVC_BIN` / `KVADM_BIN`, else from the target
+//! directory of this test (`cargo build -p kv-node -p kv-coord -p kvadm` first). Every wait has a deadline and a watchdog
 //! ends the process if a test runs far longer than it should: a hang fails, it never blocks.
 
 use std::io::{Read, Write};
@@ -1180,5 +1184,83 @@ fn migration_resume_prunes_keys_deleted_at_the_source() {
     verify_acked(&coords, &fresh);
     c.stop_node(1, 20);
     c.stop_node(0, 20);
+    c.ok = true;
+}
+
+/// The coordinator a data node's MOVED reply names for `key`, on one fresh connection.
+fn moved_target(node: SocketAddr, key: &str) -> Option<String> {
+    let mut conn = Conn::open(node).ok()?;
+    match conn.call_str(&["SET", key, "v"]).ok()? {
+        Value::Error(e) => String::from_utf8_lossy(&e)
+            .strip_prefix("MOVED ")
+            .and_then(|r| r.split_whitespace().nth(1))
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_removed_coordinator_is_never_a_moved_target() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("peers", 1, Duration::from_secs(180));
+    let n0 = c.nodes[0].id.clone();
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &n0]);
+    c.admin(&["SLOTS", "ASSIGN", "0-8191", "1"]);
+    c.wait_primary(0, 30);
+    // a key of a slot nobody serves: the node redirects it to a coordinator, chosen by its
+    // connection id among the pushed coordinator list
+    let key = (0..)
+        .map(|i| format!("m{i}"))
+        .find(|k| kv_common::key_slot(k.as_bytes()) >= 8192)
+        .unwrap();
+    let node = c.node_addr(0);
+    let targets = || -> Vec<String> { (0..12).filter_map(|_| moved_target(node, &key)).collect() };
+    // a follower is removed: the leader (and its coordinator term) stays, so the pushed
+    // assignment keeps its (coordinator term, state version) and only its coordinator list
+    // changes
+    let status = c.status();
+    let leader = (0..3)
+        .find(|i| status.contains(&format!("leader c{i}")))
+        .expect("a leader in kvadm status");
+    let gone = (0..3).find(|i| *i != leader).unwrap();
+    let removed = format!("127.0.0.1:{}", c.coords[gone].client);
+    wait_until("every coordinator named by MOVED", 10, || {
+        targets().contains(&removed)
+    });
+    // the operator removes it (no state transition follows)
+    let kvadm = bin("kvadm", "KVADM_BIN");
+    let mut args: Vec<String> = Vec::new();
+    for co in &c.coords {
+        args.push("--coord".into());
+        args.push(format!("127.0.0.1:{}", co.admin));
+    }
+    let gone_id = format!("c{gone}");
+    for w in ["--token", ADMIN, "coord", "remove", gone_id.as_str()] {
+        args.push(w.into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let out = Command::new(&kvadm).args(&args).output().unwrap();
+        if out.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "kvadm coord remove {gone_id}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    wait_until("the node drops the removed coordinator from MOVED", 10, || {
+        let t = targets();
+        t.len() >= 6 && !t.contains(&removed)
+    });
+    if let Some(mut ch) = c.coords[gone].child.take() {
+        let _ = ch.kill();
+        let _ = ch.wait();
+    }
+    // and keeps it out
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!targets().contains(&removed));
     c.ok = true;
 }

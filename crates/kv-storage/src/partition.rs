@@ -237,6 +237,8 @@ pub struct PartitionCounters {
     pub oldest_wait_ms: u64,
     /// Requests and tickets that ever stayed live for more than one second.
     pub stalled_total: u64,
+    /// Work of the active-expiry RAM sweep (hint positions and table visits), paced by time.
+    pub expire_sweep_work: u64,
     pub index_bytes: u64,
     pub alloc_state_bytes: u64,
     pub dirty_bytes: u64,
@@ -244,7 +246,8 @@ pub struct PartitionCounters {
 
 /// Seqs reserved per `seq_floor` write (§10.5).
 pub(crate) const SEQ_RESERVE: u64 = 1 << 24;
-/// Positions of the RAM expiry sweep per tick (§16.4).
+/// Positions of the RAM expiry sweep per tick at most (§16.4); the sweep is paced by time
+/// (`expire::SWEEP_PASS_NS`).
 const EXPIRY_BUDGET: usize = 64 * 1024;
 /// Empty tables a SCAN step walks past at most (§16.6).
 const SCAN_EMPTY_TABLES: u16 = 4096;
@@ -4014,11 +4017,26 @@ impl PartitionStore {
         if now_s >= self.core.expiry.hint_base_s + REBASE_PERIOD_S + 60 {
             self.rebase_hints(now_s.saturating_sub(60));
         }
-        let mut cands = core::mem::take(&mut self.core.scratch_pos);
-        let mut found: SmallVec<[(u8, u16, Entry); 8]> = SmallVec::new();
-        let mut budget = EXPIRY_BUDGET;
         let dbs = self.core.cfg.databases;
         let local = self.core.index.local_slots();
+        // paced by time (one pass per SWEEP_PASS_NS), never by the tick rate
+        let (ttl_keys, ttl_dbs) = (0..dbs).fold((0u64, 0u64), |(k, d), db| {
+            let n = self.core.index.expires(db);
+            (k + n, d + u64::from(n > 0))
+        });
+        if ttl_keys == 0 {
+            self.core.expiry.last_ns = cx.now.mono_ns;
+            self.core.expiry.credit = 0;
+            return;
+        }
+        let pass_cost = ttl_keys + ttl_dbs * u64::from(local);
+        let mut budget = self.core.expiry.earn(cx.now.mono_ns, pass_cost, EXPIRY_BUDGET as u64) as usize;
+        if budget == 0 {
+            return;
+        }
+        let earned = budget;
+        let mut cands = core::mem::take(&mut self.core.scratch_pos);
+        let mut found: SmallVec<[(u8, u16, Entry); 8]> = SmallVec::new();
         // tables visited per tick; dbs without TTL keys are skipped whole
         let mut tables = 0u32;
         while budget > 0 && tables < SWEEP_TABLES_PER_TICK {
@@ -4044,8 +4062,12 @@ impl PartitionStore {
             let resume = match self.core.index.table(db, slot) {
                 Some(t) if t.ttl_len() > 0 => {
                     cands.clear();
-                    let resume = t.expiry_candidates(sw.pos, budget.min(4096), now_lb, &mut cands);
-                    budget = budget.saturating_sub(4096);
+                    let step = budget.min(4096);
+                    let from_start = sw.pos == Pos::START;
+                    let resume = t.expiry_candidates(sw.pos, step, now_lb, &mut cands);
+                    // a whole small table costs about its TTL entries, a slice its budget
+                    let cost = if from_start && resume.is_end() { step.min(t.ttl_len() + 1) } else { step };
+                    budget = budget.saturating_sub(cost);
                     for &p in &cands {
                         if let Some((e, _)) = t.get(p) {
                             found.push((db, slot, e));
@@ -4075,6 +4097,8 @@ impl PartitionStore {
             }
         }
         self.core.scratch_pos = cands;
+        self.core.expiry.credit = budget as u64;
+        self.core.counters.expire_sweep_work += (earned - budget) as u64;
         let now_ns = cx.now.mono_ns;
         for (db, slot, e) in found {
             let page = PageId::from36(e.page36);

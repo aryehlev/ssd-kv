@@ -12,6 +12,11 @@
 //! Entries are the self-delimiting encodings of `codec` (`u32 len | u64 seq | ...`), stored
 //! back to back; an entry may wrap around the end of the ring. A group larger than the whole
 //! ring is not retained (it is counted as evicted at once).
+//!
+//! Coverage is a position test: the ring holds every group after its floor. A ring that was
+//! never told where its stream starts ([`Backlog::start_after`], [`Backlog::continue_after`])
+//! covers nothing: a fresh ring knows nothing about the groups produced before it existed, so
+//! it can never be taken as the key source of a Repair for a range it did not receive.
 
 use std::collections::VecDeque;
 
@@ -37,8 +42,8 @@ pub struct Backlog {
     first: Option<Seq>,
     last: Option<Seq>,
     /// Every group at or below this seq is gone (evicted, too large, or older than the
-    /// backlog itself).
-    floor: Seq,
+    /// backlog itself). `None`: the ring was never started and covers nothing.
+    floor: Option<Seq>,
     /// Retained groups.
     count: usize,
 }
@@ -77,7 +82,7 @@ impl Backlog {
             since_index: 0,
             first: None,
             last: None,
-            floor: Seq::ZERO,
+            floor: None,
             count: 0,
         })
     }
@@ -111,16 +116,42 @@ impl Backlog {
         self.ring.as_slice().as_ptr() as usize
     }
 
-    /// Declares that nothing at or below `s` will ever be held (a new primary's backlog starts
-    /// at its term's first seq: `start_after(Seq::new(term, 0))`).
+    /// Declares that nothing at or below `s` will ever be held and that every group after `s`
+    /// will be (a new primary's backlog starts at its term's first seq:
+    /// `start_after(Seq::new(term, 0))`). The first call starts the ring's coverage; later
+    /// calls only raise the floor.
     pub fn start_after(&mut self, s: Seq) {
-        self.floor = self.floor.max(s);
+        self.floor = Some(self.floor.map_or(s, |f| f.max(s)));
+    }
+
+    /// Whether the ring was started (before that it covers nothing).
+    pub fn is_started(&self) -> bool {
+        self.floor.is_some()
+    }
+
+    /// The position up to which the ring holds every group after its floor: the last group
+    /// retained or, if later, the floor (`None`: never started).
+    pub fn end(&self) -> Option<Seq> {
+        self.floor.map(|f| self.last.map_or(f, |l| l.max(f)))
+    }
+
+    /// A stream feeds the ring with the groups after `s` (a member's `Continue { from: s + 1
+    /// }`). When the ring does not already hold every group up to `s` (never started, or its
+    /// end is below `s`), the groups between its end and `s` were never received here: the
+    /// ring restarts after `s` instead of covering them. When it holds groups beyond `s`
+    /// (the member restarted the stream below what it had received), it is kept as it is and
+    /// [`Backlog::push_after_end`] skips the groups it already holds.
+    pub fn continue_after(&mut self, s: Seq) {
+        if self.end().is_none_or(|e| e < s) {
+            self.clear();
+            self.start_after(s);
+        }
     }
 
     /// Drops every retained group (a partition's stream restarts from scratch).
     pub fn clear(&mut self) {
-        if let Some(l) = self.last {
-            self.floor = self.floor.max(l);
+        if let (Some(l), Some(f)) = (self.last, self.floor) {
+            self.floor = Some(f.max(l));
         }
         self.head = 0;
         self.used = 0;
@@ -161,7 +192,7 @@ impl Backlog {
         self.head = (self.head + n) % self.capacity();
         self.used -= n;
         self.count -= 1;
-        self.floor = self.floor.max(seq);
+        self.floor = self.floor.map(|f| f.max(seq));
         while self.index.front().is_some_and(|&(s, _)| s <= seq) {
             self.index.pop_front();
         }
@@ -186,7 +217,7 @@ impl Backlog {
         if n > self.capacity() || codec::peek_len(encoded) != Some(n) {
             // never retained: every older group is unreachable through this backlog too
             self.clear();
-            self.floor = self.floor.max(seq);
+            self.floor = self.floor.map(|f| f.max(seq));
             self.last = Some(seq);
             return;
         }
@@ -208,6 +239,17 @@ impl Backlog {
         self.last = Some(seq);
     }
 
+    /// Stores one encoded group of a stream that may resend groups the ring already holds
+    /// (a member that redialed from its durable position): a group at or below the ring's
+    /// last seq is skipped. Returns whether it was stored.
+    pub fn push_after_end(&mut self, seq: Seq, encoded: &[u8]) -> bool {
+        if self.last.is_some_and(|l| seq <= l) {
+            return false;
+        }
+        self.push(seq, encoded);
+        true
+    }
+
     pub fn first(&self) -> Option<Seq> {
         self.first
     }
@@ -216,14 +258,16 @@ impl Backlog {
         self.last
     }
 
-    /// Every group at or below this seq is unavailable.
+    /// Every group at or below this seq is unavailable (`Seq(u64::MAX)` for a ring that was
+    /// never started: it covers nothing).
     pub fn floor(&self) -> Seq {
-        self.floor
+        self.floor.unwrap_or(Seq(u64::MAX))
     }
 
-    /// Whether every group after `s` is still retained.
+    /// Whether every group after `s` is still retained (never true for a ring that was not
+    /// started).
     pub fn covers_after(&self, s: Seq) -> bool {
-        s >= self.floor
+        self.floor.is_some_and(|f| s >= f)
     }
 
     /// Ring offset of the first retained group with seq > `s` (`None`: no such group).
@@ -403,9 +447,59 @@ mod tests {
         assert!(b.keys_between(Seq::new(1, 1), Seq::new(1, 199)).is_none());
     }
 
+    /// A ring that was never started covers nothing (a fresh received ring knows nothing about
+    /// the groups produced before it existed): it can never be taken as full coverage.
+    #[test]
+    fn a_ring_that_was_never_started_covers_nothing() {
+        let mut b = Backlog::new(4096);
+        assert!(!b.is_started());
+        assert_eq!(b.end(), None);
+        for s in [Seq::ZERO, Seq::new(1, 46), Seq(u64::MAX - 1)] {
+            assert!(!b.covers_after(s), "{s:?}");
+        }
+        assert!(b.keys_between(Seq::new(1, 46), Seq::new(3, 14)).is_none());
+        // groups pushed into it do not make it cover anything either
+        b.push(Seq::new(1, 1), &group(Seq::new(1, 1), b"a", 1));
+        assert!(!b.covers_after(Seq::ZERO));
+        b.start_after(Seq::new(2, 0));
+        assert!(b.covers_after(Seq::new(2, 0)) && !b.covers_after(Seq::new(1, 9)));
+        assert_eq!(b.end(), Some(Seq::new(2, 0)));
+    }
+
+    /// A stream continued from `s + 1`: the ring keeps its groups when it already reached `s`,
+    /// and restarts after `s` when the groups in between were never received here.
+    #[test]
+    fn continue_after_never_covers_a_gap() {
+        let mut b = Backlog::new(1 << 14);
+        b.continue_after(Seq::new(1, 49));
+        assert!(b.covers_after(Seq::new(1, 49)) && !b.covers_after(Seq::new(1, 10)));
+        for i in 50..=55 {
+            assert!(b.push_after_end(Seq::new(1, i), &group(Seq::new(1, i), b"k", 1)));
+        }
+        // redialed from a durable position below the ring's end: kept, resent groups skipped
+        b.continue_after(Seq::new(1, 52));
+        assert_eq!(
+            (b.first(), b.last()),
+            (Some(Seq::new(1, 50)), Some(Seq::new(1, 55)))
+        );
+        for i in 53..=57 {
+            let stored = b.push_after_end(Seq::new(1, i), &group(Seq::new(1, i), b"k", 1));
+            assert_eq!(stored, i > 55, "{i}");
+        }
+        assert_eq!(b.len(), 8);
+        assert!(b.keys_between(Seq::new(1, 49), Seq::new(1, 57)).is_some());
+        // a Continue after a gap: (1,57]..(1,80] were never received here
+        b.continue_after(Seq::new(1, 80));
+        assert!(b.is_empty());
+        assert!(!b.covers_after(Seq::new(1, 57)));
+        assert!(b.covers_after(Seq::new(1, 80)));
+        assert_eq!(b.end(), Some(Seq::new(1, 80)));
+    }
+
     #[test]
     fn oversize_groups_are_not_retained() {
         let mut b = Backlog::new(1024);
+        b.start_after(Seq::ZERO);
         b.push(Seq::new(1, 1), &group(Seq::new(1, 1), b"a", 10));
         b.push(Seq::new(1, 2), &group(Seq::new(1, 2), b"b", 5000));
         assert!(b.is_empty());

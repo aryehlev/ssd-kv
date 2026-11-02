@@ -13,7 +13,9 @@
 //!
 //! The decision reads only the handshake, the shard's committed history and the primary's two
 //! RAM rings; it never compares a lag or a ring size against a constant (LC-36): coverage is a
-//! position test (`seq >= floor`). A range whose groups hold a partition-wide op (`FlushDb`,
+//! position test (`seq >= floor`), and a ring that was never started covers nothing (a primary
+//! without a received ring of the term it took over refuses members behind its takeover point
+//! instead of repairing them with an empty key set). A range whose groups hold a partition-wide op (`FlushDb`,
 //! `FlushSlot`) cannot be described by keys and counts as not covered.
 
 use crate::Seq;
@@ -322,6 +324,27 @@ mod tests {
         assert!(matches!(
             decide(&h, &view(&r)),
             SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+    }
+
+    /// A primary that holds no received ring of the term it took over (it restarted, or it was
+    /// that term's primary) uses a ring that was never started: it covers nothing, so a member
+    /// behind the takeover point is refused rather than repaired with an empty key set (an
+    /// acknowledged write it never received would stay missing).
+    #[test]
+    fn a_received_ring_that_was_never_started_repairs_nothing() {
+        let r = Rings {
+            received: Backlog::new(4096),
+            ..rings()
+        };
+        assert!(matches!(
+            decide(&hello(2, Seq::new(2, 5)), &view(&r)),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+        // a member at or past the takeover point needs nothing from that ring
+        assert!(matches!(
+            decide(&hello(2, Seq::new(2, 8)), &view(&r)),
+            SyncDecision::Repair { .. }
         ));
     }
 

@@ -22,12 +22,17 @@
 //! Snapshot records are stamped `max(at, seq of the last FlushDb received during the walk)`, so
 //! a flush cutoff never hides a record written after it. Accepting a `Repair` or `Full` stream
 //! resets the received-groups ring to start after `at` (the ring then covers only groups this
-//! member really received; images and snapshot records are not groups).
+//! member really received; images and snapshot records are not groups). Accepting a
+//! `Continue { from }` keeps the ring only when it already holds every group up to `from - 1`;
+//! otherwise it restarts after `from - 1` ([`Backlog::continue_after`]), so the ring never
+//! covers the groups of a gap it did not receive (a fresh ring covers nothing at all). A member
+//! that redials from its durable position below the ring's end receives some groups again:
+//! they are applied again (idempotent) but not stored twice ([`Backlog::push_after_end`]).
 
 use std::collections::VecDeque;
 
 use crate::backlog::Backlog;
-use crate::codec;
+use crate::codec::{self, KeySet};
 use crate::frame::{AcceptMode, Frame, FrameError, ImageRec, Reassembly, RejectReason, SnapRec};
 use crate::{Group, Op, Seq};
 
@@ -59,6 +64,27 @@ pub enum MemberAction {
         mig: u64,
         last: Seq,
     },
+}
+
+/// Repair key set (a) (§23.7): the keys of this member's own groups after `takeover` (the
+/// point at which the primary of its last term was taken over), up to `upto` (the highest
+/// position the member's partition holds). Taken from the first of `rings` that holds every
+/// group in `(takeover, upto]`: started at or below `takeover` and reaching `upto`. `None` when
+/// no ring does (a ring that was never started, one that lost groups, or one that does not
+/// reach groups a previous process applied before a restart), or when such a group holds a
+/// partition-wide op a key set cannot describe: the member then lists the keys stored above
+/// `takeover` by walking its partition instead.
+pub fn own_keys_after(rings: &[&Backlog], takeover: Seq, upto: Seq) -> Option<KeySet> {
+    for ring in rings {
+        if !ring.covers_after(takeover) || ring.end().is_none_or(|e| e < upto) {
+            continue;
+        }
+        let mut ks = KeySet::default();
+        if ring.keys_between_into(takeover, Seq(u64::MAX), &mut ks) == Some(false) {
+            return Some(ks);
+        }
+    }
+    None
 }
 
 pub struct MemberStream {
@@ -175,6 +201,8 @@ impl MemberStream {
                     AcceptMode::Continue { from } => {
                         // groups from `from` follow; the member applied everything before it
                         self.applied = Seq(from.0.saturating_sub(1));
+                        // the ring covers this stream's groups only if it reached `from - 1`
+                        self.received.continue_after(self.applied);
                     }
                     AcceptMode::Repair { at } => {
                         // groups after `at` follow (interleaved with the images)
@@ -198,7 +226,9 @@ impl MemberStream {
                         continue;
                     }
                     let (group, _) = codec::decode_group(g).map_err(|_| FrameError::Malformed)?;
-                    self.received.push(seq, g);
+                    // a group the ring already holds (the stream restarted below its end) is
+                    // applied again but stored once
+                    self.received.push_after_end(seq, g);
                     self.applied = seq;
                     if matches!(self.mode, Some(AcceptMode::Full { .. }))
                         && group.ops.iter().any(|o| matches!(o, Op::FlushDb { .. }))
@@ -485,6 +515,119 @@ mod tests {
         // the ring restarted after `at`: it holds only the group received since
         assert_eq!(m.received().first(), Some(Seq::new(2, 8)));
         assert!(!m.received().covers_after(Seq::new(2, 4)));
+    }
+
+    fn puts(from: u64, to: u64) -> Frame {
+        let mut b = Vec::new();
+        for c in from..=to {
+            encode_group(
+                &Group {
+                    seq: Seq::new(1, c),
+                    ops: vec![Op::Put {
+                        db: 0,
+                        vtype: 1,
+                        expire_at: 0,
+                        key: format!("k{c}").into_bytes().into(),
+                        value: vec![1],
+                    }],
+                },
+                &mut b,
+            );
+        }
+        Frame::Groups(b)
+    }
+
+    fn run(m: &mut MemberStream, f: Frame) -> Vec<MemberAction> {
+        let a = m.on_frame(f).unwrap();
+        drain(m, a)
+    }
+
+    fn cont(from: Seq) -> Frame {
+        Frame::Accept {
+            term: 1,
+            mode: AcceptMode::Continue { from },
+        }
+    }
+
+    /// A member whose stream broke while some received groups were not durable yet redials
+    /// from its durable position: the Continue resends groups the ring holds; they are applied
+    /// again but stored once, in seq order.
+    #[test]
+    fn a_continue_below_the_ring_end_stores_each_group_once() {
+        let mut m = MemberStream::new(0, 1 << 14);
+        m.restart(Seq::new(1, 0), Seq::new(1, 0));
+        run(&mut m, cont(Seq::new(1, 1)));
+        run(&mut m, puts(1, 5));
+        m.restart(Seq::new(1, 2), Seq::new(1, 2));
+        run(&mut m, cont(Seq::new(1, 3)));
+        let acts = run(&mut m, puts(3, 6));
+        let applied = acts
+            .iter()
+            .filter(|a| matches!(a, MemberAction::Apply(_)))
+            .count();
+        assert_eq!(applied, 4, "resent groups are applied again (idempotent)");
+        assert_eq!(m.received().len(), 6);
+        assert_eq!(m.received().first(), Some(Seq::new(1, 1)));
+        assert_eq!(m.received().last(), Some(Seq::new(1, 6)));
+        assert!(
+            m.received()
+                .keys_between(Seq::new(1, 0), Seq::new(1, 6))
+                .is_some()
+        );
+    }
+
+    /// A ring fed by a `Continue { from }` never covers the groups before `from` that it did
+    /// not receive (the fresh-ring case and the gap after a missed range).
+    #[test]
+    fn a_continue_after_a_gap_never_covers_the_gap() {
+        let mut m = MemberStream::new(0, 1 << 14);
+        m.restart(Seq::new(1, 49), Seq::new(1, 49));
+        run(&mut m, cont(Seq::new(1, 50)));
+        run(&mut m, puts(50, 55));
+        assert!(
+            m.received()
+                .keys_between(Seq::new(1, 10), Seq::new(1, 55))
+                .is_none()
+        );
+        assert!(
+            m.received()
+                .keys_between(Seq::new(1, 49), Seq::new(1, 55))
+                .is_some()
+        );
+        // the stream breaks; the member misses (1,56)..(1,59) and continues from (1,60)
+        m.restart(Seq::new(1, 59), Seq::new(1, 59));
+        run(&mut m, cont(Seq::new(1, 60)));
+        run(&mut m, puts(60, 61));
+        let r = m.received();
+        assert!(r.keys_between(Seq::new(1, 49), Seq::new(1, 61)).is_none());
+        assert!(r.keys_between(Seq::new(1, 59), Seq::new(1, 61)).is_some());
+    }
+
+    #[test]
+    fn own_keys_come_from_a_ring_that_holds_the_whole_range() {
+        let mut m = MemberStream::new(0, 1 << 14);
+        m.restart(Seq::new(1, 9), Seq::new(1, 9));
+        run(&mut m, cont(Seq::new(1, 10)));
+        run(&mut m, puts(10, 14));
+        let fresh = Backlog::new(4096);
+        let r = m.received();
+        let keys = |k: KeySet| -> Vec<String> {
+            k.into_vec()
+                .into_iter()
+                .map(|(_, k)| String::from_utf8_lossy(&k).into_owned())
+                .collect()
+        };
+        // covered: (1,12]..(1,14]
+        let ks = own_keys_after(&[&fresh, r], Seq::new(1, 12), Seq::new(1, 14)).unwrap();
+        assert_eq!(keys(ks), ["k13", "k14"]);
+        // a fresh ring never answers; a takeover below the ring's floor is not covered
+        assert!(own_keys_after(&[&fresh], Seq::new(1, 12), Seq::new(1, 14)).is_none());
+        assert!(own_keys_after(&[r], Seq::new(1, 5), Seq::new(1, 14)).is_none());
+        // the partition holds more than the ring received (a previous process applied it)
+        assert!(own_keys_after(&[r], Seq::new(1, 12), Seq::new(1, 20)).is_none());
+        // nothing after the takeover point: an empty set
+        let ks = own_keys_after(&[r], Seq::new(1, 14), Seq::new(1, 14)).unwrap();
+        assert!(ks.is_empty());
     }
 
     #[test]

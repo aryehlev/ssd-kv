@@ -72,6 +72,26 @@ pub fn takeover(history: &[(u32, Vec<u64>)], term: u32, p: u16) -> Option<Seq> {
         .map(Seq)
 }
 
+/// The term before `term` in the shard's history and its takeover seq for partition `p`: the
+/// closing point of the term the current primary took over. Usually `term - 1`; a term raise
+/// (§23.12) skips the terms in between (no group carries them).
+pub fn prev_takeover(history: &[(u32, Vec<u64>)], term: u32, p: u16) -> Option<(u32, Seq)> {
+    history
+        .iter()
+        .filter(|(t, _)| *t < term)
+        .max_by_key(|(t, _)| *t)
+        .and_then(|(t, v)| v.get(usize::from(p)).map(|s| (*t, Seq(*s))))
+}
+
+/// A member whose handshake shows records of a term above the shard's `term` while its
+/// fence is not (it held another shard's data before, whose terms count separately, §23.2):
+/// the term its records reach. Such a member cannot sync at this term (every seq of the shard
+/// would sort below its records); the primary asks the coordinator to raise the shard's term
+/// above it (`TermRaise`) and refuses the handshake meanwhile.
+pub fn member_term_above(h: &Hello, term: u32) -> Option<u32> {
+    (h.fence_term <= term && h.last_term > term).then_some(h.last_term)
+}
+
 /// The seq the next group after `s` carries at the earliest (`from` of a `Continue`).
 fn after(s: Seq) -> Seq {
     Seq(s.0.saturating_add(1))
@@ -110,11 +130,7 @@ pub fn decide(h: &Hello, v: &PrimaryView<'_>) -> SyncDecision {
     let mut keys = KeySet::default();
     // (b) + (c): groups of earlier terms the member may lack, up to the end of the previous
     // term as this primary took it over; they are in this primary's received ring
-    let Some(prev_end) = v
-        .term
-        .checked_sub(1)
-        .and_then(|t| takeover(v.history, t, h.partition))
-    else {
+    let Some((_, prev_end)) = prev_takeover(v.history, v.term, h.partition) else {
         return SyncDecision::Reject(RejectReason::NeedOperatorResync);
     };
     if h.applied < prev_end {
@@ -389,5 +405,55 @@ mod tests {
         );
         assert_eq!(takeover(&r.history, 2, 3), Some(Seq::new(2, 8)));
         assert_eq!(takeover(&r.history, 1, 3), None);
+    }
+
+    /// After a term raise (the primary handed off to itself at a term past the next one,
+    /// §23.12) the previous term is the history's last term below the current one; a member
+    /// that brought records of a term above the shard's (from another shard) is told apart
+    /// from one that saw a newer term of this shard (its fence).
+    #[test]
+    fn a_raised_term_repairs_from_the_term_before_it() {
+        let mut r = rings();
+        r.history = vec![(1, vec![Seq::new(1, 3).0; 16]), (2, vec![Seq::new(2, 8).0; 16])];
+        let mut backlog = Backlog::new(1 << 16);
+        backlog.start_after(Seq::new(7, 0));
+        for i in 1..=2 {
+            let s = Seq::new(7, i);
+            backlog.push(s, &put(s, format!("new{i}").as_bytes()));
+        }
+        r.backlog = backlog;
+        let v = PrimaryView {
+            term: 7,
+            last_executed: Seq::new(7, 2),
+            ..view(&r)
+        };
+        assert_eq!(prev_takeover(&r.history, 7, 3), Some((2, Seq::new(2, 8))));
+        assert_eq!(prev_takeover(&r.history, 2, 3), Some((1, Seq::new(1, 3))));
+        assert_eq!(prev_takeover(&r.history, 1, 3), None);
+        match decide(&hello(2, Seq::new(2, 6)), &v) {
+            SyncDecision::Repair { at, primary_keys, .. } => {
+                assert_eq!(at, Seq::new(7, 2));
+                let mut keys: Vec<_> = primary_keys.into_iter().map(|(_, k)| k).collect();
+                keys.sort();
+                let want: Vec<Box<[u8]>> = ["new1", "new2", "old7", "old8"]
+                    .iter()
+                    .map(|k| k.as_bytes().into())
+                    .collect();
+                assert_eq!(keys, want);
+            }
+            _ => panic!("repair across the raised term"),
+        }
+        // a member whose records reach term 9 of another shard, fenced at this shard's term
+        let mut h = hello(9, Seq::new(9, 4));
+        h.fence_term = 7;
+        assert_eq!(member_term_above(&h, 7), Some(9));
+        assert!(matches!(
+            decide(&h, &v),
+            SyncDecision::Reject(RejectReason::StaleTerm)
+        ));
+        // a member that saw a newer term of this shard: this primary is superseded
+        h.fence_term = 9;
+        assert_eq!(member_term_above(&h, 7), None);
+        assert_eq!(member_term_above(&hello(7, Seq::new(7, 1)), 7), None);
     }
 }

@@ -1870,8 +1870,10 @@ For every command in cluster mode, before execution (and again at queue time ins
 2. Keys in more than one slot -> `-CROSSSLOT Keys in request don't hash to the same slot`.
 3. Primary, slot owned, lease valid, slot not sealed-out by a migration cutover -> execute. Writes when the committed
    ISR (including the primary) has fewer than `min_isr` members -> `-NOREPLICAS Not enough good replicas to write.`
-4. Replica, connection READONLY, read-only command, slot in the shard, lease valid, partition not in full sync ->
-   execute locally (no replication-state gate, LC-28).
+4. Replica, connection READONLY, read-only command, slot in the shard, lease valid, partition not in full sync, and
+   the replica's own committed member state (its projection carries its own member entry) neither Syncing (a learner,
+   which may still hold another shard's copy of these slots) nor NeedsFullSync -> execute locally (no
+   replication-state gate, LC-28).
 5. Slot in `incoming_pending_seal` (migration destination after cutover, before SEAL is committed) ->
    `-TRYAGAIN Multiple keys request during rehashing of slot`.
 6. Otherwise -> `-MOVED <slot> <coord_addrs[conn_id % n]>` from the pushed static coordinator list, never "the
@@ -1920,6 +1922,13 @@ RANDOMKEY), `slot_filter()`, which return decisions, not slot sets (lint, LC-24)
   4. Otherwise (including `recovered: SyncInterrupted`) -> `Reject{NeedOperatorResync}` (member state
      NeedsFullSync). Only `kvadm replica resync` or `replica add` can start a Full sync; no automatic path exists
      (LC-25).
+  Terms count per shard (§23.2). A node's fence term belongs to the shard of its role: an assignment in another shard
+  (a replica removed from one shard and added to another) starts the fence at that shard's term. Such a node's
+  records may carry a term above its new shard's (`last_term > term` while `fence_term <= term`); every seq of the
+  shard would sort below them, so the primary refuses the handshake (`StaleTerm`) and sends `TermRaise{shard, term,
+  above: last_term}`; the coordinator raises the shard's term to `above + 1` by a handoff of the primary to itself
+  (§23.12), after which the member syncs as above. "The previous term" of Repair is the history's last term below the
+  current one (a raise skips terms no group carries).
 * **Repair (cross-term catch-up, LC-29):** the primary never forwards groups produced in an earlier term by another
   primary. Key set = (a) keys of the member's own groups with seq in `(term_end[last_term][p], member max]` (from the
   member's backlog if it did not restart, else from its full-scan `maybe_divergent` set), sent as `REPAIR_KEYS`;
@@ -2083,7 +2092,11 @@ Versions are integers `(term, counter)`; there is no hybrid clock.
 of the shard with `-TRYAGAIN` (immediate error), waits until `commit_seq >= last executed seq` on every partition (a
 position barrier), relinquishes its lease and replies `HandoffDone{req, last: Vec<Seq>}`; coordinator commits
 `Promote{N, term+1, term_end = last}`, P becomes an InSync member and continues from N with no divergence. SIGTERM on a
-primary node triggers a handoff request first (same target rule).
+primary node triggers a handoff request first (same target rule). **Term raise:** on a primary's `TermRaise` (§23.7)
+the coordinator sends `Handoff{to: P}` to P itself; P reaches the same barrier but keeps its lease (writes answer
+`-TRYAGAIN` until the new assignment arrives, at most 2 s, then P serves its current term again) and the coordinator
+commits `Promote{P, new_term, term_end = last}` with the ISR and member states unchanged (the only promotion whose term
+may skip past `term + 1`).
 
 ### 23.13 Operator-initiated slot migration (`kv-repl/src/migrate.rs`, `kv-coord/src/migration.rs`)
 1. **Copy:** commit `Migration{id, slots, src A, dst B, phase Copy, rate_mbps}`; push `MigrateOut` to A's primary and

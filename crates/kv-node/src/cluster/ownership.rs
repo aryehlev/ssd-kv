@@ -7,7 +7,8 @@
 //! 3. primary, slot owned, lease valid, slot not sealed out by a migration cutover -> serve;
 //!    writes with a committed ISR below `min_isr` -> NOREPLICAS;
 //! 4. replica, READONLY connection, read-only command, slot in the shard, lease valid, partition
-//!    not in full sync -> serve locally (no replication-state gate, LC-28);
+//!    not in full sync, the replica's own committed member state neither Syncing (a learner)
+//!    nor NeedsFullSync -> serve locally (no replication-state gate, LC-28);
 //! 5. slot pending seal on a migration destination -> TRYAGAIN;
 //! 6. otherwise -> `-MOVED <slot> <coord_addrs[conn_id % n]>` from the pushed static coordinator
 //!    list: on one connection identical for every slot the node does not serve, apart from the
@@ -27,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use kv_cmd::CmdFlags;
 use kv_common::SlotSet;
-use kv_ctrl::{MigPhase, MigrationTask, NodeAssignment};
+use kv_ctrl::{MemberState, MigPhase, MigrationTask, NodeAssignment};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -64,6 +65,10 @@ pub struct Ownership {
     /// on either side would make the destination's copy disagree with what the source
     /// acknowledged.
     migrating: bool,
+    /// Replica: its own committed member state is neither Syncing (a learner whose merge full
+    /// sync has not finished, perhaps not even started: it may still hold another shard's
+    /// copy of these slots) nor NeedsFullSync (§23.7: never readable until synced).
+    readable: bool,
 }
 
 /// Decision of the gate.
@@ -115,6 +120,7 @@ impl Ownership {
             syncing: None,
             handoff: None,
             migrating: false,
+            readable: true,
         }
     }
 
@@ -182,6 +188,9 @@ impl Ownership {
         } else {
             o.role = Some(Role::Replica);
             o.isr_len = 1;
+            o.readable = !r.members.iter().any(|(n, st, _)| {
+                *n == a.node_id && matches!(st, MemberState::Syncing | MemberState::NeedsFullSync)
+            });
         }
         o
     }
@@ -259,6 +268,7 @@ impl Ownership {
             && flags.contains(CmdFlags::READONLY)
             && self.shard_slots.contains(slot)
             && lease_ok
+            && self.readable
             && !self.syncing(slot)
         {
             return Gate::Serve;
@@ -451,6 +461,29 @@ mod tests {
         );
         assert_eq!(o.gate(None, W, true, true, 0), Gate::ReadOnlyReplica);
         assert!(!o.is_primary());
+    }
+
+    /// A learner (`replica add`: Syncing until its merge full sync finishes, even before the
+    /// sync has started) and a member waiting for an operator resync are never readable: such
+    /// a node may still hold another shard's copy of the slots (keys deleted there since).
+    #[test]
+    fn learners_and_members_needing_resync_are_never_readable() {
+        for (st, readable) in [
+            (MemberState::Syncing, false),
+            (MemberState::NeedsFullSync, false),
+            (MemberState::InSync, true),
+            (MemberState::CatchingUp, true),
+            (MemberState::Reconciling, true),
+        ] {
+            let mut a = assignment(false, "0-99", Vec::new(), 0, 1);
+            a.role.as_mut().unwrap().members = vec![(a.node_id, st, false)];
+            let o = Ownership::from_assignment(&a);
+            let g = o.gate(Some(5), R, true, true, 0);
+            assert_eq!(g == Gate::Serve, readable, "{st:?}: {g:?}");
+            if !readable {
+                assert!(matches!(g, Gate::Moved(..)), "{st:?}");
+            }
+        }
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl std::error::Error for PushError {}
 /// Something a node told the leader on its own initiative.
 pub enum NodeEvent {
     /// `IsrShrink`, `IsrExpand`, `MemberReady`, `MigrationReady`, `SealDone`,
-    /// `MemberNeedsResync`, `HandoffRequest` from `from`.
+    /// `MemberNeedsResync`, `HandoffRequest`, `TermRaise` from `from`.
     Msg { from: NodeId, msg: NodeToCoord },
     /// A renewal (or handshake) came from a new process of `node`.
     NewIncarnation(NodeId),
@@ -589,7 +589,8 @@ impl Pusher {
             | NodeToCoord::MigrationReady { .. }
             | NodeToCoord::SealDone { .. }
             | NodeToCoord::MemberNeedsResync { .. }
-            | NodeToCoord::HandoffRequest { .. }) => {
+            | NodeToCoord::HandoffRequest { .. }
+            | NodeToCoord::TermRaise { .. }) => {
                 let _ = self.events.send(NodeEvent::Msg { from: node, msg: m });
                 None
             }

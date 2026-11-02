@@ -289,6 +289,52 @@ pub async fn run_handoff(
     Ok(target)
 }
 
+/// Raises `shard`'s term from `term` to `new_term` by a graceful handoff of its primary to
+/// itself (§23.12): a member brought records of a term above the shard's from another shard
+/// (terms count per shard, §23.2), which every seq of the shard's current term would sort
+/// below. The primary answers new writes with TRYAGAIN, reaches its position barrier and
+/// keeps its lease; the coordinator commits `Promote { same primary, new_term, term_end = its
+/// barrier positions }` with the ISR and member states unchanged.
+pub async fn run_term_raise(
+    wsr: Arc<Wsr>,
+    push: Arc<Pusher>,
+    shard: ShardId,
+    term: u32,
+    new_term: u32,
+) -> Result<(), FailoverError> {
+    if !wsr.is_leader() {
+        return Err(FailoverError::NotLeader);
+    }
+    let s = wsr.committed();
+    let sh = s.shard(shard).ok_or(FailoverError::UnknownShard)?;
+    let Some(p) = sh.primary.filter(|_| sh.status == ShardStatus::Serving && sh.term == term)
+    else {
+        return Err(FailoverError::Superseded);
+    };
+    if new_term <= term {
+        return Err(FailoverError::Superseded);
+    }
+    let req = push.next_req();
+    let last = match push
+        .request(&p, CoordToNode::Handoff { req, shard, to: p }, HANDOFF_TIMEOUT)
+        .await
+    {
+        Ok(NodeToCoord::HandoffDone { req: r, last }) if r == req => last,
+        _ => return Err(FailoverError::HandoffTimeout),
+    };
+    let s = wsr.committed();
+    let sh = s.shard(shard).ok_or(FailoverError::UnknownShard)?;
+    if sh.term != term || sh.primary != Some(p) || sh.status != ShardStatus::Serving {
+        return Err(FailoverError::Superseded);
+    }
+    let t = s
+        .term_raise_promote(shard, new_term, last)
+        .map_err(|e| FailoverError::Propose(ProposeError::Rejected(e)))?;
+    wsr.propose(vec![t]).await.map_err(FailoverError::Propose)?;
+    tracing::info!(shard = shard.0, term = new_term, "term raise committed");
+    Ok(())
+}
+
 /// Test fixtures shared by the module tests (the operator's static priority field lives here
 /// and in admin.rs only, LC-14).
 #[cfg(test)]

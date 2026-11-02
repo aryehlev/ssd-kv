@@ -1798,19 +1798,17 @@ impl Node {
                     // which coverage test failed (the same tests `sync::decide` makes)
                     let start = Seq::new(term, 0);
                     let at = last_exec.max(start);
+                    let prev_end = sync::prev_takeover(&history, term, p).map(|(_, s)| s);
                     let why = if h.recovered == Recovered::SyncInterrupted {
                         0
                     } else if h.last_term == term {
                         1
-                    } else if sync::takeover(&history, term - 1, p).is_none() {
+                    } else if prev_end.is_none() {
                         2
-                    } else if h.applied < sync::takeover(&history, term - 1, p).unwrap_or(Seq::ZERO)
+                    } else if h.applied < prev_end.unwrap_or(Seq::ZERO)
                         && pp
                             .prev_received
-                            .keys_between(
-                                h.applied,
-                                sync::takeover(&history, term - 1, p).unwrap_or(Seq::ZERO),
-                            )
+                            .keys_between(h.applied, prev_end.unwrap_or(Seq::ZERO))
                             .is_none()
                     {
                         3

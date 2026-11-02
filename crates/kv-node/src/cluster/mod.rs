@@ -143,6 +143,9 @@ pub enum AgentMsg {
     /// Primary: `member`'s handshake was refused with NeedOperatorResync (it cannot catch up
     /// by Continue or Repair).
     NeedsResync { shard: u16, term: u32, member: NodeId },
+    /// Primary: a member's handshake shows records of term `above`, beyond the shard's `term`
+    /// (it held another shard's data before): the shard's term must be raised past it.
+    TermRaise { shard: u16, term: u32, above: u32 },
 }
 
 /// Node-wide cluster state (one per process, cluster mode only).
@@ -310,8 +313,32 @@ impl ExpandGate {
 pub struct Identity {
     pub cluster_id: Option<[u8; 16]>,
     pub node_id: Option<NodeId>,
+    /// The fence term of `fence_shard` (§23.10): frames and peers of a lower term of that
+    /// shard are refused.
     pub fence_term: u32,
+    /// The shard the fence term counts in: the shard of the last persisted assignment
+    /// (`SHARD_NONE` without a role). Terms are counters of one shard (§23.2).
+    pub fence_shard: u16,
     pub version: u64,
+}
+
+/// The fence `(shard, term)` after an assignment with `role` is persisted over the fence
+/// `(fence_shard, fence_term)`. Terms count per shard (§23.2): a role in the shard the fence
+/// counts in keeps the highest term seen; a role in another shard (a replica removed from one
+/// shard and added to another) starts from that shard's term, since the old shard's term says
+/// nothing about the new shard's frames (a fence above them would refuse every handshake of
+/// the new shard and drop its primary's replies); without a role nothing is fenced. The fence
+/// never goes below the role's term, so only current-term frames of the shard are accepted.
+pub fn fence_after(
+    fence_shard: u16,
+    fence_term: u32,
+    role: Option<&kv_ctrl::ShardRole>,
+) -> (u16, u32) {
+    match role {
+        Some(r) if r.shard.0 == fence_shard => (fence_shard, fence_term.max(r.term)),
+        Some(r) => (r.shard.0, r.term),
+        None => (kv_storage::pmeta::SHARD_NONE, 0),
+    }
 }
 
 impl ClusterShared {
@@ -324,6 +351,7 @@ impl ClusterShared {
             cluster_id: joined.then_some(boot.node.cluster_id),
             node_id: joined.then_some(NodeId(boot.node.node_id)),
             fence_term: boot.node.fence_term,
+            fence_shard: boot.node.shard,
             version: boot.node.assignment_version,
         };
         ClusterShared {
@@ -355,7 +383,10 @@ impl ClusterShared {
     /// restart (see [`ClusterShared::restart_term`]).
     pub fn refuses_primary(&self, a: &NodeAssignment) -> bool {
         match (self.restart_term, a.role.as_ref()) {
-            (Some(rt), Some(r)) => r.is_primary && r.term <= rt,
+            // the term served before counts in the shard it was served in
+            (Some(rt), Some(r)) => {
+                r.is_primary && r.shard.0 == self.boot.node.shard && r.term <= rt
+            }
             _ => false,
         }
     }
@@ -561,6 +592,7 @@ mod tests {
         boot.clean = clean;
         boot.node.node_id = [4; 20];
         boot.node.role = role;
+        boot.node.shard = 1;
         boot.node.fence_term = fence_term;
         ClusterShared::new(boot, MetaClient::disconnected(), b"t".to_vec(), 4)
     }
@@ -578,6 +610,12 @@ mod tests {
         assert!(cs.refuses_primary(&assignment(true, 4)));
         assert!(!cs.refuses_primary(&assignment(true, 6)), "a promotion to a newer term");
         assert!(!cs.refuses_primary(&assignment(false, 5)), "member of the same term");
+        let mut other = assignment(true, 3);
+        other.role.as_mut().unwrap().shard = kv_ctrl::ShardId(2);
+        assert!(
+            !cs.refuses_primary(&other),
+            "a term of another shard says nothing about what it served"
+        );
         let clean = shared_after(true, ROLE_PRIMARY, 5);
         assert_eq!(clean.restart_term, None);
         assert!(!clean.refusing_primary.load(Ordering::Acquire));
@@ -588,6 +626,35 @@ mod tests {
         assert_eq!(replica.restart_term, None);
         assert!(!replica.refusing_primary.load(Ordering::Acquire));
         assert!(!replica.refuses_primary(&assignment(true, 5)));
+    }
+
+    /// Terms count per shard: a node removed from a shard of a high term and added to a
+    /// shard of a lower term takes the new shard's term as its fence (a fence above it would
+    /// refuse every handshake with the new primary and drop its replies); within one shard the
+    /// fence only grows; without a role nothing is fenced.
+    #[test]
+    fn fence_counts_in_the_shard_of_the_role() {
+        fn role(shard: u16, term: u32) -> kv_ctrl::ShardRole {
+            assignment(false, term)
+                .role
+                .map(|mut r| {
+                    r.shard = kv_ctrl::ShardId(shard);
+                    r
+                })
+                .unwrap()
+        }
+        assert_eq!(fence_after(1, 3, Some(&role(1, 2))), (1, 3), "never lowered");
+        assert_eq!(fence_after(1, 3, Some(&role(1, 4))), (1, 4));
+        assert_eq!(fence_after(1, 20, Some(&role(2, 10))), (2, 10), "another shard");
+        assert_eq!(
+            fence_after(1, 20, None),
+            (kv_storage::pmeta::SHARD_NONE, 0),
+            "no role"
+        );
+        assert_eq!(
+            fence_after(kv_storage::pmeta::SHARD_NONE, 0, Some(&role(2, 1))),
+            (2, 1)
+        );
     }
 
     #[test]

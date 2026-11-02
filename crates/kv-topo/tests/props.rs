@@ -572,7 +572,12 @@ proptest! {
                         if sa.term != sb.term {
                             let promoted = matches!(&t, Transition::Promote { shard, .. } if *shard == sa.id);
                             prop_assert!(promoted, "term changed without a promotion: {:?}", t);
-                            prop_assert_eq!(sa.term, sb.term + 1);
+                            // a term raise (the serving primary promoted again, §23.12) may
+                            // jump; every other promotion takes the next term
+                            let raise = sb.status == ShardStatus::Serving && sa.primary == sb.primary;
+                            if !raise {
+                                prop_assert_eq!(sa.term, sb.term + 1);
+                            }
                             prop_assert_eq!(sa.history.last().map(|h| h.term), Some(sb.term));
                             prop_assert_eq!(sa.status, ShardStatus::Serving);
                         }

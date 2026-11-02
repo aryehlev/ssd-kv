@@ -161,6 +161,8 @@ impl std::error::Error for Reject {}
 
 /// A NeedsFullSync member leaves that state only through `replica resync` (or removal).
 const NEEDS_RESYNC: &str = "member needs an operator resync (kvadm replica resync)";
+/// The largest term a seq can carry (24 bits, §10.11).
+const MAX_TERM: u32 = (1 << 24) - 1;
 
 fn pre(s: &str) -> Reject {
     Reject::Precondition(s.to_owned())
@@ -482,8 +484,15 @@ fn apply_promote(
     if term <= sh.term {
         return Err(Reject::StaleTerm);
     }
-    if Some(term) != sh.term.checked_add(1) {
+    // A term raise (§23.12): the serving primary hands off to itself at a term above the
+    // records a member brought from another shard (terms count per shard, §23.2); every
+    // other promotion takes the next term.
+    let raise = sh.status == ShardStatus::Serving && sh.primary == Some(*primary);
+    if !raise && Some(term) != sh.term.checked_add(1) {
         return Err(pre("a promotion term must be the shard term + 1"));
+    }
+    if term > MAX_TERM {
+        return Err(pre("the promotion term is above the largest seq term"));
     }
     if term_end.term != sh.term {
         return Err(pre("term_end must close the shard's current term"));
@@ -513,8 +522,9 @@ fn apply_promote(
         }
     }
     let old = sh.primary;
-    // Graceful handoff: the old primary stays in the ISR and nothing diverged (§23.12).
-    let handoff = old.is_some_and(|o| o != *primary && isr.contains(&o));
+    // Graceful handoff (to another member, or a term raise to the primary itself): the old
+    // primary stays in the ISR and nothing diverged (§23.12).
+    let handoff = old.is_some_and(|o| isr.contains(&o) && (o != *primary || raise));
     let sh = &mut st.shards[si];
     for m in &mut sh.members {
         if m.node == *primary {

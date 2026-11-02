@@ -573,8 +573,8 @@ impl ClusterState {
     /// * A primary gets `is_primary` only while its shard is `Serving`; it receives its peers
     ///   (`(node, state, in_isr)`, no addresses) and its migration tasks (`Out`, or `In` with the
     ///   source primary's replication address).
-    /// * A replica gets the primary's replication address while the shard is `Serving`, no
-    ///   member list and no migration tasks.
+    /// * A replica gets the primary's replication address while the shard is `Serving`, its
+    ///   own member entry only (its readability, §23.6 rule 4) and no migration tasks.
     /// * `owned_slots` are the slots assigned to the shard; a node with no role gets `None`.
     pub fn assignment_for(
         &self,
@@ -601,7 +601,16 @@ impl ClusterState {
                     .collect();
                 (members, self.migration_tasks(sh.id))
             } else {
-                (Vec::new(), Vec::new())
+                // a replica's own entry only: a learner (Syncing) or a member waiting for an
+                // operator resync is never readable (§23.6 rule 4, §23.7), whatever data it
+                // still holds from an earlier role
+                let own = sh
+                    .members
+                    .iter()
+                    .filter(|m| m.node == *node)
+                    .map(|m| (m.node, m.state, m.in_isr))
+                    .collect();
+                (own, Vec::new())
             };
             ShardRole {
                 shard: sh.id,
@@ -776,6 +785,38 @@ impl ClusterState {
         let sh = self.shard(shard).ok_or(Reject::UnknownShard)?;
         let isr = sh.isr().map(|m| m.node).collect();
         self.promote(sh, to, isr, last)
+    }
+
+    /// The `Promote` that raises `shard`'s term to `new_term` with the same primary, after the
+    /// primary's graceful handoff to itself reached `last` (§23.12). Terms count per shard
+    /// (§23.2): a member that was in another shard before may hold records of a term above
+    /// this shard's, which this shard's seqs would sort below; once the shard's term is above
+    /// them the member syncs like any other. The ISR and member states stay as they are
+    /// (nothing diverged: the handoff barrier committed every executed write).
+    pub fn term_raise_promote(
+        &self,
+        shard: ShardId,
+        new_term: u32,
+        last: Vec<u64>,
+    ) -> Result<Transition, Reject> {
+        let sh = self.shard(shard).ok_or(Reject::UnknownShard)?;
+        let primary = sh
+            .primary
+            .filter(|_| sh.status == ShardStatus::Serving)
+            .ok_or_else(|| Reject::Precondition("the shard has no serving primary".into()))?;
+        if new_term <= sh.term {
+            return Err(Reject::StaleTerm);
+        }
+        Ok(Transition::Promote {
+            shard,
+            primary,
+            term: new_term,
+            isr: sh.isr().map(|m| m.node).collect(),
+            term_end: TermEnd {
+                term: sh.term,
+                takeover: last,
+            },
+        })
     }
 
     fn promote(

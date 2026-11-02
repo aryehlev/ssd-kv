@@ -135,6 +135,16 @@ pub enum NodeToCoord {
         shard: ShardId,
         term: u32,
     },
+    /// Primary: a member of `shard` holds data written in a term above the shard's `term`
+    /// (`above`: the member was in another shard before, whose terms count separately, §23.2),
+    /// so the shard's seqs would sort below that member's records. The coordinator raises the
+    /// shard's term past `above` by a graceful handoff of the primary to itself (§23.12); the
+    /// member then syncs like any other.
+    TermRaise {
+        shard: ShardId,
+        term: u32,
+        above: u32,
+    },
 }
 
 impl NodeToCoord {
@@ -175,6 +185,7 @@ impl NodeToCoord {
             NodeToCoord::SealDone { .. } => "seal-done",
             NodeToCoord::MemberNeedsResync { .. } => "member-needs-resync",
             NodeToCoord::HandoffRequest { .. } => "handoff-request",
+            NodeToCoord::TermRaise { .. } => "term-raise",
         }
     }
 }

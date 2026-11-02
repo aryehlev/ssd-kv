@@ -435,8 +435,8 @@ fn assignment_projection() {
         Some(PeerAddr(s.node(&nid(1)).unwrap().repl))
     );
     assert!(
-        rrole.members.is_empty() && rrole.migrations.is_empty(),
-        "replicas learn no peers"
+        rrole.members == vec![(nid(4), MemberState::InSync, true)] && rrole.migrations.is_empty(),
+        "replicas learn no peers, only their own member entry"
     );
     assert!(rrole.owned_slots == role.owned_slots);
     // the projection does not change when another shard changes
@@ -787,6 +787,42 @@ fn graceful_handoff_keeps_old_primary_in_sync() {
     assert!(
         s.handoff_promote(S1, nid(2), takeover()).is_err(),
         "target must be in the ISR"
+    );
+}
+
+/// A term raise (the primary hands off to itself, §23.12) may jump past the next term; the
+/// members keep their states; only the serving primary of the shard can be raised; any other
+/// promotion still takes the shard term + 1.
+#[test]
+fn term_raise_jumps_with_the_same_primary_and_keeps_members() {
+    let s = three_by_two();
+    let sh = s.shard(S1).unwrap();
+    let (p, term) = (sh.primary.unwrap(), sh.term);
+    let t = s.term_raise_promote(S1, term + 5, vec![5; 64]).unwrap();
+    let n = apply_ok(&s, &[t]);
+    let nsh = n.shard(S1).unwrap();
+    assert_eq!(nsh.primary, Some(p));
+    assert_eq!(nsh.term, term + 5);
+    assert_eq!(nsh.history.last().map(|h| h.term), Some(term));
+    assert_eq!(nsh.members, sh.members, "member states and ISR unchanged");
+    assert!(
+        matches!(s.term_raise_promote(S1, term, vec![5; 64]), Err(Reject::StaleTerm)),
+        "never the current term"
+    );
+    let jump = Transition::Promote {
+        shard: S1,
+        primary: nid(4),
+        term: term + 5,
+        isr: vec![nid(4), p],
+        term_end: TermEnd {
+            term,
+            takeover: vec![5; 64],
+        },
+    };
+    assert!(is_pre(s.apply(&[jump])), "another node takes the next term only");
+    assert!(
+        is_pre(s.apply(&[s.term_raise_promote(S1, 1 << 24, vec![5; 64]).unwrap()])),
+        "a seq carries 24 bits of term"
     );
 }
 

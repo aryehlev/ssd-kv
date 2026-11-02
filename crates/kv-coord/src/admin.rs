@@ -260,6 +260,26 @@ impl Controllers {
                         });
                     }
                 }
+                NodeToCoord::TermRaise { shard, term, above } => {
+                    // a member brought records of a newer term from another shard: the shard's
+                    // term goes past them by a handoff of the primary to itself (§23.12)
+                    let ok = above > term
+                        && above < (1 << 24) - 1
+                        && s.shard(shard).is_some_and(|sh| {
+                            sh.term == term && sh.primary == Some(from) && sh.status == ShardStatus::Serving
+                        });
+                    if ok && self.take_job(false, shard, Instant::now()) {
+                        tracing::info!(shard = shard.0, term, above, "term raise requested by the primary");
+                        let me = self.clone();
+                        tokio::spawn(async move {
+                            let r = failover::run_term_raise(me.wsr.clone(), me.pusher.clone(), shard, term, above + 1).await;
+                            if let Err(e) = &r {
+                                tracing::info!(shard = shard.0, "term raise: {e}");
+                            }
+                            me.release(false, shard, Duration::from_millis(500));
+                        });
+                    }
+                }
                 _ => {}
             },
         }

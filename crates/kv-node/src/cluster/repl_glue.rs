@@ -1345,6 +1345,19 @@ impl<B: Backend> Worker<B> {
             operator_full_sync: pp.peers[mi].state == MemberState::Syncing,
             last_executed: last_executed.max(pp.sender.last()),
         };
+        if let Some(above) = sync::member_term_above(&h, term) {
+            // the member was in another shard, whose terms count separately: its records sort
+            // above every seq of this term, so nothing of this term could replace them; the
+            // coordinator raises the shard's term past them (a handoff to this primary)
+            tracing::info!(partition = p, member = %pp.peers[mi].node.hex40(), term, above,
+                "member holds records of a newer term than the shard: term raise requested");
+            cw.cs.tell_agent(AgentMsg::TermRaise {
+                shard: pp.shard,
+                term,
+                above,
+            });
+            return reject(io, RejectReason::StaleTerm, term);
+        }
         let d = sync::decide(&h, &view);
         tracing::info!(partition = p, member = %pp.peers[mi].node.hex40(), decision = d.kind(), "replication handshake");
         let mode = match d {

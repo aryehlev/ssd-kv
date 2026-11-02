@@ -179,7 +179,8 @@ fn reply_variants_carry_no_topology_fields() {
             "MigrationReady",
             "SealDone",
             "MemberNeedsResync",
-            "HandoffRequest"
+            "HandoffRequest",
+            "TermRaise"
         ]
     );
     let replies = ["HelloAck", "AssignAck", "FenceAck", "HandoffDone", "Error"];

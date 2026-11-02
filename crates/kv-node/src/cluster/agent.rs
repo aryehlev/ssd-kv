@@ -79,6 +79,9 @@ const REPORT_REPEAT: Duration = Duration::from_millis(1000);
 /// member and waiting for this node's lease by the coordinator's rule), so the shard never
 /// stays without a serving primary. The node itself never takes a lease back for that role.
 const HANDOFF_STUCK: Duration = Duration::from_secs(10);
+/// Longest wait of a primary that handed off to itself (a term raise) for the assignment of the
+/// new term; it serves writes again after it.
+const TERM_RAISE_LIMIT: Duration = Duration::from_secs(2);
 /// Longest wait of a shutting-down primary for its handoff (the coordinator's handoff bound is
 /// 5 s): after it the node shuts down anyway and its shard fails over by lease expiry.
 const SHUTDOWN_HANDOFF_LIMIT: Duration = Duration::from_secs(8);
@@ -186,6 +189,9 @@ struct WorkerGather {
     workers_left: usize,
     values: Vec<u64>,
     started: std::time::Instant,
+    /// A handoff to this node itself (a term raise, §23.12): it stays the primary, so its
+    /// lease is kept.
+    keep_lease: bool,
 }
 
 struct Agent {
@@ -202,6 +208,10 @@ struct Agent {
     sent_renewals: VecDeque<(u64, u64)>,
     /// After a completed handoff the lease stays relinquished until the demoting assignment.
     lease_held_back: Option<std::time::Instant>,
+    /// A term raise reached its barrier: writes wait for the assignment of the new term.
+    term_raise_since: Option<std::time::Instant>,
+    /// When each `TermRaise` `(shard, term)` was last sent.
+    raise_sent: Option<((u16, u32), std::time::Instant)>,
     fences: hashbrown::HashMap<u64, WorkerGather, foldhash::fast::RandomState>,
     handoffs: hashbrown::HashMap<u64, WorkerGather, foldhash::fast::RandomState>,
     /// When each member's `IsrExpand` was last sent (repeated every `REPORT_REPEAT` while the
@@ -230,6 +240,8 @@ impl Agent {
             renew_seq: 0,
             sent_renewals: VecDeque::new(),
             lease_held_back: None,
+            term_raise_since: None,
+            raise_sent: None,
             fences: Default::default(),
             handoffs: Default::default(),
             expand_sent: Default::default(),
@@ -419,7 +431,8 @@ impl Agent {
                             },
                         ),
                     };
-                    let fence = id.fence_term.max(a.role.as_ref().map_or(0, |r| r.term));
+                    let (_, fence) =
+                        super::fence_after(id.fence_shard, id.fence_term, a.role.as_ref());
                     NodeMeta {
                         cluster_id,
                         node_id: a.node_id.0,
@@ -428,6 +441,17 @@ impl Agent {
                         fence_term: fence,
                         assignment_version: a.version,
                     }
+                }
+                Persist::Fence { shard, .. } if shard.0 != id.fence_shard => {
+                    // a fence of a shard this node's persisted assignment is not in (a leader
+                    // whose committed state this node has moved past): not acknowledged, so
+                    // that leader takes its next candidate after the fence timeout; a term of
+                    // another shard never becomes this node's fence
+                    tracing::warn!(
+                        shard = shard.0,
+                        "fence for a shard this node is not assigned to: ignored"
+                    );
+                    continue;
                 }
                 Persist::Fence { new_term, .. } => {
                     let mut m = self.node_meta_now();
@@ -507,6 +531,7 @@ impl Agent {
                         workers_left: self.shared.workers.len(),
                         values: vec![0; self.partitions()],
                         started: std::time::Instant::now(),
+                        keep_lease: false,
                     },
                 );
                 self.broadcast(|| CtrlEvent::Fence {
@@ -533,7 +558,8 @@ impl Agent {
                 id.cluster_id = Some(c);
             }
             id.version = a.version;
-            id.fence_term = id.fence_term.max(a.role.as_ref().map_or(0, |r| r.term));
+            (id.fence_shard, id.fence_term) =
+                super::fence_after(id.fence_shard, id.fence_term, a.role.as_ref());
         }
         let role_key =
             |x: &NodeAssignment| x.role.as_ref().map(|r| (r.shard, r.term, r.is_primary));
@@ -541,6 +567,7 @@ impl Agent {
             // a handoff ends with the assignment that demotes this node (or any role change)
             self.cs.handoff.store(false, Ordering::Release);
             self.lease_held_back = None;
+            self.term_raise_since = None;
             self.handoffs.clear();
         }
         // after an unclean restart a primary role of the term served before it is not served
@@ -589,6 +616,7 @@ impl Agent {
     }
 
     fn on_handoff(&mut self, session: u64, req: u64, shard: ShardId, to: NodeId) {
+        let to_self = self.cs.identity().node_id == Some(to);
         self.cs.handoff.store(true, Ordering::Release);
         self.handoffs.insert(
             req,
@@ -597,8 +625,12 @@ impl Agent {
                 workers_left: self.shared.workers.len(),
                 values: vec![0; self.partitions()],
                 started: std::time::Instant::now(),
+                keep_lease: to_self,
             },
         );
+        if to_self {
+            tracing::info!(shard = shard.0, "term raise: handoff to this primary itself");
+        }
         self.broadcast(|| CtrlEvent::Handoff { req, shard, to });
     }
 
@@ -645,9 +677,15 @@ impl Agent {
                     None => false,
                 };
                 if done && let Some(g) = self.handoffs.remove(&req) {
-                    // relinquish the lease before answering (§23.12)
-                    self.lease_held_back = Some(std::time::Instant::now());
-                    self.shared.lease.set(0);
+                    if g.keep_lease {
+                        // a term raise: this node stays the primary; writes wait (TRYAGAIN)
+                        // for the assignment of the new term, at most `TERM_RAISE_LIMIT`
+                        self.term_raise_since = Some(std::time::Instant::now());
+                    } else {
+                        // relinquish the lease before answering (§23.12)
+                        self.lease_held_back = Some(std::time::Instant::now());
+                        self.shared.lease.set(0);
+                    }
                     self.send(
                         g.session,
                         NodeToCoord::HandoffDone {
@@ -714,6 +752,28 @@ impl Agent {
                         shard: ShardId(shard),
                         term,
                         member,
+                    });
+                }
+            }
+            AgentMsg::TermRaise { shard, term, above } => {
+                let a = self.cs.assignment();
+                let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else {
+                    return;
+                };
+                if !role.is_primary || role.shard.0 != shard || role.term != term {
+                    return;
+                }
+                // repeated (the member redials) until the assignment of a newer term arrives
+                let due = self
+                    .raise_sent
+                    .is_none_or(|(k, t)| k != (shard, term) || t.elapsed() >= REPORT_REPEAT);
+                if due {
+                    self.raise_sent = Some(((shard, term), std::time::Instant::now()));
+                    tracing::info!(shard, term, above, "term raise requested");
+                    self.send_all(&NodeToCoord::TermRaise {
+                        shard: ShardId(shard),
+                        term,
+                        above,
                     });
                 }
             }
@@ -924,6 +984,17 @@ impl Agent {
         for r in late {
             tracing::warn!("graceful handoff did not complete in time: writes are accepted again");
             self.handoffs.remove(&r);
+            self.cs.handoff.store(false, Ordering::Release);
+        }
+        // a term raise whose assignment never came gives writes back: this node is still the
+        // primary of the term it serves (if the raise is committed later, the members repair
+        // from the takeover point it reported, which this node's state covers)
+        if self
+            .term_raise_since
+            .is_some_and(|t| t.elapsed() >= TERM_RAISE_LIMIT)
+        {
+            tracing::warn!("term raise not committed in time: writes are accepted again");
+            self.term_raise_since = None;
             self.cs.handoff.store(false, Ordering::Release);
         }
         self.fences

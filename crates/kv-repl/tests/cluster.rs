@@ -25,6 +25,9 @@
 //!   purge advance by position barriers on their own shard's commit point, so neither shard's
 //!   members ever lag past `repl-ack-timeout-ms` (no ISR shrink), and a kill -9 of the source
 //!   primary right after it fails over at once.
+//! * `a_replica_moved_to_a_shard_of_a_lower_term_syncs`: a node removed from a shard whose term
+//!   was raised by failovers and added to a shard of a lower term syncs with the new primary
+//!   and serves it (fence terms count per shard).
 //! * `a_removed_coordinator_is_never_a_moved_target`: after `kvadm coord remove` of a follower
 //!   the data nodes take the new coordinator list even when the push that carries it keeps
 //!   the state version they applied already (the SETPEERS sync commit can reach them first):
@@ -1421,6 +1424,92 @@ fn migration_resume_prunes_keys_deleted_at_the_source() {
 }
 
 /// The coordinator a data node's MOVED reply names for `key`, on one fresh connection.
+/// The committed term of shard `sid` (`kvadm status --json`).
+fn shard_term(c: &Cluster, sid: u16) -> u32 {
+    let s = c.admin(&["STATUS", "--json"]);
+    let at = s
+        .find(&format!("{{\"id\":{sid},\"status\":"))
+        .expect("shard in the status");
+    let rest = &s[at..];
+    let t = rest.find("\"term\":").expect("term field") + "\"term\":".len();
+    rest[t..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("term")
+}
+
+/// A node removed from a shard whose term is higher than the term of the shard it is added
+/// to next syncs with its new primary: it used to keep the old shard's fence, so the new
+/// primary refused its handshake as a stale term forever and the node dropped the refusal as
+/// a frame of a fenced term, staying a learner that no `replica resync` could help. Now the
+/// fence term counts in the shard of the node's role, and since the node's records carry the
+/// old shard's higher term (every seq of the new shard would sort below them), the new
+/// primary asks for a term raise (a handoff to itself) before the merge full sync.
+#[test]
+fn a_replica_moved_to_a_shard_of_a_lower_term_syncs() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("moved", 4, Duration::from_secs(300));
+    let ids: Vec<String> = c.nodes.iter().map(|n| n.id.clone()).collect();
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &ids[0]]);
+    c.admin(&["SLOTS", "ASSIGN", "0-8191", "1"]);
+    c.admin(&["SHARD", "CREATE", "2", "--primary", &ids[2]]);
+    c.admin(&["SLOTS", "ASSIGN", "8192-16383", "2"]);
+    c.wait_primary(0, 30);
+    c.wait_primary(2, 30);
+    c.admin(&["REPLICA", "ADD", "1", &ids[1]]);
+    c.wait_member(1, "in-sync isr", 60);
+    // two handoffs raise shard 1's term; shard 2 stays at its first term
+    c.admin(&["FAILOVER", "1", "--to", &ids[1]]);
+    c.wait_primary(1, 60);
+    c.wait_member(0, "in-sync isr", 60);
+    c.admin(&["FAILOVER", "1", "--to", &ids[0]]);
+    c.wait_primary(0, 60);
+    c.wait_member(1, "in-sync isr", 60);
+    let (t1, t2) = (shard_term(&c, 1), shard_term(&c, 2));
+    assert!(t1 > t2, "shard 1 term {t1} above shard 2 term {t2}");
+    let coords = c.coord_clients();
+    let mut r = Routed::new(coords.clone());
+    let keys: Vec<(String, String)> = (0..300)
+        .map(|i| (format!("mv:{i}"), format!("v{i}")))
+        .collect();
+    for (k, v) in &keys {
+        set_settled(&mut r, k, v);
+    }
+    c.admin(&["REPLICA", "ADD", "1", &ids[3]]);
+    c.wait_member(3, "in-sync isr", 60);
+    c.admin(&["REPLICA", "REMOVE", "1", &ids[3]]);
+    wait_until("node 3 to leave shard 1", 30, || c.member_line(3).is_empty());
+    c.admin(&["REPLICA", "ADD", "2", &ids[3]]);
+    c.wait_member(3, "in-sync isr", 60);
+    let theirs: Vec<&(String, String)> = keys
+        .iter()
+        .filter(|(k, _)| kv_common::key_slot(k.as_bytes()) > 8191)
+        .collect();
+    assert!(!theirs.is_empty());
+    for (k, v) in &theirs {
+        assert_eq!(
+            c.replica_get(3, k).as_deref(),
+            Some(v.as_str()),
+            "node 3 serves {k} of shard 2"
+        );
+    }
+    // writes of shard 2 reach it as a member
+    let k = theirs[0].0.clone();
+    set_settled(&mut r, &k, "after-the-move");
+    wait_until("node 3 to apply shard 2's writes", 30, || {
+        c.replica_get(3, &k).as_deref() == Some("after-the-move")
+    });
+    // shard 2's term went past the records node 3 brought from shard 1 (a term raise)
+    let raised = shard_term(&c, 2);
+    assert!(raised > t1, "shard 2 term {raised} above shard 1's {t1}");
+    assert!(c.log_contains(2, "term raise"), "the primary asked for the raise");
+    let rest: Vec<(String, String)> = keys.iter().filter(|(x, _)| *x != k).cloned().collect();
+    verify_acked(&coords, &rest);
+    c.ok = true;
+}
+
 fn moved_target(node: SocketAddr, key: &str) -> Option<String> {
     let mut conn = Conn::open(node).ok()?;
     match conn.call_str(&["SET", key, "v"]).ok()? {

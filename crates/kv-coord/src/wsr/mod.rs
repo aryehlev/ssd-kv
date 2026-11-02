@@ -662,10 +662,31 @@ impl Driver {
         // write sends nothing before it completes, no proposal acknowledgement is counted
         // before it, every other message waits for it in arrival order, and the in-flight
         // proposal is re-sent at the next beat after it.
+        //
+        // A follower likewise keeps answering the beats of its leader's term while it writes
+        // a state value (never its term or vote): the reply says only that it follows that
+        // leader in that term, which stays true, since every message that could change it
+        // (a vote request, a higher term) waits for the write, and the beat itself is stepped
+        // after the write, ahead of anything that arrived after it, so the election timer is
+        // reset before any later vote request is seen. Beats are answered so only while no
+        // message of another term or sender waits (`answer_beats`). Without this, followers
+        // that persist every
+        // proposal on a slow disk answered no beat for the length of each write, and the
+        // leader's check-quorum lease lapsed (no node lease granted) or it stepped down.
         let mut rx = self.peer_rx.take();
         let mut closed = false;
+        let mut answer_beats = {
+            let (term, leader) = (self.core.term(), self.core.leader());
+            self.deferred
+                .iter()
+                .all(|(f, m)| m.term() == term && Some(*f) == leader)
+        };
         let joined = loop {
             let beating = !meta && self.core.role() == Role::Leader;
+            let following = !meta
+                && self.core.role() != Role::Leader
+                && self.core.leader().is_some()
+                && answer_beats;
             tokio::select! {
                 biased;
                 r = &mut task => break r,
@@ -674,18 +695,37 @@ impl Driver {
                     let out = self.beat(now);
                     self.beat_effects(&out);
                 }
-                m = recv_peer(&mut rx), if beating && !closed => {
+                m = recv_peer(&mut rx), if (beating || following) && !closed => {
                     // a closed channel is seen again by the main loop after the write
                     closed = m.is_none();
                     if let Some((from, msg)) = m {
-                        let current = matches!(&msg, WsrMsg::BeatReply { term, .. } if *term == self.core.term());
-                        if current && self.deferred.is_empty() {
-                            let mut out = Vec::new();
-                            self.core.step(Input::Msg { from, msg }, &mut out);
-                            self.beat_effects(&out);
-                        } else {
-                            self.deferred.push_back((from, msg));
+                        let term = self.core.term();
+                        if beating {
+                            let current = matches!(&msg, WsrMsg::BeatReply { term: t, .. } if *t == term);
+                            if current && self.deferred.is_empty() {
+                                let mut out = Vec::new();
+                                self.core.step(Input::Msg { from, msg }, &mut out);
+                                self.beat_effects(&out);
+                            } else {
+                                self.deferred.push_back((from, msg));
+                            }
+                            continue;
                         }
+                        // messages of the leader's own term from the leader (beats, the
+                        // proposal it re-sends at each beat) change neither the term nor whom
+                        // this member follows; anything else stops the answers
+                        if msg.term() != term || self.core.leader() != Some(from) {
+                            answer_beats = false;
+                        } else if let WsrMsg::Beat { round, .. } = &msg {
+                            let reply = WsrMsg::BeatReply {
+                                peer_gen: self.core.peers().r#gen,
+                                term,
+                                round: *round,
+                                need: false,
+                            };
+                            self.wsr.net.send(&from, &reply);
+                        }
+                        self.deferred.push_back((from, msg));
                     }
                 }
             }

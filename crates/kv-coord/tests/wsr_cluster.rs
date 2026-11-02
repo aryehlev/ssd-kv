@@ -257,6 +257,74 @@ async fn slow_leader_writes_keep_the_leader() {
     }
 }
 
+/// F6: followers whose state writes are slow (each persists every proposal before it
+/// acknowledges it) used to answer no beat while they wrote: with both followers writing the
+/// same proposal, the leader heard no majority for the length of the write, its check-quorum
+/// lease lapsed and it granted no node lease (every primary stopped serving for a while). Now a
+/// follower keeps answering the beats of its leader's term while it writes its accepted value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_follower_writes_keep_the_leader_lease() {
+    let mut ms = group("slowfollow", 3);
+    for m in &mut ms {
+        start(m).await;
+    }
+    let l = leader(&ms).await;
+    let v0 = propose_lease(&ms, 1600).await;
+    converge(&ms, v0).await;
+    let w = ms[l].wsr.as_ref().unwrap().clone();
+    let term = w.term();
+    for (i, m) in ms.iter().enumerate() {
+        if i != l {
+            m.wsr.as_ref().unwrap().set_write_delay_ms(900);
+        }
+    }
+    let start_at = Instant::now();
+    let mut lease_samples = (0u32, 0u32);
+    // back-to-back proposals keep the followers writing most of the time
+    let p = tokio::spawn({
+        let w = w.clone();
+        async move {
+            let mut last = 0;
+            for i in 0..3u32 {
+                let t = Transition::Admin(AdminOp::ParamSet {
+                    key: "lease_ms".into(),
+                    value: (1700 + i).to_string(),
+                });
+                last = w.propose(vec![t]).await?;
+            }
+            Ok::<u64, kv_coord::wsr::ProposeError>(last)
+        }
+    });
+    while !p.is_finished() {
+        assert!(start_at.elapsed() < Duration::from_secs(30), "the proposals never finished");
+        for (i, m) in ms.iter().enumerate() {
+            let x = m.wsr.as_ref().unwrap();
+            assert!(i == l || !x.is_leader(), "member {i} was elected while the followers wrote slowly");
+            assert_eq!(x.term(), term, "member {i} moved to another term");
+        }
+        lease_samples.1 += 1;
+        if w.lease_valid() {
+            lease_samples.0 += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let v = p.await.unwrap().expect("the proposals commit");
+    for m in &ms {
+        m.wsr.as_ref().unwrap().set_write_delay_ms(0);
+    }
+    converge(&ms, v).await;
+    assert!(w.is_leader() && w.term() == term);
+    assert!(
+        lease_samples.0 * 10 >= lease_samples.1 * 9,
+        "the leader's check-quorum lease lapsed while its followers wrote: valid in {} of {} samples",
+        lease_samples.0,
+        lease_samples.1
+    );
+    for m in &mut ms {
+        stop(m).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_kill_and_restart_from_files() {
     let mut ms = group("kill", 3);

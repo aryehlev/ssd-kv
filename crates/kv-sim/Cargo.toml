@@ -11,7 +11,6 @@ publish.workspace = true
 [dependencies]
 kv-storage = { workspace = true, features = ["sim"] }
 kv-index.workspace = true
-kv-repl.workspace = true
 kv-topo.workspace = true
 kv-coord.workspace = true
 kv-common.workspace = true

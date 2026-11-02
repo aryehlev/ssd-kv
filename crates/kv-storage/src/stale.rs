@@ -20,7 +20,7 @@
 //!
 //! Hand-off (liveness): an entry records the seq of the copy it tracks. A Source becomes Stale
 //! when a copy of the key *with a higher seq* is durable (and, for a txn record, committed):
-//! [`StaleCopies::sources_superseded`] takes that seq. Keying the hand-off on the seq rather than
+//! `StaleCopies::sources_superseded` takes that seq. Keying the hand-off on the seq rather than
 //! on "some copy of the key became durable" makes it independent of the order in which the
 //! events arrive: an older in-flight image of the tracked location becoming durable after the key
 //! moved on does not release the source early (E2), and a source registered after a newer copy

@@ -10,18 +10,21 @@
 //!
 //! | waiter | waits for | registered in | woken by |
 //! |---|---|---|---|
-//! | request (`io > 0`) | a page read / extent read / extent write it reads | `loads[page].waiters`, `io[tag] = ExtRead{req}`, `ext.writes[start].waiters` (id + generation) | `page_read_done`, `ext_read_done`, `ext_write_done`, or the write's cancellation (`wake`) |
+//! | request (`io > 0`) | a page read / extent read / extent write it reads | `loads[page].waiters`, `io[tag] = ExtRead{req}`, `ext.writes[start].waiters` (id + generation; only while the write is still to complete) | `page_read_done` (a read that finds no frame is issued again, `load_retry`), `ext_read_done`, `ext_write_done`, the write's cancellation or durability (`wake`) |
 //! | request (`waits > 0`) | the request ahead in a key queue | `reqs.busy[(db, key hash)]` | `finish` of the head |
 //! | request (`blocked`) | a barrier submitted before it | `reqs.blocked` | `finish` of the barrier |
-//! | barrier | every older request | `reqs.barriers` | `finish` of the oldest request |
-//! | request (`parked`, space) | an AG grant | `space_wait` (only while an `AcquireAg` is wanted or in flight) | every AG reply (granted or refused) |
+//! | barrier request | every older request | `reqs.barriers` | `finish` of the oldest request |
+//! | request (`parked`, space) | an AG grant | `space_wait` (only while an AG request is wanted or in flight) | every AG reply (granted or refused) |
 //! | request (`parked`, seq) | a seq reservation / txn id range | `seq_wait` (only while a reservation is asked, or the reserve allows a retry) | `ReserveSeq` reply; `txn_progress` each tick |
 //! | executed local txn (held) | its durable commit | `reqs.held[txn]` | `txn_committed`, or ReadOnly |
-//! | staged page effect | the page writer | `dirty` / `retry` (built next tick), image in flight (re-queued when durable), `deferred` (older copies) | `tick`, `image_durable`, `stale_gone` |
-//! | deferred effect (E14, D1) | the zeroing of a tracked older copy | `stale` entry (Stale: scrub or extent zeroing scheduled; Source: its newer copy is staged or in flight) | `image_durable` / `ext_zero_durable` → `stale_gone` re-dirties every deferred page |
-//! | tracked source | a durable copy with a higher seq | `stale` entry seq | `image_durable`, `ext_write_durable`, `txn_committed` |
-//! | page / extent write | device completion, then a flush on write-back devices | `io[tag]`, `durable_wait[wid]` + [`crate::flush::FlushTracker`] | `on_io_done`, `on_durable` |
-//! | ticket | each effect holding it, and its metadata | the effects' ticket lists (one dependency per holder, handed over on supersession, D2) | the effects' written / durable events, meta replies |
+//! | staged page effect | the page writer | `dirty` / `retry` (built next tick), image in flight (re-queued when durable), `deferred` (older copies) | `tick`, `image_durable`, `stale_gone`, FLUSH (copies dead by the cutoff) |
+//! | record that must move after acceptance (§14.3) | room on another page | `retry` + an AG request of class `Reserved` (served above the fill limit) | AG reply, next tick |
+//! | deferred effect (E14, D1) | the zeroing of a tracked older copy | `stale` entry (Stale: scrub or extent zeroing scheduled; Source: its newer copy is staged or in flight, or the older copy it shares a page with is being zeroed) | `image_durable` / `ext_zero_durable` / a build that drops it without a write → `stale_gone` re-dirties every deferred page |
+//! | delete / expiry removal | tracked copies with a lower seq than itself (D1), or a later durable write (D2) | `gone_wait` (seq), `Pending::Remove { seq }`, `ZeroWhy::Delete` | `stale_gone`, `sources_superseded`; copies that later writes create never extend it |
+//! | tracked source | a durable copy with a higher seq | `stale` entry seq | `image_durable`, `ext_write_durable`, `txn_committed`; the page writer's newest-durable-copy check counts a missed one (`missed_handoffs`) |
+//! | page / extent write | device completion, then a flush on write-back devices | `io[tag]`, `durable_wait[wid]` + [`crate::flush::FlushTracker`] | `on_io_done`, `on_durable` (FLUSHALL keeps the pages of its old AGs until both happened) |
+//! | ticket | each effect holding it, and its metadata | the effects' ticket lists (one dependency per holder, handed over with its count on supersession, D2) | the effects' written / durable events, meta replies |
+//! | barrier ticket (SAVE, SHUTDOWN drain) | the effects, open txns and tracked copies present when it executed | one dependency on each (ticket lists, `OpenTxn::barriers`, watched `stale` entries) | their events; later work never extends it |
 //! | txn (fx ticket durable) | its `COMMITTED` listing | `meta_wait` (FIFO) | `on_meta_done` |
 //!
 //! Two rules make the table hold under every interleaving: (1) a waiter is registered before the

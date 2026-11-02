@@ -11,7 +11,10 @@
 //! command's effects are written / durable.
 //!
 //! A consumed command waits only for its own I/O and for earlier commands on its keys, never
-//! for load, a memory budget or a count (LC-14, LC-15).
+//! for load, a memory budget or a count (LC-14, LC-15). Every wait is registered where its event
+//! is delivered and every waiter names that event: see [`crate::progress`] for the table of
+//! waits and wakeups, the structural check ([`PartitionStore::check_progress`]), the quiescence
+//! check and the stall counters (`requests_waiting_over_1s`, `oldest_wait_ms`).
 //!
 //! Worker contract (kv-node, [`crate::engine::LocalEngine`], the simulator):
 //! * route every [`IoDone`] whose tag names this partition to [`PartitionStore::on_io_done`];

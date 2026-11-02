@@ -10,7 +10,7 @@
 //! candidates are verified by reading their record, paced by the `active-expire-reads-per-sec /
 //! P` bucket, and either expired without write or re-hinted. The sweep is paced by time, not by
 //! ticks: a full pass over every TTL entry and every table of the dbs holding TTL keys is spread
-//! over [`SWEEP_PASS_NS`] (hints have 1 s resolution, so sweeping faster finds nothing new), with
+//! over `SWEEP_PASS_NS` (hints have 1 s resolution, so sweeping faster finds nothing new), with
 //! at most 64 Ki positions per tick. An idle partition ticked every millisecond therefore visits
 //! a handful of positions per tick instead of whole tables, and one with no TTL key none.
 //! It never scans the drive (LC-12). Replicas never expire keys on their own: they hide

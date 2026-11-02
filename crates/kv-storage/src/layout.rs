@@ -203,7 +203,7 @@ pub const DEV0_META_PAGES: u64 = PMETA_PAGES + 2 + 2 + INTENT_SLOT_PAGES;
 /// Where every fixed structure of one device lives (all values in pages of that device).
 ///
 /// Computed once at format and stored in the device's superblock; readers use the stored
-/// values ([`DeviceLayout::from_superblock`]) and [`DeviceLayout::check`] them against the rules.
+/// values (`Superblock::layout`) and [`DeviceLayout::check`] them against the rules.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DeviceLayout {
     pub device_pages: u64,

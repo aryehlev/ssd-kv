@@ -84,7 +84,8 @@ pub enum ReadWant {
 /// A key read under the lock (holds user bytes: no `Debug`, LC-32).
 pub struct KeyRead {
     pub exists: bool,
-    /// `(vtype, expire_at_ms, value)` when `ReadWant::Value` was asked and the key exists.
+    /// `(vtype, expire_at_ms, value)` when `ReadWant::Value` was asked and the key exists
+    /// (`vtype` in the storage encoding of `Op::Put`: 1 string, 2 hash).
     pub value: Option<(u8, Option<u64>, Vec<u8>)>,
 }
 
@@ -369,7 +370,7 @@ impl XTxnCoord {
                         let value = argv[usize::from(i) + 1];
                         // a later duplicate of the same key wins (Redis MSET order)
                         out[pi].retain(|op| !matches!(op, Op::Put { key: k, .. } if &**k == key));
-                        out[pi].push(Op::Put { db: p.db, vtype: 0, expire_at: 0, key: key.into(), value: value.to_vec() });
+                        out[pi].push(Op::Put { db: p.db, vtype: kv_storage::extent::EXT_VTYPE_STRING, expire_at: 0, key: key.into(), value: value.to_vec() });
                     }
                 }
             }

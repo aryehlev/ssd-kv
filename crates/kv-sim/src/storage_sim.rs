@@ -7408,6 +7408,70 @@ step cmd mset 0 0:6197174,0:5547,0:481514,0:6469183
 step quiesce
 "#,
     ),
+    (
+        "expired_rename_destination_of_an_uncommitted_txn",
+        r#"kv-sim storage case 1
+seed 1004315
+fail I4 25 ioerr_power_cut-Power
+cfg partitions 32
+cfg devices 2
+cfg ags 50
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 12
+cfg groups 3
+cfg dbs 1
+cfg profile large
+cfg steps 263
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 200
+cfg late_pct 47
+cfg skip_pct 40
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 200
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 0 3820 - nx 0 0
+step cmd set 0 0 11 r19593347 - 0 0
+step ticks 3
+step cmd copy 0 0 6 1
+step cmd mset 0 1:1082,10:85122
+step cmd append 0 0 8
+step cmd scan 0 31 3
+step cmd meta 0 6
+step cmd getdel 0 0
+step cmd meta 0 5
+step cmd set 0 5 2427 - nx 0 0
+step clean
+step cmd barrier
+step cmd set 0 0 84628 - nx 0 1
+step cmd set 0 0 4772651 - - 0 0
+step cmd set 0 10 14 r1441 - 0 0
+step cmd setrange 0 11 1113 80
+step cmd set 0 0 16 - - 0 0
+step cmd expire 0 0 r4949 1
+step ticks 1
+step ticks 1
+step cmd rename 0 0 6 0
+step cmd set 0 5 16 - - 0 0
+step ticks 7
+step clock 5826
+step crash power sectors 2
+"#,
+    ),
 ];
 
 /// Replays a case text.

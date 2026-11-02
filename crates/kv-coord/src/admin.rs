@@ -218,7 +218,7 @@ impl Controllers {
                     let ok = s
                         .shard(shard)
                         .is_some_and(|sh| sh.term == term && sh.primary == Some(from) && sh.status == ShardStatus::Serving);
-                    if ok && self.claim(false, shard, Instant::now()) {
+                    if ok && self.take_job(false, shard, Instant::now()) {
                         tracing::info!(shard = shard.0, "handoff requested by the primary (shutdown)");
                         let me = self.clone();
                         tokio::spawn(async move {
@@ -262,7 +262,7 @@ impl Controllers {
         for sh in &s.shards {
             let Some(p) = sh.primary else { continue };
             if sh.status != ShardStatus::Serving {
-                if self.claim(true, sh.id, now) {
+                if self.take_job(true, sh.id, now) {
                     let me = self.clone();
                     let shard = sh.id;
                     tokio::spawn(async move {
@@ -278,7 +278,7 @@ impl Controllers {
                         me.release(true, shard, retry);
                     });
                 }
-            } else if s.node(&p).is_some_and(|r| r.flags.maint) && self.claim(false, sh.id, now) {
+            } else if s.node(&p).is_some_and(|r| r.flags.maint) && self.take_job(false, sh.id, now) {
                 let me = self.clone();
                 let shard = sh.id;
                 tokio::spawn(async move {
@@ -293,7 +293,7 @@ impl Controllers {
     }
 
     /// Marks a job running unless it runs or waits for its retry time.
-    fn claim(&self, failover: bool, shard: ShardId, now: Instant) -> bool {
+    fn take_job(&self, failover: bool, shard: ShardId, now: Instant) -> bool {
         let mut j = lock(&self.jobs);
         let map = if failover { &mut j.failover } else { &mut j.handoff };
         let e = map.entry(shard).or_insert(Job {

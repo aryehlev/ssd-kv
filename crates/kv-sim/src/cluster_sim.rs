@@ -1123,6 +1123,13 @@ impl Store {
         if cond && self.live.get(key).is_some_and(|r| r.seq >= seq) {
             return false;
         }
+        // the storage engine never stores a key at a seq at or below the copy it replaces
+        // (such a copy is never zeroed, and later writes of the key wait for it forever)
+        assert!(
+            self.live.get(key).is_none_or(|r| r.seq < seq),
+            "a record of {key:?} would replace a copy at {:?} with one at {seq:?}",
+            self.live.get(key).map(|r| r.seq)
+        );
         let rec = value.map(|value| Rec { value, seq });
         match &rec {
             Some(r) => {
@@ -2019,7 +2026,9 @@ impl Node {
                             sq(at)
                         );
                     }
-                    store.write(&rec.key, v, at, false, fx.now_g, delay);
+                    // kv-node applies images ordered: a key held at `at` or later already shows
+                    // the image's state (`member_image`)
+                    store.write(&rec.key, v, at, true, fx.now_g, delay);
                 }
                 MemberAction::SendRepairKeys => {
                     // (a): keys of this member's own groups after its last term's takeover
@@ -3971,7 +3980,7 @@ mod tests {
     /// and `Accept { Continue { from } }` restarts the ring after `from - 1` unless it already
     /// reached it (`Backlog::continue_after`).
     #[test]
-    fn repro_r2_ring_claims_a_gap() {
+    fn repro_r2_ring_never_covers_a_gap() {
         let mut m = MemberStream::new(0, 1 << 14);
         m.restart(Seq::new(1, 49), Seq::new(1, 49));
         drain(

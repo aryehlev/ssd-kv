@@ -7606,6 +7606,81 @@ step crash kill prefix 4
 step cmd append 0 25 24
 "#,
     ),
+    (
+        "tracked_copy_of_a_key_whose_bytes_a_longer_key_prefixed",
+        r#"kv-sim storage case 1
+seed 11007748
+fail HANG 37 DEL_ticket-Executed-needs-Written
+cfg partitions 32
+cfg devices 1
+cfg ags 83
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wt
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 18
+cfg groups 3
+cfg dbs 1
+cfg profile churn
+cfg steps 877
+cfg rounds 3
+cfg tick_permille 40
+cfg delay_max 4
+cfg late_pct 37
+cfg skip_pct 0
+cfg per_poll 1
+cfg shuffle 1
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd del 0 1
+step cmd set 0 10 18 - - 0 0
+step cmd set 0 1 2050 r12588058 - 0 0
+step cmd append 0 10 128
+step cmd set 0 0 43682 - - 0 0
+step cmd mset 0 5:27657,8:2026
+step cmd set 0 1 2467 - - 0 0
+step cmd del 0 7,4,1
+step cmd set 0 7 455 - - 0 0
+step cmd set 0 2 12 - - 0 0
+step ticks 5
+step cmd append 0 1 8714
+step cmd set 0 11 5 - - 0 0
+step cmd del 0 1,10
+step cmd append 0 1 229
+step cmd set 0 0 2093 past - 0 0
+step cmd del 0 1,13,7
+step cmd get 0 5
+step cmd setrange 0 12 1130 271
+step ticks 1
+step cmd get 0 0
+step cmd get 0 0
+step cmd set 0 14 2050 r3441 - 0 0
+step cmd set 0 0 1958 - - 0 0
+step cmd getdel 0 17
+step cmd msetnx 0 8:483,17:21726
+step cmd msetnx 0 8:269,11:380
+step cmd flush all
+step cmd setrange 0 0 295 558
+step cmd msetnx 0 0:3778,3:31,9:438,12:4067
+step cmd get 0 0
+step cmd get 0 5
+step cmd flush all
+step cmd meta 0 8
+step cmd mset 0 0:1983,12:322
+step cmd del 0 5
+step cmd get 0 0
+"#,
+    ),
 ];
 
 /// Replays a case text.

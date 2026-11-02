@@ -3724,6 +3724,22 @@ impl PartitionStore {
                 _ => {}
             }
         }
+        // tracked copies here that the page no longer holds: an entry registered after the
+        // image that dropped its copy was built (a txn delete marker whose retirement was in
+        // flight when a write of its key made it a tracked older copy) is not in that image's
+        // `cleared` list; left behind, it counted as a copy of its key for good and the key's
+        // next write or delete waited for a zeroing that had already happened (E14, D1)
+        let mut orphaned: SmallVec<[(u8, Box<[u8]>); 1]> = SmallVec::new();
+        if self.core.stale.at_page(page) > 0 {
+            let img = cx.cache.frame(st.m_frame);
+            for (db, key) in self.core.stale.keys_at(page) {
+                let small_here = self.core.stale.get(db, &key).iter().any(|e| matches!(e.at, StaleRef::Small { page: p } if p == page));
+                let held = st.recs.iter().any(|r| r.db == db && r.status != RecStatus::Droppable && r.key(img) == &*key);
+                if small_here && !held && !inf.cleared.iter().any(|(d, k)| *d == db && **k == *key) {
+                    orphaned.push((db, key));
+                }
+            }
+        }
         let empty = st.recs.is_empty() && st.pending.is_empty();
         if empty {
             st.fresh = true;
@@ -3740,7 +3756,7 @@ impl PartitionStore {
         } else {
             self.core.note_page_space(cx.cache, page);
         }
-        for (db, key) in inf.cleared {
+        for (db, key) in inf.cleared.into_iter().chain(orphaned) {
             if self.core.stale.remove_at(db, &key, page) {
                 self.stale_gone(cx, db, &key);
             }

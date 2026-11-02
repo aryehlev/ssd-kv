@@ -723,9 +723,11 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
     // tracked copies of this page that N no longer holds are gone once N is durable, whichever
     // rule dropped them (superseded, removed, retired, an older copy next to a new version,
     // dead): every one of them is reported, or its registry entry would outlive the record
-    // and hold back the key's next write or delete forever
+    // and hold back the key's next write or delete forever. Keys are read from N: the records
+    // placed by this build have N's offsets, and M's bytes there are another record (a key
+    // that is a prefix of the other record's key matched it, and the copy was never reported)
     for (db, key) in env.tracked_keys() {
-        let still = keep.iter().any(|r| r.db == db && r.key(m) == &*key && r.status != RecStatus::Droppable);
+        let still = keep.iter().any(|r| r.db == db && r.key(n) == &*key && r.status != RecStatus::Droppable);
         if !still && !out.cleared.iter().any(|(d, k)| *d == db && **k == *key) {
             out.cleared.push((db, key));
         }
@@ -1043,6 +1045,75 @@ pub(crate) mod tests {
         let (n3, b3) = run(&mut st, &m1, &env);
         assert_eq!(b3.applied.len(), 1);
         assert!(resolve(&n3).is_empty());
+    }
+
+    /// The page writer reports every tracked copy the new image no longer holds. Records it
+    /// places have N's offsets: their keys must be read from N. Read from M, a record placed
+    /// where M held a record of a key that starts with the tracked key's bytes looked like the
+    /// tracked copy, the copy was never reported gone, and the key's next write waited for its
+    /// zeroing forever (third copy, E14).
+    #[test]
+    fn tracked_copy_gone_is_reported_when_a_placed_record_reuses_its_bytes() {
+        struct Tracked {
+            base: Env,
+            tracked: Vec<Vec<u8>>,
+        }
+        impl BuildEnv for Tracked {
+            fn mode(&self) -> PageUpdateMode {
+                self.base.mode()
+            }
+            fn crc(&self) -> RecordCrc {
+                self.base.crc()
+            }
+            fn partition(&self) -> u16 {
+                self.base.partition()
+            }
+            fn lba(&self) -> u32 {
+                self.base.lba()
+            }
+            fn granularity(&self) -> Granularity {
+                self.base.granularity()
+            }
+            fn atomic_min(&self) -> u32 {
+                self.base.atomic_min()
+            }
+            fn others(&self, db: u8, key: &[u8]) -> usize {
+                self.base.others(db, key)
+            }
+            fn others_older(&self, db: u8, key: &[u8], seq: Seq) -> usize {
+                self.base.others_older(db, key, seq)
+            }
+            fn tracked_here(&self, _db: u8, key: &[u8]) -> Option<CopyState> {
+                self.tracked.iter().any(|k| k == key).then_some(CopyState::Stale)
+            }
+            fn tracked_keys(&self) -> SmallVec<[(u8, Box<[u8]>); 2]> {
+                self.tracked.iter().map(|k| (0, k.clone().into_boxed_slice())).collect()
+            }
+            fn dead(&self, r: &RecDesc) -> bool {
+                self.base.dead(r)
+            }
+            fn txn_open(&self, t: u64) -> bool {
+                self.base.txn_open(t)
+            }
+        }
+        for mode in [PageUpdateMode::TwoImage, PageUpdateMode::Atomic] {
+            let base = Env { mode, lba: 512, others: HashMap::new() };
+            let mut st = state(&[0; PAGE], true);
+            st.pending.push(Pending::Put(encoded(b"{t}k10xxxxxxxxxxxxxxxxxxxxxxxx", &[5; 40], 1)));
+            let (m1, b) = run(&mut st, &[0; PAGE], &base);
+            // `{t}k1` is tracked here (a copy the previous image dropped); `{t}k10...` goes and
+            // `{t}k7` is placed in its bytes
+            let env = Tracked { base, tracked: vec![b"{t}k1".to_vec()] };
+            let mut st = PageState::loaded(page(), FrameIdx(0), b.recs);
+            let long = b"{t}k10xxxxxxxxxxxxxxxxxxxxxxxx";
+            st.pending.push(Pending::Remove { db: 0, h32: h32(long), key: (*long).into(), seq: Seq(2), tickets: SmallVec::new() });
+            st.pending.push(Pending::Put(encoded(b"{t}k7", &[6; 40], 3)));
+            let mut n = [0u8; PAGE];
+            let b2 = build(&mut st, &m1, &mut n, &env);
+            let placed = b2.recs.iter().find(|r| r.key(&n) == b"{t}k7").expect("placed");
+            assert_eq!(placed.key(&m1), b"{t}k1", "{mode:?}: the placed record sits where M holds the other key");
+            assert!(b2.cleared.iter().any(|(_, k)| &**k == b"{t}k1"), "{mode:?}: the tracked copy is reported gone");
+        }
     }
 
     #[test]

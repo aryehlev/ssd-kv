@@ -219,8 +219,10 @@ impl MemberStream {
             Frame::SnapEnd { slot, count } => self.push(MemberAction::SnapEnd { slot, count }),
             Frame::SyncDone { at } => match self.mode {
                 Some(AcceptMode::Repair { at: a }) => {
-                    self.applied = self.applied.max(a);
-                    self.push(MemberAction::RepairDone(a));
+                    // the end of the images: groups after `max(at, end)` follow from the backlog
+                    let end = a.max(at);
+                    self.applied = self.applied.max(end);
+                    self.push(MemberAction::RepairDone(end));
                 }
                 Some(AcceptMode::Full { .. }) => {
                     self.applied = self.applied.max(at);
@@ -244,6 +246,11 @@ impl MemberStream {
             Frame::Hello(_) | Frame::Ack { .. } | Frame::RepairKeys(_) => return Err(FrameError::Malformed),
         }
         Ok(())
+    }
+
+    /// Progress not yet acknowledged to the primary (an ack is due within a millisecond).
+    pub fn ack_pending(&self) -> bool {
+        self.mode.is_some() && (self.durable, self.applied) != self.acked
     }
 
     pub fn note_durable(&mut self, s: Seq) {

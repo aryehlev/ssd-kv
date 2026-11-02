@@ -68,6 +68,8 @@ pub enum JobKind {
     Scan { pattern: Option<Box<[u8]>>, home: ReplyTo },
     /// One partition's part of a FLUSH or barrier.
     Node { gather: GatherRef },
+    /// Replication, sync and migration work of the cluster glue (§23.7, §23.13).
+    Repl(crate::cluster::repl_glue::ReplJob),
 }
 
 /// A submitted partition request and its continuation.
@@ -85,8 +87,9 @@ pub struct Job {
 
 /// What a durability wait continues with.
 enum WaitFor {
-    Reply { to: ReplyTo, body: ReplyBody },
-    Node { gather: GatherRef },
+    /// `commit`: in cluster mode the reply also waits for the shard commit of that seq.
+    Reply { to: ReplyTo, body: ReplyBody, commit: Option<(u16, kv_storage::layout::Seq)> },
+    Node { gather: GatherRef, commit: Option<(u16, kv_storage::layout::Seq)> },
     Apply { xtxn: u64, coord: u16, partition: u16 },
 }
 
@@ -99,6 +102,12 @@ enum Need {
 struct Waiter {
     what: WaitFor,
     need: Need,
+}
+
+/// What waits for a shard commit (cluster mode, §23.8 step 3).
+pub enum CommitWaiter {
+    Reply(ReplyTo, ReplyBody),
+    Node(GatherRef),
 }
 
 /// A cross-partition transaction this worker coordinates.
@@ -445,7 +454,7 @@ impl<B: Backend> Worker<B> {
     }
 
     /// Delivers a result to its connection (here or on its home worker).
-    pub(super) fn deliver(&mut self, to: ReplyTo, body: ReplyBody) {
+    pub(crate) fn deliver(&mut self, to: ReplyTo, body: ReplyBody) {
         if to.conn.worker != self.id {
             let msg = match to.part {
                 None => XMsg::Reply { conn: to.conn, req_seq: to.seq, reply: body },
@@ -528,7 +537,20 @@ impl<B: Backend> Worker<B> {
                 self.submit_job(partition, request, job);
             }
             XMsg::ScanDone { conn, req_seq, out } => self.scan_done(conn, req_seq, out),
-            XMsg::Ctrl(_) => tracing::debug!(worker = self.id, "control event ignored in standalone mode"),
+            XMsg::Ctrl(ev) => {
+                if self.cluster.is_some() {
+                    self.on_ctrl(ev);
+                } else {
+                    tracing::debug!(worker = self.id, "control event ignored in standalone mode");
+                }
+            }
+            XMsg::Repl(ev) => {
+                if self.cluster.is_some() {
+                    self.on_repl(ev);
+                } else if let crate::cluster::net::ReplEvent::Inbound { stream, .. } | crate::cluster::net::ReplEvent::Dialed { stream: Some(stream), .. } = ev {
+                    stream.abort();
+                }
+            }
             XMsg::ReplSocket { fd, partition, .. } => {
                 tracing::debug!(worker = self.id, partition, "replication stream refused: not in cluster mode");
                 crate::runtime::ring::sys::close(fd);
@@ -538,6 +560,16 @@ impl<B: Backend> Worker<B> {
     }
 
     fn on_meta(&mut self, partition: u16, token: u64, done: MetaDone) {
+        if token & crate::cluster::AGENT_TOKEN_BIT != 0 && token & WORKER_TOKEN_BIT == 0 {
+            if let Some(cs) = self.shared.cluster() {
+                cs.tell_agent(crate::cluster::AgentMsg::Meta { token, done });
+            }
+            return;
+        }
+        if token & crate::cluster::REPL_TOKEN_BIT != 0 && token & WORKER_TOKEN_BIT == 0 {
+            self.repl_meta_done(partition, token, done);
+            return;
+        }
         if let MetaDone::Resolved { credits } = done {
             // the txns resolved: their credits return (whoever asked for the commit)
             self.shared.give_back_txn_credits(credits);
@@ -606,6 +638,10 @@ impl<B: Backend> Worker<B> {
         if conn.multi.is_some() && crate::cmd::txn::is_queued(spec.id) {
             if spec.flags.contains(CmdFlags::NO_MULTI) {
                 crate::cmd::txn::reject_no_multi(conn, &mut w);
+            } else if let Some(g) = self.cluster_gate(spec, &cmd, conn) {
+                // the gate again at queue time inside MULTI (§23.6): the EXEC aborts
+                router::write_gate(g, &mut w);
+                crate::cmd::txn::flag_queue_error(conn);
             } else {
                 crate::cmd::txn::queue(conn, cmd, &mut w);
             }
@@ -619,6 +655,18 @@ impl<B: Backend> Worker<B> {
             self.reply_now(conn, &mut out);
             self.x.reply = out;
             return;
+        }
+        if self.router.cluster && !spec.has_keys() && spec.flags.contains(CmdFlags::WRITE) {
+            // keyless writes (FLUSHDB/FLUSHALL) need the primary role and a valid lease
+            let lease_ok = self.shared.lease.valid(self.now.boot_ns);
+            let g = self.shared.ownership.read().gate(None, spec.flags, conn.readonly, lease_ok, conn.id);
+            if g != crate::cluster::ownership::Gate::Serve {
+                router::write_gate(g, &mut w);
+                self.shared.command_stats[usize::from(self.id)].reject(spec.id);
+                self.reply_now(conn, &mut out);
+                self.x.reply = out;
+                return;
+            }
         }
         let started = self.now.mono_ns;
         match crate::cmd::handler(spec.id) {
@@ -831,6 +879,13 @@ impl<B: Backend> Worker<B> {
 
     fn exec_transaction(&mut self, slot: u32, conn: &mut Conn, cmds: Vec<OwnedCmd>, credit: &mut Option<CreditGuard>, out: &mut Vec<u8>) {
         let proto = conn.proto;
+        if self.router.cluster
+            && let Some(g) = self.multi_gate(&cmds, conn.readonly, conn.id)
+        {
+            router::write_gate(g, &mut ReplyWriter::new(out, proto));
+            self.reply_now(conn, out);
+            return;
+        }
         let partition = match multi_partition(&cmds, self.router.partitions) {
             Ok(Some(p)) => p,
             // a keyless transaction (PING, ECHO, SELECT) runs on any partition: one of ours
@@ -988,7 +1043,7 @@ impl<B: Backend> Worker<B> {
 
     /// Submits `req` to owned partition `p` with its continuation; while a cross-partition
     /// transaction holds `p`, new requests wait in FIFO order (§6.8 step 2).
-    pub(super) fn submit_job(&mut self, p: u16, req: Request, job: Job) {
+    pub(crate) fn submit_job(&mut self, p: u16, req: Request, job: Job) {
         if !self.backend.owned().contains(&p) {
             tracing::error!(worker = self.id, partition = p, "request for a partition of another worker");
             if let Some(to) = job.to {
@@ -1043,6 +1098,31 @@ impl<B: Backend> Worker<B> {
         if let JobKind::Scan { .. } = job.kind {
             return self.run_scan(p, id, job);
         }
+        if let JobKind::Repl(rj) = &job.kind
+            && matches!(rj.work, crate::runtime::backend::ReplWork::Walk)
+        {
+            return self.run_repl_walk(p, id, job);
+        }
+        if self.router.cluster
+            && let Some(g) = self.owner_gate(&job)
+        {
+            // the role or the slot changed since dispatch: the command does not run here
+            let mut reply = std::mem::take(&mut self.x.reply);
+            reply.clear();
+            let st = self.backend.exec(p, self.now, id, Work::Nothing, &job.env, &mut reply);
+            if matches!(st, ExecStatus::Requeued) {
+                self.x.jobs.insert((p, id.0), job);
+                self.x.reply = reply;
+                return;
+            }
+            reply.clear();
+            router::write_gate(g, &mut ReplyWriter::new(&mut reply, job.env.proto));
+            if let Some(to) = job.to {
+                self.deliver(to, ReplyBody::Bytes(std::mem::take(&mut reply)));
+            }
+            self.x.reply = reply;
+            return;
+        }
         let mut reply = std::mem::take(&mut self.x.reply);
         reply.clear();
         let databases = self.cfg.databases;
@@ -1053,6 +1133,7 @@ impl<B: Backend> Worker<B> {
                 JobKind::Multi(cmds) => Work::Multi { cmds, databases },
                 JobKind::Lock { keys, .. } => Work::Reads(keys),
                 JobKind::Apply { ops, .. } => Work::Ops(ops),
+                JobKind::Repl(rj) => Work::Repl(&rj.work),
                 JobKind::Node { .. } | JobKind::Scan { .. } => Work::Nothing,
             };
             self.backend.exec(p, self.now, id, work, &job.env, &mut reply)
@@ -1069,27 +1150,44 @@ impl<B: Backend> Worker<B> {
                         c.spend();
                     }
                 }
-                self.job_done(p, job, out, eo.ticket, &mut reply);
+                self.job_done(p, job, out, &eo, &mut reply);
             }
             ExecStatus::Failed(e) => self.job_failed(p, job, e),
         }
         self.x.reply = reply;
     }
 
-    fn job_done(&mut self, p: u16, job: Job, out: WorkOut, ticket: Option<kv_storage::ticket::TicketId>, reply: &mut Vec<u8>) {
+    fn job_done(&mut self, p: u16, job: Job, out: WorkOut, eo: &kv_storage::partition::ExecOut, reply: &mut Vec<u8>) {
         let mode = self.cfg.effective_durability();
+        let ticket = eo.ticket;
         if !self.x.executed.contains(&p) {
             self.x.executed.push(p);
         }
+        if let JobKind::Repl(rj) = job.kind {
+            let res = match out {
+                WorkOut::Repl(o) => Ok(o),
+                _ => Ok(crate::runtime::backend::ReplOut::None),
+            };
+            self.repl_job_done(p, rj, res, Some(eo));
+            return;
+        }
+        // cluster primary: the group goes to the members; replies wait for the shard commit
+        let commit = match (&eo.group, self.cluster.is_some()) {
+            (Some(g), true) => self.cluster_group(p, g, ticket).map(|s| (p, s)),
+            _ => None,
+        };
         match job.kind {
             JobKind::Cmd(_) | JobKind::Multi(_) => {
                 self.record(job.id, job.start_ns, reply.first() == Some(&b'-'));
                 let Some(to) = job.to else { return };
                 let body = ReplyBody::Bytes(std::mem::take(reply));
                 match (ticket_need(mode, job.id, ticket.is_some()), ticket) {
-                    (Some(need), Some(t)) => self.wait(p, t.0, Waiter { what: WaitFor::Reply { to, body }, need }),
-                    // released after this tick's partition ticks (see `release_executed`)
-                    _ => self.x.held.push(Held::Reply(to, body)),
+                    (Some(need), Some(t)) => self.wait(p, t.0, Waiter { what: WaitFor::Reply { to, body, commit }, need }),
+                    _ => match commit {
+                        Some((cp, s)) => self.commit_wait(cp, s, CommitWaiter::Reply(to, body)),
+                        // released after this tick's partition ticks (see `release_executed`)
+                        None => self.x.held.push(Held::Reply(to, body)),
+                    },
                 }
             }
             JobKind::Lock { xtxn, coord, .. } => {
@@ -1108,10 +1206,130 @@ impl<B: Backend> Worker<B> {
             },
             JobKind::Node { gather } => match ticket {
                 // FLUSH replies after the cutoff is durable (E5); barriers after every effect is
-                Some(t) => self.wait(p, t.0, Waiter { what: WaitFor::Node { gather }, need: Need::Durable }),
-                None => self.x.held.push(Held::NodePart(gather)),
+                Some(t) => self.wait(p, t.0, Waiter { what: WaitFor::Node { gather, commit }, need: Need::Durable }),
+                None => match commit {
+                    Some((cp, s)) => self.commit_wait(cp, s, CommitWaiter::Node(gather)),
+                    None => self.x.held.push(Held::NodePart(gather)),
+                },
             },
-            JobKind::Scan { .. } => {}
+            JobKind::Scan { .. } | JobKind::Repl(_) => {}
+        }
+    }
+
+    /// A commit waiter is released: `refused` replaces the reply with that error (the write
+    /// was not acknowledged).
+    pub(crate) fn commit_released(&mut self, w: CommitWaiter, refused: Option<&[u8]>) {
+        match w {
+            CommitWaiter::Reply(to, body) => {
+                let body = match refused {
+                    Some(e) => {
+                        let mut b = Vec::with_capacity(e.len() + 3);
+                        ReplyWriter::new(&mut b, kv_resp::Proto::Resp2).error(e);
+                        ReplyBody::Bytes(b)
+                    }
+                    None => body,
+                };
+                self.deliver(to, body);
+            }
+            CommitWaiter::Node(gather) => {
+                let err = refused.map(|_| StoreError::ReadOnly);
+                self.node_part_done(gather, err);
+            }
+        }
+    }
+
+    /// The cluster gate of a command at queue time inside MULTI (`None`: queue it).
+    fn cluster_gate(&self, spec: &'static CommandSpec, cmd: &OwnedCmd, conn: &Conn) -> Option<crate::cluster::ownership::Gate> {
+        if !self.router.cluster || !spec.has_keys() {
+            return None;
+        }
+        let argv = cmd.argv();
+        let pos = kv_cmd::key_positions(spec, &argv);
+        if pos.is_empty() {
+            return None;
+        }
+        let slot = match kv_cmd::common_slot(&argv, &pos) {
+            Ok(s) => s,
+            Err(_) => return Some(crate::cluster::ownership::Gate::CrossSlot),
+        };
+        let lease_ok = self.shared.lease.valid(self.now.boot_ns);
+        let g = self.shared.ownership.read().gate(slot, spec.flags, conn.readonly, lease_ok, conn.id);
+        (g != crate::cluster::ownership::Gate::Serve).then_some(g)
+    }
+
+    /// The slot and flags of an EXEC body: one slot (else CROSSSLOT), WRITE if any command
+    /// writes.
+    fn multi_slot(cmds: &[OwnedCmd]) -> Result<(Option<u16>, CmdFlags), ()> {
+        let mut slot = None;
+        let mut flags = CmdFlags::READONLY;
+        for c in cmds {
+            let spec = c.id.spec();
+            if spec.flags.contains(CmdFlags::WRITE) {
+                flags = CmdFlags::WRITE;
+            }
+            let argv = c.argv();
+            for i in kv_cmd::key_positions(spec, &argv) {
+                let s = kv_common::key_slot(argv[usize::from(i)]);
+                match slot {
+                    None => slot = Some(s),
+                    Some(x) if x != s => return Err(()),
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok((slot, flags))
+    }
+
+    /// The cluster gate of an EXEC body at EXEC time.
+    fn multi_gate(&self, cmds: &[OwnedCmd], readonly_conn: bool, conn_id: u64) -> Option<crate::cluster::ownership::Gate> {
+        let (slot, flags) = match Self::multi_slot(cmds) {
+            Ok(x) => x,
+            Err(()) => return Some(crate::cluster::ownership::Gate::CrossSlot),
+        };
+        slot?;
+        let lease_ok = self.shared.lease.valid(self.now.boot_ns);
+        let g = self.shared.ownership.read().gate(slot, flags, readonly_conn, lease_ok, conn_id);
+        (g != crate::cluster::ownership::Gate::Serve).then_some(g)
+    }
+
+    /// The gate again on the owner, right before a client command executes (cluster mode).
+    fn owner_gate(&self, job: &Job) -> Option<crate::cluster::ownership::Gate> {
+        let (slot, flags) = match &job.kind {
+            JobKind::Cmd(c) => {
+                let spec = c.id.spec();
+                let argv = c.argv();
+                let pos = kv_cmd::key_positions(spec, &argv);
+                let slot = pos.first().map(|&i| kv_common::key_slot(argv[usize::from(i)]));
+                (slot, spec.flags)
+            }
+            JobKind::Multi(cmds) => match Self::multi_slot(cmds) {
+                Ok(x) => x,
+                Err(()) => return Some(crate::cluster::ownership::Gate::CrossSlot),
+            },
+            _ => return None,
+        };
+        slot?;
+        self.owner_refuses(flags, slot, &job.env)
+    }
+
+    /// A walk step (`SlotIter`) of the cluster glue.
+    fn run_repl_walk(&mut self, p: u16, id: ReqId, job: Job) {
+        let mut keys = Vec::new();
+        let status = self.backend.scan(p, self.now, id, &|_| true, &mut keys);
+        match status {
+            ExecStatus::Requeued => {
+                self.x.jobs.insert((p, id.0), job);
+            }
+            ExecStatus::Done(next, _) => {
+                if let JobKind::Repl(rj) = job.kind {
+                    self.repl_job_done(p, rj, Ok(crate::runtime::backend::ReplOut::Listed { next, keys }), None);
+                }
+            }
+            ExecStatus::Failed(e) => {
+                if let JobKind::Repl(rj) = job.kind {
+                    self.repl_job_done(p, rj, Err(e), None);
+                }
+            }
         }
     }
 
@@ -1152,6 +1370,7 @@ impl<B: Backend> Worker<B> {
             }
             JobKind::Node { gather } => self.node_part_done(gather, Some(e)),
             JobKind::Scan { home, .. } => self.send_scan_result(home, ScanOutcome { res: Err(e) }),
+            JobKind::Repl(rj) => self.repl_job_done(p, rj, Err(e), None),
         }
     }
 
@@ -1191,6 +1410,11 @@ impl<B: Backend> Worker<B> {
             let mut tickets = std::mem::take(&mut self.x.tickets);
             tickets.clear();
             self.backend.take_tickets(p, &mut tickets);
+            if self.cluster.is_some() {
+                for &(t, st) in &tickets {
+                    self.cluster_ticket(p, t, st);
+                }
+            }
             for &(t, st) in &tickets {
                 let Some(ws) = self.x.waits.get_mut(&(p, t.0)) else { continue };
                 let mut done: SmallVec<[Waiter; 1]> = SmallVec::new();
@@ -1219,14 +1443,15 @@ impl<B: Backend> Worker<B> {
 
     fn wait_done(&mut self, w: Waiter, failed: Option<StoreError>) {
         match w.what {
-            WaitFor::Reply { to, body } => {
-                let body = match failed {
-                    Some(e) => err_body(e, kv_resp::Proto::Resp2),
-                    None => body,
-                };
-                self.deliver(to, body);
-            }
-            WaitFor::Node { gather } => self.node_part_done(gather, failed),
+            WaitFor::Reply { to, body, commit } => match (failed, commit) {
+                (Some(e), _) => self.deliver(to, err_body(e, kv_resp::Proto::Resp2)),
+                (None, Some((p, s))) => self.commit_wait(p, s, CommitWaiter::Reply(to, body)),
+                (None, None) => self.deliver(to, body),
+            },
+            WaitFor::Node { gather, commit } => match (failed, commit) {
+                (None, Some((p, s))) => self.commit_wait(p, s, CommitWaiter::Node(gather)),
+                (f, _) => self.node_part_done(gather, f),
+            },
             WaitFor::Apply { xtxn, coord, partition } => {
                 let res = failed.map_or(Ok(()), Err);
                 self.send(coord, XMsg::XTxn(XTxnMsg::Applied { xtxn, partition, res }));

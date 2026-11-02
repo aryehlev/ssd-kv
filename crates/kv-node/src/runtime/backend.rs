@@ -22,7 +22,9 @@ use kv_storage::cache::PageCache;
 use kv_storage::effect::Op;
 use kv_storage::flush::FlushTracker;
 use kv_storage::io::{IoDone, IoReq};
-use kv_storage::keyspace::StoreError;
+use kv_storage::keyspace::{ApplyMode, ApplyOutcome, StoreError};
+use kv_storage::layout::Seq;
+use smallvec::SmallVec;
 use kv_storage::metastore::{MetaClient, MetaDone, MetaReq};
 use kv_storage::partition::{ExecStatus, PartState, PartitionCounters, PartitionStore, ReqId, Request, StorageCtx};
 use kv_storage::recovery::{RecoveryMode, RecoveryProgress};
@@ -46,6 +48,8 @@ pub enum Work<'a> {
     Ops(&'a [Op]),
     /// Nothing: the request's kind does the work (FLUSHDB, barriers).
     Nothing,
+    /// Replication, sync and migration work of the cluster glue (page store only).
+    Repl(&'a ReplWork),
 }
 
 /// The result of a [`Work`] besides its reply bytes.
@@ -53,6 +57,114 @@ pub enum WorkOut {
     None,
     /// [`Work::Reads`]: one read per lock key.
     Reads(Vec<KeyRead>),
+    /// [`Work::Repl`].
+    Repl(ReplOut),
+}
+
+/// What a replication request does with the partition's keyspace (DESIGN §23.7, §23.13).
+pub enum ReplWork {
+    /// Replicated ops applied at `seq`: a member's groups (`Ordered`), repair images (`Image`),
+    /// full-sync records (`SnapshotMerge`: identical records are confirmed, nothing written).
+    Apply { ops: Vec<Op>, seq: Seq, mode: ApplyMode },
+    /// Ops applied as this node's own writes (a migration destination's copy, slot purges):
+    /// new seqs, replicated to this shard's members like any client write.
+    Own { ops: Vec<Op> },
+    /// The current image `(vtype, expire_at, value)` of each key (full-sync records, repair
+    /// images, migration copies).
+    Read { db: u8, keys: Vec<Box<[u8]>> },
+    /// The stored version of each key (`Seq::ZERO` when absent).
+    Seqs { db: u8, keys: Vec<Box<[u8]>> },
+    /// Merge-sync prune: deletes each key whose stored version is below `below`, at `at`.
+    Prune { db: u8, keys: Vec<Box<[u8]>>, below: Seq, at: Seq },
+    /// A `SlotIter` walk step (run through the partition's key walk, not a keyspace closure).
+    Walk,
+}
+
+/// The result of a [`ReplWork`].
+pub enum ReplOut {
+    None,
+    Applied(SmallVec<[ApplyOutcome; 2]>),
+    Images(Vec<Option<(u8, u64, Vec<u8>)>>),
+    Seqs(Vec<Seq>),
+    /// A walk step: the next fingerprint (`2^32` once the slot is done) and the keys listed.
+    Listed { next: u64, keys: Vec<Box<[u8]>> },
+}
+
+/// Runs a [`ReplWork`] against the partition keyspace.
+pub fn run_repl(ks: &mut kv_storage::keyspace::Keyspace<'_>, w: &ReplWork) -> Result<ReplOut, StoreError> {
+    match w {
+        ReplWork::Apply { ops, seq, mode } => {
+            let mut out = SmallVec::new();
+            for op in ops {
+                out.push(ks.apply_replicated(op, *seq, *mode)?);
+            }
+            Ok(ReplOut::Applied(out))
+        }
+        ReplWork::Own { ops } => {
+            for op in ops {
+                match op {
+                    Op::Put { db, vtype, expire_at, key, value } => {
+                        ks.select(*db);
+                        let vt = if *vtype == kv_storage::extent::EXT_VTYPE_HASH { VType::Hash } else { VType::String };
+                        ks.put(key, value, vt, (*expire_at != 0).then_some(*expire_at))?;
+                    }
+                    Op::Del { db, key } | Op::Expired { db, key } => {
+                        ks.select(*db);
+                        ks.delete(key)?;
+                    }
+                    Op::Expire { db, key, expire_at } => {
+                        ks.select(*db);
+                        ks.set_expire(key, (*expire_at != 0).then_some(*expire_at))?;
+                    }
+                    Op::Append { db, key, data } => {
+                        ks.select(*db);
+                        ks.append(key, data)?;
+                    }
+                    Op::SetRange { db, key, offset, data } => {
+                        ks.select(*db);
+                        ks.set_range(key, *offset, data)?;
+                    }
+                    Op::FlushDb { .. } | Op::FlushSlot { .. } | Op::Noop => {}
+                }
+            }
+            Ok(ReplOut::None)
+        }
+        ReplWork::Read { db, keys } => {
+            ks.select(*db);
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                out.push(match ks.get(k)? {
+                    Some((m, v)) => {
+                        let vtype = match m.vtype {
+                            VType::String => kv_storage::extent::EXT_VTYPE_STRING,
+                            VType::Hash => kv_storage::extent::EXT_VTYPE_HASH,
+                        };
+                        Some((vtype, m.expire_at_ms.unwrap_or(0), v.to_vec()))
+                    }
+                    None => None,
+                });
+            }
+            Ok(ReplOut::Images(out))
+        }
+        ReplWork::Seqs { db, keys } => {
+            ks.select(*db);
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                out.push(ks.stored_seq(k)?);
+            }
+            Ok(ReplOut::Seqs(out))
+        }
+        ReplWork::Prune { db, keys, below, at } => {
+            ks.select(*db);
+            for k in keys {
+                if ks.stored_seq(k)? < *below {
+                    ks.apply_replicated(&Op::Del { db: *db, key: k.clone() }, *at, ApplyMode::Image)?;
+                }
+            }
+            Ok(ReplOut::None)
+        }
+        ReplWork::Walk => Ok(ReplOut::None),
+    }
 }
 
 /// Runs `work` against a store, writing its reply to `reply` (the caller truncates it before a
@@ -83,8 +195,8 @@ pub fn run_work<S: Store>(s: &mut S, work: Work<'_>, env: &ExecEnv, reply: &mut 
                     ReadWant::Value => match s.get(&k.key)? {
                         Some((m, v)) => {
                             let vtype = match m.vtype {
-                                VType::String => 0,
-                                VType::Hash => 1,
+                                VType::String => kv_storage::extent::EXT_VTYPE_STRING,
+                                VType::Hash => kv_storage::extent::EXT_VTYPE_HASH,
                             };
                             KeyRead { exists: true, value: Some((vtype, m.expire_at_ms, v.to_vec())) }
                         }
@@ -100,7 +212,7 @@ pub fn run_work<S: Store>(s: &mut S, work: Work<'_>, env: &ExecEnv, reply: &mut 
                 match op {
                     Op::Put { db, vtype, expire_at, key, value } => {
                         s.select(*db);
-                        let vt = if *vtype == 1 { VType::Hash } else { VType::String };
+                        let vt = if *vtype == kv_storage::extent::EXT_VTYPE_HASH { VType::Hash } else { VType::String };
                         let exp = (*expire_at != 0).then_some(*expire_at);
                         s.put(key, value, vt, exp)?;
                     }
@@ -114,6 +226,8 @@ pub fn run_work<S: Store>(s: &mut S, work: Work<'_>, env: &ExecEnv, reply: &mut 
             Ok(WorkOut::None)
         }
         Work::Nothing => Ok(WorkOut::None),
+        // replication work runs only on the page store's keyspace (see `PageBackend::exec`)
+        Work::Repl(_) => Err(StoreError::Io(-libc::ENOSYS)),
     }
 }
 
@@ -154,6 +268,15 @@ pub trait Backend {
     /// writer (§10.10); `true` once every owned partition handed its section in (keep ticking
     /// until then).
     fn snapshot_sections(&mut self, now: Now) -> bool;
+    /// Cluster role of partition `p`: a primary produces replication groups and starts `term`
+    /// (seq counter restarts, §10.11); a member or idle partition produces none.
+    fn set_cluster_role(&mut self, p: u16, primary: bool, term: u32);
+    /// The seq the next write of `p` takes.
+    fn next_seq(&self, p: u16) -> Seq;
+    /// The node's key-hash seed (fingerprints of the walk position).
+    fn hash_seed(&self, p: u16) -> u64;
+    /// Index entries of `(db, slot)` in `p` (walks skip empty tables).
+    fn slot_len(&self, p: u16, db: u8, slot: u16) -> usize;
 }
 
 /// Storage resources of one worker for the page store.
@@ -250,7 +373,10 @@ impl Backend for PageBackend {
         let (part, mut cx) = self.split(p, now);
         let status = part.exec(&mut cx, id, &mut |ks| {
             reply.truncate(base);
-            run_work(ks, work, env, reply)
+            match work {
+                Work::Repl(w) => run_repl(ks, w).map(WorkOut::Repl),
+                _ => run_work(ks, work, env, reply),
+            }
         });
         if !matches!(status, ExecStatus::Done(..)) {
             reply.truncate(base);
@@ -391,6 +517,28 @@ impl Backend for PageBackend {
         }
         self.snapshot = Some(w);
         all
+    }
+
+    fn set_cluster_role(&mut self, p: u16, primary: bool, term: u32) {
+        if let Some(part) = self.parts[usize::from(p)].as_mut() {
+            if primary {
+                part.set_term(term);
+            }
+            part.set_produce_groups(primary);
+            self.touched[usize::from(p)] = true;
+        }
+    }
+
+    fn next_seq(&self, p: u16) -> Seq {
+        self.parts[usize::from(p)].as_ref().map_or(Seq::ZERO, PartitionStore::next_seq)
+    }
+
+    fn hash_seed(&self, p: u16) -> u64 {
+        self.parts[usize::from(p)].as_ref().map_or(0, |part| part.cfg().hash_seed)
+    }
+
+    fn slot_len(&self, p: u16, db: u8, slot: u16) -> usize {
+        self.parts[usize::from(p)].as_ref().and_then(|part| part.index().table(db, slot)).map_or(0, |t| t.len())
     }
 }
 
@@ -689,6 +837,16 @@ pub mod mem {
         }
         fn snapshot_sections(&mut self, _now: Now) -> bool {
             true
+        }
+        fn set_cluster_role(&mut self, _p: u16, _primary: bool, _term: u32) {}
+        fn next_seq(&self, _p: u16) -> Seq {
+            Seq::ZERO
+        }
+        fn hash_seed(&self, _p: u16) -> u64 {
+            0
+        }
+        fn slot_len(&self, _p: u16, _db: u8, _slot: u16) -> usize {
+            0
         }
     }
 }

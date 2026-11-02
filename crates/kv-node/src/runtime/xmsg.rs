@@ -68,6 +68,8 @@ pub enum XMsg {
     Meta { partition: u16, token: u64, done: MetaDone },
     Ctrl(CtrlEvent),
     ReplSocket { fd: i32, partition: u16, hello: Box<kv_repl::frame::Hello> },
+    /// A replication transport event for a partition of the destination (§23.7).
+    Repl(crate::cluster::net::ReplEvent),
     Shutdown,
     /// One SCAN/KEYS/RANDOMKEY step on a partition of the destination (§16.6, LC-18).
     Scan { from: u16, conn: ConnRef, req_seq: u64, req: ScanReq },

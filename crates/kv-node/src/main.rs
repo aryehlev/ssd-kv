@@ -11,11 +11,10 @@
 //! `unsafe` is allowed only in `runtime/ring.rs` (§24).
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
-// Parts of the §24.11 interface (cluster mode, shared reply bodies, control events) are wired
-// only from M2 on; the node cluster agent modules are still stubs.
+// Parts of the §24.11 interface (shared reply bodies, the spec's socket hand-over message) are
+// not used by every build.
 #![allow(dead_code)]
 
-#[allow(unused_variables)]
 mod cluster;
 mod cmd;
 mod config;
@@ -30,9 +29,9 @@ use clap::Parser;
 
 use crate::config::{CheckArgs, Cli, Command, Config, FormatArgs, InspectArgs};
 
-/// Whether `cluster::agent` and `cluster::ownership` are implemented (M2); until then cluster
-/// mode is refused at startup with a one-line reason (§22).
-const CLUSTER_AGENT_AVAILABLE: bool = false;
+/// Whether `cluster::agent` and `cluster::ownership` are part of this build; without them
+/// cluster mode is refused at startup with a one-line reason (§22).
+const CLUSTER_AGENT_AVAILABLE: bool = true;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

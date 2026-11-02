@@ -315,6 +315,22 @@ async fn serve_metrics(mut sock: tokio::net::TcpStream, shared: Arc<NodeShared>)
     let _ = sock.write_all(&body).await;
 }
 
+/// Cluster mode: the node-wide cluster state, the unassigned gate and the replication
+/// transport (its listener is bound here, so a bad address fails startup).
+fn start_cluster(shared: &Arc<NodeShared>, cfg: &Config, boot: crate::cluster::BootMeta, meta: kv_storage::metastore::MetaClient) -> Result<(), StartError> {
+    use crate::cluster::ownership::{GateFlags, Ownership};
+    let partitions = shared.partitions;
+    let cs = Arc::new(crate::cluster::ClusterShared::new(boot, meta, cfg.cluster_auth_token.as_bytes().to_vec(), partitions));
+    let flags = GateFlags { syncing: cs.syncing.clone(), handoff: cs.handoff.clone() };
+    *shared.ownership.write() = Arc::new(Ownership::unassigned(partitions, Some(flags)));
+    shared.set_cluster(cs.clone());
+    let addr = std::net::SocketAddr::new(crate::cluster::bind_ip(cfg), crate::cluster::repl_port(cfg));
+    let net = crate::cluster::net::ReplNet::start(shared, addr).map_err(|e| fail(&format!("replication port {addr}"), e))?;
+    tracing::info!(addr = %net.listen_addr, "replication port listening");
+    let _ = cs.net.set(net);
+    Ok(())
+}
+
 /// Opens the storage and starts a node serving `cfg` (the `kvd` path).
 pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
     let paths = prepare_devices(&cfg)?;
@@ -327,6 +343,15 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
     }
     let partitions = fmt.partitions;
     let workers = cfg.worker_count(partitions);
+    // cluster mode: the node's own metadata as persisted, read before the engine opens
+    let boot_meta = if cfg.cluster_enabled {
+        let sb = read_superblock(&paths[0])
+            .map_err(|e| fail(&format!("cannot read {}", paths[0].display()), e))?
+            .ok_or_else(|| StartError(format!("{} holds no kvssd format", paths[0].display())))?;
+        Some(crate::cluster::read_boot_meta(&paths[0], &sb).map_err(|e| fail("node meta", e))?)
+    } else {
+        None
+    };
     let mut device_files = Vec::with_capacity(paths.len());
     let mut device_bytes = 0u64;
     let mut write_through = Vec::with_capacity(paths.len());
@@ -397,6 +422,9 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
         })
         .collect();
     let (meta_client, meta_thread) = kv_storage::metastore::MetaStore::start_with_fill(meta_devs, hooks, cfg.max_storage_fill);
+    if let Some(boot) = boot_meta {
+        start_cluster(&shared, &cfg, boot, meta_client.clone())?;
+    }
 
     let listeners = bind_listeners(&cfg, workers)?;
     // partitions go to their owner worker (p % W)

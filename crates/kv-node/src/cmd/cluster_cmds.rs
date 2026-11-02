@@ -44,12 +44,15 @@ pub fn cluster_keyslot(cx: &mut ConnCtx<'_>, a: &Args<'_>, w: &mut ReplyWriter<'
     ConnOutcome::Done
 }
 
-/// CLUSTER MYID: the node's own identity. The identity is assigned when the coordinator
-/// registers the node; until the node agent publishes it to the command layer this replies an
-/// error instead of an invented id.
+/// CLUSTER MYID: the node's own identity (identity only, never another node's). The identity
+/// is assigned when the coordinator registers the node; before the first assignment this
+/// replies an error instead of an invented id.
 pub fn cluster_myid(cx: &mut ConnCtx<'_>, _a: &Args<'_>, w: &mut ReplyWriter<'_>) -> ConnOutcome {
     if cluster_mode(cx, w) {
-        w.error(b"ERR node identity is not available yet");
+        match cx.shared.cluster().and_then(|c| c.identity().node_id) {
+            Some(id) => w.bulk(id.hex40().as_bytes()),
+            None => w.error(b"ERR node identity is not available yet"),
+        }
     }
     ConnOutcome::Done
 }

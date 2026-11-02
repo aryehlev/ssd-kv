@@ -72,6 +72,8 @@ pub struct NodeShared {
     /// Whether the shutdown writes the index snapshot (`SHUTDOWN NOSAVE` clears it).
     pub shutdown_snapshot: AtomicBool,
     shutdown: AtomicBool,
+    /// Cluster mode: the node-wide cluster state (set once at startup).
+    cluster: std::sync::OnceLock<Arc<crate::cluster::ClusterShared>>,
 }
 
 /// Restart facts (§18, INFO persistence).
@@ -154,7 +156,19 @@ impl NodeShared {
             partitions_recovered: AtomicU32::new(0),
             shutdown_snapshot: AtomicBool::new(true),
             shutdown: AtomicBool::new(false),
+            cluster: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The node-wide cluster state (cluster mode only).
+    #[inline]
+    pub fn cluster(&self) -> Option<Arc<crate::cluster::ClusterShared>> {
+        self.cluster.get().cloned()
+    }
+
+    /// Installs the cluster state (once, at startup).
+    pub fn set_cluster(&self, cs: Arc<crate::cluster::ClusterShared>) {
+        let _ = self.cluster.set(cs);
     }
 
     /// The current configuration.

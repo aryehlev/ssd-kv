@@ -23,6 +23,11 @@ impl LeaseCell {
     pub fn set(&self, expiry_boot_ns: u64) {
         self.0.store(expiry_boot_ns, Ordering::Release);
     }
+
+    /// The current expiry (CLOCK_BOOTTIME ns; 0 = none).
+    pub fn expiry(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 impl Default for LeaseCell {

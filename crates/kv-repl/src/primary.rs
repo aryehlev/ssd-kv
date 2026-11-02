@@ -107,6 +107,22 @@ impl ReplSender {
         self.partition
     }
 
+    /// The partition already executed groups of this term up to `s` before this sender
+    /// existed (a primary resuming its own recovered state): the stream and the backlog start
+    /// after `s`, so no member is ever continued over groups the backlog never held.
+    pub fn start_at(&mut self, s: Seq) {
+        if s > self.last {
+            self.last = s;
+            self.local_durable = self.local_durable.max(s);
+            self.backlog.start_after(s);
+        }
+    }
+
+    /// The backlog of this term's groups (kept by a demoted primary for its Repair key set).
+    pub fn into_backlog(self) -> Backlog {
+        self.backlog
+    }
+
     pub fn term(&self) -> u32 {
         self.term
     }

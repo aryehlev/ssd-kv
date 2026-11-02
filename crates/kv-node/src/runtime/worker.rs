@@ -43,6 +43,8 @@ const DRAIN_TURN: usize = 256;
 const BUSY_TIMER_NS: u32 = 1_000_000;
 /// Timer while idle: background sweeps, idle-client timeouts and counter publication.
 const IDLE_TIMER_NS: u32 = 100_000_000;
+/// Timer while replication streams are open and nothing else is pending.
+const CLUSTER_TIMER_NS: u32 = 5_000_000;
 /// Counter mirrors are published at most this often.
 const PUBLISH_EVERY_NS: u64 = 1_000_000;
 /// Upper bound of the shutdown drain.
@@ -59,29 +61,29 @@ pub struct WorkerInit<B> {
 
 pub struct Worker<B: Backend> {
     pub id: u16,
-    pub(super) ring: Ring,
-    pub(super) shared: Arc<NodeShared>,
-    pub(super) cfg: Arc<Config>,
+    pub(crate) ring: Ring,
+    pub(crate) shared: Arc<NodeShared>,
+    pub(crate) cfg: Arc<Config>,
     cfg_gen: u64,
-    pub(super) router: Router,
-    pub(super) backend: B,
+    pub(crate) router: Router,
+    pub(crate) backend: B,
     listeners: Vec<Listener>,
-    pub(super) conns: Vec<Option<Conn>>,
-    pub(super) gens: Vec<u32>,
+    pub(crate) conns: Vec<Option<Conn>>,
+    pub(crate) gens: Vec<u32>,
     free_slots: Vec<u32>,
-    pub(super) parse_q: Vec<u32>,
-    pub(super) send_q: Vec<u32>,
+    pub(crate) parse_q: Vec<u32>,
+    pub(crate) send_q: Vec<u32>,
     cq: Vec<Completion>,
-    pub(super) x: ExecState,
-    pub(super) counters: WorkerCounters,
-    pub(super) now: Now,
+    pub(crate) x: ExecState,
+    pub(crate) counters: WorkerCounters,
+    pub(crate) now: Now,
     last_publish: u64,
     /// Connections held on a node-wide limit (re-checked every millisecond).
     shared_held: Vec<u32>,
     /// The connection [`parse_conn`](Self::parse_conn) took out of the table.
-    pub(super) checked_out: Option<u32>,
+    pub(crate) checked_out: Option<u32>,
     /// Results for the checked-out connection, delivered when it is back.
-    pub(super) deferred: Vec<(crate::runtime::exec::ReplyTo, crate::runtime::xmsg::ReplyBody)>,
+    pub(crate) deferred: Vec<(crate::runtime::exec::ReplyTo, crate::runtime::xmsg::ReplyBody)>,
     /// Counters changed since the last publication (rate-limited to one per millisecond).
     publish_due: bool,
     recovering: Vec<u16>,
@@ -91,6 +93,8 @@ pub struct Worker<B: Backend> {
     dirty_full: bool,
     spare_out: Vec<Vec<u8>>,
     io_buf: Vec<(std::os::fd::RawFd, u8, kv_storage::io::IoReq)>,
+    /// Cluster mode: replication streams, sync and migration endpoints of the partitions.
+    pub(crate) cluster: Option<crate::cluster::repl_glue::ClusterWorker>,
 }
 
 /// Token of a connection's ring operations: slot and generation.
@@ -111,6 +115,10 @@ impl<B: Backend> Worker<B> {
             cluster: cfg.cluster_enabled,
         };
         let recovering = init.backend.owned().to_vec();
+        let cluster = match (cfg.cluster_enabled, init.shared.cluster()) {
+            (true, Some(cs)) => Some(crate::cluster::repl_glue::ClusterWorker::new(cs, init.backend.owned(), init.shared.partitions, &cfg)),
+            _ => None,
+        };
         Ok(Worker {
             id: init.id,
             ring,
@@ -140,6 +148,7 @@ impl<B: Backend> Worker<B> {
             dirty_full: false,
             spare_out: Vec::new(),
             io_buf: Vec::new(),
+            cluster,
         })
     }
 
@@ -169,6 +178,10 @@ impl<B: Backend> Worker<B> {
             self.release_executed();
             // 5./6. tickets, replies, flushes, sends
             self.release_tickets();
+            if self.cluster.is_some() {
+                // streams, walks, acks, committed replies (§23.7, §23.8)
+                self.cluster_tick();
+            }
             self.flush_outbox();
             self.submit_io();
             self.flush_sends();
@@ -805,7 +818,9 @@ impl<B: Backend> Worker<B> {
     }
 
     fn enter(&mut self) {
+        let cluster_busy = self.cluster.as_ref().is_some_and(|c| c.busy());
         let busy = self.backend.busy()
+            || cluster_busy
             || !self.recovering.is_empty()
             || self.stopping.is_some()
             || self.x.waiting_on_gate()
@@ -813,6 +828,9 @@ impl<B: Backend> Worker<B> {
             || !self.shared_held.is_empty();
         let timer = if busy {
             Some(BUSY_TIMER_NS)
+        } else if self.cluster.as_ref().is_some_and(|c| c.active()) {
+            // replication heartbeats, coalesced acks and position persistence
+            Some(CLUSTER_TIMER_NS)
         } else if !self.conns.is_empty() && self.cfg.timeout > 0 {
             Some(IDLE_TIMER_NS)
         } else {

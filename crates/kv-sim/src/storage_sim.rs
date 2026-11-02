@@ -235,6 +235,13 @@ pub struct StorageSimCfg {
     /// Injected device errors (per million requests; 0 = none): the request fails with EIO
     /// and changes nothing. Errors are off during recovery and verification.
     pub error_ppm: u32,
+    /// Masks for known failure triggers (CLI `--set`), so that campaigns can look past them:
+    /// no FLUSHDB/FLUSHALL commands,
+    pub no_flush: bool,
+    /// values and offsets capped at this many bytes (0 = no cap),
+    pub max_len: u32,
+    /// atomic write units capped at this many bytes (0 = no cap).
+    pub unit_cap: u32,
 }
 
 impl StorageSimCfg {
@@ -323,6 +330,9 @@ impl StorageSimCfg {
             hang_ticks: 20_000,
             settle_ticks: 30_000,
             error_ppm: 0,
+            no_flush: false,
+            max_len: 0,
+            unit_cap: 0,
         };
         // drawn last: the parameters above stay those of earlier generator versions
         if !f.smoke && r.chance(10) {
@@ -332,6 +342,9 @@ impl StorageSimCfg {
             if let Err(e) = c.set(k, v) {
                 eprintln!("--set {k}={v}: {e}");
             }
+        }
+        if c.unit_cap > 0 {
+            c.atomic_unit = c.atomic_unit.map(|u| u.min(c.unit_cap.max(c.lba)));
         }
         c
     }
@@ -434,6 +447,9 @@ impl StorageSimCfg {
         kv("hang_ticks", self.hang_ticks.to_string());
         kv("settle_ticks", self.settle_ticks.to_string());
         kv("error_ppm", self.error_ppm.to_string());
+        kv("no_flush", u8::from(self.no_flush).to_string());
+        kv("max_len", self.max_len.to_string());
+        kv("unit_cap", self.unit_cap.to_string());
     }
 
     fn set(&mut self, k: &str, v: &str) -> Result<(), String> {
@@ -473,6 +489,9 @@ impl StorageSimCfg {
             "hang_ticks" => self.hang_ticks = n()? as u32,
             "settle_ticks" => self.settle_ticks = n()? as u32,
             "error_ppm" => self.error_ppm = n()? as u32,
+            "no_flush" => self.no_flush = n()? != 0,
+            "max_len" => self.max_len = n()? as u32,
+            "unit_cap" => self.unit_cap = n()? as u32,
             _ => return Err(format!("unknown cfg key {k}")),
         }
         Ok(())
@@ -836,8 +855,13 @@ impl Gen<'_> {
             Profile::Churn => [100, 30, 300, 100, 30, 60, 20, 50, 20, 60, 30, 80, 60, 15, 5, 10, 20],
             _ => [120, 40, 300, 70, 20, 60, 20, 40, 20, 60, 30, 60, 50, 4, 1, 5, 20],
         };
+        let mut w = w;
+        if self.cfg.no_flush {
+            w[13] = 0;
+            w[14] = 0;
+        }
         let db = self.db();
-        match self.r.weighted(&w) {
+        let cmd = match self.r.weighted(&w) {
             0 => Cmd::Get { db, k: self.key() },
             1 => Cmd::Meta { db, k: self.key() },
             2 => {
@@ -910,7 +934,30 @@ impl Gen<'_> {
             14 => Cmd::Flush { db: None },
             15 => Cmd::Barrier,
             _ => Cmd::Scan { db, part: self.r.below(u64::from(self.cfg.partitions)) as u16, count: self.r.range(1, 50) as u32 },
+        };
+        self.capped(cmd)
+    }
+
+    /// `cmd` with lengths and offsets within `max_len`.
+    fn capped(&self, mut cmd: Cmd) -> Cmd {
+        let m = self.cfg.max_len;
+        if m == 0 {
+            return cmd;
         }
+        match &mut cmd {
+            Cmd::Set { len, .. } | Cmd::Append { len, .. } => *len = (*len).min(m),
+            Cmd::SetRange { off, len, .. } => {
+                *len = (*len).min(m);
+                *off = (*off).min(u64::from(m.saturating_sub(*len)));
+            }
+            Cmd::Mset { kv, .. } | Cmd::Msetnx { kv, .. } => {
+                for (_, l) in kv.iter_mut() {
+                    *l = (*l).min(m);
+                }
+            }
+            _ => {}
+        }
+        cmd
     }
 
     fn crash(&mut self) -> Step {
@@ -1110,6 +1157,8 @@ pub enum FailKind {
     I2,
     I4,
     I10,
+    /// Bounded copies on media (and a durable copy for every live key) after the final quiesce.
+    I11,
     /// The engine refused to open or recover the devices.
     Recover,
     /// The engine broke its API contract (write without ticket, unknown ready request, an
@@ -1132,6 +1181,7 @@ impl FailKind {
             FailKind::I2 => "I2",
             FailKind::I4 => "I4",
             FailKind::I10 => "I10",
+            FailKind::I11 => "I11",
             FailKind::Recover => "RECOVER",
             FailKind::Engine => "ENGINE",
             FailKind::Panic => "PANIC",
@@ -1149,6 +1199,7 @@ impl FailKind {
             FailKind::I2,
             FailKind::I4,
             FailKind::I10,
+            FailKind::I11,
             FailKind::Recover,
             FailKind::Engine,
             FailKind::Panic,
@@ -2359,11 +2410,132 @@ impl<'c> Sim<'c> {
             })?;
         }
         self.step = steps.len();
-        self.quiesce("end of run").map_err(|mut f| {
+        self.quiesce("end of run").and_then(|()| self.media_check()).map_err(|mut f| {
             f.step = steps.len();
             f
         })?;
         self.stats.ticks = self.ticks;
+        Ok(())
+    }
+
+    /// I11 and I3 on media at the end of a run (everything quiesced, then the device caches
+    /// flushed): every live key has exactly one valid copy, every absent key none (an expired
+    /// key at most one). Copies below their db's flush cutoff are dead and not counted; chunks
+    /// are counted through their chunkmap.
+    fn media_check(&mut self) -> Result<(), Failure> {
+        if self.cfg.error_ppm > 0 {
+            // a failed write leaves its key old or new: no exact count
+            return Ok(());
+        }
+        use kv_storage::extent::{self, EXT_KIND_CHUNK};
+        use kv_storage::layout::{AG_PAGES, PAGE, PageId};
+        use kv_storage::page::{PageParse, parse_small_page};
+        use kv_storage::record::REC_KIND_TXN_DELETE_MARKER;
+        let eng = self.eng.take().expect("engine open");
+        let boot = eng.boot().clone();
+        let parts = eng.partitions();
+        let cutoffs: Vec<[u64; 16]> = (0..parts).map(|p| eng.meta().partition_meta(p).map_or([0; 16], |m| m.flush_cutoff)).collect();
+        let mut devs = eng.into_devices();
+        let crc = boot.record_crc();
+        // (db, key) -> [(page, seq, small, txn id, expiry)]
+        let mut copies: BTreeMap<(u8, Vec<u8>), Vec<(u64, u64, bool, u64, Option<u64>)>> = BTreeMap::new();
+        let mut views = Vec::new();
+        for (d, dev) in devs.iter_mut().enumerate() {
+            dev.inner.flush_now();
+            let img = dev.inner.durable_image();
+            let l = boot.layouts()[d];
+            let first = l.ag_area_page;
+            let end = first + u64::from(l.n_ags) * u64::from(AG_PAGES);
+            let mut page = first;
+            while page < end {
+                let at = page as usize * PAGE;
+                let Ok(buf) = <&[u8; PAGE]>::try_from(&img[at..at + PAGE]) else { break };
+                if buf.iter().all(|&b| b == 0) {
+                    page += 1;
+                    continue;
+                }
+                let id = PageId((d as u64) << 32 | page);
+                let part = u16::from(buf[5]);
+                if parse_small_page(buf, id, part, crc, &mut views) == PageParse::Ok {
+                    for v in &views {
+                        let p = kv_common::key_slot(v.key) % parts;
+                        let cut = cutoffs[usize::from(p)].get(usize::from(v.hdr.db)).copied().unwrap_or(0);
+                        if v.hdr.seq.0 < cut || v.hdr.kind == REC_KIND_TXN_DELETE_MARKER {
+                            continue;
+                        }
+                        let at = (v.hdr.expire_at_ms != 0).then_some(v.hdr.expire_at_ms);
+                        copies.entry((v.hdr.db, v.key.to_vec())).or_default().push((id.0, v.hdr.seq.0, true, v.hdr.txn.unwrap_or(0), at));
+                    }
+                    page += 1;
+                    continue;
+                }
+                if let Some(h) = extent::parse_extent_header(buf, id) {
+                    let n = h.n_pages as usize;
+                    if h.n_pages > 0 && at + n * PAGE <= img.len() && h.kind != EXT_KIND_CHUNK && extent::verify_extent(&img[at..at + n * PAGE], &h, crc) {
+                        let kl = h.key_len as usize;
+                        let key = img[at + 80..at + 80 + kl].to_vec();
+                        let p = kv_common::key_slot(&key) % parts;
+                        let cut = cutoffs[usize::from(p)].get(usize::from(h.db)).copied().unwrap_or(0);
+                        if h.seq.0 >= cut {
+                            let at = (h.expire_at_ms != 0).then_some(h.expire_at_ms);
+                            copies.entry((h.db, key)).or_default().push((id.0, h.seq.0, false, h.txn, at));
+                        }
+                        page += n as u64;
+                        continue;
+                    }
+                }
+                page += 1;
+            }
+        }
+        let now = self.now_ms;
+        let mut bad = Vec::new();
+        // live keys whose only extra copies are older expired ones elsewhere (harmless for
+        // correctness, unbounded space)
+        let mut leftovers = 0usize;
+        for ((db, key), at) in &copies {
+            let Some(&k) = self.bykey.get(key) else {
+                bad.push(format!("a key never written ({} bytes) has {} copies on media", key.len(), at.len()));
+                continue;
+            };
+            let live = self.model.cur_live((*db, k), now).is_some();
+            // the newest copy decides; superseded copies in its own page wait for that page's
+            // next build (two-image) and lose to it in recovery: allowed, at most two (I11)
+            let newest = at.iter().max_by_key(|c| c.1).copied().expect("non-empty");
+            let others_elsewhere = at.iter().any(|c| c.0 != newest.0);
+            let newest_expired = newest.4.is_some_and(|t| t <= now);
+            let ok = if live {
+                !others_elsewhere && at.len() <= 2 && !newest_expired
+            } else {
+                // an expired newest copy stays on media as "absent" (§16.2); anything else of
+                // a deleted key is a copy a crash could bring back
+                newest_expired && !others_elsewhere && at.len() <= 2
+            };
+            if !ok {
+                if live && !newest_expired && at.iter().all(|c| c.0 == newest.0 || c.4.is_some_and(|t| t <= now)) {
+                    leftovers += 1;
+                }
+                let what = if live { "live" } else { "absent or expired" };
+                bad.push(format!("db {db} key {k} ({what}) has {} valid copies on media: {:?}", at.len(), at.iter().map(|(p, sq, small, txn, x)| format!("{}{p:#x}@seq{sq:#x} txn {txn} deadline {x:?}", if *small { "page " } else { "extent " })).collect::<Vec<_>>()));
+            }
+        }
+        for (db, k) in self.model.live_keys(now) {
+            if !copies.contains_key(&(db, self.keytab[k as usize].clone())) {
+                bad.push(format!("db {db} key {k} is live but has no valid copy on media (not durable after quiesce)"));
+            }
+        }
+        drop(devs);
+        if !bad.is_empty() {
+            let n = bad.len();
+            bad.truncate(8);
+            let sig = if bad.iter().any(|b| b.contains("no valid copy")) {
+                "copy-missing"
+            } else if leftovers == n {
+                "expired-leftover"
+            } else {
+                "extra-copies"
+            };
+            return Err(Failure::new(FailKind::I11, sig, format!("{n} key(s) violate the copy bounds after the final quiesce:\n  {}", bad.join("\n  "))));
+        }
         Ok(())
     }
 }
@@ -2374,9 +2546,17 @@ fn scan_req(db: u8, cursor: u64, count: u32) -> Request {
 
 /// Runs `steps` under `cfg`.
 pub fn run_steps(cfg: &StorageSimCfg, steps: &[Step]) -> Result<RunStats, Failure> {
-    let mut sim = Sim::new(cfg)?;
-    sim.run(steps)?;
-    Ok(sim.stats.clone())
+    let r = Sim::new(cfg).and_then(|mut sim| {
+        sim.run(steps)?;
+        Ok(sim.stats.clone())
+    });
+    r.map_err(|mut f| {
+        // runs with injected device errors form their own failure classes
+        if cfg.error_ppm > 0 {
+            f.sig = format!("ioerr {}", f.sig);
+        }
+        f
+    })
 }
 
 /// Runs one seed's generated steps; `Err` carries the violated invariant.
@@ -2440,6 +2620,9 @@ pub fn parse_case(text: &str) -> Result<(StorageSimCfg, Vec<Step>, Option<FailKi
                 let mut c = StorageSimCfg::from_seed(seed, &Filter::default());
                 // parameters added after a case was written take their neutral value
                 c.error_ppm = 0;
+                c.no_flush = false;
+                c.max_len = 0;
+                c.unit_cap = 0;
                 cfg = Some(c);
             }
             "fail" => kind = rest.split_whitespace().next().and_then(FailKind::parse),
@@ -2983,12 +3166,23 @@ pub mod cli {
         }
         if o.minimize && !by_sig.is_empty() {
             println!();
-            println!("== minimizing (up to {} per class, {} runs each)", o.max_min, o.min_budget);
-            for ((kind, sig), v) in &by_sig {
-                for s in v.iter().take(o.max_min) {
-                    minimize_seed(o, s.seed, *kind, sig, &s.cell, &s.line);
+            println!("== minimizing (up to {} per class, {} runs each, {} at a time)", o.max_min, o.min_budget, o.jobs.max(1));
+            let work: Vec<(u64, FailKind, String, String, String)> = by_sig
+                .iter()
+                .flat_map(|((kind, sig), v)| v.iter().take(o.max_min).map(move |s| (s.seed, *kind, sig.clone(), s.cell.clone(), s.line.clone())))
+                .collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|sc| {
+                for _ in 0..o.jobs.max(1) {
+                    sc.spawn(|| {
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some((seed, kind, sig, cell, line)) = work.get(i) else { break };
+                            minimize_seed(o, *seed, *kind, sig, cell, line);
+                        }
+                    });
                 }
-            }
+            });
         }
         if seen.is_empty() { 0 } else { 1 }
     }
@@ -3076,16 +3270,715 @@ pub mod cli {
         let fail = last.unwrap_or_else(|| parse_line(line));
         let note = format!("minimized from {} to {} steps in {:.0} s ({cell}); original: {}", steps.len(), min.len(), t.elapsed().as_secs_f64(), truncate(line, 300));
         let text = case_text(&cfg, &min, Some(&fail), &note);
-        match crate::write_artifact(&o.out, seed, text.as_bytes()) {
-            Ok(p) => println!("   {} [{sig}] seed {seed}: {} -> {} steps: {}", kind.name(), steps.len(), min.len(), show(&p)),
-            Err(e) => println!("   {} seed {seed}: cannot write the case: {e}", kind.name()),
-        }
-        println!("      {}", truncate(&fail.line(), 400));
+        let head = match crate::write_artifact(&o.out, seed, text.as_bytes()) {
+            Ok(p) => format!("   {} [{sig}] seed {seed}: {} -> {} steps: {}", kind.name(), steps.len(), min.len(), show(&p)),
+            Err(e) => format!("   {} seed {seed}: cannot write the case: {e}", kind.name()),
+        };
+        // one print per case so that parallel minimizations do not interleave
+        println!("{head}\n      {}", truncate(&fail.line(), 400));
     }
 
     fn show(p: &Path) -> String {
         p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).display().to_string()
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Regression cases
+
+/// Minimized cases of the failures the first campaigns found, one per distinct defect (the
+/// `fail` line records what the case showed when it was minimized). Each passes once its
+/// defect is fixed; `kv-sim storage --replay FILE` runs one from a file.
+pub const REGRESSION_CASES: &[(&str, &str)] = &[
+    (
+        "flush_supersedes_unflushed_write",
+        r#"kv-sim storage case 1
+seed 1113
+fail STALL 2 SET_ticket_Written
+cfg partitions 16
+cfg devices 1
+cfg ags 47
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 307
+cfg groups 307
+cfg dbs 3
+cfg profile small
+cfg steps 867
+cfg rounds 1
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 18
+cfg skip_pct 0
+cfg per_poll 1
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd set 0 215 16 - - 0 0
+step cmd flush all
+"#,
+    ),
+    (
+        "flush_after_extent_setrange_hangs_flushed_reply",
+        r#"kv-sim storage case 1
+seed 1059
+fail HANG 2 SETRANGE_ticket-Written-needs-Durable
+cfg partitions 16
+cfg devices 1
+cfg ags 44
+cfg lba 4096
+cfg page_mode atomic
+cfg atomic_unit 8192
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 67108864
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 187
+cfg groups 62
+cfg dbs 3
+cfg profile mixed
+cfg steps 553
+cfg rounds 2
+cfg tick_permille 250
+cfg delay_max 32
+cfg late_pct 6
+cfg skip_pct 40
+cfg per_poll 2
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd setrange 2 54 698 438
+step cmd flush all
+"#,
+    ),
+    (
+        "chunkmap_append_requeued_forever",
+        r#"kv-sim storage case 1
+seed 1104
+fail HANG 2 APPEND_requeued
+cfg partitions 64
+cfg devices 1
+cfg ags 137
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 17
+cfg groups 2
+cfg dbs 1
+cfg profile large
+cfg steps 353
+cfg rounds 1
+cfg tick_permille 450
+cfg delay_max 0
+cfg late_pct 32
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd set 0 1 9284496 r35884696 - 0 0
+step cmd append 0 1 11
+"#,
+    ),
+    (
+        "chunkmap_get_requeued_forever",
+        r#"kv-sim storage case 1
+seed 1007
+fail HANG 2 GET_requeued
+cfg partitions 16
+cfg devices 1
+cfg ags 52
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 20
+cfg groups 5
+cfg dbs 1
+cfg profile large
+cfg steps 308
+cfg rounds 1
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 30
+cfg skip_pct 0
+cfg per_poll 2
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd set 0 1 11598529 r1476 - 0 0
+step cmd get 0 1
+"#,
+    ),
+    (
+        "atomic_unit_64k_unaligned_extent_rewrite",
+        r#"kv-sim storage case 1
+seed 1108
+fail ENGINE 4 EXPIRE-ticket-failed
+cfg partitions 32
+cfg devices 1
+cfg ags 85
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 65536
+cfg cache wt
+cfg dsync 0
+cfg durability async
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 149
+cfg groups 24
+cfg dbs 3
+cfg profile mixed
+cfg steps 1432
+cfg rounds 1
+cfg tick_permille 450
+cfg delay_max 32
+cfg late_pct 56
+cfg skip_pct 10
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd msetnx 2 11:326,83:717965
+step ticks 4
+step cmd set 0 59 12932 - - 0 0
+step cmd expire 0 59 r3831 0
+"#,
+    ),
+    (
+        "page_extent_append_lost_update",
+        r#"kv-sim storage case 1
+seed 1064
+fail RESULT 4 APPEND-result
+cfg partitions 32
+cfg devices 1
+cfg ags 88
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 67108864
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 271
+cfg groups 67
+cfg dbs 1
+cfg profile mixed
+cfg steps 549
+cfg rounds 1
+cfg tick_permille 40
+cfg delay_max 4
+cfg late_pct 24
+cfg skip_pct 0
+cfg per_poll 2
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd msetnx 0 4:2052
+step ticks 5
+step cmd append 0 4 11
+step cmd append 0 4 16
+"#,
+    ),
+    (
+        "page_extent_setrange_lost_update",
+        r#"kv-sim storage case 1
+seed 1216
+fail I1 4 end_of_run-Nothing
+cfg partitions 16
+cfg devices 1
+cfg ags 52
+cfg lba 4096
+cfg page_mode atomic
+cfg atomic_unit 8192
+cfg cache wt
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 53
+cfg groups 17
+cfg dbs 1
+cfg profile churn
+cfg steps 1206
+cfg rounds 1
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 36
+cfg skip_pct 10
+cfg per_poll 8
+cfg shuffle 1
+cfg tick_ms 5
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd set 0 4 2705 - - 0 0
+step ticks 5
+step cmd setrange 0 4 816 356
+step cmd setrange 0 4 1079 54
+"#,
+    ),
+    (
+        "set_after_expired_record_invisible",
+        r#"kv-sim storage case 1
+seed 1263
+fail RESULT 4 EXPIRE-result
+cfg partitions 16
+cfg devices 1
+cfg ags 44
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 8192
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 27
+cfg groups 27
+cfg dbs 2
+cfg profile churn
+cfg steps 483
+cfg rounds 5
+cfg tick_permille 250
+cfg delay_max 0
+cfg late_pct 47
+cfg skip_pct 0
+cfg per_poll 8
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd set 0 1 2472 past - 0 0
+step ticks 4
+step cmd set 0 1 3222 - - 0 0
+step cmd expire 0 1 r21318236 1
+"#,
+    ),
+    (
+        "delete_of_page_extent_never_durable",
+        r#"kv-sim storage case 1
+seed 1114
+fail HANG 4 DEL_ticket-Executed-needs-Written
+cfg partitions 16
+cfg devices 1
+cfg ags 38
+cfg lba 4096
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability async
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 60
+cfg groups 60
+cfg dbs 2
+cfg profile full
+cfg steps 1056
+cfg rounds 2
+cfg tick_permille 120
+cfg delay_max 4
+cfg late_pct 8
+cfg skip_pct 40
+cfg per_poll 2
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd set 0 3 2174 r43754996 - 0 0
+step cmd del 0 3
+step cmd msetnx 0 3:21531
+step cmd del 0 3
+"#,
+    ),
+    (
+        "delete_after_extent_mset_never_durable",
+        r#"kv-sim storage case 1
+seed 1126
+fail HANG 5 DEL_ticket-Executed-needs-Durable
+cfg partitions 64
+cfg devices 1
+cfg ags 132
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 93
+cfg snapshot 1
+cfg keys 32
+cfg groups 32
+cfg dbs 1
+cfg profile full
+cfg steps 1025
+cfg rounds 3
+cfg tick_permille 40
+cfg delay_max 32
+cfg late_pct 48
+cfg skip_pct 10
+cfg per_poll 1
+cfg shuffle 1
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd setrange 0 1 212 193
+step cmd mset 0 0:278,0:149401
+step cmd del 0 0
+step cmd set 0 0 2418 - - 0 0
+step cmd del 0 0
+"#,
+    ),
+    (
+        "barrier_after_append_del_livelock",
+        r#"kv-sim storage case 1
+seed 1067
+fail HANG 10 BARRIER_ticket-Executed-needs-Durable
+cfg partitions 16
+cfg devices 1
+cfg ags 44
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 15
+cfg groups 2
+cfg dbs 2
+cfg profile churn
+cfg steps 1042
+cfg rounds 3
+cfg tick_permille 250
+cfg delay_max 200
+cfg late_pct 14
+cfg skip_pct 0
+cfg per_poll 1
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step ticks 1
+step cmd append 0 0 2060
+step cmd set 0 4 410 - - 1 0
+step cmd append 0 0 69
+step cmd del 0 0,0,4
+step cmd barrier
+step cmd mset 1 9:3166,1:1098,11:769
+step cmd set 0 0 1927 r192 - 0 0
+step cmd set 0 0 2070 - - 0 1
+step cmd scan 0 6 38
+"#,
+    ),
+    (
+        "deferred_page_never_built",
+        r#"kv-sim storage case 1
+seed 1181
+fail NOQUIESCE 16 busy
+cfg partitions 16
+cfg devices 1
+cfg ags 37
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 67108864
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 89
+cfg groups 17
+cfg dbs 1
+cfg profile mixed
+cfg steps 1272
+cfg rounds 1
+cfg tick_permille 40
+cfg delay_max 4
+cfg late_pct 26
+cfg skip_pct 0
+cfg per_poll 2
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd mset 0 74:9,57:894,6:34637
+step cmd set 0 0 1137 - - 0 0
+step cmd del 0 14,82
+step cmd mset 0 5:1032,22:14,39:208,73:1421
+step cmd expire 0 9 r3689 1
+step cmd set 0 33 1470 r163 - 0 1
+step cmd set 0 6 357146 - xx 0 0
+step cmd get 0 83
+step cmd persist 0 8
+step cmd meta 0 0
+step cmd set 0 6 24 - - 0 0
+step cmd get 0 56
+step cmd flush 0
+step cmd set 0 62 351 - nx 0 0
+step cmd set 0 1 381 - - 0 1
+step cmd set 0 6 913 - - 0 1
+"#,
+    ),
+    (
+        "io_error_readonly_barrier_hang",
+        r#"kv-sim storage case 1
+seed 1050
+fail HANG 7 BARRIER_ticket-Executed-needs-Durable
+cfg partitions 16
+cfg devices 1
+cfg ags 47
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 69
+cfg groups 11
+cfg dbs 2
+cfg profile small
+cfg steps 1049
+cfg rounds 2
+cfg tick_permille 120
+cfg delay_max 4
+cfg late_pct 41
+cfg skip_pct 0
+cfg per_poll 8
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 20000
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd mset 0 27:29,38:406,49:561,60:31
+step cmd set 1 0 16 r187 - 0 0
+step cmd set 0 34 15 - - 0 0
+step cmd set 0 8 15 past nx 0 1
+step ticks 4
+step cmd mset 0 15:1153,48:1499,4:1382,26:1107
+step cmd barrier
+"#,
+    ),
+    (
+        "multi_key_delete_partial_after_kill",
+        r#"kv-sim storage case 1
+seed 1037
+fail I4 11 kill_-9-Process
+cfg partitions 32
+cfg devices 2
+cfg ags 45
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability async
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 13
+cfg groups 4
+cfg dbs 1
+cfg profile large
+cfg steps 239
+cfg rounds 4
+cfg tick_permille 120
+cfg delay_max 4
+cfg late_pct 24
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+step cmd mset 0 0:6394893,0:2777,0:722387
+step cmd copy 0 0 0 0
+step cmd get 0 0
+step cmd rename 0 0 8 0
+step cmd set 0 0 9152265 - nx 0 0
+step cmd del 0 8,0
+step cmd set 0 1 138130 r74449385 - 0 0
+step ticks 2
+step ticks 2
+step ticks 7
+step ticks 6
+step crash kill none 141
+"#,
+    ),
+    (
+        "acked_write_lost_after_power_cut",
+        r#"kv-sim storage case 1
+seed 1133
+fail I1 8 power_cut-Power
+cfg partitions 16
+cfg devices 2
+cfg ags 21
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 32
+cfg groups 16
+cfg dbs 3
+cfg profile mixed
+cfg steps 1305
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 30
+cfg skip_pct 0
+cfg per_poll 8
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd set 0 18 2499 - - 0 0
+step cmd set 0 28 2882 - - 0 0
+step cmd mset 0 29:244,13:915
+step ticks 4
+step cmd set 0 3 3933 - - 0 0
+step cmd set 0 3 6278 r3625 - 0 0
+step ticks 2
+step ticks 1
+step crash power sectors 0
+"#,
+    ),
+    (
+        "orphans_after_clean_restart",
+        r#"kv-sim storage case 1
+seed 1025
+fail I10 30 clean_restart
+cfg partitions 16
+cfg devices 2
+cfg ags 21
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 67108864
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 106
+cfg groups 35
+cfg dbs 1
+cfg profile mixed
+cfg steps 1291
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 200
+cfg late_pct 44
+cfg skip_pct 40
+cfg per_poll 2
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd get 0 9
+step cmd set 0 82 833699 r70756591 - 0 0
+step cmd msetnx 0 1:26,1:1141
+step cmd get 0 12
+step cmd set 0 44 8000000 - - 0 0
+step cmd expire 0 34 r186 1
+step cmd set 0 1 347 r138 - 0 0
+step ticks 1
+step cmd set 0 94 31269 past - 0 0
+step cmd del 0 15
+step cmd del 0 38
+step cmd set 0 10 1465 past nx 0 1
+step cmd mset 0 10:28,10:919,45:1063
+step cmd get 0 41
+step cmd del 0 43
+step quiesce
+step cmd persist 0 10
+step ticks 3
+step cmd get 0 77
+step cmd set 0 10 25 - xx 0 1
+step cmd del 0 72
+step ticks 4
+step cmd getdel 0 46
+step cmd mset 0 35:96,35:944,35:327
+step cmd set 0 0 192 r168 xx 0 0
+step cmd set 0 1 231 - - 0 0
+step cmd append 0 37 155
+step ticks 43
+step cmd get 0 17
+step cmd expire 0 32 - 0
+step clean
+step cmd expire 0 8 r142 0
+"#,
+    ),
+];
+
+/// Replays a case text.
+pub fn replay_case(text: &str) -> Result<RunStats, Failure> {
+    let (cfg, steps, _) = parse_case(text).map_err(|e| Failure::new(FailKind::Engine, "bad-case", e))?;
+    run_caught(&cfg, &steps)
 }
 
 #[cfg(test)]
@@ -3107,6 +4000,26 @@ mod tests {
         assert_ne!(value(1, 0, 32), value(2, 0, 32));
         assert_ne!(value(1, 0, 32), value(1, 1, 32));
         assert_eq!(value(5, 0, 100), value(5, 0, 100));
+    }
+
+    /// Every minimized case of a known defect passes (fails until the defects are fixed).
+    #[test]
+    fn regression_cases_pass() {
+        let mut fails = Vec::new();
+        for (name, text) in REGRESSION_CASES {
+            if let Err(f) = replay_case(text) {
+                fails.push(format!("{name}: {}", f.line()));
+            }
+        }
+        assert!(fails.is_empty(), "{} of {} regression cases fail:\n{}", fails.len(), REGRESSION_CASES.len(), fails.join("\n"));
+    }
+
+    #[test]
+    fn regression_cases_parse() {
+        for (name, text) in REGRESSION_CASES {
+            let (_, steps, kind) = parse_case(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!steps.is_empty() && kind.is_some(), "{name}");
+        }
     }
 
     /// Smoke: 200 seeds of small runs (the CLI runs the full matrix).

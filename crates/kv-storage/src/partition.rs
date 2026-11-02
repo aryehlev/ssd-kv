@@ -1041,7 +1041,7 @@ impl PartitionStore {
             if let Some(st) = cache.page_state(*p) {
                 out.push_str(&format!("\n  deferred {:#x}: recs=[", p.0));
                 for r in st.recs.iter() {
-                    out.push_str(&format!("({:?} seq={:#x} txn={} klen={}) ", r.status, r.seq.0, r.txn, r.key_len));
+                    out.push_str(&format!("({:?} k={:04x} seq={:#x} txn={} kind={} klen={}) ", r.status, r.h32 & 0xffff, r.seq.0, r.txn, r.kind, r.key_len));
                 }
                 out.push_str("] pending=[");
                 for e in st.pending.iter() {
@@ -1050,16 +1050,21 @@ impl PartitionStore {
                         Pending::Remove { .. } => "remove".to_string(),
                         Pending::Retire { seq, .. } => format!("retire({:#x})", seq.0),
                     };
-                    out.push_str(&format!("{kind} klen={} tickets={} others={}; ", e.key().len(), e.tickets().len(), self.core.stale.count(e.db(), e.key())));
+                    out.push_str(&format!("{kind} k={:04x} klen={} tickets={} others={}; ", e.h32() & 0xffff, e.key().len(), e.tickets().len(), self.core.stale.count(e.db(), e.key())));
                 }
                 out.push(']');
             }
         }
         for (db, k, e) in self.core.stale.iter() {
-            out.push_str(&format!("\n  stale db={db} klen={} at={:#x} {:?} fg={}", k.len(), e.at.page().0, e.state, e.foreground));
+            let h = KeyHash::of(self.core.cfg.hash_seed, k).h32() & 0xffff;
+            out.push_str(&format!("\n  stale db={db} k={h:04x} klen={} at={:#x} {:?} seq={:#x} older={} fg={}", k.len(), e.at.page().0, e.state, e.seq.0, e.older, e.foreground));
         }
         for (t, o) in &self.core.txns {
             out.push_str(&format!("\n  txn {t} keys={} pages={} requested={} local={}", o.keys.len(), o.pages.len(), o.requested, o.local));
+        }
+        for it in &self.core.retire {
+            let h = KeyHash::of(self.core.cfg.hash_seed, &it.key).h32() & 0xffff;
+            out.push_str(&format!("\n  retire k={h:04x} at={:#x} seq={:#x}", it.page.0, it.seq.0));
         }
         out
     }

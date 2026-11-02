@@ -369,6 +369,7 @@ mod tests {
             now_ms: 1_000,
             readonly_conn: false,
             conn_id: 1,
+            watch: 0,
         };
         let mut out = Vec::new();
         let db = run_queued(

@@ -1293,13 +1293,25 @@ fn migration_resume_prunes_keys_deleted_at_the_source() {
             })
         });
     }
-    // after the cutover the destination serves the moved slots: no deleted key comes back
+    // after the cutover the destination serves the moved slots: no deleted key comes back.
+    // `kvadm migrations` shows Done as soon as it is committed; the destination answers
+    // TRYAGAIN for the slots until that commit is pushed to it (§23.13 step 3), so a direct
+    // read right after may still get TRYAGAIN, which is retried like a client does (a run of
+    // this test once failed on exactly that reply, reported as if the key were served)
     let mut dst = Conn::open(c.node_addr(1)).unwrap();
     for k in &deleted {
-        let v = dst.call_str(&["GET", k]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let v = loop {
+            let v = dst.call_str(&["GET", k]).unwrap();
+            if matches!(&v, Value::Error(e) if e.starts_with(b"TRYAGAIN")) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            break v;
+        };
         assert!(
             matches!(v, Value::Bulk(None) | Value::Null),
-            "key {k} deleted at the source before the copy finished is served by the destination: {}",
+            "key {k} deleted at the source before the copy finished: the destination answers {}",
             text(&v)
         );
     }

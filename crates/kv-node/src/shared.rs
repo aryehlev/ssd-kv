@@ -77,6 +77,8 @@ pub struct NodeShared {
     pub workers_exited: AtomicBool,
     /// Cluster mode: the node-wide cluster state (set once at startup).
     cluster: std::sync::OnceLock<Arc<crate::cluster::ClusterShared>>,
+    /// The WATCH sessions of every connection (§8.5).
+    pub watch: crate::runtime::watch::WatchTable,
 }
 
 /// Restart facts (§18, INFO persistence).
@@ -161,6 +163,7 @@ impl NodeShared {
             shutdown: AtomicBool::new(false),
             workers_exited: AtomicBool::new(false),
             cluster: std::sync::OnceLock::new(),
+            watch: crate::runtime::watch::WatchTable::default(),
         })
     }
 

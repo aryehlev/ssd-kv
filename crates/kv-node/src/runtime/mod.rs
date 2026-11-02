@@ -8,6 +8,7 @@
 //! * [`backend`]: what a worker drives its partitions through (the page store, or an in-RAM
 //!   store in tests).
 //! * [`xmsg`]: cross-worker messages over bounded SPSC queues with an eventfd doorbell.
+//! * [`watch`]: the node's WATCH sessions and the keys they watch.
 //! * [`node`]: node startup (devices, engine, meta thread, listeners, workers, service thread)
 //!   and shutdown.
 
@@ -15,6 +16,7 @@ pub mod backend;
 pub mod exec;
 pub mod node;
 pub mod ring;
+pub mod watch;
 pub mod worker;
 pub mod xmsg;
 

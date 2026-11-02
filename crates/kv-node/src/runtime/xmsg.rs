@@ -73,6 +73,11 @@ pub enum XMsg {
     Shutdown,
     /// One SCAN/KEYS/RANDOMKEY step on a partition of the destination (§16.6, LC-18).
     Scan { from: u16, conn: ConnRef, req_seq: u64, req: ScanReq },
+    /// WATCH registrations (`add`) or removals of keys of partitions the destination owns
+    /// (§8.5); a registration answers [`XMsg::WatchDone`] to `ack` once applied.
+    Watch { keys: Vec<crate::runtime::watch::WatchedKey>, add: bool, ack: Option<GatherRef> },
+    /// The destination's registrations of a [`XMsg::Watch`] are in place.
+    WatchDone { ack: GatherRef },
     /// The result of a [`XMsg::Scan`] step.
     ScanDone { conn: ConnRef, req_seq: u64, out: ScanOutcome },
     /// Durability barrier (SAVE, BGSAVE, SHUTDOWN drain) over every partition the destination
@@ -172,6 +177,9 @@ pub struct ExecEnv {
     pub now_ms: u64,
     pub readonly_conn: bool,
     pub conn_id: u64,
+    /// EXEC: the connection's WATCH session (`runtime::watch`; 0: none), checked right
+    /// before the body executes and released after.
+    pub watch: u64,
 }
 
 impl WorkerHandle {

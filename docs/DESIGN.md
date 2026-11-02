@@ -551,7 +551,7 @@ created, last_cmd, flags }`. With `requirepass` set, commands other than AUTH/HE
 | Command | Semantics |
 |---|---|
 | MULTI / EXEC / DISCARD | Commands queued per connection; EXEC runs them as one partition request (or one XTxn in standalone when partitions differ). Errors at queue time (arity, unknown) -> EXECABORT. Runtime errors are per-command replies inside the EXEC array. Crash-atomic via intent table. In cluster mode all keys must share one slot (`-CROSSSLOT` at queue time). |
-| WATCH k.. / UNWATCH (M1.4) | per-partition `watchers: HashMap<(db, KeyHash), SmallVec<ConnRef>>`; any executed write to a watched key flags the watching connections dirty; EXEC of a dirty connection returns null array. FLUSHDB/FLUSHALL flag all watchers of the db. |
+| WATCH k.. / UNWATCH (M1.4) | each connection has one WATCH session (`kv-node/src/runtime/watch.rs`, node-wide table); each watched key is registered with its partition on the partition's own worker (`PartitionStore::watch_key`) and the `+OK` waits until every owner registered; every worker drains its partitions' changed watched keys (`take_touched`: writes, deletes, lazy/active/replicated expiry, FLUSHDB/FLUSHALL) right after the request or tick that committed them, before its replies, and marks the sessions dirty; EXEC checks the session where its body runs, right before it runs, and returns a null array when dirty; EXEC, DISCARD, UNWATCH, RESET and close end the session. In cluster mode WATCH keys must be served by the node and share one slot (MOVED / CROSSSLOT). |
 
 ### 8.6 Hashes (`hash.rs`, M1.4 stretch)
 HSET, HSETNX, HGET, HMGET, HMSET, HDEL, HGETALL, HKEYS, HVALS, HLEN, HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN.
@@ -1958,7 +1958,11 @@ RANDOMKEY), `slot_filter()`, which return decisions, not slot sets (lint, LC-24)
 1. The primary partition executes the command, assigns `seq`, encodes the group into the backlog and sends it to every
    connected member (ISR and catching-up), batched per tick, in parallel with its own page writes.
 2. `commit_seq(p) = min(local_durable(p), min over ISR members m != primary of acked_durable(m, p))`, where
-   `local_durable` follows the node's `durability` (`written` or `flushed`; cluster default `flushed`).
+   `local_durable` follows the node's `durability` (`written` or `flushed`; cluster default `flushed`). A group whose
+   local write failed is never counted durable: `local_durable` (and the persisted `repl_durable` a restart announces)
+   stays before it, the partition turns read-only (§22), and the node reports `health.failed` whenever another ISR
+   member can take over (a primary alone in its ISR keeps serving reads and its other partitions), so the coordinator
+   promotes a member, which holds the group.
 3. The reply is released when the command's ticket satisfies the mode and `commit_seq(p) >= seq`, and the lease is
    valid. COMMIT/HEARTBEAT frames tell members the commit point.
 4. **ISR shrink:** a member whose oldest unacknowledged group was covered by the primary's own durability more than

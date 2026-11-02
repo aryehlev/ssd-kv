@@ -480,7 +480,7 @@ mod tests {
     use kv_resp::Proto;
 
     fn env() -> ExecEnv {
-        ExecEnv { proto: Proto::Resp2, db: 0, now_ms: 0, readonly_conn: false, conn_id: 1 }
+        ExecEnv { proto: Proto::Resp2, db: 0, now_ms: 0, readonly_conn: false, conn_id: 1, watch: 0 }
     }
 
     /// keys starting with 'a' live on partition 1, others on 2

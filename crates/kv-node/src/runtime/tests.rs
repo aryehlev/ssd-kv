@@ -479,3 +479,98 @@ fn kvd_on_a_temp_dir_serves_and_restarts() {
     n.shared.request_shutdown();
     assert_eq!(n.wait(), 0);
 }
+
+/// (e) WATCH on the page store: EXEC answers a null array when a watched key changed after
+/// WATCH (a write or delete by any connection, on any worker, FLUSHDB, an expiry), and runs
+/// otherwise; UNWATCH, DISCARD and EXEC end the session.
+#[test]
+fn watch_aborts_exec_when_a_watched_key_changed() {
+    use crate::runtime::node;
+
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut cfg = Config { port, threads: Some(2), ..Config::default() };
+    cfg.data_dir = dir.path().to_path_buf();
+    cfg.data_size = 1 << 30;
+    cfg.format_partitions = 16;
+    cfg.cache_size = Some(64 << 20);
+    let n = node::start(cfg).expect("kvd starts");
+    for _ in 0..2000 {
+        if !n.shared.loading() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let client = || redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap().get_connection().unwrap();
+    let (mut a, mut b) = (client(), client());
+    // keys whose partitions belong to different workers (and a body on a third key)
+    let (ka, kb) = keys_on_two_workers();
+    let (ka, kb) = (String::from_utf8(ka).unwrap(), String::from_utf8(kb).unwrap());
+    let exec = |c: &mut redis::Connection, key: &str, v: &str| -> Option<Vec<String>> {
+        let _: () = redis::cmd("MULTI").query(c).unwrap();
+        let q: String = redis::cmd("SET").arg(key).arg(v).query(c).unwrap();
+        assert_eq!(q, "QUEUED");
+        redis::cmd("EXEC").query(c).unwrap()
+    };
+    let watch = |c: &mut redis::Connection, keys: &[&str]| {
+        let ok: String = redis::cmd("WATCH").arg(keys).query(c).unwrap();
+        assert_eq!(ok, "OK");
+    };
+    for k in [&ka, &kb] {
+        let _: () = redis::cmd("SET").arg(k).arg("0").query(&mut a).unwrap();
+    }
+    // untouched: the transaction runs
+    watch(&mut a, &[&ka, &kb]);
+    assert_eq!(exec(&mut a, &ka, "1"), Some(vec!["OK".to_owned()]));
+    // another connection writes a watched key (on either worker): EXEC aborts, nothing runs
+    for (changed, body) in [(&ka, &ka), (&kb, &ka), (&ka, &kb)] {
+        watch(&mut a, &[&ka, &kb]);
+        let _: () = redis::cmd("SET").arg(changed).arg("by-b").query(&mut b).unwrap();
+        assert_eq!(exec(&mut a, body, "from-a"), None, "{changed} changed after WATCH");
+        let v: String = redis::cmd("GET").arg(changed).query(&mut a).unwrap();
+        assert_eq!(v, "by-b");
+    }
+    // a delete, the connection's own write, FLUSHDB
+    watch(&mut a, &[&kb]);
+    let _: i64 = redis::cmd("DEL").arg(&kb).query(&mut b).unwrap();
+    assert_eq!(exec(&mut a, &ka, "x"), None, "delete");
+    watch(&mut a, &[&ka]);
+    let _: () = redis::cmd("SET").arg(&ka).arg("mine").query(&mut a).unwrap();
+    assert_eq!(exec(&mut a, &ka, "x"), None, "own write");
+    watch(&mut a, &[&ka]);
+    let _: () = redis::cmd("FLUSHDB").query(&mut b).unwrap();
+    assert_eq!(exec(&mut a, &kb, "x"), None, "flushdb");
+    // an expiry (a read makes the expired key go)
+    let _: () = redis::cmd("SET").arg(&kb).arg("e").arg("PX").arg(40).query(&mut b).unwrap();
+    watch(&mut a, &[&kb]);
+    std::thread::sleep(Duration::from_millis(80));
+    let gone: Option<String> = redis::cmd("GET").arg(&kb).query(&mut b).unwrap();
+    assert_eq!(gone, None);
+    assert_eq!(exec(&mut a, &ka, "x"), None, "expiry");
+    // reads and other keys do not count; UNWATCH and DISCARD end the session
+    watch(&mut a, &[&ka]);
+    let _: Option<String> = redis::cmd("GET").arg(&ka).query(&mut b).unwrap();
+    let _: () = redis::cmd("SET").arg("unrelated").arg("1").query(&mut b).unwrap();
+    assert_eq!(exec(&mut a, &ka, "r"), Some(vec!["OK".to_owned()]), "reads and other keys");
+    watch(&mut a, &[&ka]);
+    let _: () = redis::cmd("UNWATCH").query(&mut a).unwrap();
+    let _: () = redis::cmd("SET").arg(&ka).arg("after-unwatch").query(&mut b).unwrap();
+    assert_eq!(exec(&mut a, &ka, "u"), Some(vec!["OK".to_owned()]), "unwatched");
+    watch(&mut a, &[&ka]);
+    let _: () = redis::cmd("MULTI").query(&mut a).unwrap();
+    let _: () = redis::cmd("DISCARD").query(&mut a).unwrap();
+    let _: () = redis::cmd("SET").arg(&ka).arg("after-discard").query(&mut b).unwrap();
+    assert_eq!(exec(&mut a, &ka, "d"), Some(vec!["OK".to_owned()]), "discarded");
+    let v: String = redis::cmd("GET").arg(&ka).query(&mut b).unwrap();
+    assert_eq!(v, "d");
+    // a closed connection's session goes with it
+    {
+        let mut c = client();
+        watch(&mut c, &[&ka, &kb]);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let _: () = redis::cmd("SET").arg(&ka).arg("z").query(&mut b).unwrap();
+    assert!(!n.shared.watch.any(), "no watched key is left behind");
+    n.shared.request_shutdown();
+    assert_eq!(n.wait(), 0);
+}

@@ -184,6 +184,7 @@ fn exec_one(node: &Node, conn: &mut Conn, argv: &[&[u8]], out: &mut Vec<u8>) -> 
                             now_ms: m.now,
                             readonly_conn: false,
                             conn_id: conn.id,
+                            watch: 0,
                         };
                         let saved = m.data.clone();
                         let mut buf = Vec::new();

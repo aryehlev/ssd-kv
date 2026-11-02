@@ -90,6 +90,7 @@ impl Model {
             now_ms: self.now,
             readonly_conn: false,
             conn_id: 1,
+            watch: 0,
         };
         let mut buf = Vec::new();
         let r = f(self, &args, &mut ReplyWriter::new(&mut buf, proto), &env);

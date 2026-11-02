@@ -663,6 +663,7 @@ impl Driver {
         // before it, every other message waits for it in arrival order, and the in-flight
         // proposal is re-sent at the next beat after it.
         let mut rx = self.peer_rx.take();
+        let mut closed = false;
         let joined = loop {
             let beating = !meta && self.core.role() == Role::Leader;
             tokio::select! {
@@ -673,8 +674,10 @@ impl Driver {
                     let out = self.beat(now);
                     self.beat_effects(&out);
                 }
-                m = recv_peer(&mut rx), if beating => match m {
-                    Some((from, msg)) => {
+                m = recv_peer(&mut rx), if beating && !closed => {
+                    // a closed channel is seen again by the main loop after the write
+                    closed = m.is_none();
+                    if let Some((from, msg)) = m {
                         let current = matches!(&msg, WsrMsg::BeatReply { term, .. } if *term == self.core.term());
                         if current && self.deferred.is_empty() {
                             let mut out = Vec::new();
@@ -684,8 +687,7 @@ impl Driver {
                             self.deferred.push_back((from, msg));
                         }
                     }
-                    None => {}
-                },
+                }
             }
         };
         self.peer_rx = rx;

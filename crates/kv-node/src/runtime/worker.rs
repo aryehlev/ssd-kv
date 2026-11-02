@@ -175,6 +175,8 @@ impl<B: Backend> Worker<B> {
             // 4. execute ready requests, partition ticks
             self.execute_ready();
             self.backend.tick(self.now);
+            // changes the ticks committed (expiries) reach the WATCH sessions first
+            self.drain_all_touched();
             self.release_executed();
             // 5./6. tickets, replies, flushes, sends
             self.release_tickets();
@@ -458,7 +460,9 @@ impl<B: Backend> Worker<B> {
             return;
         }
         sys::close(c.fd);
+        let token = std::mem::take(&mut c.watch_token);
         self.conns[slot as usize] = None;
+        self.release_watch(token);
         self.gens[slot as usize] = self.gens[slot as usize].wrapping_add(1);
         self.free_slots.push(slot);
         self.shared.clients.fetch_sub(1, Ordering::AcqRel);

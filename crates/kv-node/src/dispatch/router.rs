@@ -145,7 +145,7 @@ mod tests {
     use kv_resp::Proto;
 
     fn env() -> ExecEnv {
-        ExecEnv { proto: Proto::Resp2, db: 0, now_ms: 0, readonly_conn: false, conn_id: 1 }
+        ExecEnv { proto: Proto::Resp2, db: 0, now_ms: 0, readonly_conn: false, conn_id: 1, watch: 0 }
     }
 
     fn keys(spec: &CommandSpec, argv: &[&[u8]]) -> smallvec::SmallVec<[u16; 4]> {

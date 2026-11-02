@@ -104,6 +104,8 @@ pub struct Conn {
     pub readonly: bool,
     pub multi: Option<MultiState>,
     pub watch: Vec<WatchKey>,
+    /// The connection's WATCH session (`runtime::watch`; 0: none).
+    pub watch_token: u64,
     /// Boot-clock ns of creation / of the last command.
     pub created: u64,
     pub last_cmd: u64,
@@ -159,6 +161,7 @@ impl Conn {
             readonly: false,
             multi: None,
             watch: Vec::new(),
+            watch_token: 0,
             created: now,
             last_cmd: now,
             flags: 0,

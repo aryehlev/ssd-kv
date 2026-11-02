@@ -562,6 +562,7 @@ fn repl_env(now_ms: u64) -> ExecEnv {
         now_ms,
         readonly_conn: false,
         conn_id: 0,
+        watch: 0,
     }
 }
 
@@ -765,7 +766,13 @@ impl<B: Backend> Worker<B> {
                 return;
             }
             match what {
-                TicketFor::Produced(s) => pr.durable.done(s),
+                // a group whose local write failed is not durable here: the local durable
+                // position (and with it the shard commit point and the persisted
+                // `repl_durable` a restart announces) stays before it; the partition is
+                // read-only from now on and the node asks for a failover
+                // (`agent::device_failed_reports`), its members hold the group
+                TicketFor::Produced(s) if !failed => pr.durable.done(s),
+                TicketFor::Produced(_) => {}
                 TicketFor::Group { epoch, seq } => {
                     if let Role::Member(m) = &mut pr.role
                         && m.epoch == epoch

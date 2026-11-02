@@ -964,18 +964,33 @@ impl Agent {
                 PartState::Ready => {}
             }
         }
+        let a = self.cs.assignment();
         Health {
             ready,
             // a restarted primary asks for a newer term (see `ClusterShared::restart_term`); a
-            // handoff whose promotion never came asks for a failover (`HANDOFF_STUCK`)
+            // handoff whose promotion never came asks for a failover (`HANDOFF_STUCK`); a
+            // device that failed a write asks for one too (`device_failed_reports`)
             failed: self.cs.refusing_primary.load(Ordering::Acquire)
                 || self
                     .lease_held_back
-                    .is_some_and(|t| t.elapsed() >= HANDOFF_STUCK),
+                    .is_some_and(|t| t.elapsed() >= HANDOFF_STUCK)
+                || device_failed_reports(read_only, a.as_ref().and_then(|a| a.role.as_ref())),
             read_only_partitions: read_only,
             corrupt_pages: 0,
         }
     }
+}
+
+/// A node with a partition its device failed a write of (the partition is read-only, §22)
+/// reports `health.failed`, so that the coordinator flags it and promotes a healthy member of
+/// its shard: as a primary it can make no write of that partition durable any more (its
+/// local durable position stops before the failed group, so nothing after it commits), and as
+/// a member it can apply none. A primary of a shard with no other ISR member keeps serving
+/// what it can (reads; writes of its other partitions): flagging it would only turn the shard
+/// down.
+pub(super) fn device_failed_reports(read_only: u16, role: Option<&kv_ctrl::ShardRole>) -> bool {
+    read_only > 0
+        && role.is_some_and(|r| !r.is_primary || r.members.iter().any(|(_, _, in_isr)| *in_isr))
 }
 
 /// One coordinator connection: handshake, then frames both ways until it closes.
@@ -1076,4 +1091,42 @@ async fn write_msg(s: &mut TcpStream, m: &NodeToCoord) -> std::io::Result<()> {
     let mut f = Vec::new();
     kv_ctrl::encode(m, &mut f);
     s.write_all(&f).await
+}
+
+#[cfg(test)]
+mod tests {
+    use kv_common::slot::SlotSet;
+    use kv_ctrl::{MemberState, NodeId, ShardId, ShardRole};
+
+    use super::device_failed_reports;
+
+    fn role(primary: bool, isr_members: usize) -> ShardRole {
+        ShardRole {
+            shard: ShardId(1),
+            term: 2,
+            is_primary: primary,
+            owned_slots: SlotSet::new(),
+            primary_repl: None,
+            members: (0..2u8)
+                .map(|i| (NodeId([i + 5; 20]), MemberState::InSync, usize::from(i) < isr_members))
+                .collect(),
+            min_isr: 1,
+            history: Vec::new(),
+            migrations: Vec::new(),
+        }
+    }
+
+    /// (a): a failed device write makes a partition read-only; the node then asks for a
+    /// failover whenever a healthy member can take over, and never without a failed device.
+    #[test]
+    fn a_failed_device_asks_for_a_failover_when_a_member_can_take_over() {
+        assert!(device_failed_reports(1, Some(&role(true, 1))));
+        assert!(device_failed_reports(3, Some(&role(false, 0))), "a member is not usable either");
+        assert!(
+            !device_failed_reports(1, Some(&role(true, 0))),
+            "a primary alone keeps serving what it can"
+        );
+        assert!(!device_failed_reports(0, Some(&role(true, 2))));
+        assert!(!device_failed_reports(2, None), "no role: nothing to fail over");
+    }
 }

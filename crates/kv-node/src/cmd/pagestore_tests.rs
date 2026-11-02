@@ -196,6 +196,7 @@ impl Store {
             now_ms: self.now_ms,
             readonly_conn: false,
             conn_id: 1,
+            watch: 0,
         };
         let line = format!("{}\nrecent commands:\n{}", line_of(argv), self.recent());
         let eng = self.eng.as_mut().expect("engine open");

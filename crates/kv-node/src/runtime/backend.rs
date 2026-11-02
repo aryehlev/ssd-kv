@@ -277,6 +277,13 @@ pub trait Backend {
     fn hash_seed(&self, p: u16) -> u64;
     /// Index entries of `(db, slot)` in `p` (walks skip empty tables).
     fn slot_len(&self, p: u16, db: u8, slot: u16) -> usize;
+    /// Registers one watcher of `(db, key)` with partition `p` (WATCH, §8.5).
+    fn watch_key(&mut self, _p: u16, _db: u8, _key: &[u8]) {}
+    /// Removes one watcher of `(db, key)` from partition `p`.
+    fn unwatch_key(&mut self, _p: u16, _db: u8, _key: &[u8]) {}
+    /// The watched keys of partition `p` changed since the last call (see
+    /// `PartitionStore::take_touched`).
+    fn take_touched(&mut self, _p: u16, _out: &mut Vec<(u8, Box<[u8]>)>) {}
 }
 
 /// Storage resources of one worker for the page store.
@@ -351,6 +358,24 @@ impl PageBackend {
 impl Backend for PageBackend {
     fn owned(&self) -> &[u16] {
         &self.owned
+    }
+
+    fn watch_key(&mut self, p: u16, db: u8, key: &[u8]) {
+        if let Some(part) = self.parts.get_mut(usize::from(p)).and_then(Option::as_mut) {
+            part.watch_key(db, key);
+        }
+    }
+
+    fn unwatch_key(&mut self, p: u16, db: u8, key: &[u8]) {
+        if let Some(part) = self.parts.get_mut(usize::from(p)).and_then(Option::as_mut) {
+            part.unwatch_key(db, key);
+        }
+    }
+
+    fn take_touched(&mut self, p: u16, out: &mut Vec<(u8, Box<[u8]>)>) {
+        if let Some(part) = self.parts.get_mut(usize::from(p)).and_then(Option::as_mut) {
+            part.take_touched(out);
+        }
     }
 
     fn state(&self, p: u16) -> PartState {

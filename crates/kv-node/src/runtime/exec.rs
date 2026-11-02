@@ -179,6 +179,12 @@ pub struct ExecState {
     node_parts: hashbrown::HashMap<GatherRef, NodePart, foldhash::fast::RandomState>,
     gathers: Vec<Option<HomeGather>>,
     free_gathers: Vec<u32>,
+    /// WATCH replies waiting for their keys' owners to register them: `(reply, protocol,
+    /// owners left)` by id.
+    watch_waits: hashbrown::HashMap<u32, (ReplyTo, kv_resp::Proto, usize), foldhash::fast::RandomState>,
+    next_watch_wait: u32,
+    /// Scratch for the watched keys a partition reports changed.
+    touched: Vec<(u8, Box<[u8]>)>,
     scans: hashbrown::HashMap<(u32, u32, u64), ScanCall, foldhash::fast::RandomState>,
     lat: Vec<(CmdId, u32)>,
     reply: Vec<u8>,
@@ -204,6 +210,9 @@ impl ExecState {
             node_parts: Default::default(),
             gathers: Vec::new(),
             free_gathers: Vec::new(),
+            watch_waits: Default::default(),
+            next_watch_wait: 0,
+            touched: Vec::new(),
             scans: Default::default(),
             lat: Vec::new(),
             reply: Vec::new(),
@@ -515,6 +524,19 @@ impl<B: Backend> Worker<B> {
                 };
                 self.submit_job(partition, req, job);
             }
+            XMsg::Watch { keys, add, ack } => {
+                for (p, db, key) in &keys {
+                    if add {
+                        self.backend.watch_key(*p, *db, key);
+                    } else {
+                        self.backend.unwatch_key(*p, *db, key);
+                    }
+                }
+                if let Some(ack) = ack {
+                    self.send(ack.worker, XMsg::WatchDone { ack });
+                }
+            }
+            XMsg::WatchDone { ack } => self.watch_registered(ack.id),
             XMsg::Reply { conn, req_seq, reply } => self.deliver(ReplyTo { conn, seq: req_seq, part: None }, reply),
             XMsg::Part { conn, req_seq, part, reply } => self.deliver(ReplyTo { conn, seq: req_seq, part: Some(part) }, reply),
             XMsg::Flush { db, gather } => self.node_part_start(gather, ReqKind::FlushDb { db }),
@@ -534,7 +556,7 @@ impl<B: Backend> Worker<B> {
                     to: None,
                     id: CmdId::Scan,
                     kind: JobKind::Scan { pattern, home: ReplyTo { conn, seq: req_seq, part: None } },
-                    env: ExecEnv { proto: kv_resp::Proto::Resp2, db: request.db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 },
+                    env: ExecEnv { proto: kv_resp::Proto::Resp2, db: request.db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 },
                     start_ns: self.now.mono_ns,
                     _lv: Reservation::NONE,
                     credit: None,
@@ -705,7 +727,7 @@ impl<B: Backend> Worker<B> {
     }
 
     fn env_of(&self, conn: &Conn) -> ExecEnv {
-        ExecEnv { proto: conn.proto, db: conn.db, now_ms: self.now.unix_ms, readonly_conn: conn.readonly, conn_id: conn.id }
+        ExecEnv { proto: conn.proto, db: conn.db, now_ms: self.now.unix_ms, readonly_conn: conn.readonly, conn_id: conn.id, watch: 0 }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -828,6 +850,10 @@ impl<B: Backend> Worker<B> {
             f(&mut cx, &args, &mut w)
         };
         conn.parser.set_auth_required(!conn.authed && !self.cfg.requirepass.is_empty());
+        if conn.watch_token != 0 && conn.watch.is_empty() {
+            // RESET ended the WATCH list
+            self.end_watch(conn);
+        }
         match outcome {
             ConnOutcome::Done => self.reply_now(conn, out),
             ConnOutcome::Close => {
@@ -862,31 +888,46 @@ impl<B: Backend> Worker<B> {
         let proto = conn.proto;
         match spec.id {
             CmdId::Multi => crate::cmd::txn::multi(conn, &mut ReplyWriter::new(out, proto)),
-            CmdId::Discard => crate::cmd::txn::discard(conn, &mut ReplyWriter::new(out, proto)),
-            CmdId::Watch => {
-                // WATCH (M1.4): keys are recorded on the connection; partitions do not flag
-                // writers yet, so EXEC never sees a dirty WATCH.
-                let args = Args { argv: cmd.argv() };
-                crate::cmd::txn::watch(conn, &args, &mut ReplyWriter::new(out, proto));
+            CmdId::Discard => {
+                crate::cmd::txn::discard(conn, &mut ReplyWriter::new(out, proto));
+                self.end_watch(conn);
             }
-            CmdId::Unwatch => crate::cmd::txn::unwatch(conn, &mut ReplyWriter::new(out, proto)),
-            CmdId::Exec => match crate::cmd::txn::exec_begin(conn, &mut ReplyWriter::new(out, proto)) {
-                crate::cmd::txn::ExecStart::Replied => {}
-                crate::cmd::txn::ExecStart::Run(cmds) => {
-                    self.exec_transaction(slot, conn, cmds, credit, out);
-                    return;
+            CmdId::Watch => {
+                self.dispatch_watch(slot, conn, &cmd, out);
+                return;
+            }
+            CmdId::Unwatch => {
+                crate::cmd::txn::unwatch(conn, &mut ReplyWriter::new(out, proto));
+                self.end_watch(conn);
+            }
+            CmdId::Exec => {
+                // the WATCH session's dirty state as of now (checked again where the body runs)
+                if self.shared.watch.is_dirty(conn.watch_token) {
+                    conn.flags |= flags::WATCH_DIRTY;
                 }
-            },
+                let token = std::mem::take(&mut conn.watch_token);
+                match crate::cmd::txn::exec_begin(conn, &mut ReplyWriter::new(out, proto)) {
+                    crate::cmd::txn::ExecStart::Replied => self.release_watch(token),
+                    crate::cmd::txn::ExecStart::Run(cmds) => {
+                        // the session goes with the body: released where it runs, after its
+                        // last check
+                        self.exec_transaction(slot, conn, cmds, token, credit, out);
+                        return;
+                    }
+                }
+            }
             _ => ReplyWriter::new(out, proto).error(b"ERR internal: not a transaction command"),
         }
         self.reply_now(conn, out);
     }
 
-    fn exec_transaction(&mut self, slot: u32, conn: &mut Conn, cmds: Vec<OwnedCmd>, credit: &mut Option<CreditGuard>, out: &mut Vec<u8>) {
+    #[allow(clippy::too_many_arguments)]
+    fn exec_transaction(&mut self, slot: u32, conn: &mut Conn, cmds: Vec<OwnedCmd>, watch: u64, credit: &mut Option<CreditGuard>, out: &mut Vec<u8>) {
         let proto = conn.proto;
         if self.router.cluster
             && let Some(g) = self.multi_gate(&cmds, conn.readonly, conn.id)
         {
+            self.release_watch(watch);
             router::write_gate(g, &mut ReplyWriter::new(out, proto));
             self.reply_now(conn, out);
             return;
@@ -896,6 +937,7 @@ impl<B: Backend> Worker<B> {
             // a keyless transaction (PING, ECHO, SELECT) runs on any partition: one of ours
             Ok(None) => self.backend.owned().first().copied().unwrap_or(0),
             Err(()) => {
+                self.release_watch(watch);
                 ReplyWriter::new(out, proto)
                     .error(b"ERR EXEC whose keys span partitions is not supported yet (use a common hashtag)");
                 self.reply_now(conn, out);
@@ -903,11 +945,13 @@ impl<B: Backend> Worker<B> {
             }
         };
         if self.shared.partition_state(partition) == kv_storage::partition::PartState::Loading {
+            self.release_watch(watch);
             ReplyWriter::new(out, proto).error(router::LOADING);
             self.reply_now(conn, out);
             return;
         }
-        let env = self.env_of(conn);
+        let mut env = self.env_of(conn);
+        env.watch = watch;
         conn.db = db_after(&cmds, conn.db, self.cfg.databases);
         let seq = conn.reserve_slot();
         let to = ReplyTo { conn: self.conn_ref(slot), seq, part: None };
@@ -920,6 +964,149 @@ impl<B: Backend> Worker<B> {
             let credit = credit.take().is_some_and(CreditGuard::transfer);
             let msg = XMsg::Exec { from: self.id, conn: to.conn, req_seq: seq, partition, cmds, env, credit };
             self.send_cmd(conn, owner, msg);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // WATCH sessions (`runtime::watch`, §8.5)
+
+    /// WATCH key [key ...]: each new key joins the connection's session and is registered
+    /// with the partition that owns it; the reply waits until every owner registered its keys.
+    fn dispatch_watch(&mut self, slot: u32, conn: &mut Conn, cmd: &OwnedCmd, out: &mut Vec<u8>) {
+        let proto = conn.proto;
+        let argv = cmd.argv();
+        if conn.multi.is_some() {
+            ReplyWriter::new(out, proto).error(b"ERR WATCH inside MULTI is not allowed");
+            drop(argv);
+            self.reply_now(conn, out);
+            return;
+        }
+        if self.router.cluster {
+            // the keys must be served here, in one slot (a cluster client sends WATCH where the
+            // transaction will run)
+            let mut slot_of = None;
+            for k in &argv[1..] {
+                let s = kv_common::key_slot(k);
+                if slot_of.is_some_and(|x| x != s) {
+                    router::write_gate(crate::cluster::ownership::Gate::CrossSlot, &mut ReplyWriter::new(out, proto));
+                    drop(argv);
+                    self.reply_now(conn, out);
+                    return;
+                }
+                slot_of = Some(s);
+            }
+            let lease_ok = self.shared.lease.valid(self.now.boot_ns);
+            let g = self.shared.ownership.read().gate(slot_of, CmdFlags::READONLY, conn.readonly, lease_ok, conn.id);
+            if g != crate::cluster::ownership::Gate::Serve {
+                router::write_gate(g, &mut ReplyWriter::new(out, proto));
+                drop(argv);
+                self.reply_now(conn, out);
+                return;
+            }
+        }
+        if conn.watch_token == 0 {
+            conn.watch_token = self.shared.watch.token();
+        }
+        let token = conn.watch_token;
+        let workers = self.router.workers;
+        let mut remote: SmallVec<[(u16, Vec<crate::runtime::watch::WatchedKey>); 4]> = SmallVec::new();
+        for &key in &argv[1..] {
+            if conn.watch.iter().any(|k| k.db == conn.db && *k.key == *key) {
+                continue;
+            }
+            conn.watch.push(crate::net::conn::WatchKey { db: conn.db, key: key.into() });
+            let p = self.router.partition_of_key(key);
+            let wk: crate::runtime::watch::WatchedKey = (p, conn.db, key.into());
+            if !self.shared.watch.add(token, wk.clone()) {
+                continue;
+            }
+            let owner = p % workers;
+            if owner == self.id {
+                self.backend.watch_key(p, conn.db, key);
+            } else {
+                match remote.iter_mut().find(|(w, _)| *w == owner) {
+                    Some((_, v)) => v.push(wk),
+                    None => remote.push((owner, vec![wk])),
+                }
+            }
+        }
+        drop(argv);
+        if remote.is_empty() {
+            ReplyWriter::new(out, proto).ok();
+            self.reply_now(conn, out);
+            return;
+        }
+        let seq = conn.reserve_slot();
+        let to = ReplyTo { conn: self.conn_ref(slot), seq, part: None };
+        self.x.next_watch_wait = self.x.next_watch_wait.wrapping_add(1);
+        let id = self.x.next_watch_wait;
+        self.x.watch_waits.insert(id, (to, proto, remote.len()));
+        let ack = GatherRef { worker: self.id, id };
+        for (owner, keys) in remote {
+            self.send(owner, XMsg::Watch { keys, add: true, ack: Some(ack) });
+        }
+    }
+
+    /// One owner registered the keys of WATCH reply `id`.
+    fn watch_registered(&mut self, id: u32) {
+        let Some(e) = self.x.watch_waits.get_mut(&id) else { return };
+        e.2 = e.2.saturating_sub(1);
+        if e.2 > 0 {
+            return;
+        }
+        let (to, proto, _) = self.x.watch_waits.remove(&id).expect("present");
+        let mut b = Vec::new();
+        ReplyWriter::new(&mut b, proto).ok();
+        self.deliver(to, ReplyBody::Bytes(b));
+    }
+
+    /// The connection's WATCH list ended (DISCARD, UNWATCH, RESET, close): its session goes.
+    pub(super) fn end_watch(&mut self, conn: &mut Conn) {
+        let token = std::mem::take(&mut conn.watch_token);
+        conn.watch.clear();
+        self.release_watch(token);
+    }
+
+    /// Ends WATCH session `token` and unregisters its keys with their owners.
+    pub(super) fn release_watch(&mut self, token: u64) {
+        if token == 0 {
+            return;
+        }
+        let workers = self.router.workers;
+        let mut remote: SmallVec<[(u16, Vec<crate::runtime::watch::WatchedKey>); 4]> = SmallVec::new();
+        for wk in self.shared.watch.release(token) {
+            let owner = wk.0 % workers;
+            if owner == self.id {
+                self.backend.unwatch_key(wk.0, wk.1, &wk.2);
+            } else {
+                match remote.iter_mut().find(|(w, _)| *w == owner) {
+                    Some((_, v)) => v.push(wk),
+                    None => remote.push((owner, vec![wk])),
+                }
+            }
+        }
+        for (owner, keys) in remote {
+            self.send(owner, XMsg::Watch { keys, add: false, ack: None });
+        }
+    }
+
+    /// The watched keys partition `p` reports changed make their sessions dirty.
+    pub(super) fn drain_touched(&mut self, p: u16) {
+        let mut buf = std::mem::take(&mut self.x.touched);
+        buf.clear();
+        self.backend.take_touched(p, &mut buf);
+        for (db, key) in buf.drain(..) {
+            self.shared.watch.touched(p, db, &key);
+        }
+        self.x.touched = buf;
+    }
+
+    /// [`Worker::drain_touched`] for every owned partition (after the partitions' ticks:
+    /// expiries).
+    pub(super) fn drain_all_touched(&mut self) {
+        let owned: SmallVec<[u16; 32]> = self.backend.owned().iter().copied().collect();
+        for p in owned {
+            self.drain_touched(p);
         }
     }
 
@@ -990,7 +1177,7 @@ impl<B: Backend> Worker<B> {
     fn scan_step(&mut self, home: ReplyTo, kind: StepKind, partition: u16, request: Request, pattern: Option<Box<[u8]>>) {
         let owner = partition % self.router.workers;
         if owner == self.id {
-            let env = ExecEnv { proto: kv_resp::Proto::Resp2, db: request.db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
+            let env = ExecEnv { proto: kv_resp::Proto::Resp2, db: request.db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 };
             let job = Job { to: None, id: CmdId::Scan, kind: JobKind::Scan { pattern, home }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
             self.submit_job(partition, request, job);
         } else {
@@ -1121,7 +1308,34 @@ impl<B: Backend> Worker<B> {
                 return;
             }
             reply.clear();
+            if let JobKind::Multi(_) = job.kind {
+                self.release_watch(job.env.watch);
+            }
             router::write_gate(g, &mut ReplyWriter::new(&mut reply, job.env.proto));
+            if let Some(to) = job.to {
+                self.deliver(to, ReplyBody::Bytes(std::mem::take(&mut reply)));
+            }
+            self.x.reply = reply;
+            return;
+        }
+        let watch = match &job.kind {
+            JobKind::Multi(_) => job.env.watch,
+            _ => 0,
+        };
+        if watch != 0 && self.shared.watch.is_dirty(watch) {
+            // a watched key changed: the body never runs (EXEC answers a null array)
+            let mut reply = std::mem::take(&mut self.x.reply);
+            reply.clear();
+            let st = self.backend.exec(p, self.now, id, Work::Nothing, &job.env, &mut reply);
+            if matches!(st, ExecStatus::Requeued) {
+                self.x.jobs.insert((p, id.0), job);
+                self.x.reply = reply;
+                return;
+            }
+            self.release_watch(watch);
+            reply.clear();
+            ReplyWriter::new(&mut reply, job.env.proto).null_array();
+            self.record(job.id, job.start_ns, false);
             if let Some(to) = job.to {
                 self.deliver(to, ReplyBody::Bytes(std::mem::take(&mut reply)));
             }
@@ -1143,6 +1357,11 @@ impl<B: Backend> Worker<B> {
             };
             self.backend.exec(p, self.now, id, work, &job.env, &mut reply)
         };
+        if !matches!(status, ExecStatus::Requeued) {
+            // the changes it committed reach the WATCH sessions before any reply is released
+            self.drain_touched(p);
+            self.release_watch(watch);
+        }
         match status {
             ExecStatus::Requeued => {
                 self.x.jobs.insert((p, id.0), job);
@@ -1616,7 +1835,7 @@ impl<B: Backend> Worker<B> {
                     kind: ReqKind::Keyed,
                     origin: Origin::Client,
                 };
-                let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
+                let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 };
                 let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Lock { xtxn, coord: from, keys }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
                 self.submit_job(partition, req, job);
             }
@@ -1625,7 +1844,7 @@ impl<B: Backend> Worker<B> {
                 let db = ops.iter().find_map(op_db).unwrap_or(0);
                 let keys = ops.iter().filter_map(op_key).map(|k| (Box::<[u8]>::from(k), kv_cmd::Access::Write)).collect();
                 let req = Request { db, keys, kind: ReqKind::Txn { txn_id }, origin: Origin::Client };
-                let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
+                let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 };
                 let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Apply { xtxn, coord, ops }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
                 self.submit_job(partition, req, job);
             }
@@ -1707,7 +1926,7 @@ impl<B: Backend> Worker<B> {
                 _ => 0,
             };
             let req = Request { db, keys: SmallVec::new(), kind, origin: Origin::Client };
-            let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0 };
+            let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 };
             let id = if matches!(kind, ReqKind::FlushDb { .. }) { CmdId::Flushdb } else { CmdId::Save };
             let job = Job { to: None, id, kind: JobKind::Node { gather }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
             self.submit_job(p, req, job);

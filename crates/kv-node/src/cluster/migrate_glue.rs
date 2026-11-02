@@ -382,7 +382,7 @@ impl<B: Backend> Worker<B> {
             }
         }
         for (req, rj) in submits {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
     }
 
@@ -420,7 +420,7 @@ impl<B: Backend> Worker<B> {
             }
         }
         if let Some((req, rj)) = submit {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
     }
 
@@ -570,7 +570,7 @@ impl<B: Backend> Worker<B> {
             }
         }
         for (req, rj) in submits {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
     }
 

@@ -250,6 +250,8 @@ pub(super) struct PartRepl {
     pub(super) mig_in: Vec<MigIn>,
     purge: Option<(KeyWalk, bool)>,
     meta_wait: Option<u64>,
+    /// Replication requests waiting for a txn credit, and every later one (stream order).
+    queued: VecDeque<(Request, ReplJob, bool)>,
 }
 
 /// Which stream an id belongs to.
@@ -303,6 +305,7 @@ impl ClusterWorker {
                 mig_in: Vec::new(),
                 purge: None,
                 meta_wait: None,
+                queued: VecDeque::new(),
             });
         }
         ClusterWorker {
@@ -333,6 +336,7 @@ impl ClusterWorker {
                 }
                 || !pr.mig_out.is_empty()
                 || !pr.mig_in.is_empty()
+                || !pr.queued.is_empty()
         }) || !self.unapplied.is_empty()
     }
 
@@ -445,7 +449,32 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    pub(crate) fn submit_repl(&mut self, p: u16, req: Request, rj: ReplJob) {
+    /// Submits a replication request of partition `p`, in order with the partition's earlier
+    /// ones. A write of several keys is crash-atomic like any local multi-key write (§14.6) and
+    /// takes a txn credit first; while none is free it waits in the partition's queue, and so
+    /// does everything submitted after it (applies must keep the stream's order).
+    pub(crate) fn submit_repl(&mut self, cw: &mut ClusterWorker, p: u16, req: Request, rj: ReplJob) {
+        let needs_credit = req.keys.len() >= 2 && matches!(rj.work, ReplWork::Apply { .. } | ReplWork::Own { .. } | ReplWork::Prune { .. });
+        let Some(pr) = cw.part(p) else { return };
+        if !pr.queued.is_empty() {
+            pr.queued.push_back((req, rj, needs_credit));
+            return;
+        }
+        let credit = if needs_credit {
+            match crate::runtime::exec::CreditGuard::try_take(&self.shared) {
+                Some(c) => Some(c),
+                None => {
+                    pr.queued.push_back((req, rj, needs_credit));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.submit_repl_now(p, req, rj, credit);
+    }
+
+    fn submit_repl_now(&mut self, p: u16, req: Request, rj: ReplJob, credit: Option<crate::runtime::exec::CreditGuard>) {
         let env = repl_env(self.now.unix_ms);
         let job = Job {
             to: None,
@@ -454,9 +483,27 @@ impl<B: Backend> Worker<B> {
             id: CmdId::Ping,
             start_ns: self.now.mono_ns,
             _lv: crate::net::budget::Reservation::NONE,
-            credit: None,
+            credit,
         };
         self.submit_job(p, req, job);
+    }
+
+    /// Submits the queued replication requests of `p` whose credits are now free, in order.
+    fn drain_queued(&mut self, cw: &mut ClusterWorker, p: u16) {
+        loop {
+            let Some(pr) = cw.part(p) else { return };
+            let Some((_, _, needs)) = pr.queued.front() else { return };
+            let credit = if *needs {
+                match crate::runtime::exec::CreditGuard::try_take(&self.shared) {
+                    Some(c) => Some(c),
+                    None => return,
+                }
+            } else {
+                None
+            };
+            let Some((req, rj, _)) = pr.queued.pop_front() else { return };
+            self.submit_repl_now(p, req, rj, credit);
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -672,6 +719,7 @@ impl<B: Backend> Worker<B> {
                 mi.abort();
             }
             pr.purge = None;
+            pr.queued.clear();
             pr.tickets.retain(|_, t| matches!(t, TicketFor::Produced(_)));
             cw.streams.retain(|_, r| match r {
                 StreamRef::Member { p: x } | StreamRef::Primary { p: x, .. } | StreamRef::MigOut { p: x, .. } | StreamRef::MigIn { p: x, .. } => *x != p,
@@ -1117,7 +1165,7 @@ impl<B: Backend> Worker<B> {
             }
         }
         for (req, rj) in submits {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
     }
 
@@ -1315,7 +1363,7 @@ impl<B: Backend> Worker<B> {
         }
         m.groups.insert(seq.0, reqs.len() as u32);
         for (req, rj) in reqs {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
     }
 
@@ -1332,7 +1380,7 @@ impl<B: Backend> Worker<B> {
         };
         let ops = vec![op];
         let req = Request { db: op_db(&ops), keys: op_keys(&ops, false), kind: ReqKind::Keyed, origin: Origin::Image(at) };
-        self.submit_repl(p, req, ReplJob { work: ReplWork::Apply { ops, seq: at, mode: ApplyMode::Image }, then: Then::MemberImage { epoch, confirm: None } });
+        self.submit_repl(cw, p, req, ReplJob { work: ReplWork::Apply { ops, seq: at, mode: ApplyMode::Image }, then: Then::MemberImage { epoch, confirm: None } });
     }
 
     fn member_snap(&mut self, cw: &mut ClusterWorker, p: u16, rec: SnapRec, stamp: Seq) {
@@ -1345,7 +1393,7 @@ impl<B: Backend> Worker<B> {
         let confirm = Some((rec.db, rec.key.clone()));
         let ops = vec![Op::Put { db: rec.db, vtype: rec.vtype, expire_at: rec.expire_at, key: rec.key, value: rec.value }];
         let req = Request { db: op_db(&ops), keys: op_keys(&ops, true), kind: ReqKind::Keyed, origin: Origin::Snapshot(stamp) };
-        self.submit_repl(p, req, ReplJob { work: ReplWork::Apply { ops, seq: stamp, mode: ApplyMode::SnapshotMerge }, then: Then::MemberImage { epoch, confirm } });
+        self.submit_repl(cw, p, req, ReplJob { work: ReplWork::Apply { ops, seq: stamp, mode: ApplyMode::SnapshotMerge }, then: Then::MemberImage { epoch, confirm } });
     }
 
     /// `REPAIR_KEYS`: the keys of this member's own groups after its term's takeover point.
@@ -1415,7 +1463,7 @@ impl<B: Backend> Worker<B> {
             submit = Some((req, ReplJob { work: ReplWork::Walk, then: Then::Listed { walker: Walker::Divergent { epoch } } }));
         }
         if let Some((req, rj)) = submit {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
     }
 
@@ -1452,7 +1500,7 @@ impl<B: Backend> Worker<B> {
             }
         }
         if let Some((req, rj)) = submit {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
         if let Some((at, end, full)) = finished {
             let token = cw.cs.token(REPL_TOKEN_BIT);
@@ -1691,7 +1739,7 @@ impl<B: Backend> Worker<B> {
                     }
                 }
                 if let Some((req, rj)) = submit {
-                    self.submit_repl(p, req, rj);
+                    self.submit_repl(cw, p, req, rj);
                 }
             }
             Walker::Prune { epoch } => {
@@ -1717,7 +1765,7 @@ impl<B: Backend> Worker<B> {
                     }
                 }
                 if let Some((req, rj)) = submit {
-                    self.submit_repl(p, req, rj);
+                    self.submit_repl(cw, p, req, rj);
                 } else {
                     self.member_sync_progress(cw, p);
                 }
@@ -1746,7 +1794,7 @@ impl<B: Backend> Worker<B> {
                     }
                 }
                 if let Some((req, rj)) = submit {
-                    self.submit_repl(p, req, rj);
+                    self.submit_repl(cw, p, req, rj);
                 }
             }
             Walker::MigOut { id, epoch } => self.mig_out_listed(cw, p, id, epoch, next, keys, failed),
@@ -1767,7 +1815,7 @@ impl<B: Backend> Worker<B> {
                     }
                 }
                 if let Some((req, rj)) = submit {
-                    self.submit_repl(p, req, rj);
+                    self.submit_repl(cw, p, req, rj);
                 }
             }
         }
@@ -1853,6 +1901,7 @@ impl<B: Backend> Worker<B> {
         let mut handoff_last: Vec<(u16, u64)> = Vec::new();
         let mut handoff_open = false;
         for p in ids {
+            self.drain_queued(cw, p);
             let is_primary = matches!(cw.part(p).map(|pr| &pr.role), Some(Role::Primary(_)));
             if is_primary {
                 self.drive_direct(cw, p);
@@ -2049,7 +2098,7 @@ impl<B: Backend> Worker<B> {
             submit = Some((req, ReplJob { work: ReplWork::Walk, then: Then::Listed { walker: Walker::Purge } }));
         }
         if let Some((req, rj)) = submit {
-            self.submit_repl(p, req, rj);
+            self.submit_repl(cw, p, req, rj);
         }
     }
 

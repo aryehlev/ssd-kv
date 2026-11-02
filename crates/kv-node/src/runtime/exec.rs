@@ -296,6 +296,11 @@ fn written_keys(cmds: &[OwnedCmd]) -> usize {
 pub struct CreditGuard(Option<Arc<NodeShared>>);
 
 impl CreditGuard {
+    /// Takes a credit from the node pool for a replication request (`None`: none free now).
+    pub(crate) fn try_take(shared: &Arc<NodeShared>) -> Option<Self> {
+        shared.take_txn_credit().then(|| CreditGuard(Some(shared.clone())))
+    }
+
     /// Takes over a credit that travelled with a command to its owner worker.
     fn adopt(shared: &Arc<NodeShared>) -> Self {
         CreditGuard(Some(shared.clone()))

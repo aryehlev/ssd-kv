@@ -19,5 +19,5 @@ foldhash.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 kv-index.workspace = true
-redis.workspace = true
+kv-resp.workspace = true
 tempfile.workspace = true

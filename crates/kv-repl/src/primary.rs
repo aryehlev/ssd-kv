@@ -9,6 +9,15 @@
 //! to an `IsrShrink` request to the coordinator; the primary keeps waiting for that member until
 //! the committed assignment drops it (§23.8).
 //!
+//! The age test judges the member, never the primary: a group's age runs from when the
+//! primary's own durability covered it (a member that acknowledged everything the primary has
+//! made durable is not what holds the commit back), and the caller's clock is a
+//! [`StallClock`], which leaves out the time the primary itself did not run (a stopped or
+//! descheduled process, a receive path that did not deliver the acks waiting for it). A
+//! primary that stalls for longer than the timeout therefore never reports its healthy
+//! members on waking up, which would drop them from the ISR and leave no promotable member if
+//! it then crashed.
+//!
 //! ISR expand (§23.8 step 5) has two position tests (LC-36: positions recorded in the past,
 //! never a lag compared with a constant):
 //! 1. [`ReplSender::caught_up`]: the member acknowledged a fixed chain of barriers, the commit
@@ -45,6 +54,59 @@ pub const GROUPS_FRAME_BYTES: usize = 256 << 10;
 /// Position barriers a member outside the ISR acknowledges after the first one before it is
 /// caught up (a fixed number, LC-36).
 pub const EXPAND_BARRIERS: u8 = 2;
+
+/// Largest step a [`StallClock`] takes between two observations.
+pub const STALL_STEP_NS: u64 = 50_000_000;
+
+/// A clock for the age test of [`ReplSender::lagging`] that leaves out the time the caller did
+/// not run. The caller observes it once per tick with the boot clock; a gap between two
+/// observations counts at most [`STALL_STEP_NS`] (a primary ticks every few milliseconds while
+/// it has members, so a longer gap is a stopped or descheduled process), and nothing while
+/// `held` (the receive path that delivers the members' acks has not run recently, so a missing
+/// ack is no evidence against the member). Its readings start at the first observation's boot
+/// time and never go backwards.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StallClock {
+    run_ns: u64,
+    real_ns: u64,
+    started: bool,
+}
+
+impl StallClock {
+    pub const fn new() -> Self {
+        StallClock {
+            run_ns: 0,
+            real_ns: 0,
+            started: false,
+        }
+    }
+
+    /// One observation at boot time `real_ns`; returns the clock's reading.
+    pub fn advance(&mut self, real_ns: u64, held: bool) -> u64 {
+        if !self.started {
+            self.started = true;
+            self.real_ns = real_ns;
+            self.run_ns = real_ns;
+            return real_ns;
+        }
+        let gap = real_ns.saturating_sub(self.real_ns);
+        self.real_ns = self.real_ns.max(real_ns);
+        if !held {
+            self.run_ns = self.run_ns.saturating_add(gap.min(STALL_STEP_NS));
+        }
+        self.run_ns
+    }
+
+    /// The reading an observation at `real_ns` would give if the receive path is running (for
+    /// stamps taken between observations; never below the last reading).
+    pub fn peek(&self, real_ns: u64) -> u64 {
+        if !self.started {
+            return real_ns;
+        }
+        self.run_ns
+            .saturating_add(real_ns.saturating_sub(self.real_ns).min(STALL_STEP_NS))
+    }
+}
 
 /// Per-member stream state.
 struct MemberSlot {
@@ -111,9 +173,10 @@ pub struct ReplSender {
     local_durable: Seq,
     /// Last group pushed (`Seq::new(term, 0)` before the first).
     last: Seq,
-    /// `(seq, boot ns)` of groups not yet acknowledged by every counted member (the age test of
-    /// `lagging`).
-    produced: VecDeque<(Seq, u64)>,
+    /// `(seq, produced at, covered by the primary's own durability at (0: not yet))` of groups
+    /// not yet acknowledged by every counted member, in the caller's [`StallClock`] time (the
+    /// age test of `lagging`). The entries covered by local durability are a prefix.
+    produced: VecDeque<(Seq, u64, u64)>,
     heartbeat_ns: u64,
 }
 
@@ -205,7 +268,7 @@ impl ReplSender {
         self.backlog.push(seq, encoded);
         self.last = seq;
         if !self.isr.is_empty() {
-            self.produced.push_back((seq, now_ns));
+            self.produced.push_back((seq, now_ns, 0));
         }
     }
 
@@ -336,7 +399,7 @@ impl ReplSender {
         match min {
             None => self.produced.clear(),
             Some(min) => {
-                while self.produced.front().is_some_and(|&(s, _)| s <= min) {
+                while self.produced.front().is_some_and(|&(s, _, _)| s <= min) {
                     self.produced.pop_front();
                 }
             }
@@ -344,7 +407,22 @@ impl ReplSender {
     }
 
     pub fn set_local_durable(&mut self, s: Seq) {
+        self.set_local_durable_at(s, kv_common::clock::boot_ns());
+    }
+
+    /// [`ReplSender::set_local_durable`] with the caller's clock (the [`StallClock`] reading
+    /// of `lagging`): groups the primary's own durability covers from now on are timed from
+    /// here.
+    pub fn set_local_durable_at(&mut self, s: Seq, now_ns: u64) {
         self.local_durable = self.local_durable.max(s.min(self.last));
+        let local = self.local_durable;
+        let from = self.produced.partition_point(|&(_, _, d)| d != 0);
+        for e in self.produced.iter_mut().skip(from) {
+            if e.0 > local {
+                break;
+            }
+            e.2 = now_ns.max(1);
+        }
     }
 
     pub fn local_durable(&self) -> Seq {
@@ -490,23 +568,32 @@ impl ReplSender {
         }
     }
 
-    /// Counted members whose oldest unacknowledged group is older than `timeout_ns`. Groups
-    /// produced while nobody was counted have no time of their own: for a member that started
-    /// counting below them (its commit point then moved back to its acknowledged position)
-    /// their age runs from when it started counting, so it is reported like any other.
+    /// Counted members that hold the commit point back for longer than `timeout_ns`: a member
+    /// is reported when the oldest group it has not acknowledged was covered by the primary's
+    /// own durability more than `timeout_ns` ago (a member that acknowledged everything the
+    /// primary has made durable is never reported). Groups produced while nobody was counted
+    /// have no time of their own: for a member that started counting below them (its commit
+    /// point then moved back to its acknowledged position) their age runs from when it started
+    /// counting, so it is reported like any other. `now_ns` is the reading of the caller's
+    /// [`StallClock`], the clock every stamp of this sender's age test was taken with.
     pub fn lagging(&self, now_ns: u64, timeout_ns: u64) -> SmallVec<[MemberId; 2]> {
         let mut out = SmallVec::new();
         for &m in &self.isr {
             let (acked, since) = self
                 .slot(m)
                 .map_or((Seq::ZERO, 0), |s| (s.acked_durable, s.counted_since_ns));
-            if acked >= self.last {
+            if acked >= self.local_durable {
                 continue;
             }
             // the produced list is in seq order: the first entry above `acked` is the oldest
-            // group this member has not acknowledged that was produced while it counted
-            let i = self.produced.partition_point(|&(s, _)| s <= acked);
-            let t = self.produced.get(i).map_or(since, |&(_, t)| t.max(since));
+            // group this member has not acknowledged that was produced while it counted; when
+            // the primary's durability does not cover it yet, the groups it lacks below the
+            // local durable position were produced alone (no entry: timed from `since`)
+            let i = self.produced.partition_point(|&(s, _, _)| s <= acked);
+            let t = match self.produced.get(i) {
+                Some(&(_, _, d)) if d != 0 => d.max(since),
+                _ => since,
+            };
             if now_ns.saturating_sub(t) > timeout_ns {
                 out.push(m);
             }
@@ -719,7 +806,9 @@ mod tests {
             },
         );
         r.on_group_at(&enc(Seq::new(1, 1)), Seq::new(1, 1), 1_000);
+        r.set_local_durable_at(Seq::new(1, 1), 1_000);
         r.on_group_at(&enc(Seq::new(1, 2)), Seq::new(1, 2), 2_000);
+        r.set_local_durable_at(Seq::new(1, 2), 2_000);
         assert!(r.lagging(100_000, 250_000).is_empty());
         assert_eq!(r.lagging(300_000, 250_000).as_slice(), &[1]);
         r.on_ack(1, Seq::new(1, 1), 0);
@@ -758,7 +847,7 @@ mod tests {
         for i in 1..=5 {
             r.on_group_at(&enc(Seq::new(1, i)), Seq::new(1, i), 1_000);
         }
-        r.set_local_durable(Seq::new(1, 5));
+        r.set_local_durable_at(Seq::new(1, 5), 1_000);
         r.on_ack(1, Seq::new(1, 3), 2_000);
         r.set_isr_at(&[1], 10_000);
         assert_eq!(r.commit_seq(), Seq::new(1, 3));
@@ -775,8 +864,78 @@ mod tests {
         r.on_group_at(&enc(Seq::new(1, 6)), Seq::new(1, 6), 280_000);
         r.set_isr_at(&[], 290_000);
         r.on_group_at(&enc(Seq::new(1, 7)), Seq::new(1, 7), 300_000);
+        r.set_local_durable_at(Seq::new(1, 7), 300_000);
         r.set_isr_at(&[1], 1_000_000);
         assert!(r.lagging(1_200_000, 250_000).is_empty());
         assert_eq!(r.lagging(1_250_001, 250_000).as_slice(), &[1]);
+    }
+
+    const T: u64 = 250_000_000;
+
+    #[test]
+    fn a_primary_stall_is_not_member_lag() {
+        // a primary with one counted member stops for 400 ms (SIGSTOP, or descheduled) right
+        // after producing a group; the member acknowledged it at once, but the ack waits in the
+        // socket until the primary's receive path runs again
+        let base = 7_000_000_000u64;
+        let mut c = StallClock::new();
+        let mut r = ReplSender::new(0, 1, 1 << 16);
+        r.set_isr_at(&[1], c.advance(base, false));
+        r.attach(
+            1,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 1),
+            },
+        );
+        r.on_group_at(&enc(Seq::new(1, 1)), Seq::new(1, 1), c.peek(base + 1_000_000));
+        r.set_local_durable_at(Seq::new(1, 1), c.advance(base + 2_000_000, false));
+        // first tick after waking: the receive path has not run yet
+        let now = c.advance(base + 402_000_000, true);
+        assert!(r.lagging(now, T).is_empty(), "the stall is not the member's");
+        // the receive path runs again; the ack is one more tick away
+        let now = c.advance(base + 403_000_000, false);
+        assert!(r.lagging(now, T).is_empty());
+        r.on_ack(1, Seq::new(1, 1), 0);
+        assert!(r.lagging(now, T).is_empty());
+        // a gap counts at most one step even when the receive path seems to run
+        let mut d = StallClock::new();
+        let t0 = d.advance(base, false);
+        assert_eq!(d.advance(base + 400_000_000, false) - t0, STALL_STEP_NS);
+        assert_eq!(d.peek(base + 401_000_000) - t0, STALL_STEP_NS + 1_000_000);
+        // a member that really stops acknowledging is still reported once the primary ran
+        // for the timeout
+        r.on_group_at(&enc(Seq::new(1, 2)), Seq::new(1, 2), c.peek(base + 404_000_000));
+        let mut now = c.advance(base + 405_000_000, false);
+        r.set_local_durable_at(Seq::new(1, 2), now);
+        let start = now;
+        let mut real = base + 405_000_000;
+        while now.saturating_sub(start) <= T {
+            assert!(r.lagging(now, T).is_empty());
+            real += 5_000_000;
+            now = c.advance(real, false);
+        }
+        assert_eq!(r.lagging(now, T).as_slice(), &[1]);
+    }
+
+    #[test]
+    fn a_member_is_timed_from_the_primary_durability() {
+        let mut r = ReplSender::new(0, 1, 1 << 16);
+        r.set_isr_at(&[1], 0);
+        r.attach(
+            1,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 1),
+            },
+        );
+        r.on_group_at(&enc(Seq::new(1, 1)), Seq::new(1, 1), 1_000);
+        // the primary's own disk is slow: the member is not what holds the commit back
+        assert!(r.lagging(10 * T, T).is_empty());
+        r.on_ack(1, Seq::new(1, 1), 0);
+        r.on_group_at(&enc(Seq::new(1, 2)), Seq::new(1, 2), 11 * T);
+        r.set_local_durable_at(Seq::new(1, 2), 12 * T);
+        assert!(r.lagging(13 * T, T).is_empty(), "within the timeout");
+        assert_eq!(r.lagging(13 * T + 1, T).as_slice(), &[1]);
+        r.on_ack(1, Seq::new(1, 2), 0);
+        assert!(r.lagging(u64::MAX, T).is_empty());
     }
 }

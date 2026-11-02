@@ -152,14 +152,18 @@ impl Ownership {
             o.migrating = r.migrations.iter().any(|t| t.phase().is_active());
             for t in &r.migrations {
                 match t {
-                    // the cutover moved these slots to the destination: never served here again
+                    // the cutover moved these slots to the destination: not served here while
+                    // the task lasts, unless this shard owns them (again): a later migration
+                    // that moved them back makes them servable, whatever older task remains
                     MigrationTask::Out {
                         slots,
                         phase: MigPhase::Cutover | MigPhase::Done,
                         ..
                     } => {
                         for s in slots.iter_slots() {
-                            o.sealed_out.insert(s);
+                            if !r.owned_slots.contains(s) {
+                                o.sealed_out.insert(s);
+                            }
                         }
                     }
                     // owned since the cutover, served only after the seal is committed
@@ -476,7 +480,8 @@ mod tests {
             phase: MigPhase::Cutover,
             barriers: 2,
         };
-        let o = Ownership::from_assignment(&assignment(true, "0-99", vec![src], 2, 1));
+        // the cutover commit moved 0-9 to the destination
+        let o = Ownership::from_assignment(&assignment(true, "10-99", vec![src.clone()], 2, 1));
         assert!(
             matches!(o.gate(Some(3), R, false, true, 0), Gate::Moved(..)),
             "sealed out at the source"
@@ -506,6 +511,38 @@ mod tests {
         );
         assert_eq!(o.gate(Some(30), W, false, true, 0), Gate::Serve);
         assert!(Ownership::standalone().slot_filter().serves(16383));
+    }
+
+    /// F2 (fixed): slots migrated away and later migrated back are served again, whatever
+    /// task of the first migration an assignment still carries (a finished `Out` task used to
+    /// seal them forever: every node answered MOVED for the whole range).
+    #[test]
+    fn slots_migrated_back_are_served_again() {
+        let done_out = MigrationTask::Out {
+            id: 18,
+            slots: SlotRanges::parse("0-9").unwrap(),
+            phase: MigPhase::Done,
+            barriers: 2,
+        };
+        let back_in = MigrationTask::In {
+            id: 31,
+            slots: SlotRanges::parse("0-9").unwrap(),
+            src_repl: kv_ctrl::PeerAddr("10.0.1.1:9000".parse().unwrap()),
+            phase: MigPhase::Done,
+        };
+        let o = Ownership::from_assignment(&assignment(
+            true,
+            "0-99",
+            vec![done_out.clone(), back_in],
+            2,
+            1,
+        ));
+        assert_eq!(o.gate(Some(3), W, false, true, 0), Gate::Serve);
+        assert_eq!(o.gate(Some(3), R, false, true, 0), Gate::Serve);
+        assert!(o.slot_filter().serves(3));
+        // while the slots are elsewhere the finished task still redirects them
+        let o = Ownership::from_assignment(&assignment(true, "10-99", vec![done_out], 2, 1));
+        assert!(matches!(o.gate(Some(3), R, false, true, 0), Gate::Moved(..)));
         assert_eq!(
             Ownership::unassigned(16, None).gate(Some(1), R, false, true, 0),
             Gate::ClusterDown

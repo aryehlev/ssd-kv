@@ -2,7 +2,11 @@
 //!
 //! `IsrShrink { shard, term, member }` from the shard's primary is committed even when the ISR
 //! falls below `min_isr`; the primary stops waiting for that member only after the committed
-//! assignment arrives. `IsrExpand` is sent by the primary once it counts a caught-up member's
+//! assignment arrives. A shrink is accepted only from a primary that holds its lease in the
+//! leader's table and is not suspected ([`shrink_accepted`]): a primary that missed its
+//! renewals (stopped, cut off, or being failed over) cannot acknowledge writes, so dropping a
+//! member never helps it, and its view of who lags is the stale one; committing it could leave
+//! the failover with no promotable member. `IsrExpand` is sent by the primary once it counts a caught-up member's
 //! acks; after the commit the member is promotable and advertised. Requests of a stale term are
 //! ignored. Membership itself never changes here (LC-25).
 //!
@@ -38,6 +42,13 @@ pub fn isr_transition(s: &ClusterState, shard: ShardId, term: u32, member: NodeI
         node: member,
         add,
     })
+}
+
+/// A shrink request of the shard's primary is acted on only while the leader holds the
+/// primary's lease and does not suspect it (it is re-sent while the member still lags, so a
+/// refused one is retried once the primary renews again).
+pub fn shrink_accepted(lease_held: bool, suspected: bool) -> bool {
+    lease_held && !suspected
 }
 
 /// An ISR request is accepted only from the shard's current primary.

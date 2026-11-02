@@ -33,6 +33,8 @@ const QUEUED_BYTES_LIMIT: usize = 32 << 20;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time a dial has to connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Period of the transport's liveness stamp ([`ReplNet::alive_ns`]).
+const ALIVE_EVERY: Duration = Duration::from_millis(10);
 
 /// The worker's handle on one replication stream. Dropping it ends the stream after the bytes
 /// already handed over are written; [`StreamIo::abort`] ends it at once.
@@ -111,6 +113,8 @@ pub struct ReplNet {
     node: Weak<NodeShared>,
     next_id: Arc<AtomicU64>,
     pub listen_addr: SocketAddr,
+    /// Boot-clock time the transport's runtime last ran its liveness task.
+    alive: Arc<AtomicU64>,
 }
 
 /// Parts of a stream shared between its tasks and its handle.
@@ -153,7 +157,19 @@ impl ReplNet {
             node: Arc::downgrade(node),
             next_id: Arc::new(AtomicU64::new(1)),
             listen_addr,
+            alive: Arc::new(AtomicU64::new(kv_common::clock::boot_ns())),
         };
+        // the liveness stamp: a primary's age test of its members' acks counts no time in
+        // which this runtime did not run (the acks may be waiting in a socket it has not read)
+        let alive = net.alive.clone();
+        net.rt.spawn(async move {
+            let mut every = tokio::time::interval(ALIVE_EVERY);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                alive.store(kv_common::clock::boot_ns(), Ordering::Release);
+            }
+        });
         let weak = net.node.clone();
         let ids = net.next_id.clone();
         net.rt.spawn(async move {
@@ -178,6 +194,12 @@ impl ReplNet {
             }
         });
         Ok(net)
+    }
+
+    /// Boot-clock time the transport's runtime last ran its liveness task (every 10 ms while
+    /// it runs).
+    pub fn alive_ns(&self) -> u64 {
+        self.alive.load(Ordering::Acquire)
     }
 
     /// Dials `addr` for `partition` of worker `worker` and sends `hello` (an encoded frame);

@@ -76,7 +76,7 @@ use kv_repl::frame::{
     self, AcceptMode, Frame, FrameDecoder, Hello, ImageRec, Recovered, RejectReason,
 };
 use kv_repl::member::{MemberAction, MemberStream};
-use kv_repl::primary::{MemberId, ReplSender};
+use kv_repl::primary::{MemberId, ReplSender, StallClock};
 use kv_repl::sync::{self, PrimaryView, SyncDecision};
 use kv_repl::{Group, Op, Seq};
 use kv_topo::redirect::{Redirect, for_slot};
@@ -116,6 +116,28 @@ pub struct ClusterSimCfg {
     pub fault_every_ms: u64,
     /// Concurrent logical clients.
     pub clients: u8,
+    /// Freezes are part of the fault mix: a node or coordinator stops for 0.1-2.5 s (SIGSTOP,
+    /// a long scheduling delay) and then runs its stale timers before the input that waited;
+    /// a frozen node is sometimes crashed right after it resumes.
+    pub freezes: bool,
+    /// A scripted check (no other fault needs to run): at `at_ms` the primary of shard 1 is
+    /// frozen for `freeze_ms`, then crashed `crash_ms` after it resumes; the run fails unless
+    /// no ISR shrink was committed for the frozen primary's shard meanwhile and another
+    /// member is promoted within 3 s of the crash.
+    pub stall_crash: Option<StallCrash>,
+    /// The members' ack age test runs on the stall clock (`kv_repl::primary::StallClock`, as
+    /// kv-node does) and the coordinator acts on a shrink only from a primary whose lease it
+    /// holds; `false` models the time before both (a primary's own stall counted as member
+    /// lag, and its shrink requests were committed on waking up).
+    pub stall_clock: bool,
+}
+
+/// See [`ClusterSimCfg::stall_crash`].
+#[derive(Clone, Copy, Debug)]
+pub struct StallCrash {
+    pub at_ms: u64,
+    pub freeze_ms: u64,
+    pub crash_ms: u64,
 }
 
 /// Length of the quiet phase that ends every run.
@@ -140,6 +162,9 @@ impl ClusterSimCfg {
             },
             fault_every_ms: 1_500,
             clients: 4,
+            freezes: true,
+            stall_crash: None,
+            stall_clock: true,
         }
     }
 }
@@ -163,6 +188,7 @@ pub struct ClusterSimReport {
     pub resync_needed: u64,
     pub max_term: u32,
     pub stream_breaks: u64,
+    pub freezes: u64,
     /// NeedOperatorResync by cause: interrupted sync, same term not covered by the backlog,
     /// no takeover recorded for the previous term, the received ring does not cover the
     /// member's gap, the own backlog does not cover the current term, other.
@@ -486,6 +512,9 @@ struct Coord {
     leader_contact: u64,
     round: u64,
     leading: Option<Leading>,
+    /// kv-coord admin: an ISR shrink only from a primary whose lease is held
+    /// (`ClusterSimCfg::stall_clock: false` models the time before that rule).
+    shrink_guard: bool,
 }
 
 /// Effects of a step: messages to send and observations to make.
@@ -546,6 +575,7 @@ impl Coord {
             leader_contact: 0,
             round: 0,
             leading: None,
+            shrink_guard: true,
         }
     }
 
@@ -1021,7 +1051,12 @@ impl Coord {
                 member,
             } => {
                 let add = matches!(m, NodeToCoord::IsrExpand { .. });
-                if isr::from_primary(&s, shard, &nid)
+                // kv-coord admin: a shrink only from a primary whose lease the leader holds
+                let shrink_ok = add
+                    || !self.shrink_guard
+                    || isr::shrink_accepted(l.leases.held(&nid, now), l.detector.suspected(&nid));
+                if shrink_ok
+                    && isr::from_primary(&s, shard, &nid)
                     && let Some(t) = isr::isr_transition(&s, shard, term, member, add)
                 {
                     self.enqueue(t);
@@ -1325,6 +1360,11 @@ struct Node {
     /// After a restart: the persisted `repl_durable` lower bound per partition, announced by
     /// the first handshake.
     meta_applied: Vec<Option<Seq>>,
+    /// The clock of the members' ack age test (kv-node `ClusterWorker::run`): observed at
+    /// every tick, a gap counts at most one step (a frozen process).
+    run: StallClock,
+    /// `ClusterSimCfg::stall_clock`.
+    stall_clock: bool,
 }
 
 /// Per-node shared knobs.
@@ -1365,7 +1405,24 @@ impl Node {
             meta_applied: (0..P).map(|_| None).collect(),
             report_failed: false,
             resync_sent: BTreeMap::new(),
+            run: StallClock::new(),
+            stall_clock: true,
         }
+    }
+
+
+    /// A primary partition whose own durability covers a group a counted member has not
+    /// acknowledged yet (an ack in flight).
+    fn ack_in_flight(&self) -> bool {
+        let NodeRole::Primary { parts, .. } = &self.role else {
+            return false;
+        };
+        parts.iter().any(|pp| {
+            pp.sender
+                .isr()
+                .iter()
+                .any(|&m| pp.sender.acked(m).is_some_and(|a| a < pp.sender.local_durable()))
+        })
     }
 
     fn crash(&mut self) {
@@ -1410,6 +1467,7 @@ impl Node {
             .is_some_and(|r| r.is_primary);
         self.restart_term = was_primary.then_some(self.disk.fence_term);
         self.report_failed = was_primary;
+        self.run = StallClock::new();
         self.last_term = self.disk.last_term.clone();
         // the first handshake of each partition announces the persisted lower bound
         self.meta_applied = self.disk.repl_durable.iter().map(|s| Some(*s)).collect();
@@ -1871,6 +1929,10 @@ impl Node {
         };
         let term = *term;
         let pp = &mut parts[usize::from(p)];
+        // kv-node `drive_direct`: the stream continues after the later of the partition's last
+        // executed seq and the sender's last group (never below the term's start, which the
+        // backlog would not cover)
+        let last = last.max(pp.sender.last());
         let Some((_, Some(rs))) = pp.conns.get_mut(&mid) else {
             return;
         };
@@ -2314,8 +2376,13 @@ impl Node {
                 expand_sent.retain(|m| expanding.contains(m));
                 let mut counted = committed.clone();
                 counted.extend(expanding.iter().copied());
+                let run_now = if self.stall_clock {
+                    self.run.peek(fx.now_l)
+                } else {
+                    fx.now_l
+                };
                 for pp in parts.iter_mut() {
-                    pp.sender.set_isr_at(&counted, fx.now_l);
+                    pp.sender.set_isr_at(&counted, run_now);
                 }
             }
             return;
@@ -2534,8 +2601,13 @@ impl Node {
             },
             &mut enc,
         );
+        let run_now = if self.stall_clock {
+            self.run.peek(fx.now_l)
+        } else {
+            fx.now_l
+        };
         let pp = &mut parts[usize::from(p)];
-        pp.sender.on_group_at(&enc, seq, fx.now_l);
+        pp.sender.on_group_at(&enc, seq, run_now);
         // members under repair get every group directly, in execution order
         let mut direct = Vec::new();
         for (mid, (conn, _)) in &pp.conns {
@@ -2564,6 +2636,7 @@ impl Node {
         for s in &mut self.stores {
             s.mature(fx.now_g);
         }
+        self.run.advance(fx.now_l, false);
         if fx.now_l >= self.next_persist {
             self.next_persist = fx.now_l + 50 * MS;
             for (p, s) in self.stores.iter().enumerate() {
@@ -2657,11 +2730,22 @@ impl Node {
         else {
             return;
         };
+        let run_now = if self.stall_clock {
+            self.run.peek(fx.now_l)
+        } else {
+            fx.now_l
+        };
         let mut sends = Vec::new();
+        let mut overrun = Vec::new();
         for (p, pp) in parts.iter_mut().enumerate() {
-            pp.sender.set_local_durable(self.stores[p].durable_pos);
+            pp.sender.set_local_durable_at(self.stores[p].durable_pos, run_now);
             for (mid, (conn, rs)) in &pp.conns {
                 let _ = rs;
+                // kv-node: a member that fell behind the backlog has its stream restarted
+                if pp.sender.overrun(*mid) {
+                    overrun.push(*conn);
+                    continue;
+                }
                 let mut out = Vec::new();
                 if pp.sender.fill_send_at(*mid, &mut out, 64 << 10, fx.now_l) {
                     sends.push((*conn, out));
@@ -2712,12 +2796,34 @@ impl Node {
             *last_isr_msg = fx.now_l;
             let mut lag = BTreeSet::new();
             for pp in parts.iter() {
-                lag.extend(pp.sender.lagging(fx.now_l, ack_timeout));
+                lag.extend(pp.sender.lagging(run_now, ack_timeout));
             }
             let mut recount = false;
             for (n, mid) in mids.iter() {
                 let in_isr = committed_isr.contains(n);
                 if in_isr && lag.contains(mid) {
+                    if trace_on() {
+                        let at: Vec<String> = parts
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, pp)| pp.sender.lagging(run_now, ack_timeout).contains(mid))
+                            .map(|(p, pp)| {
+                                format!(
+                                    "p{p} acked {} local {} last {} attached {}",
+                                    pp.sender.acked(*mid).map_or("-".into(), sq),
+                                    sq(pp.sender.local_durable()),
+                                    sq(pp.sender.last()),
+                                    pp.sender.is_attached(*mid)
+                                )
+                            })
+                            .collect();
+                        eprintln!(
+                            "[{} ms] n{} shrink request n{n}: {}",
+                            fx.now_g / MS,
+                            self.idx,
+                            at.join("; ")
+                        );
+                    }
                     fx.send(
                         c,
                         Msg::Report(NodeToCoord::IsrShrink {
@@ -2764,13 +2870,16 @@ impl Node {
                     .collect();
                 counted.extend(expanding.iter().copied());
                 for pp in parts.iter_mut() {
-                    pp.sender.set_isr_at(&counted, fx.now_l);
+                    pp.sender.set_isr_at(&counted, run_now);
                 }
             }
         }
         let _ = me;
         for (conn, out) in sends {
             self.stream_send(conn, Some(out), fx);
+        }
+        for conn in overrun {
+            self.close_conn(conn, fx);
         }
     }
 
@@ -2915,6 +3024,28 @@ enum Timer {
     HealNet,
     Heal,
     FinalPhase,
+    /// The frozen process resumes.
+    Thaw(usize),
+    /// Crash a node right after a freeze (it restarts after `.1` ms).
+    CrashAfterFreeze(usize, u64),
+    /// Step of the scripted `ClusterSimCfg::stall_crash` check.
+    Script(u8),
+}
+
+/// The scripted stall-then-crash check's record.
+struct StallProbe {
+    node: usize,
+    /// Not frozen yet: the freeze starts at the end of the first tick of the node in which
+    /// an acknowledgement is in flight (its own durability covers a group a member has not
+    /// acknowledged yet), the interleaving in which the stall used to look like member lag.
+    armed: bool,
+    shard: u16,
+    isr_before: Vec<NodeId>,
+    frozen_at: u64,
+    crashed_at: Option<u64>,
+    /// An ISR shrink was committed between the freeze and the crash.
+    shrunk: Option<Vec<NodeId>>,
+    promoted_at: Option<u64>,
 }
 
 struct World {
@@ -2934,6 +3065,11 @@ struct World {
     out: Vec<(usize, usize, Msg)>,
     end: u64,
     partitioned: bool,
+    /// Per process: frozen until this global time (0: running).
+    frozen_until: Vec<u64>,
+    /// Per process: input that arrived while it was frozen, in arrival order.
+    frozen_buf: Vec<Vec<(usize, Msg)>>,
+    probe: Option<StallProbe>,
 }
 
 /// The bootstrapped cluster: 6 nodes, two RF3 shards (min ISR 2) over all slots, every
@@ -3114,7 +3250,19 @@ impl World {
             out: Vec::new(),
             end,
             partitioned: false,
+            frozen_until: vec![0; nc + nn + 1],
+            frozen_buf: (0..=nc + nn).map(|_| Vec::new()).collect(),
+            probe: None,
         };
+        for n in &mut w.nodes {
+            n.stall_clock = cfg.stall_clock;
+        }
+        for c in &mut w.coords {
+            c.shrink_guard = cfg.stall_clock;
+        }
+        if let Some(sc) = cfg.stall_crash {
+            w.schedule(sc.at_ms * MS, w.topo.client, Timer::Script(0));
+        }
         for p in 0..=w.topo.client {
             let t = w.rng.random_range(0..5 * MS);
             w.schedule(t, p, Timer::Tick);
@@ -3175,6 +3323,7 @@ impl World {
             self.report.events += 1;
             self.flush();
             self.check_instant();
+            self.observe_probe();
             if let Some(v) = self.obs.violation.take() {
                 return Err(format!("{v} (at {} ms)", self.net.now() / MS));
             }
@@ -3211,6 +3360,11 @@ impl World {
 
     fn deliver(&mut self, from: usize, to: usize, m: Msg) {
         if !self.up(to) {
+            return;
+        }
+        if self.frozen_until[to] > 0 {
+            // a stopped process reads nothing; its sockets keep what arrives
+            self.frozen_buf[to].push((from, m));
             return;
         }
         let (now_g, now_l) = self.fx_parts(to);
@@ -3292,9 +3446,50 @@ impl World {
                 };
                 let next = self.net.after(p, period);
                 self.schedule(next, p, Timer::Tick);
-                if !self.up(p) {
+                if !self.up(p) || self.frozen_until[p] > 0 {
                     return;
                 }
+                self.tick_proc(p);
+            }
+            Timer::Fault => self.inject_fault(),
+            Timer::Restart(proc_) => self.restart(proc_),
+            Timer::HealNet => {
+                self.net.heal();
+                self.partitioned = false;
+            }
+            Timer::Heal => {
+                self.net.heal();
+                self.partitioned = false;
+                for p in 0..self.topo.client {
+                    self.thaw(p);
+                    if !self.up(p) {
+                        self.restart(p);
+                    }
+                }
+                for n in &mut self.nodes {
+                    n.disk_slow_until = 0;
+                }
+            }
+            Timer::FinalPhase => self.clients.final_phase = true,
+            Timer::Thaw(proc_) => {
+                // a stale timer of an earlier freeze (the process crashed meanwhile) is ignored
+                if self.frozen_until[proc_] > 0 && self.net.now() >= self.frozen_until[proc_] {
+                    self.thaw(proc_);
+                }
+            }
+            Timer::CrashAfterFreeze(i, back_ms) => {
+                if self.nodes[i].up && self.frozen_until[self.topo.node_proc(i)] == 0 {
+                    self.crash_node(i, back_ms);
+                }
+            }
+            Timer::Script(step) => self.script(step),
+        }
+    }
+
+    /// One tick of process `p` (its timers: renewals, streams, elections, client ops).
+    fn tick_proc(&mut self, p: usize) {
+        {
+            {
                 let (now_g, now_l) = self.fx_parts(p);
                 let net = &self.net;
                 let after = |d: u64| net.after(p, d);
@@ -3320,25 +3515,200 @@ impl World {
                     client_tick(&mut self.clients, &mut fx, &self.topo);
                 }
             }
-            Timer::Fault => self.inject_fault(),
-            Timer::Restart(proc_) => self.restart(proc_),
-            Timer::HealNet => {
-                self.net.heal();
-                self.partitioned = false;
+        }
+        // the scripted stall starts right after a tick that left an ack in flight
+        if let Some(pr) = &self.probe
+            && pr.armed
+            && p == self.topo.node_proc(pr.node)
+            && self.nodes[pr.node].ack_in_flight()
+        {
+            self.flush();
+            self.script(1);
+        }
+    }
+
+    /// Process `p` stops for `ms` (SIGSTOP, a long scheduling delay): no timer runs and its
+    /// input waits until it resumes.
+    fn freeze(&mut self, p: usize, ms: u64) {
+        if p >= self.topo.client || !self.up(p) || self.frozen_until[p] > 0 {
+            return;
+        }
+        let now = self.net.now();
+        if trace_on() {
+            eprintln!("[{} ms] freeze proc {p} for {ms} ms", now / MS);
+        }
+        self.report.freezes += 1;
+        self.frozen_until[p] = now + ms * MS;
+        self.schedule(now + ms * MS, self.topo.client, Timer::Thaw(p));
+    }
+
+    /// The frozen process resumes: its stale timers run first (the worst order after
+    /// SIGCONT), then the input that waited, in arrival order.
+    fn thaw(&mut self, p: usize) {
+        if self.frozen_until[p] == 0 {
+            return;
+        }
+        self.frozen_until[p] = 0;
+        let buf = std::mem::take(&mut self.frozen_buf[p]);
+        if !self.up(p) {
+            return;
+        }
+        if trace_on() {
+            eprintln!("[{} ms] thaw proc {p}", self.net.now() / MS);
+        }
+        self.tick_proc(p);
+        self.flush();
+        for (from, m) in buf {
+            self.deliver(from, p, m);
+            self.flush();
+        }
+    }
+
+    /// Kill -9 of node `i`; it restarts `back_ms` later.
+    fn crash_node(&mut self, i: usize, back_ms: u64) {
+        if !self.nodes[i].up {
+            return;
+        }
+        let now = self.net.now();
+        let p = self.topo.node_proc(i);
+        if trace_on() {
+            eprintln!("[{} ms] crash n{i}", now / MS);
+        }
+        self.frozen_until[p] = 0;
+        self.frozen_buf[p].clear();
+        self.nodes[i].crash();
+        self.net.crash(p);
+        self.report.node_crashes += 1;
+        self.schedule(now + back_ms * MS, p, Timer::Restart(p));
+    }
+
+    /// The leader's committed state (`None` without a leader).
+    fn leader_state(&self) -> Option<Arc<ClusterState>> {
+        self.coords
+            .iter()
+            .find(|c| c.up && c.core.role() == Role::Leader && c.leading.is_some())
+            .map(|c| c.state().clone())
+    }
+
+    /// The scripted stall-then-crash check (`ClusterSimCfg::stall_crash`).
+    fn script(&mut self, step: u8) {
+        let Some(sc) = self.cfg.stall_crash else {
+            return;
+        };
+        let now = self.net.now();
+        match step {
+            0 => {
+                let Some(s) = self.leader_state() else {
+                    // no leader yet: try again shortly
+                    self.schedule(now + 100 * MS, self.topo.client, Timer::Script(0));
+                    return;
+                };
+                let Some(sh) = s.shards.first() else { return };
+                let Some(node) = sh.primary.and_then(|p| node_index(&p)) else {
+                    return;
+                };
+                let isr_before: Vec<NodeId> = sh.isr().map(|m| m.node).collect();
+                self.probe = Some(StallProbe {
+                    node,
+                    armed: true,
+                    shard: sh.id.0,
+                    isr_before,
+                    frozen_at: now,
+                    crashed_at: None,
+                    shrunk: None,
+                    promoted_at: None,
+                });
             }
-            Timer::Heal => {
-                self.net.heal();
-                self.partitioned = false;
-                for p in 0..self.topo.client {
-                    if !self.up(p) {
-                        self.restart(p);
-                    }
+            1 => {
+                let Some(node) = self.probe.as_ref().map(|p| p.node) else {
+                    return;
+                };
+                if let Some(p) = &mut self.probe {
+                    p.armed = false;
+                    p.frozen_at = now;
                 }
-                for n in &mut self.nodes {
-                    n.disk_slow_until = 0;
+                self.freeze(self.topo.node_proc(node), sc.freeze_ms);
+                self.schedule(
+                    now + (sc.freeze_ms + sc.crash_ms) * MS,
+                    self.topo.client,
+                    Timer::Script(2),
+                );
+            }
+            _ => {
+                let Some(node) = self.probe.as_ref().map(|p| p.node) else {
+                    return;
+                };
+                // it stays down long enough that only a promotion can serve its shard
+                self.crash_node(node, 8_000);
+                if let Some(p) = &mut self.probe {
+                    p.crashed_at = Some(now);
                 }
             }
-            Timer::FinalPhase => self.clients.final_phase = true,
+        }
+    }
+
+    /// The scripted check's observations after every event.
+    fn observe_probe(&mut self) {
+        if self.probe.as_ref().is_none_or(|p| p.promoted_at.is_some()) {
+            return;
+        }
+        let Some(s) = self.leader_state() else { return };
+        let now = self.net.now();
+        let Some(p) = &mut self.probe else { return };
+        let Some(sh) = s.shard(ShardId(p.shard)) else {
+            return;
+        };
+        let primary = sh.primary.and_then(|n| node_index(&n));
+        match p.crashed_at {
+            None => {
+                let isr: Vec<NodeId> = sh.isr().map(|m| m.node).collect();
+                if primary == Some(p.node) && isr.len() < p.isr_before.len() && p.shrunk.is_none() {
+                    p.shrunk = Some(isr);
+                }
+            }
+            Some(_) => {
+                if primary.is_some_and(|n| n != p.node) && sh.status == ShardStatus::Serving {
+                    p.promoted_at = Some(now);
+                }
+            }
+        }
+    }
+
+    /// The scripted check's verdict (final checks).
+    fn probe_verdict(&self) -> Result<(), String> {
+        let Some(p) = &self.probe else {
+            return if self.cfg.stall_crash.is_some() {
+                Err("the scripted stall never ran".into())
+            } else {
+                Ok(())
+            };
+        };
+        if let Some(isr) = &p.shrunk {
+            return Err(format!(
+                "a {} ms stall of the primary n{} of shard {} shrank its ISR from {} to {} members while every member was healthy",
+                self.cfg.stall_crash.map_or(0, |s| s.freeze_ms),
+                p.node,
+                p.shard,
+                p.isr_before.len(),
+                isr.len()
+            ));
+        }
+        let Some(c) = p.crashed_at else {
+            return Err("the scripted crash never ran".into());
+        };
+        match p.promoted_at {
+            Some(t) if t - c <= 3_000 * MS => Ok(()),
+            Some(t) => Err(format!(
+                "shard {} was promoted {} ms after its primary crashed (bound 3000 ms)",
+                p.shard,
+                (t - c) / MS
+            )),
+            None => Err(format!(
+                "shard {} had no new primary after its primary n{} crashed (frozen at {} ms)",
+                p.shard,
+                p.node,
+                p.frozen_at / MS
+            )),
         }
     }
 
@@ -3346,6 +3716,8 @@ impl World {
         if self.up(p) {
             return;
         }
+        self.frozen_until[p] = 0;
+        self.frozen_buf[p].clear();
         self.net.restart(p);
         if p < self.topo.coords {
             let peers = self.peers.clone();
@@ -3377,23 +3749,58 @@ impl World {
         }
         let down_nodes = self.nodes.iter().filter(|n| !n.up).count();
         let down_coords = self.coords.iter().filter(|c| !c.up).count();
+        if self.cfg.freezes && self.rng.random_bool(0.15) {
+            // a freeze (SIGSTOP, a long scheduling delay) of a primary, any node or a
+            // coordinator; a frozen node is sometimes crashed right after it resumes
+            let ms = self.rng.random_range(100..2_500u64);
+            let pick = self.rng.random_range(0..10u32);
+            let primaries: Vec<usize> = self
+                .leader_state()
+                .map(|s| {
+                    s.shards
+                        .iter()
+                        .filter_map(|sh| sh.primary.and_then(|p| node_index(&p)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let proc_ = if pick < 5 && !primaries.is_empty() {
+                let i = primaries[self.rng.random_range(0..primaries.len())];
+                Some((self.topo.node_proc(i), Some(i)))
+            } else if pick < 8 {
+                let i = self.rng.random_range(0..self.topo.nodes);
+                Some((self.topo.node_proc(i), Some(i)))
+            } else {
+                Some((self.rng.random_range(0..self.topo.coords), None))
+            };
+            if let Some((p, node)) = proc_ {
+                self.freeze(p, ms);
+                if let Some(i) = node
+                    && down_nodes < 2
+                    && self.rng.random_bool(0.3)
+                {
+                    let after = self.rng.random_range(0..400u64);
+                    let back = self.rng.random_range(300..6_000u64);
+                    self.schedule(
+                        now + (ms + after) * MS,
+                        self.topo.client,
+                        Timer::CrashAfterFreeze(i, back),
+                    );
+                }
+            }
+            return;
+        }
         if r < 40 && down_nodes < 2 {
             // crash a node (kill -9); it restarts after a while
             let i = self.rng.random_range(0..self.topo.nodes);
             if self.nodes[i].up {
-                let p = self.topo.node_proc(i);
-                if trace_on() {
-                    eprintln!("[{} ms] crash n{i}", now / MS);
-                }
-                self.nodes[i].crash();
-                self.net.crash(p);
-                self.report.node_crashes += 1;
-                let back = now + self.rng.random_range(300 * MS..6_000 * MS);
-                self.schedule(back, p, Timer::Restart(p));
+                let back = self.rng.random_range(300..6_000u64);
+                self.crash_node(i, back);
             }
         } else if r < 55 && down_coords < 1 {
             let i = self.rng.random_range(0..self.topo.coords);
             if self.coords[i].up {
+                self.frozen_until[i] = 0;
+                self.frozen_buf[i].clear();
                 self.coords[i].up = false;
                 self.coords[i].leading = None;
                 self.net.crash(i);
@@ -3508,6 +3915,7 @@ impl World {
     /// After the quiet phase: every key's history is linearizable in the §23.11 sense (the
     /// final reads after quiescence included), and the members converged to their primaries.
     fn final_checks(&mut self) -> Result<(), String> {
+        self.probe_verdict()?;
         let missing = self.clients.final_reads.iter().filter(|r| !**r).count();
         if missing > 0 {
             let keys: Vec<String> = (0..KEYS)
@@ -3786,6 +4194,8 @@ pub mod cli {
         let mut sim_ms = None;
         let mut hostile = false;
         let mut quiet_net = false;
+        let mut freezes = true;
+        let mut stall_clock = true;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let mut num = |name: &str| -> Option<u64> {
@@ -3810,6 +4220,8 @@ pub mod cli {
                 },
                 "--hostile" => hostile = true,
                 "--quiet-net" => quiet_net = true,
+                "--no-freezes" => freezes = false,
+                "--boot-clock" => stall_clock = false,
                 other => {
                     eprintln!("kv-sim cluster: unknown argument {other}");
                     return 2;
@@ -3820,6 +4232,8 @@ pub mod cli {
         let mut total = ClusterSimReport::default();
         for seed in start..start + seeds {
             let mut cfg = ClusterSimCfg::new(seed);
+            cfg.freezes = freezes;
+            cfg.stall_clock = stall_clock;
             if let Some(ms) = sim_ms {
                 cfg.sim_ms = ms;
             }
@@ -3866,6 +4280,7 @@ impl ClusterSimReport {
         self.resync_needed += r.resync_needed;
         self.max_term = self.max_term.max(r.max_term);
         self.stream_breaks += r.stream_breaks;
+        self.freezes += r.freezes;
         for (a, b) in self.resync_why.iter_mut().zip(r.resync_why) {
             *a += b;
         }
@@ -4061,6 +4476,63 @@ mod tests {
         for seed in [17, 33] {
             run(&ClusterSimCfg::new(seed)).unwrap();
         }
+    }
+
+    /// kv-node/kv-repl F1 (fixed), found by real-process runs (SIGSTOP of a primary for
+    /// 400 ms, then kill -9): the age test of the members' acks ran on the boot clock and
+    /// timed groups from when they were produced, so the first tick after the primary resumed
+    /// saw every group it produced before the stop as older than `repl-ack-timeout-ms` (the
+    /// acks sat unread in its sockets) and asked to shrink every member out of the ISR; the
+    /// coordinator committed it, and a crash right after left the shard with no promotable
+    /// member until the dead primary restarted. Fix: the age test runs on a
+    /// `StallClock` (a gap between two ticks counts at most one step; nothing while the
+    /// replication transport has not run) and times a group from when the primary's own
+    /// durability covered it; the coordinator acts on a shrink only from a primary whose lease
+    /// it holds. `stall_clock: false` reproduces the stuck shard.
+    #[test]
+    fn repro_f1_primary_stall_then_crash_fails_over() {
+        let cases = [(400, 0), (400, 150), (700, 50), (300, 300), (1_200, 20)];
+        for (i, &(freeze_ms, crash_ms)) in cases.iter().enumerate() {
+            let cfg = ClusterSimCfg {
+                faults: NetFaults::default(),
+                fault_every_ms: 0,
+                sim_ms: 9_000,
+                freezes: false,
+                stall_crash: Some(StallCrash {
+                    at_ms: 3_000 + 37 * i as u64,
+                    freeze_ms,
+                    crash_ms,
+                }),
+                ..ClusterSimCfg::new(70 + i as u64)
+            };
+            run(&cfg).unwrap();
+        }
+        // the boot clock: the same stalls shrink healthy members (whenever the primary had
+        // noticed its own durability of a group before it stopped)
+        let mut stuck = Vec::new();
+        for i in 0..6u64 {
+            let old = ClusterSimCfg {
+                faults: NetFaults::default(),
+                fault_every_ms: 0,
+                sim_ms: 9_000,
+                freezes: false,
+                stall_clock: false,
+                stall_crash: Some(StallCrash {
+                    at_ms: 3_000 + 13 * i,
+                    freeze_ms: 400,
+                    crash_ms: 100,
+                }),
+                ..ClusterSimCfg::new(70 + i)
+            };
+            if let Err(e) = run(&old) {
+                stuck.push(e);
+            }
+        }
+        eprintln!("boot clock: {} of 6 stalls failed: {stuck:#?}", stuck.len());
+        assert!(
+            stuck.iter().any(|e| e.contains("shrank its ISR")),
+            "the boot clock counts the primary's stall as member lag"
+        );
     }
 
     fn quiet(seed: u64) -> ClusterSimCfg {

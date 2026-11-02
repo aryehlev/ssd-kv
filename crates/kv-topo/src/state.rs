@@ -626,9 +626,17 @@ impl ClusterState {
         }
     }
 
+    /// The migrations a shard's primary acts on. A finished migration is not one of them: its
+    /// routing is in the shards' slot sets, the source purges whatever it does not own once no
+    /// task keeps it, and the destination serves its owned slots once no task holds them. A
+    /// finished task that stayed in the projection would outlive a later migration of the
+    /// same slots (moving them back must make them servable again).
     fn migration_tasks(&self, shard: ShardId) -> Vec<MigrationTask> {
         let mut out = Vec::new();
         for m in &self.migrations {
+            if m.phase == MigPhase::Done {
+                continue;
+            }
             if m.src == shard {
                 out.push(MigrationTask::Out {
                     id: m.id,

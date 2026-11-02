@@ -8,13 +8,18 @@
 //!   against the new primary) and serves the same data on READONLY reads.
 //! * `slot_migration_under_load`: an operator migration of half the slots to a second shard
 //!   while a writer runs; zero acknowledged writes lost, routing follows the cutover, the
-//!   source purges the moved slots.
+//!   source purges the moved slots; part of the range migrated back is served by the first
+//!   shard again and purged by the second.
 //! * `sigterm_on_a_primary_hands_off_first`: SIGTERM on a primary with an in-sync replica asks
 //!   the coordinator for a graceful handoff before the node stops (§23.12): the replica is
 //!   promoted, no acknowledged write is lost, the old primary returns as a member.
 //! * `migration_resume_prunes_keys_deleted_at_the_source`: a migration paused mid-copy leaves
 //!   an inert partial copy on the destination; keys deleted at the source meanwhile are never
 //!   served by the destination after `migrate resume` completes (the copy is a merge).
+//! * `a_primary_stall_keeps_its_members_and_a_crash_after_it_fails_over`: SIGSTOP of a primary
+//!   for 400 ms (longer than `repl-ack-timeout-ms`, shorter than the lease) under writes
+//!   never drops its healthy member from the ISR (the stall is the primary's, not the
+//!   member's), so kill -9 right after the stall still promotes the member within 3 s.
 //! * `a_removed_coordinator_is_never_a_moved_target`: after `kvadm coord remove` of a follower
 //!   the data nodes take the new coordinator list even when the push that carries it keeps
 //!   the state version they applied already (the SETPEERS sync commit can reach them first):
@@ -511,6 +516,21 @@ impl Cluster {
         self.nodes[i].id = id;
     }
 
+    /// SIGSTOP (`true`) or SIGCONT (`false`) to node `i`.
+    fn pause_node(&self, i: usize, stop: bool) {
+        if let Some(c) = &self.nodes[i].child {
+            let sig = if stop { "-STOP" } else { "-CONT" };
+            let _ = Command::new("kill").args([sig, &c.id().to_string()]).status();
+        }
+    }
+
+    /// Lines of node `i`'s diagnostics file that contain `what`.
+    fn log_count(&self, i: usize, what: &str) -> usize {
+        std::fs::read_to_string(self.root.join(format!("n{i}.log")))
+            .map(|s| s.lines().filter(|l| l.contains(what)).count())
+            .unwrap_or(0)
+    }
+
     fn kill_node(&mut self, i: usize) {
         if let Some(mut c) = self.nodes[i].child.take() {
             let _ = c.kill();
@@ -935,6 +955,67 @@ fn replication_failover_and_returning_member() {
 }
 
 #[test]
+fn a_primary_stall_keeps_its_members_and_a_crash_after_it_fails_over() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("stall", 2, Duration::from_secs(300));
+    let coords = c.coord_clients();
+    let (n0, n1) = (c.nodes[0].id.clone(), c.nodes[1].id.clone());
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &n0, "--min-isr", "1"]);
+    c.admin(&["SLOTS", "ASSIGN", "0-16383", "1"]);
+    c.wait_primary(0, 30);
+    c.admin(&["REPLICA", "ADD", "1", &n1]);
+    c.wait_member(1, "in-sync isr", 60);
+    let ws: Vec<Writer> = (0..3)
+        .map(|i| Writer::start(coords.clone(), &format!("st{i}"), Duration::ZERO))
+        .collect();
+    for w in &ws {
+        w.at_least(50, 60);
+    }
+    // stalls of the primary: 400 ms is above repl-ack-timeout-ms (250) and below the lease
+    // (600 ms here): its member keeps acknowledging, so it stays in the ISR
+    let shrinks = c.log_count(0, "ISR shrink requested");
+    for round in 0..5 {
+        c.wait_member(1, "in-sync isr", 30);
+        c.pause_node(0, true);
+        std::thread::sleep(Duration::from_millis(400));
+        c.pause_node(0, false);
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            c.member_line(1).contains(" isr"),
+            "round {round}: the member left the ISR after a 400 ms stall of the primary"
+        );
+    }
+    assert_eq!(
+        c.log_count(0, "ISR shrink requested"),
+        shrinks,
+        "the primary's stalls were reported as member lag"
+    );
+    // a crash right after a stall fails over to the member
+    c.wait_member(1, "in-sync isr", 30);
+    c.pause_node(0, true);
+    std::thread::sleep(Duration::from_millis(400));
+    c.pause_node(0, false);
+    std::thread::sleep(Duration::from_millis(50));
+    let t0 = Instant::now();
+    c.kill_node(0);
+    c.wait_primary(1, 10);
+    let took = t0.elapsed();
+    eprintln!("promotion {took:?} after the kill");
+    assert!(took < Duration::from_secs(3), "failover took {took:?}");
+    std::thread::sleep(Duration::from_millis(500));
+    let mut acked = Vec::new();
+    for w in ws {
+        let (a, _) = w.finish();
+        acked.extend(a);
+    }
+    verify_acked(&coords, &acked);
+    c.spawn_node(0);
+    c.wait_serving(0);
+    c.wait_member(0, "in-sync isr", 90);
+    c.ok = true;
+}
+
+#[test]
 fn slot_migration_under_load() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = Cluster::start("migrate", 2, Duration::from_secs(300));
@@ -1000,6 +1081,47 @@ fn slot_migration_under_load() {
         Conn::open(c.node_addr(0))
             .and_then(|mut cs| cs.call_str(&["DBSIZE"]))
             .is_ok_and(|v| matches!(v, Value::Int(n) if (n as usize) <= kept + failed))
+    });
+    // F2: part of the moved range goes back to the source; that range is served there again
+    // (a finished task of the first migration used to seal it on the source forever, every
+    // node answering MOVED), with every acknowledged write, and the destination purges it
+    let back: Vec<&(String, String)> = pre
+        .iter()
+        .chain(acked.iter())
+        .filter(|(k, _)| (4096..=5119).contains(&kv_common::key_slot(k.as_bytes())))
+        .collect();
+    assert!(!back.is_empty());
+    let out = c.admin(&["MIGRATE", "4096-5119", "--to", "1"]);
+    let id: String = out.split_whitespace().nth(2).unwrap_or("").to_owned();
+    wait_until("the migration back to finish", 120, || {
+        c.admin_try(&["MIGRATIONS"]).is_ok_and(|m| {
+            m.lines()
+                .any(|l| l.starts_with(&format!("{id} ")) && l.contains("phase=done"))
+        })
+    });
+    let mut r = Routed::new(coords.clone());
+    for (k, v) in &back {
+        match r.exec(k.as_bytes(), &[b"GET", k.as_bytes()]) {
+            Outcome::Ok(Value::Bulk(Some(b))) if b == v.as_bytes() => {}
+            Outcome::Ok(other) => panic!("GET {k} after moving back: {}", text(&other)),
+            Outcome::Failed(e) => panic!("GET {k} after moving back: {e}"),
+        }
+    }
+    let mut src = Conn::open(c.node_addr(0)).unwrap();
+    for (k, v) in back.iter().take(20) {
+        assert_eq!(text(&src.call_str(&["GET", k]).unwrap()), *v, "the source serves {k} again");
+    }
+    let k = back[0].0.clone();
+    set_settled(&mut r, &k, "written-after-moving-back");
+    assert_eq!(
+        text(&src.call_str(&["GET", &k]).unwrap()),
+        "written-after-moving-back"
+    );
+    wait_until("the second source to purge the range it gave back", 60, || {
+        Conn::open(c.node_addr(1))
+            .and_then(|mut d| d.call_str(&["GET", &k]))
+            .is_ok_and(|v| text(&v).starts_with("MOVED"))
+            && c.log_count(1, "purging keys of slots this shard no longer serves") > 0
     });
     // a cluster node stops cleanly on SIGTERM while its streams are open
     c.stop_node(1, 20);

@@ -1956,10 +1956,17 @@ RANDOMKEY), `slot_filter()`, which return decisions, not slot sets (lint, LC-24)
    `local_durable` follows the node's `durability` (`written` or `flushed`; cluster default `flushed`).
 3. The reply is released when the command's ticket satisfies the mode and `commit_seq(p) >= seq`, and the lease is
    valid. COMMIT/HEARTBEAT frames tell members the commit point.
-4. **ISR shrink:** a member that has unacked groups older than `repl-ack-timeout-ms` (250) -> primary sends
-   `IsrShrink{shard, term, member}`; the coordinator commits it (even if the ISR falls below `min_isr`); only after the
-   committed assignment arrives does the primary stop waiting for that member. Writes that cannot commit because the
-   ISR is below `min_isr` reply `-NOREPLICAS` (they may still have taken effect: unacked).
+4. **ISR shrink:** a member whose oldest unacknowledged group was covered by the primary's own durability more than
+   `repl-ack-timeout-ms` (250) ago -> primary sends `IsrShrink{shard, term, member}`. The age test judges the member,
+   never the primary: a member that acknowledged everything the primary has made durable is never reported, and the
+   age runs on a stall clock (`kv_repl::primary::StallClock`) that counts at most 50 ms for a gap between two ticks and
+   nothing while the node's replication transport has not run in the last 50 ms, so a primary that was stopped or
+   descheduled (SIGSTOP, a VM pause, CPU starvation) never reports its healthy members when it resumes (their acks are
+   still unread in its sockets). The coordinator commits a shrink (even if the ISR falls below `min_isr`) only while
+   it holds the primary's lease and does not suspect it (a primary that missed its renewals cannot acknowledge writes,
+   and its view of who lags is the stale one); only after the committed assignment arrives does the primary stop
+   waiting for that member. Writes that cannot commit because the ISR is below `min_isr` reply `-NOREPLICAS` (they may
+   still have taken effect: unacked).
 5. **ISR expand:** a caught-up member (acked_durable >= commit_seq) -> the primary starts counting its acks, then
    sends `IsrExpand{shard, term, member}`; the coordinator commits; only then is the member promotable/advertised.
 6. `min_isr` counts the primary; defaults: RF1 1, RF2 1, RF3 2. `WAIT n t` replies the number of ISR members other
@@ -2091,7 +2098,10 @@ primary node triggers a handoff request first (same target rule).
    coordinator committed phase Done and pushed it to B; only then does B serve. The coordinator redirects to B from the
    Cutover commit on. No command is ever held (LC-14); the TRYAGAIN window is SEAL commit + one coordinator commit
    (~2-5 ms).
-4. **Done:** after the Done commit, A purges the slots (paced deletes; `FlushSlot` replicated to A's members).
+4. **Done:** after the Done commit, A purges the slots (paced deletes; `FlushSlot` replicated to A's members). A
+   finished migration leaves the primaries' projections (`ShardRole.migrations` carries running and paused tasks
+   only; the record stays in `ClusterState` for `kvadm migrations`), so slots migrated back later are served again
+   and purged by the shard that gave them back.
 5. **Failures:** any failover of A or B before phase Done is committed -> the coordinator commits routing back to A (no
    data moves: A's ISR holds every write A acknowledged, A never purged, and B never acknowledged a write for those
    slots) and phase Paused. B keeps its partial copy **inert** (not owned, never served, excluded from SCAN/DBSIZE by

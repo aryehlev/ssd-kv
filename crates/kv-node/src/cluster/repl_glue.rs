@@ -34,7 +34,7 @@ use kv_repl::backlog::Backlog;
 use kv_repl::codec::{self, KeySet};
 use kv_repl::frame::{self, AcceptMode, Frame, Hello, ImageRec, Recovered, RejectReason, SnapRec};
 use kv_repl::member::{MemberAction, MemberStream};
-use kv_repl::primary::{MemberId, ReplSender};
+use kv_repl::primary::{MemberId, ReplSender, STALL_STEP_NS, StallClock};
 use kv_repl::sync::{self, PrimaryView, SyncDecision};
 use kv_repl::walk::{self, WalkPos};
 use kv_storage::effect::{Group, Op};
@@ -374,6 +374,10 @@ pub struct ClusterWorker {
     pub(super) sync_iops: u64,
     /// The worker is shutting down: no stream is accepted, dialed or driven any more.
     stopped: bool,
+    /// The clock of the members' ack age test (`ReplSender::lagging`): time this worker or the
+    /// replication transport did not run is left out, so a primary that was stopped or
+    /// descheduled never reports its members for its own stall (§23.8 step 4).
+    run: StallClock,
 }
 
 impl ClusterWorker {
@@ -428,6 +432,7 @@ impl ClusterWorker {
             ack_timeout_ns: cfg.repl_ack_timeout_ms.saturating_mul(1_000_000),
             sync_iops: cfg.sync_iops,
             stopped: false,
+            run: StallClock::new(),
         }
     }
 
@@ -687,14 +692,16 @@ impl<B: Backend> Worker<B> {
     ) -> Option<Seq> {
         let seed = self.backend.hash_seed(p);
         let done_now = ticket.is_none() || self.local_need().is_none();
+        let boot_now = self.now.boot_ns;
         self.with_cluster(|_, cw| {
+            let run_now = cw.run.peek(boot_now);
             let pr = cw.part(p)?;
             let Role::Primary(pp) = &mut pr.role else {
                 return None;
             };
             let mut enc = Vec::with_capacity(codec::encoded_len(g));
             codec::encode_group(g, &mut enc);
-            pp.sender.on_group(&enc, g.seq);
+            pp.sender.on_group_at(&enc, g.seq, run_now);
             let term = pp.term;
             let fps = group_fps(g, seed);
             let wide = is_wide(g);
@@ -893,6 +900,7 @@ impl<B: Backend> Worker<B> {
         let backlog_bytes = cw.backlog_bytes;
         let heartbeat_ns = cw.heartbeat_ns;
         let boot_now = self.now.boot_ns;
+        let run_now = cw.run.peek(boot_now);
         let cs = cw.cs.clone();
         let Some(pr) = cw.part(p) else { return };
         let want = a.role.as_ref();
@@ -1090,7 +1098,7 @@ impl<B: Backend> Worker<B> {
                     pp.sender.detach(i as MemberId);
                 }
             }
-            pp.sender.set_isr_at(&counted_members(&pp.peers), boot_now);
+            pp.sender.set_isr_at(&counted_members(&pp.peers), run_now);
             let tasks = r.migrations.clone();
             self.sync_migrations(cw, p, &tasks);
         }
@@ -2788,6 +2796,14 @@ impl<B: Backend> Worker<B> {
             self.apply_roles(cw);
         }
         let now = self.now.boot_ns;
+        // the ack age test's clock: a gap since the last tick counts at most one step, and
+        // nothing while the transport that delivers the members' acks has not run recently
+        let net_held = cw
+            .cs
+            .net
+            .get()
+            .is_some_and(|n| now.saturating_sub(n.alive_ns()) > STALL_STEP_NS);
+        let run_now = cw.run.advance(now, net_held);
         let partitions = self.shared.partitions;
         let lease_ok = self.shared.lease.valid(now);
         let below_min = self.shared.ownership.read().below_min_isr();
@@ -2815,7 +2831,7 @@ impl<B: Backend> Worker<B> {
                 if let Some(pr) = cw.part(p)
                     && let Role::Primary(pp) = &mut pr.role
                 {
-                    pp.sender.set_local_durable(pr.durable.upto());
+                    pp.sender.set_local_durable_at(pr.durable.upto(), run_now);
                     let term = pp.term;
                     let shard = pp.shard;
                     // backlog streams
@@ -2838,7 +2854,7 @@ impl<B: Backend> Worker<B> {
                         }
                     }
                     // ISR shrink requests and expands (age tests and position tests only)
-                    let lag = pp.sender.lagging(now, ack_timeout);
+                    let lag = pp.sender.lagging(run_now, ack_timeout);
                     let mut recount = false;
                     let gate = &cs.expand_gate;
                     for m in lag {
@@ -2875,7 +2891,7 @@ impl<B: Backend> Worker<B> {
                     if recount {
                         // at once: dropping it restarts its barrier chain, so the pass below
                         // cannot count it again on the chain it finished before it lagged
-                        pp.sender.set_isr_at(&counted_members(&pp.peers), now);
+                        pp.sender.set_isr_at(&counted_members(&pp.peers), run_now);
                         recount = false;
                     }
                     for (i, x) in pp.peers.iter_mut().enumerate() {
@@ -2919,7 +2935,7 @@ impl<B: Backend> Worker<B> {
                         }
                     }
                     if recount {
-                        pp.sender.set_isr_at(&counted_members(&pp.peers), now);
+                        pp.sender.set_isr_at(&counted_members(&pp.peers), run_now);
                     }
                     // committed replies
                     let commit = pp.sender.commit_seq();
@@ -3076,9 +3092,13 @@ impl<B: Backend> Worker<B> {
         };
         let mut keep = r.owned_slots.clone();
         for t in &r.migrations {
+            // a running or paused migration keeps its slots (the source's until Done, the
+            // destination's partial copy until it is done or aborted); a finished one keeps
+            // nothing beyond what the shard owns, so slots moved away again are purged
             let active = match t {
-                MigrationTask::Out { phase, .. } => *phase != MigPhase::Done,
-                MigrationTask::In { .. } => true,
+                MigrationTask::Out { phase, .. } | MigrationTask::In { phase, .. } => {
+                    *phase != MigPhase::Done
+                }
             };
             if active {
                 for s in t.slots().iter_slots() {

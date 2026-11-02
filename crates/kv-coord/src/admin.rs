@@ -69,8 +69,20 @@ struct Job {
 struct Jobs {
     failover: hashbrown::HashMap<ShardId, Job, foldhash::fast::RandomState>,
     handoff: hashbrown::HashMap<ShardId, Job, foldhash::fast::RandomState>,
-    /// Health transitions submitted and not yet answered.
-    health: hashbrown::HashSet<(NodeId, bool), foldhash::fast::RandomState>,
+    /// Transitions from node reports submitted and not yet answered: a repeated report of the
+    /// same change is not proposed again while one is in flight (a lagging member is reported
+    /// by every partition and every 100 ms).
+    pending: hashbrown::HashSet<Pending, foldhash::fast::RandomState>,
+}
+
+/// The change a submitted report asks for (in-flight deduplication).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Pending {
+    Health(NodeId, bool),
+    Isr(ShardId, u32, NodeId, bool),
+    Ready(ShardId, u32, NodeId),
+    Resync(ShardId, u32, NodeId),
+    Migration(u64, bool),
 }
 
 /// Progress of `rebalance apply`.
@@ -151,12 +163,12 @@ impl Controllers {
     }
 
     /// Submits `batch` in order with the other submissions and logs its outcome.
-    fn submit(&self, what: &'static str, batch: Vec<Transition>, done: Option<(NodeId, bool)>) {
+    fn submit(&self, what: &'static str, batch: Vec<Transition>, done: Option<Pending>) {
         let rx = match self.wsr.submit(batch) {
             Ok(rx) => rx,
             Err(_) => {
                 if let Some(k) = done {
-                    lock(&self.jobs).health.remove(&k);
+                    lock(&self.jobs).pending.remove(&k);
                 }
                 return;
             }
@@ -169,9 +181,16 @@ impl Controllers {
                 Err(_) => {}
             }
             if let Some(k) = done {
-                lock(&jobs).health.remove(&k);
+                lock(&jobs).pending.remove(&k);
             }
         });
+    }
+
+    /// Submits a report's transition unless the same change is already in flight.
+    fn submit_once(&self, what: &'static str, batch: Vec<Transition>, key: Pending) {
+        if lock(&self.jobs).pending.insert(key) {
+            self.submit(what, batch, Some(key));
+        }
     }
 
     fn on_event(self: &Arc<Self>, ev: NodeEvent) {
@@ -187,30 +206,41 @@ impl Controllers {
                     if !isr::from_primary(&s, shard, &from) {
                         return;
                     }
+                    if !add {
+                        let now = kv_common::clock::boot_ns();
+                        if !isr::shrink_accepted(self.pusher.lease_held(&from, now), self.pusher.suspected(&from)) {
+                            tracing::debug!(shard = shard.0, member = %member.hex40(),
+                                "ISR shrink from a primary without a held lease ignored");
+                            return;
+                        }
+                    }
                     if let Some(t) = isr::isr_transition(&s, shard, term, member, add) {
-                        self.submit(if add { "ISR expand" } else { "ISR shrink" }, vec![t], None);
+                        self.submit_once(if add { "ISR expand" } else { "ISR shrink" }, vec![t], Pending::Isr(shard, term, member, add));
                     }
                 }
                 NodeToCoord::MemberReady { shard, term, member } => {
                     if let Some(t) = isr::member_ready_transition(&s, &from, shard, term, member) {
-                        self.submit("member ready", vec![t], None);
+                        self.submit_once("member ready", vec![t], Pending::Ready(shard, term, member));
                     }
                 }
                 NodeToCoord::MigrationReady { id } => {
                     if let Some(b) = migration::on_ready(&s, &from, id) {
-                        self.submit("migration cutover", b, None);
+                        self.submit_once("migration cutover", b, Pending::Migration(id, false));
                     }
                 }
                 NodeToCoord::SealDone { id } => {
                     if let Some(t) = migration::on_seal_done(&s, &from, id) {
-                        self.submit("migration done", vec![t], None);
+                        self.submit_once("migration done", vec![t], Pending::Migration(id, true));
                     }
                 }
                 NodeToCoord::MemberNeedsResync { shard, term, member } => {
                     if let Some(t) = isr::needs_resync_transition(&s, &from, shard, term, member) {
+                        if lock(&self.jobs).pending.contains(&Pending::Resync(shard, term, member)) {
+                            return;
+                        }
                         tracing::warn!(shard = shard.0, member = %member.hex40(),
                             "member cannot catch up by continue or repair: needs-full-sync (kvadm replica resync)");
-                        self.submit("member needs resync", vec![t], None);
+                        self.submit_once("member needs resync", vec![t], Pending::Resync(shard, term, member));
                     }
                 }
                 NodeToCoord::HandoffRequest { shard, term } => {
@@ -253,9 +283,9 @@ impl Controllers {
             .with_lease(|ls| ls.detector.tick(&s, &ls.leases, now_ns, since));
         for t in health {
             if let Transition::Health { node, fail } = t
-                && lock(&self.jobs).health.insert((node, fail)) {
+                && lock(&self.jobs).pending.insert(Pending::Health(node, fail)) {
                     tracing::info!(node = %node.hex40(), fail, "node health change");
-                    self.submit("health", vec![t], Some((node, fail)));
+                    self.submit("health", vec![t], Some(Pending::Health(node, fail)));
                 }
         }
         let now = Instant::now();

@@ -1044,6 +1044,40 @@ fn migration_lifecycle() {
     assert!(is_pre(ab.apply(&[admin(AdminOp::ShardDelete { id: S1 })])));
 }
 
+/// F2 (fixed): a primary's projection carries only migrations that still run or are paused.
+/// Finished ones used to stay (up to `MAX_DONE_MIGRATIONS`), and a finished `Out` task sealed
+/// its slots on the source forever, so moving them back made the range unservable.
+#[test]
+fn finished_migrations_leave_the_projection() {
+    let s = three_by_two();
+    let s = apply_ok(
+        &s,
+        &[
+            migrate(18, 100, 200, S2),
+            phase(18, MigPhase::Cutover),
+            phase(18, MigPhase::Done),
+        ],
+    );
+    let src = s.assignment_for(&nid(1), 1, &[]);
+    let r = src.role.as_ref().unwrap();
+    assert!(r.migrations.is_empty(), "{:?}", r.migrations);
+    assert!(!r.owned_slots.contains(150));
+    let s = apply_ok(&s, &[migrate(31, 100, 200, S1)]);
+    let back = s.assignment_for(&nid(2), 1, &[]);
+    assert_eq!(back.role.as_ref().unwrap().migrations.len(), 1, "the running one");
+    let s = apply_ok(
+        &s,
+        &[phase(31, MigPhase::Cutover), phase(31, MigPhase::Done)],
+    );
+    assert_eq!(s.migrations.len(), 2, "both kept for kvadm migrations");
+    for n in [1u8, 2] {
+        let a = s.assignment_for(&nid(n), 1, &[]);
+        assert!(a.role.as_ref().unwrap().migrations.is_empty());
+    }
+    let a = s.assignment_for(&nid(1), 1, &[]);
+    assert!(a.role.as_ref().unwrap().owned_slots.contains(150));
+}
+
 #[test]
 fn done_migrations_are_bounded() {
     let mut s = three_by_two();

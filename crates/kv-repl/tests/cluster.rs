@@ -963,6 +963,8 @@ fn replication_failover_and_returning_member() {
 fn a_primary_stall_keeps_its_members_and_a_crash_after_it_fails_over() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = Cluster::start("stall", 2, Duration::from_secs(300));
+    // the stall below must outlast the ack timeout
+    c.admin(&["PARAMS", "SET", "repl_ack_timeout_ms", "250"]);
     let coords = c.coord_clients();
     let (n0, n1) = (c.nodes[0].id.clone(), c.nodes[1].id.clone());
     c.admin(&["SHARD", "CREATE", "1", "--primary", &n0, "--min-isr", "1"]);

@@ -2694,7 +2694,7 @@ impl Node {
             .disk
             .assignment
             .as_ref()
-            .map_or(250, |a| a.params.repl_ack_timeout_ms);
+            .map_or(500, |a| a.params.repl_ack_timeout_ms);
         match &mut self.role {
             NodeRole::Primary { .. } => self.primary_tick(fx, u64::from(ack_timeout) * MS),
             NodeRole::Replica { .. } => self.member_tick(fx, env),
@@ -4504,9 +4504,10 @@ mod tests {
     }
 
     /// kv-node/kv-repl F1 (fixed), found by real-process runs (SIGSTOP of a primary for
-    /// 400 ms, then kill -9): the age test of the members' acks ran on the boot clock and
-    /// timed groups from when they were produced, so the first tick after the primary resumed
-    /// saw every group it produced before the stop as older than `repl-ack-timeout-ms` (the
+    /// 400 ms with the 250 ms ack timeout of then, then kill -9): the age test of the members'
+    /// acks ran on the boot clock and timed groups from when they were produced, so the first
+    /// tick after the primary resumed saw every group it produced before the stop as older
+    /// than `repl-ack-timeout-ms` (the
     /// acks sat unread in its sockets) and asked to shrink every member out of the ISR; the
     /// coordinator committed it, and a crash right after left the shard with no promotable
     /// member until the dead primary restarted. Fix: the age test runs on a
@@ -4516,7 +4517,8 @@ mod tests {
     /// it holds. `stall_clock: false` reproduces the stuck shard.
     #[test]
     fn repro_f1_primary_stall_then_crash_fails_over() {
-        let cases = [(400, 0), (400, 150), (700, 50), (300, 300), (1_200, 20)];
+        // every stall outlasts the ack timeout (the 500 ms default)
+        let cases = [(700, 0), (700, 150), (900, 50), (600, 300), (1_200, 20)];
         for (i, &(freeze_ms, crash_ms)) in cases.iter().enumerate() {
             let cfg = ClusterSimCfg {
                 faults: NetFaults::default(),
@@ -4544,7 +4546,7 @@ mod tests {
                 stall_clock: false,
                 stall_crash: Some(StallCrash {
                     at_ms: 3_000 + 13 * i,
-                    freeze_ms: 400,
+                    freeze_ms: 700,
                     crash_ms: 100,
                 }),
                 ..ClusterSimCfg::new(70 + i)

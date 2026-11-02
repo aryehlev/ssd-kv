@@ -461,7 +461,7 @@ impl Default for Config {
             cluster_announce_port: 0,
             cluster_auth_token: String::new(),
             repl_backlog_size: 32 * MIB,
-            repl_ack_timeout_ms: 250,
+            repl_ack_timeout_ms: 500,
             repl_heartbeat_ms: 10,
             sync_mbps: 200,
             sync_iops: 5000,

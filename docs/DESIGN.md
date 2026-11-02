@@ -1620,7 +1620,7 @@ Shipped systemd units (`dist/kvd.service`, `dist/kvc.service`): `LimitMEMLOCK=in
 | cluster-announce-ip / cluster-announce-port | "" / 0 | - | |
 | cluster-auth-token | "" | - | required in cluster mode |
 | repl-backlog-size | 32mb | - | per partition (RAM ring; hugetlb or mlocked, `MADV_DONTDUMP`; never persisted) |
-| repl-ack-timeout-ms / repl-heartbeat-ms | 250 / 10 | R | |
+| repl-ack-timeout-ms / repl-heartbeat-ms | 500 / 10 | R | |
 | sync-mbps / sync-iops | 200 / 5000 | R | static token-bucket rates for full sync and migration streams |
 CONFIG GET also answers compatibility keys clients query: `save ""`, `appendonly no`, `maxmemory 0`,
 `maxmemory-policy noeviction`, `cluster-enabled`, `databases`; unknown patterns -> empty array (Redis behavior).
@@ -1684,7 +1684,7 @@ pub struct ClusterState {
     pub version: u64,                       // +1 per committed batch of transitions; the only map version
     pub cluster_id: [u8; 16],               // random once at `kvc init`; never per transition
     pub params: ClusterParams,              // partitions P, lease_ms 1500, renew_ms 100, fail_grace_ms 200,
-                                            // repl_ack_timeout_ms 250, client_password
+                                            // repl_ack_timeout_ms 500, client_password
                                             // (no coordinator list: peer lists live in each coord.meta, §23.3)
     pub nodes: Vec<NodeRecord>,             // operator order. {id: NodeId, ctrl, client, repl, zone, priority: u8,
                                             //  flags: {fail, maint}, partitions: u16, added_version}
@@ -1966,7 +1966,7 @@ RANDOMKEY), `slot_filter()`, which return decisions, not slot sets (lint, LC-24)
 3. The reply is released when the command's ticket satisfies the mode and `commit_seq(p) >= seq`, and the lease is
    valid. COMMIT/HEARTBEAT frames tell members the commit point.
 4. **ISR shrink:** a member whose oldest unacknowledged group was covered by the primary's own durability more than
-   `repl-ack-timeout-ms` (250) ago -> primary sends `IsrShrink{shard, term, member}`. The age test judges the member,
+   `repl-ack-timeout-ms` (500) ago -> primary sends `IsrShrink{shard, term, member}`. The age test judges the member,
    never the primary: a member that acknowledged everything the primary has made durable is never reported, and the
    age runs on a stall clock (`kv_repl::primary::StallClock`) that counts at most 50 ms for a gap between two ticks and
    nothing while the node's replication transport has not run in the last 50 ms, so a primary that was stopped or
@@ -1975,7 +1975,10 @@ RANDOMKEY), `slot_filter()`, which return decisions, not slot sets (lint, LC-24)
    it holds the primary's lease and does not suspect it (a primary that missed its renewals cannot acknowledge writes,
    and its view of who lags is the stale one); only after the committed assignment arrives does the primary stop
    waiting for that member. Writes that cannot commit because the ISR is below `min_isr` reply `-NOREPLICAS` (they may
-   still have taken effect: unacked).
+   still have taken effect: unacked). The 500 ms default leaves room for the sub-second stalls a busy or shared host
+   gives a healthy member (a shrink there costs `-NOREPLICAS` under `min_isr` 2, and a shard with no promotable member
+   if its primary then fails) while a write waiting on a dead member is still answered well within 1 s (timeout +
+   one coordinator commit + push).
 5. **ISR expand:** a caught-up member (acked_durable >= commit_seq) -> the primary starts counting its acks, then
    sends `IsrExpand{shard, term, member}`; the coordinator commits; only then is the member promotable/advertised.
 6. `min_isr` counts the primary; defaults: RF1 1, RF2 1, RF3 2. `WAIT n t` replies the number of ISR members other

@@ -348,7 +348,7 @@ impl Default for NodeParams {
             partitions: 64,
             lease_ms: 1500,
             renew_ms: 100,
-            repl_ack_timeout_ms: 250,
+            repl_ack_timeout_ms: 500,
         }
     }
 }

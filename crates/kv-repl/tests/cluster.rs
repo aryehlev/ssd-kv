@@ -1426,7 +1426,6 @@ fn migration_resume_prunes_keys_deleted_at_the_source() {
     c.ok = true;
 }
 
-/// The coordinator a data node's MOVED reply names for `key`, on one fresh connection.
 /// Both members of a shard with `min_isr` 2 stall together for a fraction of a second (a
 /// host disk or scheduling hiccup, SIGSTOP here) under writes: the writes wait for them and
 /// none fails. The primary used to ask for both members to leave the ISR at
@@ -1602,6 +1601,7 @@ fn a_replica_moved_to_a_shard_of_a_lower_term_syncs() {
     c.ok = true;
 }
 
+/// The coordinator a data node's MOVED reply names for `key`, on one fresh connection.
 fn moved_target(node: SocketAddr, key: &str) -> Option<String> {
     let mut conn = Conn::open(node).ok()?;
     match conn.call_str(&["SET", key, "v"]).ok()? {

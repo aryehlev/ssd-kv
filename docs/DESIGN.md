@@ -1832,7 +1832,7 @@ Rendered SLOTS/SHARDS/NODES replies are cached per `version`.
 **Per-library behavior (verified against current client sources in the research scratchpad):**
 | Library (minimum) | Bootstrap / refresh | Redirect handling | Settings |
 |---|---|---|---|
-| redis-py >= 5.0 `RedisCluster` | CLUSTER SLOTS against shuffled `startup_nodes`; ResponseError -> next node. Default `dynamic_startup_nodes=True` replaces seeds with nodes from SLOTS, after which refreshes reach only data nodes | `move_slot()` patches the slot to the MOVED target (coordinator, then owner); full re-init every `reinitialize_steps` (5) MOVEDs; TRYAGAIN retried; CLUSTERDOWN: sleep 0.25 s, re-init | **Required:** `startup_nodes=[all coordinators]`, `dynamic_startup_nodes=False`; before 7.2 the seeds by host name (below) |
+| redis-py >= 5.0 (RESP3: >= 6.0) `RedisCluster` | CLUSTER SLOTS against shuffled `startup_nodes`; ResponseError -> next node. Default `dynamic_startup_nodes=True` replaces seeds with nodes from SLOTS, after which refreshes reach only data nodes | `move_slot()` patches the slot to the MOVED target (coordinator, then owner); full re-init every `reinitialize_steps` (5) MOVEDs; TRYAGAIN retried; CLUSTERDOWN: sleep 0.25 s, re-init | **Required:** `startup_nodes=[all coordinators]`, `dynamic_startup_nodes=False`; before 7.2 the seeds by host name (below) |
 | Jedis >= 4.0 `JedisCluster` | shuffled `startNodes` CLUSTER SLOTS | `renewClusterSlots` tries the MOVED connection (data node: error caught), then `startNodes`; `maxAttempts` 5 | **Required for <= 3 s failover:** 1 s connection and socket timeouts and `maxTotalRetriesDuration` 1 s (below); TRYAGAIN/CLUSTERDOWN surface as exceptions in ms-scale windows. Jedis 3.x unsupported |
 | Lettuce >= 6.1 `RedisClusterClient` | CLUSTER NODES + INFO from seeds; needs a `myself` line | follows MOVED (maxRedirects 5) only to nodes in its partitions; coordinators are listed (R1 or R2), so MOVED-to-coordinator works | **Recommended:** `ClusterTopologyRefreshOptions.builder().dynamicRefreshSources(false).enableAllAdaptiveRefreshTriggers().enablePeriodicRefresh(Duration.ofSeconds(30))`; **required for <= 3 s failover:** `.adaptiveRefreshTriggersTimeout(Duration.ofMillis(500)).refreshTriggersReconnectAttempts(1)` (below) |
 | go-redis v9 `ClusterClient` | CLUSTER SHARDS then SLOTS on shuffled addrs; all-fail -> back to seeds | MOVED -> LazyReload + retry (MaxRedirects 3; we need <= 2); TRYAGAIN/CLUSTERDOWN retried | **Recommended:** `ClusterSlots` func that queries the coordinators; add an `OnConnect` hook sending READONLY if replica reads are wanted; **required for <= 3 s failover:** `ReloadState` after a failed command (below) |
@@ -1868,7 +1868,8 @@ with, and its `kill-primary` scenario asserts the 3 s bound with them.
   give the seeds by host name (DNS names of the coordinators, or one name resolving to all of them): MOVED replies
   carry the IP addresses of the coordinator list, so a removed name never matches a seed. Treat
   `RedisClusterException` ("cannot be connected", raised while no coordinator answers) as retryable like
-  `ConnectionError`.
+  `ConnectionError`. RESP3 (`protocol=3`) needs redis-py 6.0 or later: earlier versions map MOVED, ASK and TRYAGAIN
+  to cluster errors only on RESP2 connections and raise a MOVED to the caller under RESP3 instead of following it.
 * **ioredis:** `retryDelayOnClusterDown` and `retryDelayOnTryAgain` of at most 100 ms, `slotsRefreshTimeout` of at most
   2 s and a `commandTimeout` of at most 3 s.
 Every library: retry a write that failed with a connection error, a timeout, TRYAGAIN or CLUSTERDOWN (it may or may not

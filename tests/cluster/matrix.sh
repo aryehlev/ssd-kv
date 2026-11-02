@@ -13,6 +13,8 @@
 #   kill-primary   kill -9 the primary of shard 2 (failover <= 3 s client-visible), then the
 #                  old primary restarts and returns as a member
 #   kill-leader    kill -9 the coordinator leader; a new leader takes over; it restarts
+#   coord-outage   kill -9 of every coordinator, restarted 4 s later: every client recovers
+#                  by itself (its outage ends within KV_MATRIX_COORD_OUTAGE_MAX_S)
 #   migrate        `kvadm migrate` of a slot range from shard 1 to shard 3 under the load
 #   node-add       `kvadm node add` of n5 + `replica add 3 n5` (learner merge full sync)
 #   coord-replace  coordinator replacement by `coord setpeers` under load: c3 joins
@@ -36,6 +38,7 @@
 #   KV_MATRIX_NODE_MODULES      node_modules holding ioredis (default: tests/cluster/node/node_modules)
 #   KV_MATRIX_LEASE_MS          coordinator lease_ms (default: the cluster default)
 #   KV_MATRIX_FAILOVER_MAX_S    client-visible failover bound (default 3)
+#   KV_MATRIX_COORD_OUTAGE_MAX_S  client-visible outage bound of coord-outage (default 15)
 #   KV_MATRIX_LIMIT_S           watchdog limit for the whole run (default 1500)
 set -uo pipefail
 
@@ -51,6 +54,7 @@ STYLE=${KV_MATRIX_STYLE:-r1}
 PY=${KV_MATRIX_PYTHON:-python3}
 CLIENTS=${KV_MATRIX_CLIENTS:-"py2 py3 jedis lettuce2 lettuce3 go2 go3 io"}
 FAILOVER_MAX=${KV_MATRIX_FAILOVER_MAX_S:-3}
+COORD_OUTAGE_MAX=${KV_MATRIX_COORD_OUTAGE_MAX_S:-15}
 LIMIT=${KV_MATRIX_LIMIT_S:-1500}
 TOKEN=matrix-cluster-token
 ADMIN=matrix-admin-token
@@ -193,8 +197,14 @@ build_clients() {
   local avail=()
   for c in $CLIENTS; do
     case $c in
-      py2|py3)
+      py2)
         if "$PY" -c 'import redis, redis.cluster' 2>/dev/null; then avail+=("$c"); else say "SKIP $c: redis-py not importable by $PY"; fi ;;
+      py3)
+        # redis-py before 6.0 maps MOVED/ASK/TRYAGAIN to cluster errors only on RESP2
+        # connections: under RESP3 it raises MOVED to the caller instead of following it
+        if ! "$PY" -c 'import redis, redis.cluster' 2>/dev/null; then say "SKIP $c: redis-py not importable by $PY"
+        elif "$PY" -c 'import redis, sys; sys.exit(int(redis.__version__.split(".")[0]) < 6)' 2>/dev/null; then avail+=("$c")
+        else say "SKIP $c: redis-py $("$PY" -c 'import redis; print(redis.__version__)') does not follow MOVED under RESP3 (6.0 or later needed)"; fi ;;
       jedis|lettuce2|lettuce3)
         if [ -z "${JAVA_OK:-}" ]; then
           JAVA_OK=no
@@ -336,6 +346,16 @@ start_coord "$L"
 sleep 3
 phase_end
 
+# every coordinator down for longer than a lease (data nodes stop serving and redirect to
+# coordinators that do not answer); each client must recover by itself once they are back
+phase_begin coord-outage
+for i in 0 1 2; do kill9 "${CPID[$i]}"; done
+sleep 4
+for i in 0 1 2; do start_coord "$i"; done
+wait_for 60 "a leader after the coordinator outage" has_leader || die "no leader after restarting every coordinator"
+sleep 12
+phase_end
+
 phase_begin migrate
 out=$(adm_retry 30 migrate 0-4095 --to 3) || die "migrate: $out"
 MID=$(echo "$out" | awk '{print $3}')
@@ -383,9 +403,9 @@ phase_end
 # ---------------------------------------------------------------------------------------------
 # report
 
-"$PY" - "$CTRL" "$PHASES" "$FAILOVER_MAX" "${RUN_CLIENTS[@]}" <<'EOF' | tee -a "$LOG"
+"$PY" - "$CTRL" "$PHASES" "$FAILOVER_MAX" "$COORD_OUTAGE_MAX" "${RUN_CLIENTS[@]}" <<'EOF' | tee -a "$LOG"
 import json, os, sys
-ctrl, phases, fmax, clients = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4:]
+ctrl, phases, fmax, cmax, clients = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]), sys.argv[5:]
 ph = []
 for line in open(phases):
     n, a, b = line.split()
@@ -410,6 +430,9 @@ for c in clients:
         per.append("%s=%.2f" % (n, m))
         if n == "kill-primary" and m > fmax:
             fail_ok = False
+        if n == "coord-outage" and m > cmax:
+            fail_ok = False
+            print("            %s: no recovery within %.0f s of the coordinator outage" % (c, cmax))
     ok = r.get("ok") and r.get("lost", 1) == 0 and fail_ok
     bad += 0 if ok else 1
     print("%-9s %-6s %8d %8d %5d  %s" % (c, "ok" if ok else "FAIL", r.get("acked", 0), r.get("unacked", 0), r.get("lost", -1), " ".join(per)))

@@ -4,7 +4,8 @@
 Usage: client.py --name NAME --ctrl DIR --seeds h:p,h:p,h:p [--proto 2|3]
 
 1. Bootstraps a ``RedisCluster`` with the documented settings (all coordinators as startup
-   nodes, ``dynamic_startup_nodes=False``), writes static keys, then checks a cluster
+   nodes, by host name before redis-py 7.2, ``dynamic_startup_nodes=False``), writes static
+   keys, then checks a cluster
    pipeline, MULTI/EXEC on one slot (hashtag keys) and the server's CROSSSLOT error; writes
    ``NAME.static`` when they pass.
 2. Writes (and sometimes overwrites) keys until ``DIR/stop`` appears, remembering every
@@ -21,11 +22,13 @@ import argparse
 import json
 import os
 import random
+import socket
 import sys
 import time
 
+import redis
 from redis.cluster import ClusterNode, RedisCluster
-from redis.exceptions import RedisError, ResponseError
+from redis.exceptions import RedisClusterException, RedisError, ResponseError
 
 try:
     from redis.cluster import LoadBalancingStrategy
@@ -35,6 +38,33 @@ except ImportError:  # redis-py < 5.3
 
 # A gap between two successful writes of one slot range longer than this is an outage.
 GAP_S = 0.25
+
+# Retryable client errors (§23.5): every RedisError, and the RedisClusterException redis-py
+# raises while it cannot reach any startup node (every coordinator down).
+RETRYABLE = (RedisError, RedisClusterException)
+
+
+def seed_host(host):
+    """The documented seed setting (§23.5): redis-py before 7.2 drops a startup node whose
+    name equals a MOVED target it could not reach (MOVED from a data node names a coordinator
+    by the IP address of the coordinator list) and never adds it back, so with every
+    coordinator down for longer than a lease it loses every seed. Seeds given by host name
+    are never removed that way; 7.2 and later keep the seed (moved to the end) anyway."""
+    try:
+        major, minor = (int(x) for x in redis.__version__.split(".")[:2])
+    except ValueError:
+        return host
+    if (major, minor) >= (7, 2):
+        return host
+    # this machine's host name when it names the seed address (redis-py turns "localhost"
+    # into 127.0.0.1 itself, so that name would match the MOVED targets again)
+    try:
+        name = socket.gethostname()
+        if name != "localhost" and socket.gethostbyname(name) == host:
+            return name
+    except OSError:
+        pass
+    return host
 
 
 class History:
@@ -90,7 +120,7 @@ def retry(fn, deadline, what):
     while time.time() < deadline:
         try:
             return fn()
-        except RedisError as e:  # transient: topology changes, failover windows
+        except RETRYABLE as e:  # transient: topology changes, failover windows
             last = e
             time.sleep(0.1)
     raise RuntimeError(f"{what}: {last}")
@@ -105,7 +135,7 @@ def main():
     ap.add_argument("--pause-ms", type=float, default=float(os.environ.get("KV_MATRIX_WRITER_PAUSE_MS", "4")))
     a = ap.parse_args()
     name, ctrl = a.name, a.ctrl
-    seeds = [ClusterNode(h, int(p)) for h, p in (s.rsplit(":", 1) for s in a.seeds.split(","))]
+    seeds = [ClusterNode(seed_host(h), int(p)) for h, p in (s.rsplit(":", 1) for s in a.seeds.split(","))]
     common = dict(
         startup_nodes=seeds,
         dynamic_startup_nodes=False,
@@ -148,7 +178,9 @@ def main():
         tx.get(f"{tag}:a")
         out = retry(tx.execute, deadline, "MULTI/EXEC")
         mode = "cluster pipeline transaction"
-    except (NotImplementedError, AttributeError, TypeError) as e:
+    except (NotImplementedError, AttributeError, TypeError, RedisClusterException) as e:
+        # redis-py before 6 refuses cluster pipeline transactions ("transaction is
+        # deprecated in cluster mode"): MULTI/EXEC on the slot owner's own connection
         node = rc.get_node_from_key(f"{tag}:a")
         tx = node.redis_connection.pipeline(transaction=True)
         tx.set(f"{tag}:a", "1")
@@ -195,8 +227,9 @@ def main():
         t0 = time.time()
         try:
             ok = rc.set(k, v) is True
-        except RedisError:
+        except RETRYABLE:
             ok = False
+            time.sleep(0.05)
         hist.record(k, v, ok, time.time(), t0)
         if a.pause_ms > 0:
             time.sleep(a.pause_ms / 1000.0)

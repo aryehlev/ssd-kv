@@ -78,6 +78,8 @@ pub enum XMsg {
     Watch { keys: Vec<crate::runtime::watch::WatchedKey>, add: bool, ack: Option<GatherRef> },
     /// The destination's registrations of a [`XMsg::Watch`] are in place.
     WatchDone { ack: GatherRef },
+    /// Ends a WATCH session of a connection of the destination (`runtime::watch`).
+    WatchRelease { token: u64 },
     /// The result of a [`XMsg::Scan`] step.
     ScanDone { conn: ConnRef, req_seq: u64, out: ScanOutcome },
     /// Durability barrier (SAVE, BGSAVE, SHUTDOWN drain) over every partition the destination

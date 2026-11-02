@@ -11,7 +11,9 @@
 //! that watch the key dirty here. EXEC checks its session right before its body executes on
 //! the partition's worker (and answers a null array when dirty), then releases it; DISCARD,
 //! UNWATCH, RESET, a refused EXEC and a closing connection release it too. Releasing removes
-//! the session's keys and unregisters each with its owner.
+//! the session's keys and unregisters each with its owner; it always runs on the
+//! connection's own worker (another worker hands it there), so an owner never sees a removal
+//! before the registration it undoes.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -40,9 +42,15 @@ pub struct WatchTable {
 }
 
 impl WatchTable {
-    /// A new session token (never 0).
-    pub fn token(&self) -> u64 {
-        self.next.fetch_add(1, Ordering::Relaxed) + 1
+    /// A new session token (never 0) of a connection on worker `home`.
+    pub fn token(&self, home: u16) -> u64 {
+        ((u64::from(home) + 1) << 48) | ((self.next.fetch_add(1, Ordering::Relaxed) + 1) & ((1 << 48) - 1))
+    }
+
+    /// The worker of the connection that owns session `token`: it alone releases the session,
+    /// so its removals reach every owner after the registrations it sent there.
+    pub fn home(token: u64) -> u16 {
+        ((token >> 48).saturating_sub(1)) as u16
     }
 
     /// Whether any key is watched (the workers skip draining their partitions' reports
@@ -112,8 +120,9 @@ mod tests {
     #[test]
     fn sessions_are_dirtied_by_their_keys_only_and_released_clean() {
         let t = WatchTable::default();
-        let (a, b) = (t.token(), t.token());
+        let (a, b) = (t.token(0), t.token(3));
         assert!(a != 0 && a != b);
+        assert_eq!((WatchTable::home(a), WatchTable::home(b)), (0, 3));
         assert!(!t.any());
         assert!(t.add(a, k(1, "x")));
         assert!(!t.add(a, k(1, "x")), "once per session");
@@ -134,7 +143,7 @@ mod tests {
         assert!(!t.any());
         assert!(t.release(0).is_empty());
         // a new session of the same keys starts clean
-        let c = t.token();
+        let c = t.token(1);
         t.add(c, k(1, "x"));
         assert!(!t.is_dirty(c));
     }

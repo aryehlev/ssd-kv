@@ -537,6 +537,7 @@ impl<B: Backend> Worker<B> {
                 }
             }
             XMsg::WatchDone { ack } => self.watch_registered(ack.id),
+            XMsg::WatchRelease { token } => self.release_watch(token),
             XMsg::Reply { conn, req_seq, reply } => self.deliver(ReplyTo { conn, seq: req_seq, part: None }, reply),
             XMsg::Part { conn, req_seq, part, reply } => self.deliver(ReplyTo { conn, seq: req_seq, part: Some(part) }, reply),
             XMsg::Flush { db, gather } => self.node_part_start(gather, ReqKind::FlushDb { db }),
@@ -1005,7 +1006,7 @@ impl<B: Backend> Worker<B> {
             }
         }
         if conn.watch_token == 0 {
-            conn.watch_token = self.shared.watch.token();
+            conn.watch_token = self.shared.watch.token(self.id);
         }
         let token = conn.watch_token;
         let workers = self.router.workers;
@@ -1067,9 +1068,15 @@ impl<B: Backend> Worker<B> {
         self.release_watch(token);
     }
 
-    /// Ends WATCH session `token` and unregisters its keys with their owners.
+    /// Ends WATCH session `token` and unregisters its keys with their owners (on the
+    /// session's home worker: its removals follow its registrations in every queue).
     pub(super) fn release_watch(&mut self, token: u64) {
         if token == 0 {
+            return;
+        }
+        let home = crate::runtime::watch::WatchTable::home(token);
+        if home != self.id {
+            self.send(home, XMsg::WatchRelease { token });
             return;
         }
         let workers = self.router.workers;

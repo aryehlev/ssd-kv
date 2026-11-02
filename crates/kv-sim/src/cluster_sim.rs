@@ -2489,6 +2489,9 @@ impl Node {
         let slot = kv_common::key_slot(&key);
         let p = slot % P;
         let lease_ok = fx.now_l < self.lease_expiry;
+        if trace_on() && trace_key(&key) {
+            eprintln!("[{} ms] n{} request op {op} lease_ok {lease_ok}", fx.now_g / MS, self.idx);
+        }
         let role = self.disk.assignment.as_ref().and_then(|a| a.role.clone());
         let fence = self.disk.fence_term;
         let delay = self.disk_delay(fx.rng, fx.now_g);
@@ -4004,6 +4007,15 @@ fn client_tick(c: &mut Clients, fx: &mut Fx<'_>, topo: &Topo) {
             if fx.now_g > op.deadline {
                 // no reply in time: not acknowledged (a write may still take effect)
                 let op = c.active[i].take().expect("active");
+                if trace_on() && trace_key(&key_name(op.key)) {
+                    eprintln!(
+                        "[{} ms] client op {} kind {} timed out (node {:?})",
+                        fx.now_g / MS,
+                        op.op,
+                        op.kind,
+                        op.node
+                    );
+                }
                 if c.final_phase {
                     c.final_last[op.key] = "timeout";
                 }
@@ -4050,7 +4062,9 @@ fn client_tick(c: &mut Clients, fx: &mut Fx<'_>, topo: &Topo) {
             kind,
             write_id: 0,
             start: fx.now_g,
-            deadline: fx.now_g + 2_000 * MS,
+            // the final reads give up sooner: a request or reply lost by the network (the
+            // drop fault stays on after the heal) is retried within the final window
+            deadline: fx.now_g + if final_phase { 500 * MS } else { 2_000 * MS },
             node: None,
             hist_index: None,
         };
@@ -4115,6 +4129,9 @@ fn find_active(c: &mut Clients, op: u64) -> Option<usize> {
 fn client_route_reply(c: &mut Clients, op: u64, node: Option<usize>, fx: &mut Fx<'_>, topo: &Topo) {
     let Some(i) = find_active(c, op) else { return };
     let o = c.active[i].as_mut().expect("active");
+    if trace_on() && trace_key(&key_name(o.key)) {
+        eprintln!("[{} ms] client op {} kind {} routed to {node:?}", fx.now_g / MS, o.op, o.kind);
+    }
     match node {
         Some(n) => {
             c.route.insert(kv_common::key_slot(&key_name(o.key)), n);
@@ -4141,6 +4158,14 @@ fn client_resp(c: &mut Clients, fx: &mut Fx<'_>, op: u64, from: usize, resp: Res
     let o = c.active[i].take().expect("active");
     let _ = topo;
     let now = fx.now_g;
+    if trace_on() && trace_key(&key_name(o.key)) {
+        eprintln!(
+            "[{} ms] client op {} kind {} reply {resp:?} from proc {from}",
+            now / MS,
+            o.op,
+            o.kind
+        );
+    }
     let hist = &mut fx.obs.hist[o.key];
     match (o.kind, resp) {
         (0 | 1, Resp::Ok) => {

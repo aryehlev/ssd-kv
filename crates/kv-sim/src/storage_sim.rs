@@ -2499,6 +2499,8 @@ impl<'c> Sim<'c> {
         // live keys whose only extra copies are older expired ones elsewhere (harmless for
         // correctness, unbounded space)
         let mut leftovers = 0usize;
+        // absent keys with a valid unexpired copy: a crash would bring them back
+        let mut resurrectable = 0usize;
         for ((db, key), at) in &copies {
             let Some(&k) = self.bykey.get(key) else {
                 bad.push(format!("a key never written ({} bytes) has {} copies on media", key.len(), at.len()));
@@ -2521,6 +2523,9 @@ impl<'c> Sim<'c> {
                 if live && !newest_expired && at.iter().all(|c| c.0 == newest.0 || c.4.is_some_and(|t| t <= now)) {
                     leftovers += 1;
                 }
+                if !live && !newest_expired {
+                    resurrectable += 1;
+                }
                 let what = if live { "live" } else { "absent or expired" };
                 bad.push(format!("db {db} key {k} ({what}) has {} valid copies on media: {:?}", at.len(), at.iter().map(|(p, sq, small, txn, x)| format!("{}{p:#x}@seq{sq:#x} txn {txn} deadline {x:?}", if *small { "page " } else { "extent " })).collect::<Vec<_>>()));
             }
@@ -2536,6 +2541,8 @@ impl<'c> Sim<'c> {
             bad.truncate(8);
             let sig = if bad.iter().any(|b| b.contains("no valid copy")) {
                 "copy-missing"
+            } else if resurrectable > 0 {
+                "deleted-key-copy"
             } else if leftovers == n {
                 "expired-leftover"
             } else {

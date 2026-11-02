@@ -2371,6 +2371,8 @@ impl<'c> Sim<'c> {
 
     fn clean(&mut self) -> Result<(), Failure> {
         self.quiesce("before clean shutdown")?;
+        // SHUTDOWN's own writes see no injected errors (a failed shutdown ends the run)
+        self.set_errors(false);
         let eng = self.eng.take().expect("engine open");
         let devs = eng.shutdown(true).map_err(|e| Failure::new(FailKind::Recover, "shutdown", format!("clean shutdown: {e}")))?;
         self.reset_requests();

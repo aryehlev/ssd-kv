@@ -924,9 +924,12 @@ dependencies = [
  "kv-coord",
  "kv-ctrl",
  "kv-index",
+ "kv-repl",
  "kv-storage",
  "kv-topo",
+ "postcard",
  "rand 0.9.5",
+ "serde",
  "stateright",
 ]
 

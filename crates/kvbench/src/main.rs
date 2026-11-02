@@ -36,7 +36,11 @@ use clap::Parser;
 use kv_common::metrics::Hist;
 
 #[derive(Parser, Clone, Debug)]
-#[command(name = "kvbench", version, about = "kvssd benchmark client (pipelined RESP load generator)")]
+#[command(
+    name = "kvbench",
+    version,
+    about = "kvssd benchmark client (pipelined RESP load generator)"
+)]
 struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -232,12 +236,19 @@ fn scan_reply(buf: &[u8]) -> Result<Option<(Reply, usize)>, String> {
     let Some(&t) = buf.first() else {
         return Ok(None);
     };
-    let line_end = |from: usize| buf[from..].windows(2).position(|w| w == b"\r\n").map(|p| from + p);
+    let line_end = |from: usize| {
+        buf[from..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| from + p)
+    };
     match t {
         b'+' | b':' => Ok(line_end(1).map(|e| (Reply::Ok, e + 2))),
         b'-' => Ok(line_end(1).map(|e| (Reply::Err(buf[1..e].to_vec()), e + 2))),
         b'$' => {
-            let Some(e) = line_end(1) else { return Ok(None) };
+            let Some(e) = line_end(1) else {
+                return Ok(None);
+            };
             let len: i64 = std::str::from_utf8(&buf[1..e])
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -251,7 +262,9 @@ fn scan_reply(buf: &[u8]) -> Result<Option<(Reply, usize)>, String> {
         b'_' => Ok(line_end(1).map(|e| (Reply::Nil, e + 2))),
         _ => match kv_resp::decode_value(buf) {
             Ok(Some((kv_resp::Value::Error(e), n))) => Ok(Some((Reply::Err(e), n))),
-            Ok(Some((kv_resp::Value::Null | kv_resp::Value::Bulk(None), n))) => Ok(Some((Reply::Nil, n))),
+            Ok(Some((kv_resp::Value::Null | kv_resp::Value::Bulk(None), n))) => {
+                Ok(Some((Reply::Nil, n)))
+            }
             Ok(Some((_, n))) => Ok(Some((Reply::Ok, n))),
             Ok(None) => Ok(None),
             Err(_) => Err("malformed reply".into()),
@@ -284,7 +297,10 @@ impl Conn {
             kv_resp::encode_command(&[b"AUTH", pw.as_bytes()], &mut out);
             c.s.write_all(&out)?;
             if let Reply::Err(e) = c.read_reply()? {
-                return Err(std::io::Error::other(format!("AUTH: {}", String::from_utf8_lossy(&e))));
+                return Err(std::io::Error::other(format!(
+                    "AUTH: {}",
+                    String::from_utf8_lossy(&e)
+                )));
             }
         }
         Ok(c)
@@ -319,7 +335,10 @@ impl Conn {
             };
             self.rbuf.truncate(old + n);
             if n == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ));
             }
         }
     }
@@ -343,7 +362,10 @@ impl Conn {
             let mut chunk = [0u8; 16384];
             let n = self.s.read(&mut chunk)?;
             if n == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ));
             }
             buf.extend_from_slice(&chunk[..n]);
         }
@@ -359,26 +381,43 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
 }
 
 /// The slot -> primary address map of a cluster, read with `CLUSTER SLOTS` at a seed.
-fn fetch_slots(seed: SocketAddr, timeout: Duration, auth: Option<&str>) -> Result<Vec<Option<SocketAddr>>, String> {
+fn fetch_slots(
+    seed: SocketAddr,
+    timeout: Duration,
+    auth: Option<&str>,
+) -> Result<Vec<Option<SocketAddr>>, String> {
     let mut c = Conn::open(seed, timeout, auth).map_err(|e| format!("{seed}: {e}"))?;
-    let v = c.call(&[b"CLUSTER", b"SLOTS"]).map_err(|e| format!("CLUSTER SLOTS at {seed}: {e}"))?;
+    let v = c
+        .call(&[b"CLUSTER", b"SLOTS"])
+        .map_err(|e| format!("CLUSTER SLOTS at {seed}: {e}"))?;
     let mut map = vec![None; kv_common::SLOTS];
     let kv_resp::Value::Array(Some(ranges)) = v else {
         return Err(format!("CLUSTER SLOTS at {seed}: unexpected reply"));
     };
     for r in ranges {
-        let kv_resp::Value::Array(Some(f)) = r else { continue };
-        let (Some(kv_resp::Value::Int(a)), Some(kv_resp::Value::Int(b)), Some(kv_resp::Value::Array(Some(node)))) =
-            (f.first(), f.get(1), f.get(2))
+        let kv_resp::Value::Array(Some(f)) = r else {
+            continue;
+        };
+        let (
+            Some(kv_resp::Value::Int(a)),
+            Some(kv_resp::Value::Int(b)),
+            Some(kv_resp::Value::Array(Some(node))),
+        ) = (f.first(), f.get(1), f.get(2))
         else {
             continue;
         };
         let ip = match node.first() {
-            Some(kv_resp::Value::Bulk(Some(ip))) | Some(kv_resp::Value::Simple(ip)) => String::from_utf8_lossy(ip).into_owned(),
+            Some(kv_resp::Value::Bulk(Some(ip))) | Some(kv_resp::Value::Simple(ip)) => {
+                String::from_utf8_lossy(ip).into_owned()
+            }
             _ => continue,
         };
-        let Some(kv_resp::Value::Int(port)) = node.get(1) else { continue };
-        let Ok(addr) = resolve(&ip, *port as u16) else { continue };
+        let Some(kv_resp::Value::Int(port)) = node.get(1) else {
+            continue;
+        };
+        let Ok(addr) = resolve(&ip, *port as u16) else {
+            continue;
+        };
         for s in (*a).max(0)..=(*b).min(16383) {
             map[s as usize] = Some(addr);
         }
@@ -544,14 +583,21 @@ fn worker(plan: Arc<Plan>, idx: u32, measure_from: Instant, end: Instant) -> Sta
                 if k >= cli.keys {
                     break;
                 }
-                ops.push(Op { kind: Kind::Set, key: k });
+                ops.push(Op {
+                    kind: Kind::Set,
+                    key: k,
+                });
             }
             if ops.is_empty() {
                 break;
             }
         } else {
             for _ in 0..depth {
-                let kind = if (rng.below(100) as u32) < plan.read_pct { Kind::Get } else { Kind::Set };
+                let kind = if (rng.below(100) as u32) < plan.read_pct {
+                    Kind::Get
+                } else {
+                    Kind::Set
+                };
                 ops.push(Op {
                     kind,
                     key: plan.dist.next(&mut rng, cli.keys.max(1)),
@@ -623,12 +669,18 @@ fn worker(plan: Arc<Plan>, idx: u32, measure_from: Instant, end: Instant) -> Sta
                 };
                 let done = Instant::now();
                 match r {
-                    Ok(Reply::Err(e)) if cli.cluster && (e.starts_with(b"MOVED") || e.starts_with(b"ASK")) => {
+                    Ok(Reply::Err(e))
+                        if cli.cluster && (e.starts_with(b"MOVED") || e.starts_with(b"ASK")) =>
+                    {
                         st.retries += 1;
                         refresh = true;
                         redo.push(i);
                     }
-                    Ok(Reply::Err(e)) if e.starts_with(b"TRYAGAIN") || e.starts_with(b"CLUSTERDOWN") || e.starts_with(b"LOADING") => {
+                    Ok(Reply::Err(e))
+                        if e.starts_with(b"TRYAGAIN")
+                            || e.starts_with(b"CLUSTERDOWN")
+                            || e.starts_with(b"LOADING") =>
+                    {
                         st.retries += 1;
                         redo.push(i);
                     }
@@ -721,8 +773,20 @@ fn pct_line(h: &Hist) -> String {
     let v: Vec<String> = PCTS
         .iter()
         .map(|p| {
-            let us = if *p >= 100.0 { h.max() } else { h.percentile(*p) };
-            format!("p{}={:.3}ms", if *p >= 100.0 { "max".into() } else { p.to_string() }, us as f64 / 1000.0)
+            let us = if *p >= 100.0 {
+                h.max()
+            } else {
+                h.percentile(*p)
+            };
+            format!(
+                "p{}={:.3}ms",
+                if *p >= 100.0 {
+                    "max".into()
+                } else {
+                    p.to_string()
+                },
+                us as f64 / 1000.0
+            )
         })
         .collect();
     v.join(" ")
@@ -732,8 +796,16 @@ fn pct_json(h: &Hist) -> String {
     let v: Vec<String> = PCTS
         .iter()
         .map(|p| {
-            let us = if *p >= 100.0 { h.max() } else { h.percentile(*p) };
-            let name = if *p >= 100.0 { "max".to_string() } else { format!("p{p}") };
+            let us = if *p >= 100.0 {
+                h.max()
+            } else {
+                h.percentile(*p)
+            };
+            let name = if *p >= 100.0 {
+                "max".to_string()
+            } else {
+                format!("p{p}")
+            };
             format!("\"{name}_us\":{us}")
         })
         .collect();
@@ -742,14 +814,27 @@ fn pct_json(h: &Hist) -> String {
 
 fn hdr_table(name: &str, h: &Hist, out: &mut String) {
     use std::fmt::Write as _;
-    let _ = writeln!(out, "# {name}: {} samples, mean {:.1} us", h.count(), h.mean());
-    let _ = writeln!(out, "{:>12} {:>12} {:>14}", "value_us", "percentile", "1/(1-p)");
+    let _ = writeln!(
+        out,
+        "# {name}: {} samples, mean {:.1} us",
+        h.count(),
+        h.mean()
+    );
+    let _ = writeln!(
+        out,
+        "{:>12} {:>12} {:>14}",
+        "value_us", "percentile", "1/(1-p)"
+    );
     // halving steps toward 100%: 0, 50, 75, 87.5, ... (the usual HDR percentile spacing)
     let mut p = 0.0f64;
     let mut step = 50.0f64;
     while p < 99.9999 {
         let v = h.percentile(p);
-        let inv = if p < 100.0 { 1.0 / (1.0 - p / 100.0) } else { f64::INFINITY };
+        let inv = if p < 100.0 {
+            1.0 / (1.0 - p / 100.0)
+        } else {
+            f64::INFINITY
+        };
         let _ = writeln!(out, "{v:>12} {:>12.6} {inv:>14.2}", p / 100.0);
         p += step;
         step /= 2.0;
@@ -765,7 +850,11 @@ fn run(cli: Cli) -> Result<i32, String> {
         return Err("--conns must be > 0".into());
     }
     let read_pct = parse_ratio(&cli.ratio)?;
-    let dist = if cli.load { Dist::Uniform } else { Dist::parse(&cli.dist, cli.keys)? };
+    let dist = if cli.load {
+        Dist::Uniform
+    } else {
+        Dist::parse(&cli.dist, cli.keys)?
+    };
     let seed_addr = resolve(&cli.host, cli.port)?;
     let timeout = Duration::from_millis(cli.timeout_ms.max(1));
     let slots = if cli.cluster {
@@ -776,8 +865,10 @@ fn run(cli: Cli) -> Result<i32, String> {
         m
     } else {
         // one probe so a wrong address fails fast with a clear message
-        let mut c = Conn::open(seed_addr, timeout, cli.auth.as_deref()).map_err(|e| format!("{seed_addr}: {e}"))?;
-        c.call(&[b"PING"]).map_err(|e| format!("{seed_addr}: {e}"))?;
+        let mut c = Conn::open(seed_addr, timeout, cli.auth.as_deref())
+            .map_err(|e| format!("{seed_addr}: {e}"))?;
+        c.call(&[b"PING"])
+            .map_err(|e| format!("{seed_addr}: {e}"))?;
         Vec::new()
     };
     let plan = Arc::new(Plan {
@@ -792,7 +883,10 @@ fn run(cli: Cli) -> Result<i32, String> {
     let start = Instant::now();
     let (measure_from, end) = if cli.load {
         // a load has no warm-up and ends when every key is written (bounded by a generous cap)
-        (start, start + Duration::from_secs(cli.duration.max(1).saturating_mul(1000)))
+        (
+            start,
+            start + Duration::from_secs(cli.duration.max(1).saturating_mul(1000)),
+        )
     } else {
         let m = start + Duration::from_secs(cli.warmup);
         (m, m + Duration::from_secs(cli.duration.max(1)))
@@ -831,7 +925,9 @@ fn run(cli: Cli) -> Result<i32, String> {
     let elapsed = if cli.load {
         start.elapsed()
     } else {
-        Instant::now().min(end).saturating_duration_since(measure_from)
+        Instant::now()
+            .min(end)
+            .saturating_duration_since(measure_from)
     };
     let secs = elapsed.as_secs_f64().max(1e-9);
     let ops = total.gets + total.sets;
@@ -840,7 +936,13 @@ fn run(cli: Cli) -> Result<i32, String> {
     if cli.json {
         println!(
             "{{\"mode\":\"{}\",\"conns\":{},\"pipeline\":{},\"seconds\":{:.3},\"ops\":{},\"ops_per_s\":{:.1},\"gets\":{},\"sets\":{},\"misses\":{},\"errors\":{},\"retries\":{},\"stuck_threads\":{},\"all\":{{{}}},\"get\":{{{}}},\"set\":{{{}}}}}",
-            if cli.load { "load" } else if cli.rate.is_some() { "open" } else { "closed" },
+            if cli.load {
+                "load"
+            } else if cli.rate.is_some() {
+                "open"
+            } else {
+                "closed"
+            },
             cli.conns,
             cli.pipeline,
             secs,
@@ -859,7 +961,13 @@ fn run(cli: Cli) -> Result<i32, String> {
     } else {
         println!(
             "kvbench {}: {} conns x pipeline {}, {:.1} s measured, {} ops, {:.0} ops/s",
-            if cli.load { "load" } else if cli.rate.is_some() { "open loop" } else { "closed loop" },
+            if cli.load {
+                "load"
+            } else if cli.rate.is_some() {
+                "open loop"
+            } else {
+                "closed loop"
+            },
             cli.conns,
             cli.pipeline,
             secs,
@@ -868,10 +976,24 @@ fn run(cli: Cli) -> Result<i32, String> {
         );
         if !cli.load {
             println!("  all  {}", pct_line(&all));
-            println!("  GET  {:>10} ops ({:.0}/s, {} misses)  {}", total.gets, total.gets as f64 / secs, total.misses, pct_line(&total.get));
+            println!(
+                "  GET  {:>10} ops ({:.0}/s, {} misses)  {}",
+                total.gets,
+                total.gets as f64 / secs,
+                total.misses,
+                pct_line(&total.get)
+            );
         }
-        println!("  SET  {:>10} ops ({:.0}/s)  {}", total.sets, total.sets as f64 / secs, pct_line(&total.set));
-        println!("  errors {} retries {} stuck threads {}", total.errors, total.retries, stuck);
+        println!(
+            "  SET  {:>10} ops ({:.0}/s)  {}",
+            total.sets,
+            total.sets as f64 / secs,
+            pct_line(&total.set)
+        );
+        println!(
+            "  errors {} retries {} stuck threads {}",
+            total.errors, total.retries, stuck
+        );
         if let Some(e) = &total.first_error {
             println!("  first error: {e}");
         }
@@ -916,7 +1038,10 @@ mod tests {
         assert_eq!(scan_reply(b"+OK\r\n").unwrap(), Some((Reply::Ok, 5)));
         assert_eq!(scan_reply(b"+OK\r").unwrap(), None);
         assert_eq!(scan_reply(b"$-1\r\n").unwrap(), Some((Reply::Nil, 5)));
-        assert_eq!(scan_reply(b"$3\r\nabc\r\n+OK\r\n").unwrap(), Some((Reply::Ok, 9)));
+        assert_eq!(
+            scan_reply(b"$3\r\nabc\r\n+OK\r\n").unwrap(),
+            Some((Reply::Ok, 9))
+        );
         assert_eq!(scan_reply(b"$3\r\nab").unwrap(), None);
         assert_eq!(scan_reply(b"_\r\n").unwrap(), Some((Reply::Nil, 3)));
         assert_eq!(scan_reply(b":12\r\n").unwrap(), Some((Reply::Ok, 5)));
@@ -924,7 +1049,10 @@ mod tests {
             scan_reply(b"-MOVED 1 127.0.0.1:7000\r\n").unwrap(),
             Some((Reply::Err(b"MOVED 1 127.0.0.1:7000".to_vec()), 25))
         );
-        assert_eq!(scan_reply(b"*1\r\n$1\r\na\r\n").unwrap(), Some((Reply::Ok, 11)));
+        assert_eq!(
+            scan_reply(b"*1\r\n$1\r\na\r\n").unwrap(),
+            Some((Reply::Ok, 11))
+        );
         assert!(scan_reply(b"$x\r\n").is_err());
     }
 
@@ -984,13 +1112,18 @@ mod tests {
                         };
                         buf.extend_from_slice(&chunk[..n]);
                         let mut out = Vec::new();
-                        let mut p = kv_resp::Parser::new(kv_resp::Limits { max_bulk: 1 << 20, max_args: 16, max_inline: 1024 });
+                        let mut p = kv_resp::Parser::new(kv_resp::Limits {
+                            max_bulk: 1 << 20,
+                            max_args: 16,
+                            max_inline: 1024,
+                        });
                         loop {
                             let mut args = Vec::new();
                             match p.parse(&buf, &mut args) {
                                 Ok(kv_resp::Parsed::Command { consumed }) => {
                                     let (o, l) = args[0];
-                                    let name = buf[o as usize..(o + l) as usize].to_ascii_uppercase();
+                                    let name =
+                                        buf[o as usize..(o + l) as usize].to_ascii_uppercase();
                                     match name.as_slice() {
                                         b"GET" => out.extend_from_slice(b"$-1\r\n"),
                                         _ => out.extend_from_slice(b"+OK\r\n"),
@@ -1011,19 +1144,53 @@ mod tests {
             }
         });
         let cli = Cli::try_parse_from([
-            "kvbench", "--port", &port.to_string(), "--keys", "1000", "--conns", "2", "--pipeline", "8",
-            "--duration", "1", "--warmup", "0", "--value-size", "16",
+            "kvbench",
+            "--port",
+            &port.to_string(),
+            "--keys",
+            "1000",
+            "--conns",
+            "2",
+            "--pipeline",
+            "8",
+            "--duration",
+            "1",
+            "--warmup",
+            "0",
+            "--value-size",
+            "16",
         ])
         .unwrap();
         assert_eq!(run(cli).unwrap(), 0);
         let cli = Cli::try_parse_from([
-            "kvbench", "--port", &port.to_string(), "--keys", "500", "--conns", "2", "--pipeline", "4", "--load",
+            "kvbench",
+            "--port",
+            &port.to_string(),
+            "--keys",
+            "500",
+            "--conns",
+            "2",
+            "--pipeline",
+            "4",
+            "--load",
         ])
         .unwrap();
         assert_eq!(run(cli).unwrap(), 0);
         let cli = Cli::try_parse_from([
-            "kvbench", "--port", &port.to_string(), "--keys", "1000", "--conns", "1", "--rate", "2000",
-            "--duration", "1", "--warmup", "0", "--json",
+            "kvbench",
+            "--port",
+            &port.to_string(),
+            "--keys",
+            "1000",
+            "--conns",
+            "1",
+            "--rate",
+            "2000",
+            "--duration",
+            "1",
+            "--warmup",
+            "0",
+            "--json",
         ])
         .unwrap();
         assert_eq!(run(cli).unwrap(), 0);

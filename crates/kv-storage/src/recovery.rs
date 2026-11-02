@@ -452,6 +452,9 @@ fn scan_small_page(p: &mut PartitionStore, scan: &mut Scan, page: PageId, buf: &
         }
         let (db, h32, key) = (views[i].hdr.db, views[i].hdr.h32, views[i].key);
         let mut best: Option<usize> = None;
+        // valid records of the key in this page (an older one sits next to the newest after a
+        // two-image update whose follow-up image was not written)
+        let mut copies = 0u32;
         for j in i..views.len() {
             let v = &views[j];
             if done[j] || v.hdr.db != db || v.hdr.h32 != h32 || v.key != key {
@@ -466,6 +469,7 @@ fn scan_small_page(p: &mut PartitionStore, scan: &mut Scan, page: PageId, buf: &
                 continue;
             }
             occupied += u32::from(v.len);
+            copies += 1;
             if best.is_none_or(|b| v.hdr.seq > views[b].hdr.seq) {
                 best = Some(j);
             }
@@ -484,7 +488,24 @@ fn scan_small_page(p: &mut PartitionStore, scan: &mut Scan, page: PageId, buf: &
         let expired = crate::expire::is_expired(v.hdr.expire_at(), scan.dead_ms);
         let vtype = if v.hdr.kind == REC_KIND_HASH { VType::Hash } else { VType::String };
         let e = Entry { fp32: kh.fp32(), x8: kh.x8(), page36: page.to36(), kind: Kind::Small, vtype, sync_mark: false };
-        insert_survivor(p, scan, db, slot, kh, e, v.hdr.expire_at(), marker || expired);
+        let absent = marker || expired;
+        insert_survivor(p, scan, db, slot, kh, e, v.hdr.expire_at(), absent);
+        if absent && copies > 1 {
+            // an absent newest copy (expired, or a committed marker) with an older valid copy
+            // of the key next to it: the key's newest copy on media until the older one is
+            // zeroed (D1, v1.2), as for older copies elsewhere (`resolve_group`). Left
+            // unrecorded, nothing zeroed the older copy: a later write of the key made a third
+            // copy (E14 never counted the two here) and the page kept both for good
+            p.core.stale.note_absent(db, key, page, v.hdr.seq, 0);
+            p.core.retire.push(RetireItem { db, key: key.into(), page, seq: v.hdr.seq });
+            if let Some(a) = scan.absent.last_mut()
+                && a.at == page
+                && a.db == db
+                && a.kh == kh
+            {
+                a.reserved = true;
+            }
+        }
     }
     p.core.alloc.recovered_page(page, occupied.min(u32::from(crate::alloc::PAGE_ROOM)) as u16);
 }

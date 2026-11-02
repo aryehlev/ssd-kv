@@ -7472,6 +7472,140 @@ step clock 5826
 step crash power sectors 2
 "#,
     ),
+    (
+        "txn_after_flushdb_relocated_onto_a_flushed_copy",
+        r#"kv-sim storage case 1
+seed 7003003
+fail HANG 7 MSET_ticket-Executed-needs-Durable
+cfg partitions 16
+cfg devices 2
+cfg ags 29
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 47
+cfg groups 7
+cfg dbs 3
+cfg profile churn
+cfg steps 847
+cfg rounds 1
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 52
+cfg skip_pct 10
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd setrange 2 4 136 534
+step cmd set 0 4 3 r857 - 1 0
+step cmd flush 0
+step cmd set 0 4 3169 - - 0 0
+step cmd set 0 15 2222 - - 0 0
+step cmd mset 0 4:1450,18:388,39:1073,11:1904
+step cmd flush 1
+"#,
+    ),
+    (
+        "txn_after_flushdb_two_image_atomic_unit",
+        r#"kv-sim storage case 1
+seed 7009970
+fail HANG 8 MSET_ticket-Executed-needs-Durable
+cfg partitions 32
+cfg devices 1
+cfg ags 75
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 37
+cfg groups 7
+cfg dbs 3
+cfg profile churn
+cfg steps 1169
+cfg rounds 3
+cfg tick_permille 250
+cfg delay_max 32
+cfg late_pct 21
+cfg skip_pct 10
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd msetnx 0 5:1132,5:1967,33:950,12:36608
+step cmd expire 0 33 past 0
+step cmd flush 0
+step cmd set 2 26 1467 r1977 - 0 0
+step cmd set 0 5 1262 - - 0 1
+step cmd set 0 3 19766 - - 0 0
+step cmd set 0 33 8 - - 0 0
+step cmd mset 0 19:1150,33:1990,5:1994
+"#,
+    ),
+    (
+        "expired_newest_with_an_older_copy_in_its_page_after_a_crash",
+        r#"kv-sim storage case 1
+seed 7007949
+fail I11 5 extra-copies
+cfg partitions 128
+cfg devices 1
+cfg ags 280
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability async
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 275
+cfg groups 55
+cfg dbs 1
+cfg profile mixed
+cfg steps 1449
+cfg rounds 4
+cfg tick_permille 250
+cfg delay_max 32
+cfg late_pct 44
+cfg skip_pct 10
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd msetnx 0 25:4,25:1924,25:1969,25:1980
+step ticks 3
+step cmd expire 0 25 r73 0
+step crash kill prefix 4
+step cmd append 0 25 24
+"#,
+    ),
 ];
 
 /// Replays a case text.

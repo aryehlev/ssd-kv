@@ -2286,13 +2286,22 @@ impl PartitionStore {
     /// Marks the key's copies in `page` protected (not live): a newer version lives elsewhere
     /// or is a txn version that is not committed. Returns the seq of the newest copy the page
     /// holds (M or the image in flight), `None` when it holds none.
+    ///
+    /// Records of the key that a FLUSHDB/FLUSHALL executed since (seq below the db's cutoff,
+    /// durable or not) or of a txn that never committed are not copies of the key's current
+    /// value: they are left alone and never become a tracked source. A source stays protected
+    /// until a copy with a higher seq becomes durable; a flushed record registered as one when
+    /// the key's post-flush copy was already durable waited for a hand-off that only the
+    /// write which registered it could bring, and that write waited for it (E14).
     fn protect_in_page(&mut self, cache: &mut PageCache, page: PageId, db: u8, h32: u32, key: &[u8]) -> Option<Seq> {
         let f = cache.peek(page)?;
         let mut st = cache.take_state(f)?;
         let mut newest: Option<Seq> = None;
+        let core = &self.core;
+        let gone = |r: &RecDesc| core.cutoff.get(usize::from(r.db)).is_some_and(|&c| r.seq.0 < c) || core.dead(r.db, r.seq, r.txn);
         let mut mark = |recs: &mut [RecDesc], img: &[u8; PAGE]| {
             for r in recs.iter_mut() {
-                if r.db == db && r.h32 == h32 && matches!(r.status, RecStatus::Live | RecStatus::Protected) && r.key(img) == key {
+                if r.db == db && r.h32 == h32 && matches!(r.status, RecStatus::Live | RecStatus::Protected) && !gone(r) && r.key(img) == key {
                     r.status = RecStatus::Protected;
                     newest = Some(newest.map_or(r.seq, |n| n.max(r.seq)));
                 }
@@ -3923,6 +3932,16 @@ impl PartitionStore {
                 self.core.tickets.meta_done(ticket);
                 if all {
                     self.core.flushall_wait = true;
+                }
+                // effects deferred behind in-page copies of the flushed dbs go ahead: the page
+                // writer counts those copies until the cutoff is durable (a pre-flush copy is
+                // still the key's state if the flush is lost) and dead ones after it; nothing
+                // else rebuilds a page whose only wait was such a copy
+                if !self.core.deferred.is_empty() {
+                    let deferred: Vec<PageId> = self.core.deferred.drain().collect();
+                    for p in deferred {
+                        self.core.mark_dirty(cx.cache, p);
+                    }
                 }
                 // deletes waiting for copies of flushed keys: those copies are dead now (E5)
                 let mut i = 0;

@@ -3259,11 +3259,19 @@ mod tests {
         let mut queued = RepairQueued::default();
         // the primary's key set (b), then the member's own set (a) that shares keys with it
         queue_repair_keys(&mut q, &mut queued, vec![k(0, "a"), k(0, "b"), k(3, "c")]);
-        queue_repair_keys(&mut q, &mut queued, vec![k(0, "b"), k(3, "c"), k(0, "d"), k(0, "a")]);
+        queue_repair_keys(
+            &mut q,
+            &mut queued,
+            vec![k(0, "b"), k(3, "c"), k(0, "d"), k(0, "a")],
+        );
         assert_eq!(q.len(), 4, "every key once");
         // a key already sent is not queued again either
         let first = repair_batch(&mut q, 64).unwrap();
-        assert_eq!(first, (0, vec![k(0, "a").1, k(0, "b").1]), "stops at another database");
+        assert_eq!(
+            first,
+            (0, vec![k(0, "a").1, k(0, "b").1]),
+            "stops at another database"
+        );
         queue_repair_keys(&mut q, &mut queued, vec![k(0, "a")]);
         assert_eq!(repair_batch(&mut q, 64).unwrap(), (3, vec![k(3, "c").1]));
         assert_eq!(repair_batch(&mut q, 1).unwrap(), (0, vec![k(0, "d").1]));

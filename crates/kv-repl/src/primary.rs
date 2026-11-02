@@ -767,7 +767,10 @@ mod tests {
         // the age running from when it started counting
         assert_eq!(r.lagging(260_001, 250_000).as_slice(), &[1]);
         r.on_ack(1, Seq::new(1, 5), 270_000);
-        assert!(r.lagging(u64::MAX, 250_000).is_empty(), "everything acknowledged");
+        assert!(
+            r.lagging(u64::MAX, 250_000).is_empty(),
+            "everything acknowledged"
+        );
         // dropped and counted again later: the age restarts then
         r.on_group_at(&enc(Seq::new(1, 6)), Seq::new(1, 6), 280_000);
         r.set_isr_at(&[], 290_000);

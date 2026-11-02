@@ -1251,10 +1251,14 @@ fn a_removed_coordinator_is_never_a_moved_target() {
         );
         std::thread::sleep(Duration::from_millis(300));
     }
-    wait_until("the node drops the removed coordinator from MOVED", 10, || {
-        let t = targets();
-        t.len() >= 6 && !t.contains(&removed)
-    });
+    wait_until(
+        "the node drops the removed coordinator from MOVED",
+        10,
+        || {
+            let t = targets();
+            t.len() >= 6 && !t.contains(&removed)
+        },
+    );
     if let Some(mut ch) = c.coords[gone].child.take() {
         let _ = ch.kill();
         let _ = ch.wait();

@@ -192,10 +192,11 @@ struct Peer {
     present: bool,
     stream: Option<StreamIo>,
     epoch: u64,
-    /// Counted although not in the committed ISR yet (caught up, `IsrExpand` sent).
+    /// Counted although not in the committed ISR yet (its catch-up barriers are done; its
+    /// `IsrExpand` follows once it holds every committed write, see `ExpandGate`).
     expanding: bool,
-    /// Last value reported to the agent for this partition.
-    reported_counted: bool,
+    /// Last readiness reported to the expand gate for this partition.
+    reported_ready: bool,
     direct: Option<Direct>,
     last_shrink_ns: u64,
 }
@@ -1022,6 +1023,7 @@ impl<B: Backend> Worker<B> {
                         x.in_isr = *in_isr;
                         if *in_isr {
                             x.expanding = false;
+                            x.reported_ready = false;
                         }
                     }
                     None => pp.peers.push(Peer {
@@ -1032,7 +1034,7 @@ impl<B: Backend> Worker<B> {
                         stream: None,
                         epoch: 0,
                         expanding: false,
-                        reported_counted: false,
+                        reported_ready: false,
                         direct: None,
                         last_shrink_ns: 0,
                     }),
@@ -2080,6 +2082,9 @@ impl<B: Backend> Worker<B> {
                 };
                 m.sync = MemberSync::None;
                 m.ready_reported = Some(true);
+                // caught up in the current term: the backlog of a term this node served as
+                // primary is no Repair key source any more (its locked memory goes)
+                m.own_groups = None;
                 let st = (m.shard, m.term);
                 if let Some((t, _)) = m.stream.accepted() {
                     pr.last_term = pr.last_term.max(t);
@@ -2739,6 +2744,7 @@ impl<B: Backend> Worker<B> {
             self.apply_roles(cw);
         }
         let now = self.now.boot_ns;
+        let partitions = self.shared.partitions;
         let lease_ok = self.shared.lease.valid(now);
         let below_min = self.shared.ownership.read().below_min_isr();
         let persist = now.saturating_sub(cw.last_persist_ns) >= PERSIST_EVERY_NS;
@@ -2790,6 +2796,7 @@ impl<B: Backend> Worker<B> {
                     // ISR shrink requests and expands (age tests and position tests only)
                     let lag = pp.sender.lagging(now, ack_timeout);
                     let mut recount = false;
+                    let gate = &cs.expand_gate;
                     for m in lag {
                         let Some(x) = pp.peers.get_mut(usize::from(m)) else {
                             continue;
@@ -2803,8 +2810,12 @@ impl<B: Backend> Worker<B> {
                                     member: x.node,
                                 });
                             }
-                        } else if x.expanding {
+                        } else if x.expanding && gate.set(x.node, term, p, partitions, false) {
+                            // its expand was not requested yet: it stops counting and catches
+                            // up again (once requested it counts until the committed ISR shows
+                            // it, and then leaves through the shrink path)
                             x.expanding = false;
+                            x.reported_ready = false;
                             recount = true;
                         }
                     }
@@ -2816,24 +2827,36 @@ impl<B: Backend> Worker<B> {
                                 x.state,
                                 MemberState::Syncing | MemberState::NeedsFullSync
                             );
+                        // 1. its catch-up barriers are done: count its acks
                         if eligible && !x.expanding && pp.sender.caught_up(m) {
                             x.expanding = true;
                             recount = true;
                         }
-                        if x.expanding && !pp.sender.is_attached(m) {
+                        if x.expanding
+                            && !pp.sender.is_attached(m)
+                            && gate.set(x.node, term, p, partitions, false)
+                        {
                             x.expanding = false;
+                            x.reported_ready = false;
                             recount = true;
                         }
-                        let counted = x.expanding || x.in_isr;
-                        if counted != x.reported_counted && !x.in_isr {
-                            x.reported_counted = counted;
-                            reports.push(AgentMsg::Expand {
-                                shard,
-                                term,
-                                member: x.node,
-                                partition: p,
-                                counted,
-                            });
+                        // 2. it holds every write committed before it counted: ready for its
+                        // IsrExpand (the agent asks once every partition is ready)
+                        let ready = x.expanding && !x.in_isr && pp.sender.holds_committed(m);
+                        if ready != x.reported_ready
+                            && !x.in_isr
+                            && gate.set(x.node, term, p, partitions, ready)
+                        {
+                            x.reported_ready = ready;
+                            if ready {
+                                reports.push(AgentMsg::Expand {
+                                    shard,
+                                    term,
+                                    member: x.node,
+                                    partition: p,
+                                    counted: true,
+                                });
+                            }
                         }
                     }
                     if recount {
@@ -2918,6 +2941,7 @@ impl<B: Backend> Worker<B> {
                         && let Some((t, AcceptMode::Continue { .. })) = m.stream.accepted()
                     {
                         m.ready_reported = Some(true);
+                        m.own_groups = None;
                         pr.last_term = pr.last_term.max(t);
                         cs.tell_agent(AgentMsg::PartReady {
                             shard: m.shard,

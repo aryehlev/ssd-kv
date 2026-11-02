@@ -204,7 +204,9 @@ struct Agent {
     lease_held_back: Option<std::time::Instant>,
     fences: hashbrown::HashMap<u64, WorkerGather, foldhash::fast::RandomState>,
     handoffs: hashbrown::HashMap<u64, WorkerGather, foldhash::fast::RandomState>,
-    expand: hashbrown::HashMap<NodeId, (u32, Gather), foldhash::fast::RandomState>,
+    /// When each member's `IsrExpand` was last sent (repeated every `REPORT_REPEAT` while the
+    /// committed ISR does not show it; readiness itself is in `ClusterShared::expand_gate`).
+    expand_sent: hashbrown::HashMap<NodeId, std::time::Instant, foldhash::fast::RandomState>,
     shrink_sent: hashbrown::HashMap<NodeId, std::time::Instant, foldhash::fast::RandomState>,
     /// When the last `HandoffRequest` of a shutting-down primary was sent.
     handoff_requested: Option<std::time::Instant>,
@@ -230,7 +232,7 @@ impl Agent {
             lease_held_back: None,
             fences: Default::default(),
             handoffs: Default::default(),
-            expand: Default::default(),
+            expand_sent: Default::default(),
             shrink_sent: Default::default(),
             handoff_requested: None,
             resync_sent: Default::default(),
@@ -555,6 +557,8 @@ impl Agent {
             r.migrations.clear();
         }
         let a: Arc<NodeAssignment> = Arc::from(a);
+        // before any worker sees it: expand rounds end only by what the committed state shows
+        self.cs.expand_gate.on_assignment(a.role.as_ref());
         self.current = Some(a.order_key());
         *self.cs.assignment.write() = Some(a.clone());
         let flags = GateFlags {
@@ -651,15 +655,8 @@ impl Agent {
                 partition,
                 counted,
             } => {
-                let n = self.partitions();
-                let e = self
-                    .expand
-                    .entry(member)
-                    .or_insert_with(|| (term, Gather::new(n)));
-                if e.0 != term {
-                    *e = (term, Gather::new(n));
-                }
-                e.1.set(usize::from(partition), counted);
+                // readiness is in the expand gate; this only says it changed
+                let _ = (term, partition, counted);
                 self.report_expand(shard, member);
             }
             AgentMsg::Shrink {
@@ -747,7 +744,6 @@ impl Agent {
     }
 
     fn report_expand(&mut self, shard: u16, member: NodeId) {
-        let all = self.all_partitions();
         let a = self.cs.assignment();
         let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else {
             return;
@@ -757,12 +753,19 @@ impl Agent {
         }
         let in_isr = role.members.iter().any(|(n, _, isr)| *n == member && *isr);
         let term = role.term;
-        let Some((t, g)) = self.expand.get_mut(&member) else {
-            return;
-        };
-        if *t != term || in_isr || !g.complete_over(&all) || !g.due() {
+        // every partition counts it and it holds every committed write: from this request on
+        // no partition stops counting it (see `ExpandGate`)
+        if in_isr || !self.cs.expand_gate.request(&member, term) {
             return;
         }
+        let due = self
+            .expand_sent
+            .get(&member)
+            .is_none_or(|t| t.elapsed() >= REPORT_REPEAT);
+        if !due {
+            return;
+        }
+        self.expand_sent.insert(member, std::time::Instant::now());
         tracing::info!(member = %member.hex40(), "replica caught up: ISR expand requested");
         self.send_all(&NodeToCoord::IsrExpand {
             shard: ShardId(shard),
@@ -932,7 +935,8 @@ impl Agent {
         if let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) {
             let shard = role.shard.0;
             let term = role.term;
-            let members: Vec<NodeId> = self.expand.keys().copied().collect();
+            let members: Vec<NodeId> = self.cs.expand_gate.members();
+            self.expand_sent.retain(|n, _| members.contains(n));
             for m in members {
                 self.report_expand(shard, m);
             }

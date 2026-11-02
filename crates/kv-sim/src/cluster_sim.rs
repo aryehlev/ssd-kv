@@ -37,9 +37,12 @@
 //! covers nothing), the Repair key set (a) (`kv_repl::member::own_keys_after`, else a walk of
 //! the partition), the persisted `last_term` of the handshake, and the restart hold of a
 //! primary (after a crash it never serves the term it served before and reports
-//! `health.failed` while its assignment names it primary of that term). The coordinator side
-//! runs the failover steps of `run_failover`, including the lease hold-off of the failed
-//! primary while another node is fenced (`Detector::hold_off`).
+//! `health.failed` while its assignment names it primary of that term), the ISR expand
+//! handshake (counting starts after `ReplSender::caught_up`, the `IsrExpand` is sent once
+//! `ReplSender::holds_committed`, and a counted member stops counting only before its expand
+//! was requested: kv-node `ExpandGate`) and the primary's NeedsFullSync report. The
+//! coordinator side runs the failover steps of `run_failover`, including the lease hold-off of
+//! the failed primary while another node is fenced (`Detector::hold_off`).
 //!
 //! The findings of earlier campaigns are regression tests (`repro_*`): R1 and R2 (received
 //! rings, kv-repl and kv-node), the failover lease wait (kv-coord). `KV_SIM_TRACE=1` (and
@@ -970,8 +973,14 @@ impl Coord {
                     l.detector.on_reported_failed(nid);
                 }
                 // a failover that fenced another node holds the failed primary's leases off
-                // (`Detector::may_grant`), so its wait for that lease (§23.9 step 4) ends
-                if quorum && l.detector.may_grant(&s, &nid) {
+                // (`Detector::may_grant`), so its wait for that lease (§23.9 step 4) ends; and no
+                // grant reaches a node with an unacknowledged push (kv-coord `Pusher`: it may
+                // still apply an older role)
+                let unacked = l
+                    .pushed
+                    .get(&from_node)
+                    .is_some_and(|&(v, _)| l.acked.get(&from_node).is_none_or(|&a| a < v));
+                if quorum && !unacked && l.detector.may_grant(&s, &nid) {
                     l.leases.grant(&nid, now);
                     let lease_ms = s.params.lease_ms;
                     fx.send(
@@ -1250,6 +1259,9 @@ enum NodeRole {
         pending: Vec<Pending>,
         /// Members counted ahead of their committed expand.
         expanding: BTreeSet<MemberId>,
+        /// Expanding members whose IsrExpand was sent: they count until the committed ISR
+        /// shows them (kv-node `ExpandGate`), whatever their lag.
+        expand_sent: BTreeSet<MemberId>,
         last_isr_msg: u64,
     },
     Replica {
@@ -2050,6 +2062,8 @@ impl Node {
                     store.advance(end, fx.now_g, delay);
                     store.last_exec = store.last_exec.max(end);
                     ms.ready = true;
+                    // kv-node: caught up, the own backlog of an earlier term is dropped
+                    ms.own_groups = None;
                     if let Some((t, _)) = ms.stream.accepted() {
                         *last_term = (*last_term).max(t);
                     }
@@ -2074,6 +2088,7 @@ impl Node {
         if let Some((t, AcceptMode::Continue { .. })) = ms.stream.accepted() {
             // kv-node: a plain Continue on the current term is a ready partition
             ms.ready = true;
+            ms.own_groups = None;
             *last_term = (*last_term).max(t);
         }
         if ms.ready {
@@ -2269,6 +2284,7 @@ impl Node {
                     mids,
                     pending: Vec::new(),
                     expanding: BTreeSet::new(),
+                    expand_sent: BTreeSet::new(),
                     last_isr_msg: 0,
                 };
             }
@@ -2276,6 +2292,7 @@ impl Node {
                 parts,
                 mids,
                 expanding,
+                expand_sent,
                 ..
             } = &mut self.role
             {
@@ -2285,6 +2302,7 @@ impl Node {
                     .map(|(_, m)| *m)
                     .collect();
                 expanding.retain(|m| !committed.contains(m));
+                expand_sent.retain(|m| expanding.contains(m));
                 let mut counted = committed.clone();
                 counted.extend(expanding.iter().copied());
                 for pp in parts.iter_mut() {
@@ -2624,6 +2642,7 @@ impl Node {
             pending,
             mids,
             expanding,
+            expand_sent,
             last_isr_msg,
         } = &mut self.role
         else {
@@ -2686,6 +2705,7 @@ impl Node {
             for pp in parts.iter() {
                 lag.extend(pp.sender.lagging(fx.now_l, ack_timeout));
             }
+            let mut recount = false;
             for (n, mid) in mids.iter() {
                 let in_isr = committed_isr.contains(n);
                 if in_isr && lag.contains(mid) {
@@ -2697,26 +2717,45 @@ impl Node {
                             member: node_id(*n),
                         }),
                     );
-                } else if !in_isr && parts.iter().all(|pp| pp.sender.caught_up(*mid)) {
-                    if expanding.insert(*mid) {
-                        let mut counted: Vec<MemberId> = mids
-                            .iter()
-                            .filter(|(x, _)| committed_isr.contains(x))
-                            .map(|(_, m)| *m)
-                            .collect();
-                        counted.extend(expanding.iter().copied());
-                        for pp in parts.iter_mut() {
-                            pp.sender.set_isr(&counted);
-                        }
+                } else if !in_isr {
+                    // kv-node: counting starts after the barrier chain (`caught_up`); a lagging
+                    // counted member stops counting unless its IsrExpand was sent
+                    if expanding.contains(mid) && !expand_sent.contains(mid) && lag.contains(mid) {
+                        expanding.remove(mid);
+                        recount = true;
+                        continue;
                     }
-                    fx.send(
-                        c,
-                        Msg::Report(NodeToCoord::IsrExpand {
-                            shard: ShardId(*shard),
-                            term: *term,
-                            member: node_id(*n),
-                        }),
-                    );
+                    if !expanding.contains(mid) && parts.iter().all(|pp| pp.sender.caught_up(*mid))
+                    {
+                        expanding.insert(*mid);
+                        recount = true;
+                        continue;
+                    }
+                    // IsrExpand once it holds every write committed before it counted
+                    if expanding.contains(mid)
+                        && parts.iter().all(|pp| pp.sender.holds_committed(*mid))
+                    {
+                        expand_sent.insert(*mid);
+                        fx.send(
+                            c,
+                            Msg::Report(NodeToCoord::IsrExpand {
+                                shard: ShardId(*shard),
+                                term: *term,
+                                member: node_id(*n),
+                            }),
+                        );
+                    }
+                }
+            }
+            if recount {
+                let mut counted: Vec<MemberId> = mids
+                    .iter()
+                    .filter(|(x, _)| committed_isr.contains(x))
+                    .map(|(_, m)| *m)
+                    .collect();
+                counted.extend(expanding.iter().copied());
+                for pp in parts.iter_mut() {
+                    pp.sender.set_isr(&counted);
                 }
             }
         }

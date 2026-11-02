@@ -540,7 +540,11 @@ impl Pusher {
                     ls.detector.on_reported_failed(node);
                     let _ = self.events.send(NodeEvent::ReportsFailed(node));
                 }
-                if self.wsr.lease_valid() && ls.detector.may_grant(s, &node) {
+                // no grant while the node has not acknowledged its latest projection: a grant
+                // must never reach a node still applying an older role (an old primary that
+                // returns must not serve its old term again under a fresh lease while its new
+                // primary serves, §23.10 lease disjointness); its next renewal is answered
+                if pending_ack.is_none() && self.wsr.lease_valid() && ls.detector.may_grant(s, &node) {
                     ls.leases.grant(&node, now);
                     return Some(CoordToNode::LeaseGrant {
                         seq,

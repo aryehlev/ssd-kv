@@ -9,6 +9,17 @@
 //! to an `IsrShrink` request to the coordinator; the primary keeps waiting for that member until
 //! the committed assignment drops it (§23.8).
 //!
+//! ISR expand (§23.8 step 5) has two position tests (LC-36: positions recorded in the past,
+//! never a lag compared with a constant):
+//! 1. [`ReplSender::caught_up`]: the member acknowledged a fixed chain of barriers, the commit
+//!    point when its backlog stream started, then the commit point when it reached that one,
+//!    and so on, [`EXPAND_BARRIERS`] times; the caller then starts counting its acks. An
+//!    instantaneous `acked >= commit` test is never met by a member that stays a few
+//!    milliseconds behind under a steady write load, so it would never rejoin.
+//! 2. [`ReplSender::holds_committed`]: once counted, the member acknowledged the commit point
+//!    recorded when counting started. From then on it holds every write ever committed (the
+//!    later ones needed its ack), so only then may the caller ask for its `IsrExpand`.
+//!
 //! Members are attached when their handshake completes: `Continue { from }` streams groups from
 //! the backlog from `from`. `Repair { at }` and `Full { at }` attach the member without backlog
 //! streaming: during the repair images or the full-sync walk the caller writes every frame in
@@ -31,6 +42,10 @@ pub type MemberId = u16;
 /// Bytes of encoded groups per `GROUPS` frame (one group may exceed it; it then travels alone).
 pub const GROUPS_FRAME_BYTES: usize = 256 << 10;
 
+/// Position barriers a member outside the ISR acknowledges after the first one before it is
+/// caught up (a fixed number, LC-36).
+pub const EXPAND_BARRIERS: u8 = 2;
+
 /// Per-member stream state.
 struct MemberSlot {
     id: MemberId,
@@ -47,6 +62,11 @@ struct MemberSlot {
     last_send_ns: u64,
     /// The backlog dropped a group this member still needed: its stream must restart.
     overrun: bool,
+    /// The catch-up barrier chain of a streaming member: `(position, barriers left after it)`.
+    barrier: Option<(Seq, u8)>,
+    /// While counted: the commit point when counting started (every write committed before it
+    /// did not need this member's ack).
+    counted_from: Option<Seq>,
 }
 
 impl MemberSlot {
@@ -60,6 +80,19 @@ impl MemberSlot {
             commit_sent: Seq::ZERO,
             last_send_ns: 0,
             overrun: false,
+            barrier: None,
+            counted_from: None,
+        }
+    }
+
+    /// Moves the barrier chain on while the member's acknowledged position covers it; every
+    /// next barrier is the commit point at the moment the previous one was reached.
+    fn advance_barrier(&mut self, commit: Seq) {
+        while let Some((b, left)) = self.barrier {
+            if self.acked_durable < b || left == 0 {
+                break;
+            }
+            self.barrier = Some((commit.max(b), left - 1));
         }
     }
 }
@@ -173,6 +206,7 @@ impl ReplSender {
     }
 
     pub fn attach(&mut self, m: MemberId, mode: &AcceptMode) {
+        let commit = self.commit_seq();
         let s = self.slot_mut(m);
         s.attached = true;
         s.overrun = false;
@@ -184,11 +218,14 @@ impl ReplSender {
                 s.sent = before;
                 // the member's handshake position is durable there (a persisted lower bound)
                 s.acked_durable = s.acked_durable.max(before);
+                s.barrier = Some((commit, EXPAND_BARRIERS));
+                s.advance_barrier(commit);
             }
             AcceptMode::Repair { at } | AcceptMode::Full { at } => {
                 // fed directly by the caller until `resume`
                 s.streaming = false;
                 s.sent = at;
+                s.barrier = None;
             }
         }
     }
@@ -196,9 +233,13 @@ impl ReplSender {
     /// Starts streaming backlog groups after `after` to a member attached with `Full` (the
     /// walk is complete).
     pub fn resume(&mut self, m: MemberId, after: Seq) {
+        let commit = self.commit_seq();
         let s = self.slot_mut(m);
         s.streaming = true;
         s.sent = after;
+        // its catch-up barriers start at the end of the direct feed
+        s.barrier = Some((commit.max(after), EXPAND_BARRIERS));
+        s.advance_barrier(commit);
     }
 
     pub fn detach(&mut self, m: MemberId) {
@@ -208,6 +249,7 @@ impl ReplSender {
             let s = self.slot_mut(m);
             s.attached = false;
             s.streaming = false;
+            s.barrier = None;
         } else {
             self.members.retain(|s| s.id != m);
         }
@@ -215,9 +257,43 @@ impl ReplSender {
 
     /// Members whose acks count toward `commit_seq` (the committed ISR minus the primary).
     pub fn set_isr(&mut self, counted: &[MemberId]) {
+        let dropped: SmallVec<[MemberId; 4]> = self
+            .isr
+            .iter()
+            .copied()
+            .filter(|m| !counted.contains(m))
+            .collect();
+        let added: SmallVec<[MemberId; 4]> = counted
+            .iter()
+            .copied()
+            .filter(|m| !self.isr.contains(m))
+            .collect();
+        // the commit point before the new members count: what they must hold before their
+        // IsrExpand (see `holds_committed`)
+        let before = self.commit_seq();
         self.isr = counted.iter().copied().collect();
         for &m in counted {
             self.slot_mut(m);
+        }
+        for m in added {
+            self.slot_mut(m).counted_from = Some(before);
+        }
+        for &m in &dropped {
+            if let Some(s) = self.members.iter_mut().find(|s| s.id == m) {
+                s.counted_from = None;
+            }
+        }
+        // a member that stops counting (it lagged, or the ISR dropped it) catches up again
+        // through a fresh chain of barriers before it may count again
+        let commit = self.commit_seq();
+        for m in dropped {
+            if let Some(s) = self.members.iter_mut().find(|s| s.id == m)
+                && s.attached
+                && s.streaming
+            {
+                s.barrier = Some((commit, EXPAND_BARRIERS));
+                s.advance_barrier(commit);
+            }
         }
         let isr = self.isr.clone();
         self.members.retain(|s| s.attached || isr.contains(&s.id));
@@ -234,6 +310,8 @@ impl ReplSender {
         let durable = durable.min(self.last);
         let s = self.slot_mut(m);
         s.acked_durable = s.acked_durable.max(durable);
+        let commit = self.commit_seq();
+        self.slot_mut(m).advance_barrier(commit);
         self.trim_produced();
     }
 
@@ -286,11 +364,25 @@ impl ReplSender {
         self.slot(m).is_some_and(|s| s.attached)
     }
 
-    /// The member streams from the backlog and has acknowledged everything up to the commit
-    /// point (§23.8 step 5).
+    /// The member streams from the backlog and has acknowledged its whole chain of catch-up
+    /// barriers (§23.8 step 5; see the module notes).
     pub fn caught_up(&self, m: MemberId) -> bool {
-        self.slot(m)
-            .is_some_and(|s| s.attached && s.streaming && s.acked_durable >= self.commit_seq())
+        self.slot(m).is_some_and(|s| {
+            s.attached
+                && s.streaming
+                && s.barrier
+                    .is_some_and(|(b, left)| left == 0 && s.acked_durable >= b)
+        })
+    }
+
+    /// The member counts toward the commit point and acknowledged the commit point recorded
+    /// when it started to count: it holds every write ever committed, so it may join the
+    /// committed ISR (`IsrExpand`).
+    pub fn holds_committed(&self, m: MemberId) -> bool {
+        self.isr.contains(&m)
+            && self
+                .slot(m)
+                .is_some_and(|s| s.counted_from.is_some_and(|c| s.acked_durable >= c))
     }
 
     /// The member is attached and fed directly (repair images or a full-sync walk).
@@ -526,6 +618,75 @@ mod tests {
         assert!(
             matches!(&frames(&out)[0], Frame::Groups(g) if crate::codec::peek_seq(g) == Some(Seq::new(1, 6)))
         );
+    }
+
+    /// A member that stays a few groups behind under a steady write load is caught up once it
+    /// acknowledged the fixed chain of barriers (positions recorded in the past); an
+    /// instantaneous `acked >= commit` test would never hold for it.
+    #[test]
+    fn catch_up_is_a_fixed_chain_of_position_barriers() {
+        let mut r = ReplSender::new(0, 1, 1 << 16);
+        fn produce(r: &mut ReplSender, seq: &mut u64, n: u64) {
+            for _ in 0..n {
+                *seq += 1;
+                r.on_group_at(&enc(Seq::new(1, *seq)), Seq::new(1, *seq), 0);
+            }
+            r.set_local_durable(Seq::new(1, *seq));
+        }
+        let mut seq = 0u64;
+        produce(&mut r, &mut seq, 100);
+        r.attach(
+            5,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 1),
+            },
+        );
+        assert!(!r.caught_up(5));
+        // the member acknowledges, always 3 groups behind the head, while writes continue
+        let mut rounds = 0;
+        while !r.caught_up(5) {
+            rounds += 1;
+            assert!(rounds < 10, "caught up after a fixed number of barriers");
+            r.on_ack(5, Seq::new(1, seq - 3), 0);
+            produce(&mut r, &mut seq, 5);
+            assert!(r.acked(5).unwrap() < r.local_durable(), "always behind");
+        }
+        assert!(
+            rounds <= usize::from(EXPAND_BARRIERS) + 2,
+            "{rounds} rounds"
+        );
+        // counting starts: the member may join the committed ISR only once it acknowledged
+        // the commit point of that moment (it misses no write committed before it counted)
+        let before = r.commit_seq();
+        r.set_isr(&[5]);
+        assert!(!r.holds_committed(5) || r.acked(5).unwrap() >= before);
+        produce(&mut r, &mut seq, 5);
+        assert!(
+            r.commit_seq() <= r.acked(5).unwrap(),
+            "now nothing commits without it"
+        );
+        r.on_ack(5, before, 0);
+        assert!(r.holds_committed(5));
+        r.set_isr(&[]);
+        assert!(!r.holds_committed(5), "not counted any more");
+        // an idle shard: caught up at once
+        let mut idle = ReplSender::new(1, 1, 1 << 16);
+        idle.on_group_at(&enc(Seq::new(1, 1)), Seq::new(1, 1), 0);
+        idle.set_local_durable(Seq::new(1, 1));
+        idle.attach(
+            2,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 2),
+            },
+        );
+        assert!(idle.caught_up(2));
+        // a repaired member's chain starts at the end of its direct feed
+        idle.attach(3, &AcceptMode::Repair { at: Seq::new(1, 1) });
+        assert!(!idle.caught_up(3));
+        idle.resume(3, Seq::new(1, 1));
+        assert!(!idle.caught_up(3), "nothing acknowledged yet");
+        idle.on_ack(3, Seq::new(1, 1), 0);
+        assert!(idle.caught_up(3));
     }
 
     #[test]

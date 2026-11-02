@@ -257,8 +257,10 @@ for i in 0 1 2; do
 done
 for i in $(seq 0 $((NODES - 1))); do rm -rf "$W/n$i"; mkdir -p "$W/n$i"; start_node "$i"; done
 wait_for 30 "a coordinator leader" has_leader || die "no coordinator leader"
-if [ -n "${KV_MATRIX_LEASE_MS:-}" ]; then adm cluster params set lease_ms "$KV_MATRIX_LEASE_MS" > /dev/null || die "params"; fi
-adm cluster params set partitions "$PARTS" > /dev/null || die "params partitions"
+# the first leader may step down at once (an election of the next term started before its first
+# beat arrived): the parameter calls are retried while the coordinators settle
+if [ -n "${KV_MATRIX_LEASE_MS:-}" ]; then adm_retry 30 cluster params set lease_ms "$KV_MATRIX_LEASE_MS" > /dev/null || die "params"; fi
+adm_retry 30 cluster params set partitions "$PARTS" > /dev/null || die "params partitions"
 for i in $(seq 0 $((NODES - 1))); do
   wait_for 90 "node $i to listen" ping_port "$(nport "$i")" || die "node $i did not start: $(tail -3 "$W/n$i.err")"
 done

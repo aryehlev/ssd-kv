@@ -192,10 +192,118 @@ pub struct ClusterShared {
     /// Per partition: keys stored in slots this node does not serve (an inert migration copy,
     /// slots being purged), refreshed every 50 ms; DBSIZE in cluster mode leaves them out.
     unserved_keys: Box<[AtomicU64]>,
+    /// The ISR expand handshake of this node's primary partitions (see [`ExpandGate`]).
+    pub expand_gate: ExpandGate,
 }
 
 /// `links` bit of a member partition whose stream to the primary is up.
 pub const LINK_UP: u64 = 1 << 63;
+
+/// The ISR expand handshake between a primary's partitions and its agent (§23.8 step 5).
+///
+/// A partition reports a member *ready* once it counts the member's acks and the member holds
+/// every write committed before that (`ReplSender::holds_committed`). The agent asks for the
+/// member's `IsrExpand` only when every partition is ready, and from that request on no
+/// partition may stop counting the member (the coordinator may commit the expand at any later
+/// time, and a member in the committed ISR must hold every acknowledged write): a partition's
+/// "not ready any more" is refused once the request was made. The round ends when the agent
+/// applies an assignment that shows the member in the ISR and then out of it again (a
+/// committed shrink, after which the partitions stop counting it through the normal path), or
+/// that shows it can never be added (not a member, NeedsFullSync, Syncing, another term).
+#[derive(Default)]
+pub struct ExpandGate {
+    inner: parking_lot::Mutex<hashbrown::HashMap<NodeId, ExpandRound, foldhash::fast::RandomState>>,
+}
+
+struct ExpandRound {
+    term: u32,
+    ready: Vec<bool>,
+    requested: bool,
+    seen_in_isr: bool,
+}
+
+impl ExpandGate {
+    /// Partition `p` of the primary of `term` reports `member` ready or not. Returns false
+    /// (nothing changes) when `ready` is false and the expand was already requested: the
+    /// partition must keep counting the member.
+    pub fn set(&self, member: NodeId, term: u32, p: u16, partitions: u16, ready: bool) -> bool {
+        let mut g = self.inner.lock();
+        let n = usize::from(partitions);
+        let e = g.entry(member).or_insert_with(|| ExpandRound {
+            term,
+            ready: vec![false; n],
+            requested: false,
+            seen_in_isr: false,
+        });
+        if e.term != term {
+            *e = ExpandRound {
+                term,
+                ready: vec![false; n],
+                requested: false,
+                seen_in_isr: false,
+            };
+        }
+        if !ready && e.requested {
+            return false;
+        }
+        if let Some(b) = e.ready.get_mut(usize::from(p)) {
+            *b = ready;
+        }
+        true
+    }
+
+    /// The agent may send (or repeat) `member`'s `IsrExpand` of `term`: every partition is
+    /// ready (the request is recorded) or the request was made already, and the committed ISR
+    /// has not shown it yet.
+    pub fn request(&self, member: &NodeId, term: u32) -> bool {
+        let mut g = self.inner.lock();
+        let Some(e) = g.get_mut(member) else {
+            return false;
+        };
+        if e.term != term || e.seen_in_isr {
+            return false;
+        }
+        if !e.requested && !e.ready.is_empty() && e.ready.iter().all(|b| *b) {
+            e.requested = true;
+        }
+        e.requested
+    }
+
+    /// The members with a round in progress.
+    pub fn members(&self) -> Vec<NodeId> {
+        self.inner.lock().keys().copied().collect()
+    }
+
+    /// The agent applied an assignment (before the workers see it): rounds end as described
+    /// on the type. `role` is the node's role when it is a primary, `None` otherwise.
+    pub fn on_assignment(&self, role: Option<&kv_ctrl::ShardRole>) {
+        let mut g = self.inner.lock();
+        let Some(r) = role.filter(|r| r.is_primary) else {
+            g.clear();
+            return;
+        };
+        g.retain(|n, e| {
+            if e.term != r.term {
+                return false;
+            }
+            let Some((_, st, in_isr)) = r.members.iter().find(|(x, _, _)| x == n) else {
+                return false;
+            };
+            if matches!(st, kv_ctrl::MemberState::NeedsFullSync | kv_ctrl::MemberState::Syncing)
+            {
+                return false;
+            }
+            if *in_isr {
+                if e.requested {
+                    e.seen_in_isr = true;
+                }
+                return true;
+            }
+            // out of the ISR after it was in: the shrink is committed, the round is over
+            !e.seen_in_isr
+        });
+    }
+}
 
 /// Who this node is in the cluster.
 #[derive(Clone, Copy)]
@@ -239,6 +347,7 @@ impl ClusterShared {
             shutdown_handoff: parking_lot::Mutex::new(None),
             links: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
             unserved_keys: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            expand_gate: ExpandGate::default(),
         }
     }
 
@@ -502,6 +611,38 @@ mod tests {
         cs.set_unserved_keys(1, 7);
         cs.set_unserved_keys(3, 5);
         assert_eq!(cs.unserved_keys(), 12);
+    }
+
+    /// A member's IsrExpand is requested only when every partition is ready; from then on no
+    /// partition may stop counting it until a committed assignment showed it in the ISR and
+    /// then out again (or showed it can never be added).
+    #[test]
+    fn expand_requests_are_never_withdrawn_by_a_partition() {
+        let g = ExpandGate::default();
+        let n = NodeId([9; 20]);
+        let mut role = assignment(true, 3).role.unwrap();
+        role.members = vec![(n, kv_ctrl::MemberState::CatchingUp, false)];
+        assert!(g.set(n, 3, 0, 2, true));
+        assert!(!g.request(&n, 3), "partition 1 is not ready");
+        assert!(g.set(n, 3, 0, 2, false), "not requested yet: it may stop counting");
+        assert!(g.set(n, 3, 0, 2, true) && g.set(n, 3, 1, 2, true));
+        assert!(g.request(&n, 3));
+        assert!(!g.set(n, 3, 1, 2, false), "requested: partition 1 keeps counting");
+        g.on_assignment(Some(&role));
+        assert!(g.request(&n, 3), "repeated while the committed ISR does not show it");
+        role.members[0] = (n, kv_ctrl::MemberState::InSync, true);
+        g.on_assignment(Some(&role));
+        assert!(!g.request(&n, 3), "in the ISR: no more requests");
+        assert!(!g.set(n, 3, 0, 2, false), "still counted until the shrink is committed");
+        role.members[0] = (n, kv_ctrl::MemberState::CatchingUp, false);
+        g.on_assignment(Some(&role));
+        assert!(g.members().is_empty(), "shrink committed: the round is over");
+        assert!(g.set(n, 3, 0, 2, true) && g.set(n, 3, 0, 2, false), "a new round");
+        // a member that can never be added ends the round at once
+        assert!(g.set(n, 3, 0, 2, true) && g.set(n, 3, 1, 2, true) && g.request(&n, 3));
+        role.members[0] = (n, kv_ctrl::MemberState::NeedsFullSync, false);
+        g.on_assignment(Some(&role));
+        assert!(g.members().is_empty());
     }
 
     #[test]

@@ -178,6 +178,10 @@ impl MigOut {
 }
 
 /// The destination side of one migration on one partition.
+/// Stream bytes of one paced burst of a migration destination (with at most `WALK_KEYS`
+/// actions): a fixed step, like the walks' listing steps.
+const BURST_BYTES: usize = 256 << 10;
+
 pub struct MigIn {
     pub id: u64,
     pub phase: MigPhase,
@@ -188,6 +192,17 @@ pub struct MigIn {
     /// After `SYNC_DONE`: the prune walk and the `copy_end` it ends with; later actions wait.
     prune: Option<(KeyWalk, Seq)>,
     held: VecDeque<MemberAction>,
+    /// Pacing of the copy's own writes by position barriers (LC-36): the actions that arrived
+    /// while the writes submitted before them are not committed on this shard's ISR yet, in
+    /// stream order, with their stream bytes (handed back to the transport when they are
+    /// released, so that its admission stops reading the source meanwhile). The copy can
+    /// never run ahead of this shard's members by more than one burst, so its own writes
+    /// never make them lag (§23.8 step 4).
+    paced: VecDeque<(MemberAction, usize)>,
+    /// The last item of the burst in flight; once every item up to it executed, the highest
+    /// seq they wrote is the barrier the commit point reaches before the next burst.
+    burst_last: Option<u64>,
+    barrier: Seq,
     src_addr: SocketAddr,
     pub io: Option<StreamIo>,
     pub dial_tag: Option<u64>,
@@ -211,6 +226,9 @@ impl MigIn {
             confirmed: KeySet::default(),
             prune: None,
             held: VecDeque::new(),
+            paced: VecDeque::new(),
+            burst_last: None,
+            barrier: Seq::ZERO,
             src_addr,
             io: None,
             dial_tag: None,
@@ -245,6 +263,15 @@ impl MigIn {
         self.confirmed = KeySet::default();
         self.prune = None;
         self.held.clear();
+        self.paced.clear();
+        self.burst_last = None;
+        self.barrier = Seq::ZERO;
+    }
+
+    /// Whether the actions arriving now must wait (a burst is in flight, or its writes are
+    /// not committed yet).
+    fn gate_closed(&self, commit: Option<Seq>) -> bool {
+        self.burst_last.is_some() || commit.is_none_or(|c| c < self.barrier) || !self.paced.is_empty()
     }
 
     pub fn dial_failed(&mut self, now: u64) {
@@ -705,10 +732,32 @@ impl<B: Backend> Worker<B> {
         let mut reports = Vec::new();
         let mut prune_steps: Vec<(Request, ReplJob)> = Vec::new();
         let mut released: Vec<(u64, Vec<MemberAction>)> = Vec::new();
+        let mut paced_bursts: Vec<(u64, Vec<MemberAction>)> = Vec::new();
         let lens = |w: &Self, s: u16| w.backend.slot_len(p, 0, s);
         {
             let Some(pr) = cw.part(p) else { return };
             for mi in pr.mig_in.iter_mut() {
+                // paced actions go on once the burst before them is committed, one fixed step
+                // at a time (at most WALK_KEYS actions or BURST_BYTES of stream bytes)
+                if mi.io.is_some()
+                    && mi.burst_last.is_none()
+                    && !mi.paced.is_empty()
+                    && commit.is_some_and(|c| c >= mi.barrier)
+                {
+                    let mut bytes = 0usize;
+                    let mut acts: Vec<MemberAction> = Vec::new();
+                    while let Some((a, b)) = mi.paced.pop_front() {
+                        bytes += b;
+                        acts.push(a);
+                        if acts.len() >= WALK_KEYS as usize || bytes >= BURST_BYTES {
+                            break;
+                        }
+                    }
+                    if let Some(io) = &mi.io {
+                        io.consumed(bytes);
+                    }
+                    paced_bursts.push((mi.id, acts));
+                }
                 // the merge prune after the copy: one listing step at a time
                 if mi.io.is_some()
                     && let Some((walk, end)) = &mut mi.prune
@@ -831,6 +880,9 @@ impl<B: Backend> Worker<B> {
         for (id, acts) in released {
             self.mig_in_actions(cw, p, id, acts);
         }
+        for (id, acts) in paced_bursts {
+            self.mig_in_burst(cw, p, id, acts);
+        }
     }
 
     /// A listing step of the merge prune: deletes the keys the copy did not confirm (own
@@ -897,6 +949,9 @@ impl<B: Backend> Worker<B> {
         }
     }
 
+    /// Returns whether the frame's stream bytes are handled now (false: they wait with its
+    /// paced actions and are handed back when those are released).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn mig_in_frame(
         &mut self,
         cw: &mut ClusterWorker,
@@ -905,15 +960,17 @@ impl<B: Backend> Worker<B> {
         stream: u64,
         _term: u32,
         f: Frame,
-    ) {
+        bytes: usize,
+    ) -> bool {
         let now = self.now.boot_ns;
         let acts = {
-            let Some(pr) = cw.part(p) else { return };
+            let Some(pr) = cw.part(p) else { return true };
+            let commit = pr.primary_commit();
             let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else {
-                return;
+                return true;
             };
             if mi.io.as_ref().is_none_or(|i| i.id != stream) {
-                return;
+                return true;
             }
             mi.last_rx_ns = now;
             if let Frame::Reject(r) = &f {
@@ -925,7 +982,7 @@ impl<B: Backend> Worker<B> {
                 if let Some(io) = mi.io.take() {
                     io.abort();
                 }
-                return;
+                return true;
             }
             let mut acts = Vec::new();
             match mi.stream.on_frame(f) {
@@ -934,15 +991,42 @@ impl<B: Backend> Worker<B> {
                     if let Some(io) = mi.io.take() {
                         io.abort();
                     }
-                    return;
+                    return true;
                 }
             }
             while let Some(a) = mi.stream.next_action() {
                 acts.push(a);
             }
+            if mi.gate_closed(commit) {
+                // the bytes of the frame go back with its last action
+                let n = acts.len();
+                for (i, a) in acts.into_iter().enumerate() {
+                    mi.paced.push_back((a, if i + 1 == n { bytes } else { 0 }));
+                }
+                return false;
+            }
             acts
         };
+        self.mig_in_burst(cw, p, id, acts);
+        true
+    }
+
+    /// Submits `acts` as one burst: the next actions wait until its writes are committed.
+    fn mig_in_burst(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, acts: Vec<MemberAction>) {
+        let before = cw
+            .part(p)
+            .and_then(|pr| pr.mig_in.iter().find(|m| m.id == id))
+            .map(|mi| mi.markers.next_item());
         self.mig_in_actions(cw, p, id, acts);
+        if let Some(pr) = cw.part(p)
+            && let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id)
+            && let Some(before) = before
+        {
+            let after = mi.markers.next_item();
+            if after > before && mi.markers.executed_below() < after {
+                mi.burst_last = Some(after - 1);
+            }
+        }
     }
 
     /// Applies destination actions in stream order. From `SYNC_DONE` on they wait until the
@@ -1052,5 +1136,10 @@ impl<B: Backend> Worker<B> {
             return;
         }
         mi.markers.executed(item, wrote);
+        if mi.burst_last.is_some_and(|l| mi.markers.executed_below() > l) {
+            // the burst executed: the next one waits until its writes are committed
+            mi.burst_last = None;
+            mi.barrier = mi.barrier.max(mi.markers.written());
+        }
     }
 }

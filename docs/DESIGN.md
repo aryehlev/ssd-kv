@@ -2091,7 +2091,10 @@ primary node triggers a handoff request first (same target rule).
    `sync-mbps`/`sync-iops` buckets (or the migration's `rate_mbps` bucket), interleaved with A's live groups for those
    slots (forwarded for keys whose `(slot, fp)` is below the single scalar walk position, dropped otherwise, as in
    full sync). B applies them as its own writes (new B seqs, replicated to B's ISR) and acks A's seqs once committed on
-   B's ISR. Clients keep using A (B answers MOVED to the coordinator, which says A). Multi-key commands keep working.
+   B's ISR. B's applies advance by position barriers on its own commit point: a burst (one fixed step, at most 64
+   records or 256 KiB) is submitted only once the writes of the burst before it are committed on B's ISR; frames that
+   arrive meanwhile wait, with their stream bytes, so the transport's admission stops reading A. The copy therefore
+   never runs ahead of B's members and never makes them lag past `repl-ack-timeout-ms` (§23.8 step 4). Clients keep using A (B answers MOVED to the coordinator, which says A). Multi-key commands keep working.
 2. **Ready (position barriers only, LC-36):** when A's partition p finishes the snapshot walk of all its migrating
    slots it records `copy_end[p]` = its last executed seq. A reports `MigrationReady` once B has acknowledged (as
    committed on B's ISR) every `copy_end[p]`: a `Seq >= Seq` test against positions fixed in the past; no count of
@@ -2107,7 +2110,9 @@ primary node triggers a handoff request first (same target rule).
    coordinator committed phase Done and pushed it to B; only then does B serve. The coordinator redirects to B from the
    Cutover commit on. No command is ever held (LC-14); the TRYAGAIN window is SEAL commit + one coordinator commit
    (~2-5 ms).
-4. **Done:** after the Done commit, A purges the slots (paced deletes; `FlushSlot` replicated to A's members). A
+4. **Done:** after the Done commit, A purges the slots (paced deletes; `FlushSlot` replicated to A's members; each
+   listing step of the purge waits until A's commit point covers the deletes of the step before it, so the purge never
+   makes A's members lag). A
    finished migration leaves the primaries' projections (`ShardRole.migrations` carries running and paused tasks
    only; the record stays in `ClusterState` for `kvadm migrations`), so slots migrated back later are served again
    and purged by the shard that gave them back.

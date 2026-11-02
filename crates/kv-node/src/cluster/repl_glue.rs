@@ -343,6 +343,10 @@ pub(super) struct PartRepl {
     pub(super) mig_out: Vec<MigOut>,
     pub(super) mig_in: Vec<MigIn>,
     purge: Option<(KeyWalk, bool)>,
+    /// The purge's next listing waits until the shard commit point reaches the deletes of the
+    /// batch before it (a position barrier, LC-36): the purge never runs ahead of the members,
+    /// so its deletes never make them lag (§23.8 step 4, §23.13 step 4).
+    purge_barrier: Seq,
     meta_wait: Option<u64>,
     /// Replication requests waiting for a txn credit, and every later one (stream order).
     queued: VecDeque<(Request, ReplJob, bool)>,
@@ -414,6 +418,7 @@ impl ClusterWorker {
                 mig_out: Vec::new(),
                 mig_in: Vec::new(),
                 purge: None,
+                purge_barrier: Seq::ZERO,
                 meta_wait: None,
                 queued: VecDeque::new(),
             });
@@ -1141,13 +1146,24 @@ impl<B: Backend> Worker<B> {
                 let Some(r) = cw.streams.get(&stream).copied() else {
                     return;
                 };
-                match r {
-                    StreamRef::Member { p } => w.member_frame(cw, p, stream, term, frame),
-                    StreamRef::Primary { p, m } => w.primary_frame(cw, p, m, stream, term, frame),
-                    StreamRef::MigOut { p, id } => w.mig_out_frame(cw, p, id, stream, frame),
-                    StreamRef::MigIn { p, id } => w.mig_in_frame(cw, p, id, stream, term, frame),
+                let now = match r {
+                    StreamRef::Member { p } => {
+                        w.member_frame(cw, p, stream, term, frame);
+                        true
+                    }
+                    StreamRef::Primary { p, m } => {
+                        w.primary_frame(cw, p, m, stream, term, frame);
+                        true
+                    }
+                    StreamRef::MigOut { p, id } => {
+                        w.mig_out_frame(cw, p, id, stream, frame);
+                        true
+                    }
+                    StreamRef::MigIn { p, id } => w.mig_in_frame(cw, p, id, stream, term, frame, bytes),
+                };
+                if now {
+                    w.consumed(cw, stream, bytes);
                 }
-                w.consumed(cw, stream, bytes);
             }
             ReplEvent::Closed { stream } => w.on_closed(cw, stream),
         });
@@ -2408,6 +2424,9 @@ impl<B: Backend> Worker<B> {
                     && let Some((walk, _)) = &mut pr.purge
                 {
                     walk.busy = false;
+                    if let Some(w) = wrote {
+                        pr.purge_barrier = pr.purge_barrier.max(w);
+                    }
                 }
             }
         }
@@ -3134,10 +3153,13 @@ impl<B: Backend> Worker<B> {
         let submit;
         {
             let Some(pr) = cw.part(p) else { return };
+            let committed = pr
+                .primary_commit()
+                .is_some_and(|c| c >= pr.purge_barrier);
             let Some((walk, _)) = &mut pr.purge else {
                 return;
             };
-            if walk.busy {
+            if walk.busy || !committed {
                 return;
             }
             if walk.done() {

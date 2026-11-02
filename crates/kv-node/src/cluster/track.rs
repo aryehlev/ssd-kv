@@ -115,6 +115,21 @@ impl Markers {
         i
     }
 
+    /// The index the next item gets.
+    pub fn next_item(&self) -> u64 {
+        self.next
+    }
+
+    /// Every item below this index executed.
+    pub fn executed_below(&self) -> u64 {
+        self.executed_below
+    }
+
+    /// The highest destination seq written by the executed prefix.
+    pub fn written(&self) -> Seq {
+        self.hwm
+    }
+
     /// Item `i` executed, writing destination seq `wrote` (or nothing).
     pub fn executed(&mut self, i: u64, wrote: Option<Seq>) {
         if let Some(e) = self.items.iter_mut().find(|e| e.0 == i) {

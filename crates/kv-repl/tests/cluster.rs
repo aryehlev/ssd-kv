@@ -20,6 +20,11 @@
 //!   for 400 ms (longer than `repl-ack-timeout-ms`, shorter than the lease) under writes
 //!   never drops its healthy member from the ISR (the stall is the primary's, not the
 //!   member's), so kill -9 right after the stall still promotes the member within 3 s.
+//! * `a_bulk_migration_never_outruns_the_members`: a migration of a range holding megabytes
+//!   between two shards with one replica each: the destination's copy writes and the source's
+//!   purge advance by position barriers on their own shard's commit point, so neither shard's
+//!   members ever lag past `repl-ack-timeout-ms` (no ISR shrink), and a kill -9 of the source
+//!   primary right after it fails over at once.
 //! * `a_removed_coordinator_is_never_a_moved_target`: after `kvadm coord remove` of a follower
 //!   the data nodes take the new coordinator list even when the push that carries it keeps
 //!   the state version they applied already (the SETPEERS sync commit can reach them first):
@@ -1126,6 +1131,98 @@ fn slot_migration_under_load() {
     // a cluster node stops cleanly on SIGTERM while its streams are open
     c.stop_node(1, 20);
     c.stop_node(0, 20);
+    c.ok = true;
+}
+
+#[test]
+fn a_bulk_migration_never_outruns_the_members() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("bulkmig", 4, Duration::from_secs(300));
+    let ids: Vec<String> = c.nodes.iter().map(|n| n.id.clone()).collect();
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &ids[0], "--min-isr", "2"]);
+    c.admin(&["SLOTS", "ASSIGN", "0-8191", "1"]);
+    c.admin(&["SHARD", "CREATE", "2", "--primary", &ids[1], "--min-isr", "2"]);
+    c.admin(&["SLOTS", "ASSIGN", "8192-16383", "2"]);
+    c.wait_primary(0, 30);
+    c.wait_primary(1, 30);
+    c.admin(&["REPLICA", "ADD", "1", &ids[2]]);
+    c.admin(&["REPLICA", "ADD", "2", &ids[3]]);
+    c.wait_member(2, "in-sync isr", 60);
+    c.wait_member(3, "in-sync isr", 60);
+    // about 8 MB in the range that moves, loaded straight into the source primary
+    let n_keys = 6000usize;
+    let value = "v".repeat(1400);
+    let key = |i: usize| format!("{{bulk}}:{i}");
+    assert!(kv_common::key_slot(b"bulk") <= 8191);
+    {
+        let mut conn = Conn::open(c.node_addr(0)).unwrap();
+        for chunk in (0..n_keys).collect::<Vec<_>>().chunks(200) {
+            let mut out = Vec::new();
+            for &i in chunk {
+                kv_resp::encode_command(&[b"SET", key(i).as_bytes(), value.as_bytes()], &mut out);
+            }
+            conn.s.write_all(&out).unwrap();
+            for _ in chunk {
+                loop {
+                    match kv_resp::decode_value(&conn.buf) {
+                        Ok(Some((v, n))) => {
+                            conn.buf.drain(..n);
+                            assert!(matches!(v, Value::Simple(ref ok) if ok == b"OK"), "SET: {}", text(&v));
+                            break;
+                        }
+                        Ok(None) => {
+                            let mut b = [0u8; 65536];
+                            let n = conn.s.read(&mut b).unwrap();
+                            assert!(n > 0, "connection closed");
+                            conn.buf.extend_from_slice(&b[..n]);
+                        }
+                        Err(_) => panic!("bad reply"),
+                    }
+                }
+            }
+        }
+    }
+    let coords = c.coord_clients();
+    let w = Writer::start(coords.clone(), "bm", Duration::from_millis(2));
+    w.at_least(50, 60);
+    let shrinks = |c: &Cluster| c.log_count(0, "ISR shrink requested") + c.log_count(1, "ISR shrink requested");
+    let before = shrinks(&c);
+    let out = c.admin(&["MIGRATE", "0-8191", "--to", "2"]);
+    let id: String = out.split_whitespace().nth(2).unwrap_or("").to_owned();
+    wait_until("the bulk migration to finish", 120, || {
+        c.admin_try(&["MIGRATIONS"]).is_ok_and(|m| {
+            m.lines()
+                .any(|l| l.starts_with(&format!("{id} ")) && l.contains("phase=done"))
+        })
+    });
+    // the source purges the moved range meanwhile
+    wait_until("the source to purge the moved range", 60, || {
+        Conn::open(c.node_addr(0))
+            .and_then(|mut cs| cs.call_str(&["DBSIZE"]))
+            .is_ok_and(|v| matches!(v, Value::Int(n) if (n as usize) < 100))
+    });
+    assert_eq!(
+        shrinks(&c),
+        before,
+        "the copy or the purge made a healthy member lag past repl-ack-timeout-ms"
+    );
+    assert!(c.member_line(2).contains(" isr") && c.member_line(3).contains(" isr"));
+    // the source primary dies right after: its member takes over at once
+    let t0 = Instant::now();
+    c.kill_node(0);
+    c.wait_primary(2, 10);
+    eprintln!("promotion {:?} after the kill", t0.elapsed());
+    w.at_least(w.acks.load(Ordering::Relaxed) + 50, 60);
+    let (acked, _) = w.finish();
+    verify_acked(&coords, &acked);
+    let mut r = Routed::new(coords.clone());
+    for i in (0..n_keys).step_by(97) {
+        match r.exec(key(i).as_bytes(), &[b"GET", key(i).as_bytes()]) {
+            Outcome::Ok(Value::Bulk(Some(b))) if b == value.as_bytes() => {}
+            Outcome::Ok(other) => panic!("GET {}: {}", key(i), text(&other)),
+            Outcome::Failed(e) => panic!("GET {}: {e}", key(i)),
+        }
+    }
     c.ok = true;
 }
 

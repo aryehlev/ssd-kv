@@ -290,6 +290,8 @@ pub enum MigrationTask {
         id: u64,
         slots: SlotRanges,
         phase: MigPhase,
+        /// Further position barriers after the copy (`migrate --barriers k`, §23.13 step 2).
+        barriers: u8,
     },
     In {
         id: u64,

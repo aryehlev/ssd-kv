@@ -206,6 +206,30 @@ impl Controllers {
                         self.submit("migration done", vec![t], None);
                     }
                 }
+                NodeToCoord::MemberNeedsResync { shard, term, member } => {
+                    if let Some(t) = isr::needs_resync_transition(&s, &from, shard, term, member) {
+                        tracing::warn!(shard = shard.0, member = %member.hex40(),
+                            "member cannot catch up by continue or repair: needs-full-sync (kvadm replica resync)");
+                        self.submit("member needs resync", vec![t], None);
+                    }
+                }
+                NodeToCoord::HandoffRequest { shard, term } => {
+                    // a primary that is shutting down asks to hand its shard off first (§23.12)
+                    let ok = s
+                        .shard(shard)
+                        .is_some_and(|sh| sh.term == term && sh.primary == Some(from) && sh.status == ShardStatus::Serving);
+                    if ok && self.claim(false, shard, Instant::now()) {
+                        tracing::info!(shard = shard.0, "handoff requested by the primary (shutdown)");
+                        let me = self.clone();
+                        tokio::spawn(async move {
+                            let r = failover::run_handoff(me.wsr.clone(), me.pusher.clone(), shard, None).await;
+                            if let Err(e) = &r {
+                                tracing::info!(shard = shard.0, "shutdown handoff: {e}");
+                            }
+                            me.release(false, shard, Duration::from_millis(500));
+                        });
+                    }
+                }
                 _ => {}
             },
         }
@@ -996,6 +1020,39 @@ fn js(s: &str) -> String {
 }
 
 /// `kvadm status`: a read-only summary of the committed state and this coordinator's view.
+/// States that wait for the operator (no automatic path leaves them, LC-25): members that need
+/// a resync, paused migrations, shards without a serving primary. One line each.
+fn attention(s: &ClusterState) -> Vec<String> {
+    let mut out = Vec::new();
+    for sh in &s.shards {
+        if sh.status == ShardStatus::NoPrimary {
+            out.push(format!(
+                "shard {} has no eligible member to promote (CLUSTERDOWN for its slots): it serves again when its primary returns, or after operator action",
+                sh.id.0
+            ));
+        }
+        for m in &sh.members {
+            if m.state == MemberState::NeedsFullSync {
+                out.push(format!(
+                    "member {} of shard {} cannot catch up by continue or repair: kvadm replica resync {}",
+                    m.node.hex40(),
+                    sh.id.0,
+                    m.node.hex40()
+                ));
+            }
+        }
+    }
+    for m in &s.migrations {
+        if m.phase == MigPhase::Paused {
+            out.push(format!(
+                "migration {} is paused (a failover of its source or destination): kvadm migrate resume {} or kvadm migrate abort {}",
+                m.id, m.id, m.id
+            ));
+        }
+    }
+    out
+}
+
 fn status_text(ctl: &Controllers, json: bool) -> String {
     let wsr = &ctl.wsr;
     let s = wsr.committed();
@@ -1096,6 +1153,13 @@ fn status_text(ctl: &Controllers, json: bool) -> String {
                 m.barriers
             ));
         }
+        o.push_str("],\"attention\":[");
+        for (i, a) in attention(&s).iter().enumerate() {
+            if i > 0 {
+                o.push(',');
+            }
+            o.push_str(&js(a));
+        }
         o.push_str(&format!(
             "],\"assigned_slots\":{},\"rebalance\":{{\"running\":{},\"done\":{},\"total\":{},\"outcome\":{}}}}}",
             s.assigned_slots(),
@@ -1180,6 +1244,13 @@ fn status_text(ctl: &Controllers, json: bool) -> String {
     }
     if reb.total > 0 || reb.running {
         t.push_str(&format!("rebalance: {} ({}/{})\n", reb.outcome, reb.done, reb.total));
+    }
+    let att = attention(&s);
+    if !att.is_empty() {
+        t.push_str(&format!("operator action needed ({}):\n", att.len()));
+        for a in att {
+            t.push_str(&format!("  {a}\n"));
+        }
     }
     t
 }

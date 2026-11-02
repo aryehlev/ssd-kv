@@ -14,8 +14,8 @@
 //! every earlier frame for these slots precedes it) and, after the cutover, `SEAL`. The
 //! destination acknowledges a marker's position once every item before it executed as its own
 //! write and its shard's commit point covers those writes; the source tests barriers against
-//! those positions only (LC-36). The number of further barriers is not part of the pushed
-//! assignment; the source uses the default of `kvadm migrate --barriers` (2).
+//! those positions only (LC-36). The number of further barriers is the migration's
+//! `--barriers k`, carried by the pushed `MigrationTask::Out`.
 
 use std::net::SocketAddr;
 
@@ -41,8 +41,6 @@ use super::{AgentMsg, before, same_token};
 use crate::runtime::backend::{Backend, ReplOut, ReplWork};
 use crate::runtime::worker::Worker;
 
-/// Further barriers after `copy_end` (`kvadm migrate --barriers`, default).
-const BARRIERS: u8 = 2;
 /// Pause before a destination redials its source.
 const REDIAL_NS: u64 = 200_000_000;
 /// A source repeats its position marker at least this often.
@@ -74,17 +72,19 @@ pub struct MigOut {
     sealed: bool,
     ready_reported: bool,
     rate: u64,
+    /// Further barriers after `copy_end` (the migration's `--barriers k`).
+    barriers: u8,
     /// When the last position marker was written (boot ns).
     pos_sent_ns: u64,
 }
 
 impl MigOut {
-    fn new(id: u64, phase: MigPhase, slots: Vec<u16>, rate: u64) -> Self {
+    fn new(id: u64, phase: MigPhase, slots: Vec<u16>, rate: u64, barriers: u8) -> Self {
         let rate = rate.max(1);
         MigOut {
             id,
             phase,
-            src: MigrationSource::new(id, &slots, BARRIERS),
+            src: MigrationSource::new(id, &slots, barriers),
             walk: KeyWalk::new(slots.clone()),
             slots,
             io: None,
@@ -98,6 +98,7 @@ impl MigOut {
             sealed: false,
             ready_reported: false,
             rate,
+            barriers,
             pos_sent_ns: 0,
         }
     }
@@ -108,7 +109,7 @@ impl MigOut {
             old.abort();
         }
         self.epoch += 1;
-        self.src = MigrationSource::new(self.id, &self.slots, BARRIERS);
+        self.src = MigrationSource::new(self.id, &self.slots, self.barriers);
         self.walk = KeyWalk::new(self.slots.clone());
         self.reading = false;
         self.begun = false;
@@ -283,11 +284,18 @@ impl<B: Backend> Worker<B> {
                 continue;
             }
             match t {
-                MigrationTask::Out { id, phase, .. } if active(*phase) => {
+                MigrationTask::Out {
+                    id,
+                    phase,
+                    barriers,
+                    ..
+                } if active(*phase) => {
                     keep_out.push(*id);
                     match pr.mig_out.iter_mut().find(|m| m.id == *id) {
                         Some(m) => m.phase = *phase,
-                        None => pr.mig_out.push(MigOut::new(*id, *phase, slots, rate)),
+                        None => pr
+                            .mig_out
+                            .push(MigOut::new(*id, *phase, slots, rate, *barriers)),
                     }
                 }
                 MigrationTask::In {

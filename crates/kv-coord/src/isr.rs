@@ -9,6 +9,11 @@
 //! `MemberReady` closes a member's catch-up: a repaired ISR member (Reconciling) becomes InSync
 //! and is advertised again; a member that finished an operator-started full sync (Syncing)
 //! becomes CatchingUp until its primary's `IsrExpand`.
+//!
+//! `MemberNeedsResync` from the primary records that a member cannot catch up by Continue or
+//! Repair (§23.7 case 4): its state becomes NeedsFullSync (it leaves the ISR through this
+//! committed change, so the primary stops waiting for it only once the assignment arrives),
+//! shown by `kvadm status`; only `kvadm replica resync` starts its full sync (LC-25).
 
 use kv_ctrl::{MemberState, NodeId, ShardId};
 use kv_topo::{ClusterState, Transition};
@@ -67,6 +72,31 @@ pub fn member_ready_transition(
     })
 }
 
+/// The transition for `MemberNeedsResync { shard, term, member }` sent by `from` (only the
+/// shard's primary of `term` decides that), or `None` when stale or already recorded.
+pub fn needs_resync_transition(
+    s: &ClusterState,
+    from: &NodeId,
+    shard: ShardId,
+    term: u32,
+    member: NodeId,
+) -> Option<Transition> {
+    let sh = s.shard(shard)?;
+    if sh.term != term || sh.primary != Some(*from) || sh.primary == Some(member) {
+        return None;
+    }
+    let m = sh.member(&member)?;
+    if matches!(m.state, MemberState::NeedsFullSync | MemberState::Syncing) {
+        // already recorded, or the operator's full sync runs (its handshake is a Full)
+        return None;
+    }
+    Some(Transition::MemberState {
+        shard,
+        node: member,
+        state: MemberState::NeedsFullSync,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use kv_topo::{AdminOp, ClusterParams};
@@ -120,5 +150,26 @@ mod tests {
         // membership is unchanged by ISR changes
         assert_eq!(s.shard(sh).unwrap().members.len(), 2);
         assert_eq!(s.nodes.len(), 3);
+    }
+
+    /// The primary records a member it refused with NeedOperatorResync: the member leaves the
+    /// ISR as NeedsFullSync (the precondition of `replica resync`); nothing else starts a sync.
+    #[test]
+    fn needs_resync_is_recorded_from_the_primary_only() {
+        let s = state();
+        let sh = ShardId(1);
+        let t = isr_transition(&s, sh, 1, nid(2), true).unwrap();
+        let s = s.apply(&[t]).unwrap();
+        assert!(needs_resync_transition(&s, &nid(2), sh, 1, nid(2)).is_none(), "not the primary");
+        assert!(needs_resync_transition(&s, &nid(1), sh, 2, nid(2)).is_none(), "wrong term");
+        assert!(needs_resync_transition(&s, &nid(1), sh, 1, nid(1)).is_none(), "the primary itself");
+        let t = needs_resync_transition(&s, &nid(1), sh, 1, nid(2)).unwrap();
+        let s = s.apply(&[t]).unwrap();
+        let m = s.shard(sh).unwrap().member(&nid(2)).unwrap();
+        assert_eq!(m.state, MemberState::NeedsFullSync);
+        assert!(!m.in_isr);
+        assert!(needs_resync_transition(&s, &nid(1), sh, 1, nid(2)).is_none(), "recorded once");
+        assert!(s.resync_allowed(&nid(2), false).is_ok(), "replica resync is accepted now");
+        assert!(isr_transition(&s, sh, 1, nid(2), true).is_none(), "never expanded by itself");
     }
 }

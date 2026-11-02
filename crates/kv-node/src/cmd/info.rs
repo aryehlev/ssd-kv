@@ -293,10 +293,26 @@ fn render(shared: &NodeShared, sel: Selection) -> String {
                 f!("rejected_connections", workers.rejected_connections);
             }
             Section::Replication => {
-                // role and replica count only (LC-24, LC-28); the node's cluster role reaches
-                // INFO through the ownership projection once replication is wired
-                f!("role", "master");
-                f!("connected_slaves", 0);
+                // role, member count and link state only (LC-24, LC-28): no shard id, term,
+                // seq, lag position or peer identity
+                match shared.cluster() {
+                    Some(cs) if shared.ownership.read().is_replica() => {
+                        f!("role", "slave");
+                        f!("connected_slaves", 0);
+                        f!(
+                            "master_link_status",
+                            if cs.member_links_up() { "up" } else { "down" }
+                        );
+                    }
+                    Some(cs) => {
+                        f!("role", "master");
+                        f!("connected_slaves", cs.connected_members());
+                    }
+                    None => {
+                        f!("role", "master");
+                        f!("connected_slaves", 0);
+                    }
+                }
             }
             Section::Cluster => f!("cluster_enabled", u8::from(cfg.cluster_enabled)),
             Section::Keyspace => {

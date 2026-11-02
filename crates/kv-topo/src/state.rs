@@ -634,6 +634,7 @@ impl ClusterState {
                     id: m.id,
                     slots: m.slots.clone(),
                     phase: m.phase,
+                    barriers: m.barriers,
                 });
             } else if m.dst == shard {
                 let src_repl = self

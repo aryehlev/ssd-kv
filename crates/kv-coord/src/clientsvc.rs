@@ -517,9 +517,24 @@ impl Svc {
             ));
         }
         if want(b"cluster") {
-            t.push_str("# Cluster\r\ncluster_enabled:1\r\n\r\n");
+            t.push_str("# Cluster\r\ncluster_enabled:1\r\n");
+            // states that wait for the operator (`kvadm status` lists them one by one)
+            let resync = s
+                .shards
+                .iter()
+                .flat_map(|sh| sh.members.iter())
+                .filter(|m| m.state == kv_ctrl::MemberState::NeedsFullSync)
+                .count();
+            let paused = s.migrations.iter().filter(|m| m.phase == kv_ctrl::MigPhase::Paused).count();
+            let no_primary = s
+                .shards
+                .iter()
+                .filter(|sh| sh.status == kv_topo::state::ShardStatus::NoPrimary)
+                .count();
+            t.push_str(&format!(
+                "cluster_members_need_resync:{resync}\r\ncluster_migrations_paused:{paused}\r\ncluster_shards_without_primary:{no_primary}\r\n\r\n"
+            ));
         }
-        let _ = s;
         while t.ends_with("\r\n\r\n") {
             t.truncate(t.len() - 2);
         }

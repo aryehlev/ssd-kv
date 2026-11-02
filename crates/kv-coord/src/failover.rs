@@ -122,9 +122,42 @@ async fn lease_gone(wsr: &Wsr, push: &Pusher, n: &NodeId) -> Result<(), Failover
     }
 }
 
+/// While a failover fences a node other than the failed primary, that primary gets no lease
+/// (so the step 4 wait for its lease ends); released when the failover run ends, however it
+/// ends.
+struct LeaseHoldOff {
+    push: Arc<Pusher>,
+    node: NodeId,
+    on: bool,
+}
+
+impl LeaseHoldOff {
+    fn new(push: &Arc<Pusher>, node: NodeId) -> Self {
+        LeaseHoldOff { push: push.clone(), node, on: false }
+    }
+
+    fn set(&mut self) {
+        if !self.on {
+            self.on = true;
+            let n = self.node;
+            self.push.with_lease(|ls| ls.detector.hold_off(n));
+        }
+    }
+}
+
+impl Drop for LeaseHoldOff {
+    fn drop(&mut self) {
+        if self.on {
+            let n = self.node;
+            self.push.with_lease(|ls| ls.detector.release_hold(&n));
+        }
+    }
+}
+
 pub async fn run_failover(wsr: Arc<Wsr>, push: Arc<Pusher>, shard: ShardId, failed: NodeId) -> Result<(), FailoverError> {
     new_leader_wait(&wsr, &push).await?;
     let mut unusable: Vec<NodeId> = Vec::new();
+    let mut hold = LeaseHoldOff::new(&push, failed);
     loop {
         if !wsr.is_leader() {
             return Err(FailoverError::NotLeader);
@@ -154,6 +187,11 @@ pub async fn run_failover(wsr: Arc<Wsr>, push: Arc<Pusher>, shard: ShardId, fail
         let new_term = term.checked_add(1).ok_or(FailoverError::Superseded)?;
         let partitions = usize::from(s.params.partitions);
         let req = push.next_req();
+        if n != failed {
+            // From the fence on, the failed primary's lease only runs out: the leader grants
+            // it no new one (its renewals may be healthy again), so the wait below ends.
+            hold.set();
+        }
         // One fence, to the chosen node only; no other node is asked anything.
         let takeover = match push
             .request(&n, CoordToNode::Fence { req, shard, new_term }, FENCE_TIMEOUT)

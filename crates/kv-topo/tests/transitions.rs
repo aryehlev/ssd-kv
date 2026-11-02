@@ -953,7 +953,8 @@ fn migration_lifecycle() {
         vec![MigrationTask::Out {
             id: 1,
             slots: ranges(0, 99),
-            phase: MigPhase::Copy
+            phase: MigPhase::Copy,
+            barriers: 2,
         }]
     );
     let inn = n.assignment_for(&nid(2), 1, &[]).role.unwrap().migrations;

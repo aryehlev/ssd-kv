@@ -191,9 +191,10 @@ pub fn command_getkeys(
 // ---------------------------------------------------------------------------------------------
 // keyspace-wide commands
 
-/// DBSIZE: the sum of the partitions' published key counts of the connection's database.
+/// DBSIZE: the sum of the partitions' published key counts of the connection's database (in
+/// cluster mode only the keys of the slots this node serves).
 pub fn dbsize(cx: &mut ConnCtx<'_>, _a: &Args<'_>, w: &mut ReplyWriter<'_>) -> ConnOutcome {
-    w.int(cx.shared.dbsize(cx.conn.db) as i64);
+    w.int(cx.shared.served_dbsize(cx.conn.db) as i64);
     ConnOutcome::Done
 }
 

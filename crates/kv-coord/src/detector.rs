@@ -26,6 +26,17 @@ pub struct Detector {
     /// Nodes that restarted (new incarnation) or reported `health.failed` and whose FAIL flag is
     /// not committed yet: no lease is granted to them meanwhile.
     fail_pending: hashbrown::HashSet<NodeId, foldhash::fast::RandomState>,
+    /// Recorded primaries of shards whose running failover has fenced (or is fencing) another
+    /// node: no lease is granted to them until that failover ends, so its wait for their lease
+    /// (§23.9 step 4) always ends. Without this, a primary that renews healthy again while its
+    /// shard waits for a promotion keeps its lease forever and the shard never serves again.
+    held_off: hashbrown::HashSet<NodeId, foldhash::fast::RandomState>,
+    /// When this leadership's detector first saw each node in the committed state: a node
+    /// added after the leader started is silent since its addition, not since the leader's
+    /// start (otherwise a freshly added node is flagged FAIL before it could renew once).
+    first_seen: hashbrown::HashMap<NodeId, u64, foldhash::fast::RandomState>,
+    /// `first_seen` holds the nodes registered when this leadership started.
+    primed: bool,
 }
 
 impl Default for Detector {
@@ -39,6 +50,9 @@ impl Detector {
         Detector {
             pfail: hashbrown::HashSet::default(),
             fail_pending: hashbrown::HashSet::default(),
+            held_off: hashbrown::HashSet::default(),
+            first_seen: hashbrown::HashMap::default(),
+            primed: false,
         }
     }
 
@@ -62,15 +76,35 @@ impl Detector {
         self.fail_pending.insert(n);
     }
 
-    /// May the leader grant `n` a lease? Not while a FAIL flag is committed or pending.
+    /// May the leader grant `n` a lease? Not while a FAIL flag is committed or pending, and not
+    /// while a failover that fenced another node waits for `n`'s lease to end.
     pub fn may_grant(&self, s: &ClusterState, n: &NodeId) -> bool {
-        !self.fail_pending.contains(n) && s.node(n).is_some_and(|r| !r.flags.fail)
+        !self.fail_pending.contains(n) && !self.held_off.contains(n) && s.node(n).is_some_and(|r| !r.flags.fail)
+    }
+
+    /// A failover of the shard whose recorded primary is `n` fences another node: `n` gets no
+    /// lease until [`Detector::release_hold`].
+    pub fn hold_off(&mut self, n: NodeId) {
+        self.held_off.insert(n);
+    }
+
+    /// The failover that held `n`'s leases off ended.
+    pub fn release_hold(&mut self, n: &NodeId) {
+        self.held_off.remove(n);
+    }
+
+    /// Whether `n`'s leases are held off by a running failover.
+    pub fn held_off(&self, n: &NodeId) -> bool {
+        self.held_off.contains(n)
     }
 
     /// Forgets all suspicion (the coordinator stopped leading).
     pub fn clear(&mut self) {
         self.pfail.clear();
         self.fail_pending.clear();
+        self.held_off.clear();
+        self.first_seen.clear();
+        self.primed = false;
     }
 
     /// One detection pass at `now_ns` (CLOCK_BOOTTIME). `leader_since_ns` is when this
@@ -88,13 +122,23 @@ impl Detector {
             + u64::from(s.params.fail_grace_ms) * 1_000_000;
         self.pfail.retain(|n| s.node(n).is_some());
         self.fail_pending.retain(|n| s.node(n).is_some());
+        self.held_off.retain(|n| s.node(n).is_some());
+        self.first_seen.retain(|n, _| s.node(n).is_some());
+        if !self.primed {
+            // the nodes registered when the leadership started are silent since its start
+            self.primed = true;
+            for rec in &s.nodes {
+                self.first_seen.insert(rec.id, leader_since_ns);
+            }
+        }
         let mut out = Vec::new();
         for rec in &s.nodes {
             let n = rec.id;
-            let last = leases
-                .last_renew(&n)
-                .unwrap_or(leader_since_ns)
-                .max(leader_since_ns);
+            let seen = *self.first_seen.entry(n).or_insert(now_ns);
+            let renewed = leases.last_renew(&n);
+            // never renewed: silent since the leader started or since the node was added,
+            // whichever is later
+            let last = renewed.unwrap_or(seen).max(leader_since_ns);
             let silent = now_ns.saturating_sub(last);
             if silent > 3 * renew_ns {
                 self.pfail.insert(n);
@@ -109,12 +153,19 @@ impl Detector {
                     && !awaiting_promotion(s, &n) {
                         out.push(Transition::Health { node: n, fail: false });
                     }
-            } else if silent >= fail_after || self.fail_pending.contains(&n) {
+            } else if self.fail_pending.contains(&n) || (silent >= fail_after && (renewed.is_some() || has_role(s, &n))) {
+                // a node that never renewed to this leader and has no shard role is not
+                // flagged: it is still joining (`node add`) and its flag would change nothing
                 out.push(Transition::Health { node: n, fail: true });
             }
         }
         out
     }
+}
+
+/// `n` is a member of some shard.
+fn has_role(s: &ClusterState, n: &NodeId) -> bool {
+    s.shards.iter().any(|sh| sh.member(n).is_some())
 }
 
 /// `n` is the recorded primary of a shard waiting for a promotion of another member.
@@ -194,6 +245,56 @@ mod tests {
         assert!(out.iter().any(|t| matches!(t, Transition::Health { node, fail: true } if *node == nid(2))));
     }
 
+    /// A recorded primary whose shard's failover fenced another node gets no lease while that
+    /// failover runs, even when it renews healthy (otherwise the wait for its lease never ends
+    /// and the shard stays down).
+    #[test]
+    fn a_held_off_primary_gets_no_lease_until_released() {
+        let s = state();
+        let mut d = Detector::new();
+        assert!(d.may_grant(&s, &nid(1)));
+        d.hold_off(nid(1));
+        assert!(d.held_off(&nid(1)));
+        assert!(!d.may_grant(&s, &nid(1)));
+        assert!(d.may_grant(&s, &nid(2)), "only that node");
+        d.release_hold(&nid(1));
+        assert!(d.may_grant(&s, &nid(1)));
+        d.hold_off(nid(1));
+        d.clear();
+        assert!(d.may_grant(&s, &nid(1)), "a new leadership starts without holds");
+    }
+
+    /// A node added after the leader started is silent since its addition: it gets the full
+    /// grace before PFAIL/FAIL, and without a shard role it is never flagged before its first
+    /// renewal.
+    #[test]
+    fn a_freshly_added_node_is_not_flagged_before_it_renews() {
+        let s = state();
+        let mut l = LeaseTable::new(s.params.lease_ms);
+        let mut d = Detector::new();
+        let since = 1_000 * MS;
+        l.on_renew(nid(1), 1, since);
+        l.on_renew(nid(2), 1, since);
+        assert!(d.tick(&s, &l, since + 10 * MS, since).is_empty());
+        // node 3 is added an hour into the leadership
+        let t_add = since + 3_600_000 * MS;
+        l.on_renew(nid(1), 1, t_add);
+        l.on_renew(nid(2), 1, t_add);
+        let s3 = s.apply(&[crate::failover::test_support::node_add(nid(3), 9500, s.params.partitions)]).unwrap();
+        assert!(d.tick(&s3, &l, t_add + MS, since).is_empty(), "not at once");
+        assert!(!d.suspected(&nid(3)));
+        l.on_renew(nid(1), 1, t_add + 5_000 * MS);
+        l.on_renew(nid(2), 1, t_add + 5_000 * MS);
+        let out = d.tick(&s3, &l, t_add + 5_000 * MS, since);
+        assert!(out.is_empty(), "no role and never renewed: never flagged");
+        assert!(d.suspected(&nid(3)), "PFAIL only (leader RAM)");
+        // once it renewed, the normal rule applies
+        l.on_renew(nid(3), 7, t_add + 5_000 * MS);
+        assert!(d.tick(&s3, &l, t_add + 5_100 * MS, since).is_empty());
+        let out = d.tick(&s3, &l, t_add + 7_000 * MS, since);
+        assert!(out.iter().any(|t| matches!(t, Transition::Health { node, fail: true } if *node == nid(3))));
+    }
+
     #[test]
     fn leader_start_is_the_baseline_for_silent_nodes() {
         let s = state();
@@ -201,6 +302,10 @@ mod tests {
         let mut d = Detector::new();
         let since = 5_000 * MS;
         assert!(d.tick(&s, &l, since + 1000 * MS, since).is_empty());
-        assert_eq!(d.tick(&s, &l, since + 1712 * MS, since).len(), 2);
+        let out = d.tick(&s, &l, since + 1712 * MS, since);
+        // node 1 (a shard primary) is flagged; node 2 has no role and never renewed: PFAIL only
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Transition::Health { node, fail: true } if node == nid(1)));
+        assert!(d.suspected(&nid(2)));
     }
 }

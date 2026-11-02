@@ -121,6 +121,20 @@ pub enum NodeToCoord {
     SealDone {
         id: u64,
     },
+    /// Primary: `member` cannot catch up by Continue or Repair (its handshake was refused with
+    /// `NeedOperatorResync`): only `replica resync` can bring it back (§23.7 case 4). The
+    /// coordinator records the member state NeedsFullSync; nothing starts a sync by itself.
+    MemberNeedsResync {
+        shard: ShardId,
+        term: u32,
+        member: NodeId,
+    },
+    /// Primary: the node is shutting down (SIGTERM) and asks for a graceful handoff of
+    /// `shard` first (§23.12; the target is chosen by the coordinator's static rule).
+    HandoffRequest {
+        shard: ShardId,
+        term: u32,
+    },
 }
 
 impl NodeToCoord {
@@ -159,6 +173,8 @@ impl NodeToCoord {
             NodeToCoord::MemberReady { .. } => "member-ready",
             NodeToCoord::MigrationReady { .. } => "migration-ready",
             NodeToCoord::SealDone { .. } => "seal-done",
+            NodeToCoord::MemberNeedsResync { .. } => "member-needs-resync",
+            NodeToCoord::HandoffRequest { .. } => "handoff-request",
         }
     }
 }

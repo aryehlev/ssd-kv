@@ -230,6 +230,17 @@ impl NodeShared {
         self.counters.iter().map(|c| c.keys(db)).sum()
     }
 
+    /// DBSIZE as clients see it: in cluster mode the keys of slots this node does not serve
+    /// (an inert migration copy, slots being purged) are left out (§23.14: keyless commands act
+    /// on the node's own slots).
+    pub fn served_dbsize(&self, db: u8) -> u64 {
+        let all = self.dbsize(db);
+        match self.cluster() {
+            Some(cs) if db == 0 => all.saturating_sub(cs.unserved_keys()),
+            _ => all,
+        }
+    }
+
     /// Asks every worker to stop (SHUTDOWN, SIGTERM/SIGINT); idempotent.
     pub fn request_shutdown(&self) {
         if !self.shutdown.swap(true, Ordering::AcqRel) {

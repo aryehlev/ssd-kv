@@ -59,6 +59,11 @@ pub struct Ownership {
     syncing: Option<Arc<[AtomicBool]>>,
     /// A graceful handoff runs (shared with the agent).
     handoff: Option<Arc<AtomicBool>>,
+    /// Primary: a migration from or to this shard is running (Copy, Ready or Cutover): keyless
+    /// writes (FLUSHDB, FLUSHALL) are refused until it is Done, paused or aborted, since a flush
+    /// on either side would make the destination's copy disagree with what the source
+    /// acknowledged.
+    migrating: bool,
 }
 
 /// Decision of the gate.
@@ -71,6 +76,8 @@ pub enum Gate {
     TryAgain,
     ReadOnlyReplica,
     ClusterDown,
+    /// A keyless write (FLUSHDB/FLUSHALL) while a migration of this shard runs.
+    MigrationRunning,
 }
 
 /// opaque predicate: does this node serve slot s for keyless walks
@@ -107,6 +114,7 @@ impl Ownership {
             partitions: 1,
             syncing: None,
             handoff: None,
+            migrating: false,
         }
     }
 
@@ -141,6 +149,7 @@ impl Ownership {
             o.owned = r.owned_slots.clone();
             o.isr_len =
                 (1 + r.members.iter().filter(|(_, _, in_isr)| *in_isr).count()).min(255) as u8;
+            o.migrating = r.migrations.iter().any(|t| t.phase().is_active());
             for t in &r.migrations {
                 match t {
                     // the cutover moved these slots to the destination: never served here again
@@ -214,6 +223,7 @@ impl Ownership {
             }
             return match self.role {
                 Some(Role::Primary) if lease_ok && self.in_handoff() => Gate::TryAgain,
+                Some(Role::Primary) if lease_ok && self.migrating => Gate::MigrationRunning,
                 Some(Role::Primary) if lease_ok && self.isr_len < self.min_isr => Gate::NoReplicas,
                 Some(Role::Primary) if lease_ok => Gate::Serve,
                 Some(Role::Replica) => Gate::ReadOnlyReplica,
@@ -280,6 +290,11 @@ impl Ownership {
     /// Whether this node is the shard primary (replies of writes wait for the shard commit).
     pub fn is_primary(&self) -> bool {
         self.role == Some(Role::Primary)
+    }
+
+    /// Whether this node is a replica of a shard (INFO replication `role:slave`).
+    pub fn is_replica(&self) -> bool {
+        self.mode == Mode::Cluster && self.role == Some(Role::Replica)
     }
 
     /// Writes committed now would reach fewer ISR members than `min_isr` (their replies are
@@ -459,11 +474,22 @@ mod tests {
             id: 1,
             slots: SlotRanges::parse("0-9").unwrap(),
             phase: MigPhase::Cutover,
+            barriers: 2,
         };
         let o = Ownership::from_assignment(&assignment(true, "0-99", vec![src], 2, 1));
         assert!(
             matches!(o.gate(Some(3), R, false, true, 0), Gate::Moved(..)),
             "sealed out at the source"
+        );
+        assert_eq!(
+            o.gate(None, W, false, true, 0),
+            Gate::MigrationRunning,
+            "no FLUSHDB/FLUSHALL while the migration runs"
+        );
+        assert_eq!(
+            o.gate(None, R, false, true, 0),
+            Gate::Serve,
+            "keyless reads are served"
         );
         assert!(!o.slot_filter().serves(3) && o.slot_filter().serves(10));
         let dst = MigrationTask::In {

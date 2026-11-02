@@ -177,7 +177,9 @@ fn reply_variants_carry_no_topology_fields() {
             "IsrExpand",
             "MemberReady",
             "MigrationReady",
-            "SealDone"
+            "SealDone",
+            "MemberNeedsResync",
+            "HandoffRequest"
         ]
     );
     let replies = ["HelloAck", "AssignAck", "FenceAck", "HandoffDone", "Error"];
@@ -220,6 +222,15 @@ fn reply_variants_carry_no_topology_fields() {
         },
         NodeToCoord::Error(NodeError::StaleAssignment),
         NodeToCoord::SealDone { id: 1 },
+        NodeToCoord::MemberNeedsResync {
+            shard: ShardId(1),
+            term: 2,
+            member: NodeId([3; 20]),
+        },
+        NodeToCoord::HandoffRequest {
+            shard: ShardId(1),
+            term: 2,
+        },
     ];
     for s in &samples {
         assert_eq!(
@@ -364,6 +375,7 @@ fn sample_assignment(slots: &[u16], password: Option<String>) -> NodeAssignment 
                     id: 1,
                     slots: SlotRanges(vec![(0, 10)]),
                     phase: MigPhase::Copy,
+                    barriers: 2,
                 },
                 MigrationTask::In {
                     id: 2,
@@ -488,6 +500,17 @@ fn node_msg() -> impl Strategy<Value = NodeToCoord> {
         }),
         any::<u64>().prop_map(|id| NodeToCoord::MigrationReady { id }),
         any::<u64>().prop_map(|id| NodeToCoord::SealDone { id }),
+        (any::<u16>(), any::<u32>(), node_id()).prop_map(|(s, term, member)| {
+            NodeToCoord::MemberNeedsResync {
+                shard: ShardId(s),
+                term,
+                member,
+            }
+        }),
+        (any::<u16>(), any::<u32>()).prop_map(|(s, term)| NodeToCoord::HandoffRequest {
+            shard: ShardId(s),
+            term,
+        }),
     ]
 }
 

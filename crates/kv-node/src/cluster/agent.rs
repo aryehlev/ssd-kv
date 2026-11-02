@@ -24,8 +24,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use kv_ctrl::{
-    CoordToNode, Health, MigPhase, MigrationTask, NodeAssignment, NodeError, NodeId, NodeToCoord,
-    ShardId,
+    CoordToNode, Health, MemberState, MigPhase, MigrationTask, NodeAssignment, NodeError, NodeId,
+    NodeToCoord, ShardId,
 };
 use kv_storage::metastore::{MetaDone, MetaReq};
 use kv_storage::partition::PartState;
@@ -69,6 +69,9 @@ const HANDOFF_LIMIT: Duration = Duration::from_secs(6);
 const PERSIST_LIMIT: Duration = Duration::from_secs(10);
 /// Period of repeated node-initiated reports not yet reflected by an assignment.
 const REPORT_REPEAT: Duration = Duration::from_millis(1000);
+/// Longest wait of a shutting-down primary for its handoff (the coordinator's handoff bound is
+/// 5 s): after it the node shuts down anyway and its shard fails over by lease expiry.
+const SHUTDOWN_HANDOFF_LIMIT: Duration = Duration::from_secs(8);
 
 /// Runs the agent until shutdown.
 pub fn run(shared: Arc<NodeShared>) -> std::io::Result<()> {
@@ -193,6 +196,9 @@ struct Agent {
     handoffs: hashbrown::HashMap<u64, WorkerGather, foldhash::fast::RandomState>,
     expand: hashbrown::HashMap<NodeId, (u32, Gather), foldhash::fast::RandomState>,
     shrink_sent: hashbrown::HashMap<NodeId, std::time::Instant, foldhash::fast::RandomState>,
+    /// When the last `HandoffRequest` of a shutting-down primary was sent.
+    handoff_requested: Option<std::time::Instant>,
+    resync_sent: hashbrown::HashMap<NodeId, std::time::Instant, foldhash::fast::RandomState>,
     ready: (u32, Gather),
     mig_ready: hashbrown::HashMap<u64, Gather, foldhash::fast::RandomState>,
     sealed: hashbrown::HashMap<u64, Gather, foldhash::fast::RandomState>,
@@ -216,6 +222,8 @@ impl Agent {
             handoffs: Default::default(),
             expand: Default::default(),
             shrink_sent: Default::default(),
+            handoff_requested: None,
+            resync_sent: Default::default(),
             ready: (0, Gather::new(p)),
             mig_ready: Default::default(),
             sealed: Default::default(),
@@ -514,6 +522,28 @@ impl Agent {
             self.lease_held_back = false;
             self.handoffs.clear();
         }
+        // after an unclean restart a primary role of the term served before it is not served
+        // again: the node applies it as a member without a primary (it serves nothing for the
+        // shard) and reports `health.failed` until the coordinator moves the shard to a newer
+        // term (the normal failover path, which may promote this node again at that term)
+        let refuse = self.cs.refuses_primary(&a);
+        if refuse != self.cs.refusing_primary.swap(refuse, Ordering::AcqRel) || refuse {
+            if refuse {
+                tracing::warn!(
+                    version = a.version,
+                    "restarted after a crash as a shard primary: that term is not served again; reporting failed until a newer term is assigned"
+                );
+            } else {
+                tracing::info!("a newer assignment arrived: the restart hold ends");
+            }
+        }
+        let mut a = a;
+        if refuse && let Some(r) = a.role.as_mut() {
+            r.is_primary = false;
+            r.primary_repl = None;
+            r.members.clear();
+            r.migrations.clear();
+        }
         let a: Arc<NodeAssignment> = Arc::from(a);
         self.current = Some(a.order_key());
         *self.cs.assignment.write() = Some(a.clone());
@@ -635,6 +665,36 @@ impl Agent {
                     self.shrink_sent.insert(member, std::time::Instant::now());
                     tracing::info!(member = %member.hex40(), "replica is not acknowledging: ISR shrink requested");
                     self.send_all(&NodeToCoord::IsrShrink {
+                        shard: ShardId(shard),
+                        term,
+                        member,
+                    });
+                }
+            }
+            AgentMsg::NeedsResync {
+                shard,
+                term,
+                member,
+            } => {
+                let a = self.cs.assignment();
+                let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else {
+                    return;
+                };
+                let recorded = role.members.iter().any(|(n, st, _)| {
+                    *n == member && matches!(st, MemberState::NeedsFullSync | MemberState::Syncing)
+                });
+                if !role.is_primary || role.shard.0 != shard || role.term != term || recorded {
+                    return;
+                }
+                // repeated (the member redials) until the committed assignment shows it
+                let due = self
+                    .resync_sent
+                    .get(&member)
+                    .is_none_or(|t| t.elapsed() >= REPORT_REPEAT);
+                if due {
+                    self.resync_sent.insert(member, std::time::Instant::now());
+                    tracing::warn!(member = %member.hex40(), "replica cannot catch up by continue or repair: needs an operator resync");
+                    self.send_all(&NodeToCoord::MemberNeedsResync {
                         shard: ShardId(shard),
                         term,
                         member,
@@ -782,7 +842,39 @@ impl Agent {
     // -------------------------------------------------------------------------------------
     // periodic work
 
+    /// SIGTERM on a primary: ask for a handoff (repeated every second) and shut down once the
+    /// node is no longer the primary, when no coordinator is connected, or after the bound.
+    fn shutdown_handoff_tick(&mut self) {
+        let Some(since) = self.cs.shutdown_handoff_since() else {
+            return;
+        };
+        let a = self.cs.assignment();
+        let primary = a
+            .as_ref()
+            .and_then(|a| a.role.as_ref())
+            .filter(|r| r.is_primary)
+            .map(|r| (r.shard, r.term));
+        let Some((shard, term)) = primary else {
+            tracing::info!("handed off: shutting down");
+            self.shared.request_shutdown();
+            return;
+        };
+        if self.sessions.is_empty() || since.elapsed() >= SHUTDOWN_HANDOFF_LIMIT {
+            tracing::warn!("the shard was not handed off in time: shutting down (it fails over)");
+            self.shared.request_shutdown();
+            return;
+        }
+        if self
+            .handoff_requested
+            .is_none_or(|t| t.elapsed() >= REPORT_REPEAT)
+        {
+            self.handoff_requested = Some(std::time::Instant::now());
+            self.send_all(&NodeToCoord::HandoffRequest { shard, term });
+        }
+    }
+
     fn on_tick(&mut self) {
+        self.shutdown_handoff_tick();
         // renewals: one per period on every coordinator connection
         if !self.sessions.is_empty() {
             self.renew_seq += 1;
@@ -851,7 +943,8 @@ impl Agent {
         }
         Health {
             ready,
-            failed: false,
+            // a restarted primary asks for a newer term (see `ClusterShared::restart_term`)
+            failed: self.cs.refusing_primary.load(Ordering::Acquire),
             read_only_partitions: read_only,
             corrupt_pages: 0,
         }

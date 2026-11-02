@@ -132,6 +132,9 @@ pub fn write_gate(g: Gate, w: &mut kv_resp::ReplyWriter<'_>) {
         Gate::TryAgain => w.error(b"TRYAGAIN Multiple keys request during rehashing of slot"),
         Gate::ReadOnlyReplica => w.error(b"READONLY You can't write against a read only replica."),
         Gate::ClusterDown => w.error(b"CLUSTERDOWN The cluster is down"),
+        Gate::MigrationRunning => w.error(
+            b"ERR FLUSHDB and FLUSHALL are refused while a slot migration of this shard runs (see kvadm migrations; retry after it is done, paused or aborted)",
+        ),
     }
 }
 

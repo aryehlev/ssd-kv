@@ -249,7 +249,9 @@ enum MemberSync {
 struct MemberPart {
     shard: u16,
     term: u32,
-    primary: SocketAddr,
+    /// The primary's replication address; `None` while the shard has no serving primary
+    /// (a failover is pending): the member keeps its rings and waits for the next assignment.
+    primary: Option<SocketAddr>,
     stream: MemberStream,
     io: Option<StreamIo>,
     dial_tag: Option<u64>,
@@ -844,7 +846,7 @@ impl<B: Backend> Worker<B> {
                 !r.is_primary
                     && m.term == r.term
                     && m.shard == r.shard.0
-                    && r.primary_repl.map(|x| x.0) == Some(m.primary)
+                    && r.primary_repl.map(|x| x.0) == m.primary
             }
             _ => false,
         };
@@ -852,7 +854,13 @@ impl<B: Backend> Worker<B> {
             let old = std::mem::replace(&mut pr.role, Role::Idle);
             let mut carried_ring: Option<Backlog> = None;
             let mut own_groups: Option<Backlog> = None;
-            let mut waits = std::mem::take(&mut pr.commit_waits);
+            // replies of writes the old role executed: they cannot commit any more; answered
+            // now, before anything below can return early (a dropped waiter is a reply that
+            // never comes)
+            let waits = std::mem::take(&mut pr.commit_waits);
+            for (_, _, w) in waits {
+                self.commit_released(w, Some(b"TRYAGAIN the shard role of this node changed"));
+            }
             match old {
                 Role::Primary(pp) => {
                     for peer in &pp.peers {
@@ -866,6 +874,10 @@ impl<B: Backend> Worker<B> {
                     if let Some(io) = &m.io {
                         io.abort();
                     }
+                    let m = *m;
+                    // a member that moves to a newer term (or is promoted) keeps the groups
+                    // it received: its own Repair key set (a), or the new primary's key set (b)
+                    own_groups = m.own_groups;
                     carried_ring = Some(m.stream.into_received());
                 }
                 Role::Idle => {}
@@ -907,7 +919,12 @@ impl<B: Backend> Worker<B> {
                     let mut sender = ReplSender::with_backlog(p, r.term, ring);
                     sender.set_heartbeat_ns(heartbeat_ns);
                     sender.start_at(before(self.backend.next_seq(p)));
-                    let received = carried_ring.unwrap_or_else(|| {
+                    // the groups of the term taken over (Repair key sets (b)): received as its
+                    // member, or produced as its primary (re-promoted after a NoPrimary
+                    // period); without either (a restart) a ring that was never started: it
+                    // covers nothing, so members behind the takeover point are refused rather
+                    // than repaired with an empty key set
+                    let received = carried_ring.or(own_groups).unwrap_or_else(|| {
                         Backlog::try_new(SMALL_RING).unwrap_or_else(|_| Backlog::new(4096))
                     });
                     pr.durable.reset(Seq::new(r.term, 0));
@@ -930,22 +947,23 @@ impl<B: Backend> Worker<B> {
                 }
                 Some(r) => {
                     self.backend.set_cluster_role(p, false, r.term);
-                    let Some(primary) = r.primary_repl.map(|x| x.0) else {
-                        pr.role = Role::Idle;
-                        return;
-                    };
-                    let ring = match Backlog::try_new(backlog_bytes) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!(
-                                partition = p,
-                                "replication ring memory cannot be locked: {e}"
-                            );
-                            self.shared.request_shutdown();
-                            return;
-                        }
-                    };
-                    let _ = carried_ring;
+                    // without a primary address (the shard waits for a promotion) the member
+                    // dials nobody but keeps its rings for the next term's Repair
+                    let primary = r.primary_repl.map(|x| x.0);
+                    // the groups received in the previous term stay with the member (Repair
+                    // key set (a)); a fresh ring covers nothing until a stream starts it
+                    let ring =
+                        match carried_ring.map_or_else(|| Backlog::try_new(backlog_bytes), Ok) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!(
+                                    partition = p,
+                                    "replication ring memory cannot be locked: {e}"
+                                );
+                                self.shared.request_shutdown();
+                                return;
+                            }
+                        };
                     pr.role = Role::Member(Box::new(MemberPart {
                         shard: r.shard.0,
                         term: r.term,
@@ -964,10 +982,6 @@ impl<B: Backend> Worker<B> {
                         last_reject: None,
                     }));
                 }
-            }
-            // replies of writes this role executed but cannot commit any more
-            for (_, _, w) in waits.drain(..) {
-                self.commit_released(w, Some(b"TRYAGAIN the shard role of this node changed"));
             }
             let _ = cs;
         }
@@ -1250,7 +1264,18 @@ impl<B: Backend> Worker<B> {
         let d = sync::decide(&h, &view);
         tracing::info!(partition = p, member = %pp.peers[mi].node.hex40(), decision = d.kind(), "replication handshake");
         let mode = match d {
-            SyncDecision::Reject(r) => return reject(io, r, term),
+            SyncDecision::Reject(r) => {
+                if r == RejectReason::NeedOperatorResync {
+                    // only `replica resync` can bring this member back: the coordinator records
+                    // it (NeedsFullSync, shown by `kvadm status`); nothing starts a sync here
+                    cw.cs.tell_agent(AgentMsg::NeedsResync {
+                        shard: pp.shard,
+                        term,
+                        member: pp.peers[mi].node,
+                    });
+                }
+                return reject(io, r, term);
+            }
             SyncDecision::Continue { from } => AcceptMode::Continue { from },
             SyncDecision::Repair {
                 at,
@@ -1510,7 +1535,8 @@ impl<B: Backend> Worker<B> {
                 return;
             };
             let Role::Member(m) = &pr.role else { return };
-            if m.io.is_some() || m.dial_tag.is_some() || now < m.next_dial_ns {
+            if m.primary.is_none() || m.io.is_some() || m.dial_tag.is_some() || now < m.next_dial_ns
+            {
                 return;
             }
             match self.member_hello(cw, p, pr, m) {
@@ -1525,10 +1551,11 @@ impl<B: Backend> Worker<B> {
         let Role::Member(m) = &mut pr.role else {
             return;
         };
+        let Some(primary) = m.primary else { return };
         cw.next_tag += 1;
         m.dial_tag = Some(tag);
         m.next_dial_ns = now + REDIAL_NS;
-        net.dial(self.id, p, tag, m.primary, hello);
+        net.dial(self.id, p, tag, primary, hello);
     }
 
     fn member_frame(&mut self, cw: &mut ClusterWorker, p: u16, stream: u64, term: u32, f: Frame) {
@@ -1841,6 +1868,10 @@ impl<B: Backend> Worker<B> {
             })
             .unwrap_or_default();
         let slots = slots_of(p, self.shared.partitions);
+        // the highest position this partition holds: a ring is a complete key source only if
+        // it reaches it (after a restart the previous process may have applied groups past
+        // what this process received)
+        let upto = before(self.backend.next_seq(p));
         let cs = cw.cs.clone();
         let Some(pr) = cw.part(p) else { return };
         let last_term = pr.last_term;
@@ -1852,15 +1883,13 @@ impl<B: Backend> Worker<B> {
             return;
         };
         let takeover = sync::takeover(&history, last_term, p);
-        let mut ks = KeySet::default();
         let from_ring = takeover.and_then(|t| {
-            let ring = m
-                .own_groups
-                .as_ref()
-                .filter(|b| b.covers_after(t))
-                .or(Some(m.stream.received()).filter(|b| b.covers_after(t)))?;
-            ring.keys_between_into(t, Seq(u64::MAX), &mut ks)
-                .filter(|wide| !wide)
+            let mut rings: SmallVec<[&Backlog; 2]> = SmallVec::new();
+            if let Some(b) = m.own_groups.as_ref() {
+                rings.push(b);
+            }
+            rings.push(m.stream.received());
+            kv_repl::member::own_keys_after(&rings, t, upto)
         });
         m.sync = MemberSync::Repair {
             at,
@@ -1878,7 +1907,7 @@ impl<B: Backend> Worker<B> {
             partition: p,
             ready: false,
         });
-        if from_ring.is_some() {
+        if let Some(ks) = from_ring {
             io.send(frame_bytes(&Frame::RepairKeys(ks.into_vec()), p, term));
             m.stream.reset_received(at);
             return;
@@ -2676,6 +2705,8 @@ impl<B: Backend> Worker<B> {
         if persist {
             cw.last_persist_ns = now;
         }
+        // keys in slots this node does not serve (DBSIZE leaves them out), every 50 ms
+        let filter = persist.then(|| self.shared.ownership.read().slot_filter());
         let ids: Vec<u16> = cw.parts.iter().flatten().map(|pr| pr.p).collect();
         let cs = cw.cs.clone();
         let worker_handoff = cw.handoff;
@@ -2858,6 +2889,35 @@ impl<B: Backend> Worker<B> {
                 }
             }
             self.drive_mig_in(cw, p);
+            // replication links for INFO replication (no ids or positions leave the node)
+            let links = cw.part(p).map_or(0, |pr| match &pr.role {
+                Role::Primary(pp) => pp
+                    .peers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, x)| {
+                        *i < 63 && x.stream.is_some() && pp.sender.is_attached(*i as MemberId)
+                    })
+                    .fold(0u64, |acc, (i, _)| acc | (1u64 << i)),
+                Role::Member(m) => {
+                    if m.io.is_some() && m.stream.accepted().is_some() {
+                        super::LINK_UP
+                    } else {
+                        0
+                    }
+                }
+                Role::Idle => 0,
+            });
+            cs.set_links(p, links);
+            if let Some(f) = &filter {
+                let step = usize::from(self.shared.partitions.max(1));
+                let n: u64 = (p..kv_common::SLOTS as u16)
+                    .step_by(step)
+                    .filter(|&s| !f.serves(s))
+                    .map(|s| self.backend.slot_len(p, 0, s) as u64)
+                    .sum();
+                cs.set_unserved_keys(p, n);
+            }
             if persist {
                 let changed = cw.part(p).is_some_and(|pr| {
                     let commit = match &pr.role {

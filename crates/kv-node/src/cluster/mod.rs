@@ -140,6 +140,9 @@ pub enum AgentMsg {
     MigReady { id: u64, partition: u16 },
     /// Migration destination: `partition` committed everything up to the seal.
     Sealed { id: u64, partition: u16 },
+    /// Primary: `member`'s handshake was refused with NeedOperatorResync (it cannot catch up
+    /// by Continue or Repair).
+    NeedsResync { shard: u16, term: u32, member: NodeId },
 }
 
 /// Node-wide cluster state (one per process, cluster mode only).
@@ -165,7 +168,32 @@ pub struct ClusterShared {
     /// The replication transport (started once the node is up).
     pub net: std::sync::OnceLock<net::ReplNet>,
     next_token: AtomicU64,
+    /// After an unclean restart: the highest term this node may have served as a primary
+    /// before it (its persisted fence term). A primary role of a term at or below it is never
+    /// served again: the recovered partitions may lack groups the previous process produced
+    /// and shipped, so its next seqs could repeat ones a member already holds. Only a newer
+    /// term (a promotion through the normal failover path) makes it a primary again.
+    pub restart_term: Option<u32>,
+    /// The current assignment names this node primary of a term it must not serve (see
+    /// `restart_term`), or, before the first assignment, it was a primary when it stopped:
+    /// renewals report `health.failed`, so the coordinator flags it and fails the shard over
+    /// (a new coordinator leader cannot tell a restart from a first renewal otherwise).
+    pub refusing_primary: AtomicBool,
+    /// SIGTERM on a primary: since when the node waits for the coordinator to hand its shard
+    /// off before it shuts down (§23.12); bounded by the agent.
+    shutdown_handoff: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Per partition, refreshed by the owning worker's tick: a primary partition's members with
+    /// an attached stream (bit = member index, bits 0..62); a member partition sets bit 63
+    /// while its stream to the primary has been accepted. INFO replication reads these
+    /// (`connected_slaves`, `master_link_status`, LC-24: no ids or positions).
+    links: Box<[AtomicU64]>,
+    /// Per partition: keys stored in slots this node does not serve (an inert migration copy,
+    /// slots being purged), refreshed every 50 ms; DBSIZE in cluster mode leaves them out.
+    unserved_keys: Box<[AtomicU64]>,
 }
+
+/// `links` bit of a member partition whose stream to the primary is up.
+pub const LINK_UP: u64 = 1 << 63;
 
 /// Who this node is in the cluster.
 #[derive(Clone, Copy)]
@@ -180,6 +208,8 @@ impl ClusterShared {
     pub fn new(boot: BootMeta, meta: MetaClient, auth: Vec<u8>, partitions: u16) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let joined = boot.node.node_id != [0u8; 20];
+        let restart_term = (joined && !boot.clean).then_some(boot.node.fence_term);
+        let was_primary = boot.node.role == kv_storage::pmeta::ROLE_PRIMARY;
         let identity = Identity {
             cluster_id: joined.then_some(boot.node.cluster_id),
             node_id: joined.then_some(NodeId(boot.node.node_id)),
@@ -202,7 +232,72 @@ impl ClusterShared {
             handoff: Arc::new(AtomicBool::new(false)),
             net: std::sync::OnceLock::new(),
             next_token: AtomicU64::new(1),
+            restart_term,
+            refusing_primary: AtomicBool::new(restart_term.is_some() && was_primary),
+            shutdown_handoff: parking_lot::Mutex::new(None),
+            links: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            unserved_keys: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
         }
+    }
+
+    /// Whether `a` names this node primary of a term it must not serve after an unclean
+    /// restart (see [`ClusterShared::restart_term`]).
+    pub fn refuses_primary(&self, a: &NodeAssignment) -> bool {
+        match (self.restart_term, a.role.as_ref()) {
+            (Some(rt), Some(r)) => r.is_primary && r.term <= rt,
+            _ => false,
+        }
+    }
+
+    /// SIGTERM: when this node is a shard primary, starts the handoff-before-shutdown (the
+    /// agent asks the coordinator for a graceful handoff and shuts the node down once it is
+    /// no longer the primary, or after a bound) and returns true; false means shut down now
+    /// (not a primary, or a second signal).
+    pub fn begin_shutdown_handoff(&self) -> bool {
+        let primary = self.assignment().and_then(|a| a.role.as_ref().map(|r| r.is_primary)).unwrap_or(false);
+        let mut h = self.shutdown_handoff.lock();
+        if !primary || h.is_some() {
+            return false;
+        }
+        *h = Some(std::time::Instant::now());
+        true
+    }
+
+    /// Since when a handoff-before-shutdown runs (see [`ClusterShared::begin_shutdown_handoff`]).
+    pub fn shutdown_handoff_since(&self) -> Option<std::time::Instant> {
+        *self.shutdown_handoff.lock()
+    }
+
+    /// Records partition `p`'s replication links (see `links`).
+    pub fn set_links(&self, p: u16, v: u64) {
+        if let Some(a) = self.links.get(usize::from(p)) {
+            a.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Members with an attached stream on every partition (INFO `connected_slaves`).
+    pub fn connected_members(&self) -> u32 {
+        if self.links.is_empty() {
+            return 0;
+        }
+        self.links.iter().fold(!LINK_UP, |acc, a| acc & a.load(Ordering::Relaxed)).count_ones()
+    }
+
+    /// Every partition's stream to the primary is up (INFO `master_link_status:up`).
+    pub fn member_links_up(&self) -> bool {
+        !self.links.is_empty() && self.links.iter().all(|a| a.load(Ordering::Relaxed) & LINK_UP != 0)
+    }
+
+    /// Records the keys of partition `p` in slots this node does not serve.
+    pub fn set_unserved_keys(&self, p: u16, n: u64) {
+        if let Some(a) = self.unserved_keys.get(usize::from(p)) {
+            a.store(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Keys stored in slots this node does not serve, over all partitions.
+    pub fn unserved_keys(&self) -> u64 {
+        self.unserved_keys.iter().map(|a| a.load(Ordering::Relaxed)).sum()
     }
 
     /// A node-meta request; `false` once the node is shutting down.

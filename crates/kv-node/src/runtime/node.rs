@@ -276,12 +276,21 @@ async fn service(shared: Arc<NodeShared>) {
     loop {
         tokio::select! {
             _ = async { match term.as_mut() { Some(s) => { s.recv().await; } None => std::future::pending().await } } => {
-                tracing::info!("SIGTERM: shutting down");
-                shared.request_shutdown();
+                // a shard primary hands its shard off first (§23.12); a second signal stops now
+                if shared.cluster().is_some_and(|cs| cs.begin_shutdown_handoff()) {
+                    tracing::info!("SIGTERM: handing the shard off before shutting down");
+                } else {
+                    tracing::info!("SIGTERM: shutting down");
+                    shared.request_shutdown();
+                }
             }
             _ = async { match int.as_mut() { Some(s) => { s.recv().await; } None => std::future::pending().await } } => {
-                tracing::info!("SIGINT: shutting down");
-                shared.request_shutdown();
+                if shared.cluster().is_some_and(|cs| cs.begin_shutdown_handoff()) {
+                    tracing::info!("SIGINT: handing the shard off before shutting down");
+                } else {
+                    tracing::info!("SIGINT: shutting down");
+                    shared.request_shutdown();
+                }
             }
             conn = async { match metrics.as_ref() { Some(l) => l.accept().await, None => std::future::pending().await } } => {
                 if let Ok((sock, _)) = conn {

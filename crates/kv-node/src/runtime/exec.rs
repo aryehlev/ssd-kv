@@ -1385,7 +1385,11 @@ impl<B: Backend> Worker<B> {
         let mut keys = Vec::new();
         let status = {
             let m = crate::dispatch::scan::matcher(pattern.as_deref());
-            self.backend.scan(p, self.now, id, &m, &mut keys)
+            // cluster mode: only the keys of slots this node serves (an inert migration copy
+            // or slots being purged are never listed, §23.13 step 5, §23.14)
+            let filter = self.router.cluster.then(|| self.shared.ownership.read().slot_filter());
+            let f = |k: &[u8]| filter.as_ref().is_none_or(|f| f.serves(kv_common::key_slot(k))) && m(k);
+            self.backend.scan(p, self.now, id, &f, &mut keys)
         };
         match status {
             ExecStatus::Requeued => {

@@ -1,0 +1,8 @@
+{
+  "name": "kvssd-cluster-matrix-node",
+  "private": true,
+  "description": "ioredis verifier client of the cluster client matrix (DESIGN §25.6)",
+  "dependencies": {
+    "ioredis": "^5.4.0"
+  }
+}

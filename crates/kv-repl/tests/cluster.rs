@@ -9,6 +9,12 @@
 //! * `slot_migration_under_load`: an operator migration of half the slots to a second shard
 //!   while a writer runs; zero acknowledged writes lost, routing follows the cutover, the
 //!   source purges the moved slots.
+//! * `sigterm_on_a_primary_hands_off_first`: SIGTERM on a primary with an in-sync replica asks
+//!   the coordinator for a graceful handoff before the node stops (§23.12): the replica is
+//!   promoted, no acknowledged write is lost, the old primary returns as a member.
+//! * `migration_resume_prunes_keys_deleted_at_the_source`: a migration paused mid-copy leaves
+//!   an inert partial copy on the destination; keys deleted at the source meanwhile are never
+//!   served by the destination after `migrate resume` completes (the copy is a merge).
 //!
 //! The binaries are taken from `KVD_BIN` / `KVC_BIN`, else from the target directory of this
 //! test (`cargo build -p kv-node -p kv-coord` first). Every wait has a deadline and a watchdog
@@ -992,6 +998,186 @@ fn slot_migration_under_load() {
             .is_ok_and(|v| matches!(v, Value::Int(n) if (n as usize) <= kept + failed))
     });
     // a cluster node stops cleanly on SIGTERM while its streams are open
+    c.stop_node(1, 20);
+    c.stop_node(0, 20);
+    c.ok = true;
+}
+
+#[test]
+fn sigterm_on_a_primary_hands_off_first() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("sigterm", 2, Duration::from_secs(240));
+    let coords = c.coord_clients();
+    let (n0, n1) = (c.nodes[0].id.clone(), c.nodes[1].id.clone());
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &n0]);
+    c.admin(&["SLOTS", "ASSIGN", "0-16383", "1"]);
+    c.wait_primary(0, 30);
+    c.admin(&["REPLICA", "ADD", "1", &n1]);
+    c.wait_member(1, "in-sync isr", 60);
+    let w = Writer::start(coords.clone(), "h1", Duration::from_millis(1));
+    w.at_least(100, 60);
+    // SIGTERM: the primary asks for a handoff, is demoted, then stops cleanly
+    let t0 = Instant::now();
+    c.stop_node(0, 15);
+    assert!(
+        c.log_contains(0, "handing the shard off before shutting down"),
+        "SIGTERM on a primary starts a handoff"
+    );
+    assert!(
+        c.log_contains(0, "handed off: shutting down"),
+        "the node stopped only after it was demoted"
+    );
+    c.wait_primary(1, 10);
+    eprintln!("handoff and stop took {:?}", t0.elapsed());
+    let before = w.acks.load(Ordering::Relaxed);
+    w.at_least(before + 100, 60);
+    let (acked, failed) = w.finish();
+    eprintln!(
+        "writer across the shutdown handoff: {} acked, {failed} not acknowledged",
+        acked.len()
+    );
+    verify_acked(&coords, &acked);
+    // the old primary returns as a member and converges
+    c.spawn_node(0);
+    c.wait_serving(0);
+    c.wait_member(0, "in-sync isr", 90);
+    let last = acked.last().unwrap().clone();
+    wait_until("the returned node follows", 30, || {
+        c.replica_get(0, &last.0).as_deref() == Some(last.1.as_str())
+    });
+    c.ok = true;
+}
+
+#[test]
+fn migration_resume_prunes_keys_deleted_at_the_source() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("resume", 2, Duration::from_secs(300));
+    let (n0, n1) = (c.nodes[0].id.clone(), c.nodes[1].id.clone());
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &n0]);
+    c.admin(&["SLOTS", "ASSIGN", "0-16383", "1"]);
+    c.admin(&["SHARD", "CREATE", "2", "--primary", &n1]);
+    c.wait_primary(0, 30);
+    c.wait_primary(1, 30);
+    let coords = c.coord_clients();
+    let mut r = Routed::new(coords.clone());
+    set_settled(&mut r, "warm", "up");
+    // enough keys that the copy (paced at the default sync-iops) takes about a second
+    let n_keys = 8000usize;
+    let key = |i: usize| format!("rs:{i}");
+    {
+        let mut conn = Conn::open(c.node_addr(0)).unwrap();
+        for chunk in (0..n_keys).collect::<Vec<_>>().chunks(500) {
+            let mut out = Vec::new();
+            for &i in chunk {
+                let k = key(i);
+                let v = format!("v{i}");
+                kv_resp::encode_command(&[b"SET", k.as_bytes(), v.as_bytes()], &mut out);
+            }
+            conn.s.write_all(&out).unwrap();
+            for _ in chunk {
+                loop {
+                    match kv_resp::decode_value(&conn.buf) {
+                        Ok(Some((v, n))) => {
+                            conn.buf.drain(..n);
+                            assert!(
+                                matches!(v, Value::Simple(ref ok) if ok == b"OK"),
+                                "SET: {}",
+                                text(&v)
+                            );
+                            break;
+                        }
+                        Ok(None) => {
+                            let mut b = [0u8; 65536];
+                            let n = conn.s.read(&mut b).unwrap();
+                            assert!(n > 0, "connection closed");
+                            conn.buf.extend_from_slice(&b[..n]);
+                        }
+                        Err(_) => panic!("bad reply"),
+                    }
+                }
+            }
+        }
+    }
+    let migrating = |k: &str| kv_common::key_slot(k.as_bytes()) <= 8191;
+    // start the migration and pause it once the destination holds part of the copy
+    let dst_keys = || -> u64 {
+        Conn::open(c.node_addr(1))
+            .and_then(|mut d| d.call_str(&["INFO", "keyspace"]))
+            .map(|v| {
+                let t = text(&v);
+                t.split("keys=")
+                    .nth(1)
+                    .and_then(|r| r.split(',').next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    };
+    let out = c.admin(&["MIGRATE", "0-8191", "--to", "2"]);
+    let id: String = out.split_whitespace().nth(2).unwrap_or("").to_owned();
+    let t0 = Instant::now();
+    while dst_keys() < 200 && t0.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let copied = dst_keys();
+    let paused = c.admin_try(&["MIGRATE", "PAUSE", &id]);
+    eprintln!("paused with {copied} keys copied");
+    eprintln!("pause: {paused:?}");
+    wait_until("the migration to be paused", 30, || {
+        c.admin_try(&["MIGRATIONS"]).is_ok_and(|m| {
+            m.lines().any(|l| {
+                l.starts_with(&format!("{id} "))
+                    && (l.contains("phase=paused") || l.contains("phase=done"))
+            })
+        })
+    });
+    let done_already = c.admin_try(&["MIGRATIONS"]).is_ok_and(|m| {
+        m.lines()
+            .any(|l| l.starts_with(&format!("{id} ")) && l.contains("phase=done"))
+    });
+    if done_already {
+        eprintln!(
+            "the copy finished before the pause: nothing to resume (the check below still holds)"
+        );
+    }
+    // the source deletes every migrating key and writes new ones while the migration waits
+    let mut deleted = Vec::new();
+    for i in (0..n_keys).filter(|&i| migrating(&key(i))) {
+        let k = key(i);
+        match r.exec(k.as_bytes(), &[b"DEL", k.as_bytes()]) {
+            Outcome::Ok(Value::Int(_)) => deleted.push(k),
+            Outcome::Ok(v) => panic!("DEL {k}: {}", text(&v)),
+            Outcome::Failed(e) => panic!("DEL {k}: {e}"),
+        }
+    }
+    assert!(!deleted.is_empty());
+    let fresh: Vec<(String, String)> = (0..200)
+        .map(|i| (format!("rf:{i}"), format!("f{i}")))
+        .filter(|(k, _)| migrating(k))
+        .collect();
+    for (k, v) in &fresh {
+        set_settled(&mut r, k, v);
+    }
+    if !done_already {
+        c.admin(&["MIGRATE", "RESUME", &id]);
+        wait_until("the resumed migration to finish", 120, || {
+            c.admin_try(&["MIGRATIONS"]).is_ok_and(|m| {
+                m.lines()
+                    .any(|l| l.starts_with(&format!("{id} ")) && l.contains("phase=done"))
+            })
+        });
+    }
+    // after the cutover the destination serves the moved slots: no deleted key comes back
+    let mut dst = Conn::open(c.node_addr(1)).unwrap();
+    for k in &deleted {
+        let v = dst.call_str(&["GET", k]).unwrap();
+        assert!(
+            matches!(v, Value::Bulk(None) | Value::Null),
+            "key {k} deleted at the source before the copy finished is served by the destination: {}",
+            text(&v)
+        );
+    }
+    verify_acked(&coords, &fresh);
     c.stop_node(1, 20);
     c.stop_node(0, 20);
     c.ok = true;

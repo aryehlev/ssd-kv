@@ -1,5 +1,13 @@
 //! Migration endpoints of the node's partitions (DESIGN §23.13).
 //!
+//! Every copy is a merge (§23.13 step 5): the destination may hold keys of these slots from an
+//! earlier copy of the same migration (a stream that restarted, or `migrate resume`), and the
+//! source may have deleted some of them meanwhile. The destination therefore records every
+//! key the copy confirms (snapshot records and forwarded ops) and, at `SYNC_DONE { copy_end }`,
+//! deletes the keys of the migrating slots that the copy did not confirm, before it
+//! acknowledges `copy_end` (frames after it wait); so a key deleted at the source is never
+//! served by the destination after the cutover.
+//!
 //! Source: the partition streams its migrating slots through the page-reference walk, paced by
 //! static rates, forwards live groups of keys below the walk position, records its position
 //! barriers and reports `MigrationReady` / seals after cutover. Destination: each partition
@@ -22,7 +30,10 @@ use std::net::SocketAddr;
 use kv_common::Access;
 use kv_common::pace::TokenBucket;
 use kv_ctrl::{MigPhase, MigrationTask};
+use std::collections::VecDeque;
+
 use kv_repl::backlog::Backlog;
+use kv_repl::codec::KeySet;
 use kv_repl::frame::{AcceptMode, Frame, Hello, Recovered, RejectReason, SnapRec};
 use kv_repl::member::{MemberAction, MemberStream};
 use kv_repl::migrate::{MigrationDest, MigrationSource};
@@ -170,6 +181,13 @@ impl MigOut {
 pub struct MigIn {
     pub id: u64,
     pub phase: MigPhase,
+    /// The migrating slots of this partition, in slot order.
+    slots: Vec<u16>,
+    /// Keys the current copy wrote or deleted (the merge prune keeps exactly these).
+    confirmed: KeySet,
+    /// After `SYNC_DONE`: the prune walk and the `copy_end` it ends with; later actions wait.
+    prune: Option<(KeyWalk, Seq)>,
+    held: VecDeque<MemberAction>,
     src_addr: SocketAddr,
     pub io: Option<StreamIo>,
     pub dial_tag: Option<u64>,
@@ -184,11 +202,15 @@ pub struct MigIn {
 }
 
 impl MigIn {
-    fn new(id: u64, phase: MigPhase, src_addr: SocketAddr, p: u16) -> Self {
+    fn new(id: u64, phase: MigPhase, src_addr: SocketAddr, p: u16, slots: Vec<u16>) -> Self {
         let ring = Backlog::try_new(64 << 10).unwrap_or_else(|_| Backlog::new(4096));
         MigIn {
             id,
             phase,
+            slots,
+            confirmed: KeySet::default(),
+            prune: None,
+            held: VecDeque::new(),
             src_addr,
             io: None,
             dial_tag: None,
@@ -219,6 +241,10 @@ impl MigIn {
         self.stream.restart(Seq::ZERO, Seq::ZERO);
         self.acked = Seq::ZERO;
         self.sealed_reported = false;
+        // a new copy confirms its keys again (a merge over what an earlier copy left)
+        self.confirmed = KeySet::default();
+        self.prune = None;
+        self.held.clear();
     }
 
     pub fn dial_failed(&mut self, now: u64) {
@@ -239,6 +265,19 @@ fn frame_bytes(f: &Frame, p: u16, term: u32) -> Vec<u8> {
     let mut out = Vec::new();
     kv_repl::frame::encode(f, p, term, &mut out);
     out
+}
+
+/// The key an op writes or deletes, if any.
+fn op_key(o: &Op) -> Option<(u8, &[u8])> {
+    match o {
+        Op::Put { db, key, .. }
+        | Op::Del { db, key }
+        | Op::Expired { db, key }
+        | Op::Expire { db, key, .. }
+        | Op::Append { db, key, .. }
+        | Op::SetRange { db, key, .. } => Some((*db, key)),
+        _ => None,
+    }
 }
 
 fn ops_keys(ops: &[Op]) -> SmallVec<[(Box<[u8]>, Access); 2]> {
@@ -315,7 +354,8 @@ impl<B: Backend> Worker<B> {
                             if let Some(i) = pr.mig_in.iter().position(|m| m.id == *id) {
                                 pr.mig_in.remove(i).abort();
                             }
-                            pr.mig_in.push(MigIn::new(*id, *phase, src_repl.0, p));
+                            pr.mig_in
+                                .push(MigIn::new(*id, *phase, src_repl.0, p, slots));
                         }
                     }
                 }
@@ -663,9 +703,48 @@ impl<B: Backend> Worker<B> {
         let mut tag = cw.next_tag;
         let commit = cw.part(p).and_then(|pr| pr.primary_commit());
         let mut reports = Vec::new();
+        let mut prune_steps: Vec<(Request, ReplJob)> = Vec::new();
+        let mut released: Vec<(u64, Vec<MemberAction>)> = Vec::new();
+        let lens = |w: &Self, s: u16| w.backend.slot_len(p, 0, s);
         {
             let Some(pr) = cw.part(p) else { return };
             for mi in pr.mig_in.iter_mut() {
+                // the merge prune after the copy: one listing step at a time
+                if mi.io.is_some()
+                    && let Some((walk, end)) = &mut mi.prune
+                    && !walk.busy
+                {
+                    walk.skip_empty(&|s| lens(self, s));
+                    if walk.done() {
+                        mi.markers.marker(*end);
+                        mi.prune = None;
+                        released.push((mi.id, mi.held.drain(..).collect()));
+                    } else {
+                        walk.busy = true;
+                        let slot = walk.slots[walk.idx];
+                        prune_steps.push((
+                            Request {
+                                db: 0,
+                                keys: SmallVec::new(),
+                                kind: ReqKind::SlotIter {
+                                    slot,
+                                    fp_from: walk.fp_from as u32,
+                                    max_entries: WALK_KEYS,
+                                },
+                                origin: Origin::Client,
+                            },
+                            ReplJob {
+                                work: ReplWork::Walk,
+                                then: Then::Listed {
+                                    walker: Walker::MigInPrune {
+                                        id: mi.id,
+                                        epoch: mi.epoch,
+                                    },
+                                },
+                            },
+                        ));
+                    }
+                }
                 match &mi.io {
                     None => {
                         if mi.dial_tag.is_some() || now < mi.next_dial_ns {
@@ -746,6 +825,76 @@ impl<B: Backend> Worker<B> {
         for r in reports {
             cs.tell_agent(r);
         }
+        for (req, rj) in prune_steps {
+            self.submit_repl(cw, p, req, rj);
+        }
+        for (id, acts) in released {
+            self.mig_in_actions(cw, p, id, acts);
+        }
+    }
+
+    /// A listing step of the merge prune: deletes the keys the copy did not confirm (own
+    /// writes of the destination, tracked like every copy item).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn mig_in_prune_listed(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        id: u64,
+        epoch: u64,
+        next: u64,
+        keys: Vec<Box<[u8]>>,
+        failed: bool,
+    ) {
+        let mut submit = None;
+        {
+            let Some(pr) = cw.part(p) else { return };
+            let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else {
+                return;
+            };
+            if mi.epoch != epoch {
+                return;
+            }
+            let Some((walk, _)) = &mut mi.prune else {
+                return;
+            };
+            walk.busy = false;
+            if failed {
+                // the copy starts again on a new stream
+                if let Some(io) = mi.io.take() {
+                    io.abort();
+                }
+                return;
+            }
+            walk.listed(next);
+            let doomed: Vec<Box<[u8]>> = keys
+                .into_iter()
+                .filter(|k| !mi.confirmed.contains(0, k))
+                .collect();
+            if !doomed.is_empty() {
+                let item = mi.markers.item();
+                let req = Request {
+                    db: 0,
+                    keys: doomed.iter().map(|k| (k.clone(), Access::Write)).collect(),
+                    kind: ReqKind::Keyed,
+                    origin: Origin::Client,
+                };
+                let ops = doomed
+                    .into_iter()
+                    .map(|key| Op::Del { db: 0, key })
+                    .collect();
+                submit = Some((
+                    req,
+                    ReplJob {
+                        work: ReplWork::Own { ops },
+                        then: Then::MigInApply { id, epoch, item },
+                    },
+                ));
+            }
+        }
+        if let Some((req, rj)) = submit {
+            self.submit_repl(cw, p, req, rj);
+        }
     }
 
     pub(super) fn mig_in_frame(
@@ -758,8 +907,7 @@ impl<B: Backend> Worker<B> {
         f: Frame,
     ) {
         let now = self.now.boot_ns;
-        let mut submits: Vec<(Request, ReplJob)> = Vec::new();
-        {
+        let acts = {
             let Some(pr) = cw.part(p) else { return };
             let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else {
                 return;
@@ -779,7 +927,6 @@ impl<B: Backend> Worker<B> {
                 }
                 return;
             }
-            let epoch = mi.epoch;
             let mut acts = Vec::new();
             match mi.stream.on_frame(f) {
                 Ok(a) => acts.push(a),
@@ -793,23 +940,58 @@ impl<B: Backend> Worker<B> {
             while let Some(a) = mi.stream.next_action() {
                 acts.push(a);
             }
+            acts
+        };
+        self.mig_in_actions(cw, p, id, acts);
+    }
+
+    /// Applies destination actions in stream order. From `SYNC_DONE` on they wait until the
+    /// merge prune deleted every key of the migrating slots the copy did not confirm.
+    fn mig_in_actions(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, acts: Vec<MemberAction>) {
+        let mut submits: Vec<(Request, ReplJob)> = Vec::new();
+        {
+            let Some(pr) = cw.part(p) else { return };
+            let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else {
+                return;
+            };
+            let epoch = mi.epoch;
             for a in acts {
+                if mi.prune.is_some() {
+                    mi.held.push_back(a);
+                    continue;
+                }
                 let ops = match a {
-                    MemberAction::Snap(rec, _) => vec![Op::Put {
-                        db: rec.db,
-                        vtype: rec.vtype,
-                        expire_at: rec.expire_at,
-                        key: rec.key,
-                        value: rec.value,
-                    }],
-                    MemberAction::Apply(g) => g
-                        .ops
-                        .into_iter()
-                        .filter(|o| {
-                            !matches!(o, Op::FlushDb { .. } | Op::FlushSlot { .. } | Op::Noop)
-                        })
-                        .collect(),
-                    MemberAction::SyncDone(at) | MemberAction::Commit(at) => {
+                    MemberAction::Snap(rec, _) => {
+                        mi.confirmed.insert(rec.db, &rec.key);
+                        vec![Op::Put {
+                            db: rec.db,
+                            vtype: rec.vtype,
+                            expire_at: rec.expire_at,
+                            key: rec.key,
+                            value: rec.value,
+                        }]
+                    }
+                    MemberAction::Apply(g) => {
+                        let ops: Vec<Op> = g
+                            .ops
+                            .into_iter()
+                            .filter(|o| {
+                                !matches!(o, Op::FlushDb { .. } | Op::FlushSlot { .. } | Op::Noop)
+                            })
+                            .collect();
+                        for o in &ops {
+                            if let Some((db, k)) = op_key(o) {
+                                mi.confirmed.insert(db, k);
+                            }
+                        }
+                        ops
+                    }
+                    MemberAction::SyncDone(at) => {
+                        // the copy is complete: prune what it did not confirm, then `copy_end`
+                        mi.prune = Some((KeyWalk::new(mi.slots.clone()), at));
+                        continue;
+                    }
+                    MemberAction::Commit(at) => {
                         mi.markers.marker(at);
                         continue;
                     }

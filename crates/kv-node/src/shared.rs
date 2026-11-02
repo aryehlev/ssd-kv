@@ -72,6 +72,9 @@ pub struct NodeShared {
     /// Whether the shutdown writes the index snapshot (`SHUTDOWN NOSAVE` clears it).
     pub shutdown_snapshot: AtomicBool,
     shutdown: AtomicBool,
+    /// Every worker thread has ended (the service thread stops even if messages were sent to
+    /// their side queues after that, e.g. a replication dial completing late).
+    pub workers_exited: AtomicBool,
     /// Cluster mode: the node-wide cluster state (set once at startup).
     cluster: std::sync::OnceLock<Arc<crate::cluster::ClusterShared>>,
 }
@@ -156,6 +159,7 @@ impl NodeShared {
             partitions_recovered: AtomicU32::new(0),
             shutdown_snapshot: AtomicBool::new(true),
             shutdown: AtomicBool::new(false),
+            workers_exited: AtomicBool::new(false),
             cluster: std::sync::OnceLock::new(),
         })
     }

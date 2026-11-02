@@ -63,12 +63,22 @@ pub enum CtrlEvent {
 
 /// Time a coordinator has to send its `Hello` after connecting.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A leading coordinator answers every renewal (every `renew_ms`): a control connection that
+/// delivered nothing for this long is dead (a silent partition, or a coordinator that stopped
+/// leading without closing it) and is closed; a leader dials again.
+const SESSION_IDLE: Duration = Duration::from_secs(10);
 /// Longest graceful handoff before writes are accepted again.
 const HANDOFF_LIMIT: Duration = Duration::from_secs(6);
 /// Longest node-meta write before its step is given up (unacknowledged).
 const PERSIST_LIMIT: Duration = Duration::from_secs(10);
 /// Period of repeated node-initiated reports not yet reflected by an assignment.
 const REPORT_REPEAT: Duration = Duration::from_millis(1000);
+/// A primary that relinquished its lease for a handoff and still holds its role after this
+/// long (the coordinator never committed the promotion, e.g. it lost leadership meanwhile)
+/// reports `health.failed`: the normal failover path then moves the shard on (fencing another
+/// member and waiting for this node's lease by the coordinator's rule), so the shard never
+/// stays without a serving primary. The node itself never takes a lease back for that role.
+const HANDOFF_STUCK: Duration = Duration::from_secs(10);
 /// Longest wait of a shutting-down primary for its handoff (the coordinator's handoff bound is
 /// 5 s): after it the node shuts down anyway and its shard fails over by lease expiry.
 const SHUTDOWN_HANDOFF_LIMIT: Duration = Duration::from_secs(8);
@@ -191,7 +201,7 @@ struct Agent {
     renew_seq: u64,
     sent_renewals: VecDeque<(u64, u64)>,
     /// After a completed handoff the lease stays relinquished until the demoting assignment.
-    lease_held_back: bool,
+    lease_held_back: Option<std::time::Instant>,
     fences: hashbrown::HashMap<u64, WorkerGather, foldhash::fast::RandomState>,
     handoffs: hashbrown::HashMap<u64, WorkerGather, foldhash::fast::RandomState>,
     expand: hashbrown::HashMap<NodeId, (u32, Gather), foldhash::fast::RandomState>,
@@ -217,7 +227,7 @@ impl Agent {
             persist_inflight: None,
             renew_seq: 0,
             sent_renewals: VecDeque::new(),
-            lease_held_back: false,
+            lease_held_back: None,
             fences: Default::default(),
             handoffs: Default::default(),
             expand: Default::default(),
@@ -347,7 +357,7 @@ impl Agent {
         let Some(&(_, t_send)) = self.sent_renewals.iter().find(|(s, _)| *s == seq) else {
             return;
         };
-        if self.lease_held_back {
+        if self.lease_held_back.is_some() {
             return;
         }
         // node rule: t_send + lease_ms * 0.95 - 10 ms (CLOCK_BOOTTIME)
@@ -519,7 +529,7 @@ impl Agent {
         if old.as_ref().is_none_or(|o| role_key(o) != role_key(&a)) {
             // a handoff ends with the assignment that demotes this node (or any role change)
             self.cs.handoff.store(false, Ordering::Release);
-            self.lease_held_back = false;
+            self.lease_held_back = None;
             self.handoffs.clear();
         }
         // after an unclean restart a primary role of the term served before it is not served
@@ -623,7 +633,7 @@ impl Agent {
                 };
                 if done && let Some(g) = self.handoffs.remove(&req) {
                     // relinquish the lease before answering (§23.12)
-                    self.lease_held_back = true;
+                    self.lease_held_back = Some(std::time::Instant::now());
                     self.shared.lease.set(0);
                     self.send(
                         g.session,
@@ -943,8 +953,12 @@ impl Agent {
         }
         Health {
             ready,
-            // a restarted primary asks for a newer term (see `ClusterShared::restart_term`)
-            failed: self.cs.refusing_primary.load(Ordering::Acquire),
+            // a restarted primary asks for a newer term (see `ClusterShared::restart_term`); a
+            // handoff whose promotion never came asks for a failover (`HANDOFF_STUCK`)
+            failed: self.cs.refusing_primary.load(Ordering::Acquire)
+                || self
+                    .lease_held_back
+                    .is_some_and(|t| t.elapsed() >= HANDOFF_STUCK),
             read_only_partitions: read_only,
             corrupt_pages: 0,
         }
@@ -1003,9 +1017,13 @@ async fn session(
         }
     });
     loop {
-        let body = match read_frame_half(&mut rd).await {
-            Ok(b) => b,
-            Err(_) => break,
+        let body = match tokio::time::timeout(SESSION_IDLE, read_frame_half(&mut rd)).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                tracing::info!(%peer, "no frame from the coordinator for {} s: closing the control connection", SESSION_IDLE.as_secs());
+                break;
+            }
         };
         match kv_ctrl::decode_body::<CoordToNode>(&body) {
             Ok(msg) => {

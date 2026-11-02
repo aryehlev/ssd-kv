@@ -254,9 +254,18 @@ impl ClusterShared {
     /// no longer the primary, or after a bound) and returns true; false means shut down now
     /// (not a primary, or a second signal).
     pub fn begin_shutdown_handoff(&self) -> bool {
-        let primary = self.assignment().and_then(|a| a.role.as_ref().map(|r| r.is_primary)).unwrap_or(false);
+        // only a primary with an in-sync ISR member to hand off to (else nobody could take
+        // the shard and the node stops at once; its shard fails over or waits for it)
+        let primary = self.assignment().and_then(|a| {
+            a.role.as_ref().map(|r| {
+                r.is_primary
+                    && r.members
+                        .iter()
+                        .any(|(_, st, in_isr)| *in_isr && *st == kv_ctrl::MemberState::InSync)
+            })
+        });
         let mut h = self.shutdown_handoff.lock();
-        if !primary || h.is_some() {
+        if primary != Some(true) || h.is_some() {
             return false;
         }
         *h = Some(std::time::Instant::now());
@@ -412,6 +421,82 @@ mod tests {
         assert!(!same_token(b"abc", b"abd"));
         assert!(!same_token(b"abc", b"ab"));
         assert!(same_token(b"", b""));
+    }
+
+    fn assignment(primary: bool, term: u32) -> NodeAssignment {
+        NodeAssignment {
+            version: 9,
+            coord_term: 1,
+            node_id: NodeId([4; 20]),
+            coordinators: Vec::new(),
+            role: Some(kv_ctrl::ShardRole {
+                shard: kv_ctrl::ShardId(1),
+                term,
+                is_primary: primary,
+                owned_slots: kv_common::SlotSet::new(),
+                primary_repl: None,
+                members: Vec::new(),
+                min_isr: 1,
+                history: Vec::new(),
+                migrations: Vec::new(),
+            }),
+            client_password: None,
+            params: kv_ctrl::NodeParams::default(),
+        }
+    }
+
+    fn shared_after(clean: bool, role: u8, fence_term: u32) -> ClusterShared {
+        let mut boot = BootMeta::empty(4);
+        boot.clean = clean;
+        boot.node.node_id = [4; 20];
+        boot.node.role = role;
+        boot.node.fence_term = fence_term;
+        ClusterShared::new(boot, MetaClient::disconnected(), b"t".to_vec(), 4)
+    }
+
+    /// After an unclean restart a primary role of the term served before is refused (its next
+    /// seqs could repeat ones a member holds) and renewals report failed until a newer term
+    /// is assigned; a clean restart resumes, and a replica never refuses its member role.
+    #[test]
+    fn a_restarted_primary_never_resumes_its_term() {
+        use kv_storage::pmeta::{ROLE_PRIMARY, ROLE_REPLICA};
+        let cs = shared_after(false, ROLE_PRIMARY, 5);
+        assert_eq!(cs.restart_term, Some(5));
+        assert!(cs.refusing_primary.load(Ordering::Acquire), "failed until an assignment");
+        assert!(cs.refuses_primary(&assignment(true, 5)));
+        assert!(cs.refuses_primary(&assignment(true, 4)));
+        assert!(!cs.refuses_primary(&assignment(true, 6)), "a promotion to a newer term");
+        assert!(!cs.refuses_primary(&assignment(false, 5)), "member of the same term");
+        let clean = shared_after(true, ROLE_PRIMARY, 5);
+        assert_eq!(clean.restart_term, None);
+        assert!(!clean.refusing_primary.load(Ordering::Acquire));
+        assert!(!clean.refuses_primary(&assignment(true, 5)));
+        let replica = shared_after(false, ROLE_REPLICA, 5);
+        assert!(!replica.refusing_primary.load(Ordering::Acquire));
+        assert!(replica.refuses_primary(&assignment(true, 5)), "fenced for 5 before the crash");
+    }
+
+    #[test]
+    fn replication_links_for_info() {
+        let cs = shared_after(true, 0, 0);
+        assert_eq!(cs.connected_members(), 0);
+        assert!(!cs.member_links_up());
+        for p in 0..4 {
+            cs.set_links(p, 0b101);
+        }
+        assert_eq!(cs.connected_members(), 2);
+        cs.set_links(2, 0b001);
+        assert_eq!(cs.connected_members(), 1, "attached on every partition");
+        for p in 0..4 {
+            cs.set_links(p, LINK_UP);
+        }
+        assert!(cs.member_links_up());
+        assert_eq!(cs.connected_members(), 0);
+        cs.set_links(3, 0);
+        assert!(!cs.member_links_up());
+        cs.set_unserved_keys(1, 7);
+        cs.set_unserved_keys(3, 5);
+        assert_eq!(cs.unserved_keys(), 12);
     }
 
     #[test]

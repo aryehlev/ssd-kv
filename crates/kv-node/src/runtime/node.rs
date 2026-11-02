@@ -66,6 +66,7 @@ impl NodeHandle {
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
+        self.shared.workers_exited.store(true, Ordering::Release);
         // cluster mode: the agent's meta client goes too, so the meta thread can end
         if let Some(cs) = self.shared.cluster() {
             cs.release_meta();
@@ -309,7 +310,11 @@ async fn service(shared: Arc<NodeShared>) {
                     let ops = ((last - first) * 10).checked_div(secs).unwrap_or(0);
                     shared.ops_per_sec.store(ops, Ordering::Relaxed);
                 }
-                if shared.shutdown_requested() && shared.workers.iter().all(|w| w.side.is_empty()) {
+                // stop once the workers drained their queues, or ended (nothing reads a message
+                // that arrives in a side queue after that, e.g. a late replication event)
+                if shared.shutdown_requested()
+                    && (shared.workers_exited.load(Ordering::Acquire) || shared.workers.iter().all(|w| w.side.is_empty()))
+                {
                     break;
                 }
             }

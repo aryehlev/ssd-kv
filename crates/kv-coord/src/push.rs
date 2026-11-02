@@ -135,6 +135,11 @@ const RECONNECT_PAUSE: Duration = Duration::from_millis(200);
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 /// Longest wait of a destination's cutover assignment for the source's acknowledgement.
 const CUTOVER_ORDER_WAIT: Duration = Duration::from_secs(1);
+/// A node renews every `renew_ms` (100 ms): a control connection that delivered nothing for this
+/// long is broken (a silent network partition) and is replaced by a new one.
+const NODE_IDLE: Duration = Duration::from_secs(3);
+/// Longest write of one control frame; a socket that does not drain for this long is broken.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -183,15 +188,17 @@ impl Pusher {
         };
         let (tx, rx) = oneshot::channel();
         lock(&self.waiters).insert((*n, req), tx);
-        let r = async {
+        // the bound covers the queueing too: a node whose connection stopped draining (a full
+        // per-node queue behind a stuck socket write) must not hold a failover forever
+        let r = match tokio::time::timeout(timeout, async {
             self.send(n, m).await?;
-            match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(reply)) => Ok(reply),
-                Ok(Err(_)) => Err(PushError::Closed),
-                Err(_) => Err(PushError::Timeout),
-            }
-        }
-        .await;
+            rx.await.map_err(|_| PushError::Closed)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(PushError::Timeout),
+        };
         lock(&self.waiters).remove(&(*n, req));
         r
     }
@@ -414,6 +421,7 @@ impl Pusher {
         let mut computed_for: Option<(u64, u64, u64)> = None;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_rx = Instant::now();
         loop {
             if !self.wsr.is_leader() {
                 return Ok(());
@@ -460,12 +468,17 @@ impl Pusher {
                 m = in_rx.recv() => match m {
                     None => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed by the node")),
                     Some(m) => {
+                        last_rx = Instant::now();
                         if let Some(reply) = self.on_inbound(node, m, &mut pending_ack, &s) {
                             write_msg(&mut wr, &reply).await?;
                         }
                     }
                 },
-                _ = tick.tick() => {}
+                _ = tick.tick() => {
+                    if last_rx.elapsed() >= NODE_IDLE {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no renewal from the node"));
+                    }
+                }
                 _ = self.acked_changed.notified(), if deferred_since.is_some() => {}
                 _ = tokio::time::sleep(Duration::from_millis(20)), if deferred_since.is_some() => {}
             }
@@ -586,7 +599,11 @@ fn invalid(e: impl std::fmt::Display) -> std::io::Error {
 
 async fn write_msg(w: &mut OwnedWriteHalf, m: &CoordToNode) -> std::io::Result<()> {
     let f = encode_frame(m)?;
-    w.write_all(&f).await
+    // a socket that does not drain is broken: the session ends and a new one is dialed
+    match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&f)).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "control write did not drain")),
+    }
 }
 
 /// Dials a node's control port for `kvadm node add`: handshake only, returning the

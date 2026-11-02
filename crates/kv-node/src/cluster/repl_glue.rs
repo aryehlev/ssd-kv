@@ -114,6 +114,8 @@ pub enum Walker {
     Divergent { epoch: u64 },
     /// Migration source.
     MigOut { id: u64, epoch: u64 },
+    /// Migration destination: the prune of keys the copy did not confirm.
+    MigInPrune { id: u64, epoch: u64 },
     /// Purge of slots this primary no longer serves.
     Purge,
 }
@@ -688,7 +690,8 @@ impl<B: Backend> Worker<B> {
         if !self.ticket_satisfies(st) {
             return;
         }
-        if matches!(st, TicketState::Failed(_)) {
+        let failed = matches!(st, TicketState::Failed(_));
+        if failed {
             tracing::error!(
                 partition = p,
                 "a replicated write failed on this node's device"
@@ -699,6 +702,21 @@ impl<B: Backend> Worker<B> {
             let Some(what) = pr.tickets.remove(&t.0) else {
                 return;
             };
+            if failed
+                && matches!(what, TicketFor::Group { .. } | TicketFor::Sync { .. })
+                && let Role::Member(m) = &mut pr.role
+            {
+                // a member never acknowledges a write its device did not take: the durable
+                // prefix stays where it is and the stream restarts from it
+                if let Some(io) = m.io.take() {
+                    io.abort();
+                }
+                m.epoch += 1;
+                m.sync = MemberSync::None;
+                m.divergent = None;
+                m.groups.clear();
+                return;
+            }
             match what {
                 TicketFor::Produced(s) => pr.durable.done(s),
                 TicketFor::Group { epoch, seq } => {
@@ -2523,6 +2541,9 @@ impl<B: Backend> Worker<B> {
                     self.submit_repl(cw, p, req, rj);
                 }
             }
+            Walker::MigInPrune { id, epoch } => {
+                self.mig_in_prune_listed(cw, p, id, epoch, next, keys, failed)
+            }
             Walker::MigOut { id, epoch } => {
                 self.mig_out_listed(cw, p, id, epoch, next, keys, failed)
             }
@@ -2568,6 +2589,7 @@ impl<B: Backend> Worker<B> {
 
     /// A meta reply for the replication glue of partition `p`.
     pub(crate) fn repl_meta_done(&mut self, p: u16, token: u64, done: MetaDone) {
+        let failed = matches!(done, MetaDone::Failed(_));
         if let MetaDone::Failed(e) = done {
             tracing::error!(partition = p, errno = e, "partition meta write failed");
         }
@@ -2581,6 +2603,24 @@ impl<B: Backend> Worker<B> {
                 let Role::Member(m) = &mut pr.role else {
                     return None;
                 };
+                if failed
+                    && matches!(
+                        m.sync,
+                        MemberSync::Full {
+                            flag_durable: false,
+                            ..
+                        }
+                    )
+                {
+                    // SYNCING is not durable: no record of the merge may be applied. The
+                    // stream ends; the next handshake starts the operator's sync again.
+                    if let Some(io) = m.io.take() {
+                        io.abort();
+                    }
+                    m.epoch += 1;
+                    m.sync = MemberSync::None;
+                    return None;
+                }
                 match &mut m.sync {
                     MemberSync::Full {
                         held, flag_durable, ..

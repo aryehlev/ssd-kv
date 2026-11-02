@@ -30,12 +30,21 @@
 //! which is then redialed (as a TCP reset would). Nothing in a run writes a trace (LC-33); a
 //! failure is reported with its seed, from which the whole run is regenerated.
 //!
-//! Findings are kept as knobs of [`ClusterSimCfg`] (the default models the proposed fix, the
-//! knob off models the code as it is) with `repro_*` tests that fail until the fix lands:
-//! R1 and R2 (`MemberStream` / received rings, kv-repl and kv-node), the failover lease wait
-//! (kv-coord), and the restarted primary that resumes its term (kv-node). `KV_SIM_TRACE=1`
-//! (and `KV_SIM_TRACE_KEY=<k>`) print proposals, faults and the writes of one key to stderr
-//! for a failing seed.
+//! The node model follows `kv-node/src/cluster/*` step for step where it decides something:
+//! the rings a partition keeps across role changes (a member keeps its received ring and the
+//! backlog of a term it served as primary; a promoted node uses the ring of the term it took
+//! over, or its own backlog when it is re-promoted, else a ring that was never started and
+//! covers nothing), the Repair key set (a) (`kv_repl::member::own_keys_after`, else a walk of
+//! the partition), the persisted `last_term` of the handshake, and the restart hold of a
+//! primary (after a crash it never serves the term it served before and reports
+//! `health.failed` while its assignment names it primary of that term). The coordinator side
+//! runs the failover steps of `run_failover`, including the lease hold-off of the failed
+//! primary while another node is fenced (`Detector::hold_off`).
+//!
+//! The findings of earlier campaigns are regression tests (`repro_*`): R1 and R2 (received
+//! rings, kv-repl and kv-node), the failover lease wait (kv-coord). `KV_SIM_TRACE=1` (and
+//! `KV_SIM_TRACE_KEY=<k>`) print proposals, faults and the writes of one key to stderr for a
+//! failing seed.
 //!
 //! Scope of this harness (reported, not hidden): no operator command runs during a simulated
 //! run (the cluster is bootstrapped by admin transitions before it starts), so full sync,
@@ -104,21 +113,6 @@ pub struct ClusterSimCfg {
     pub fault_every_ms: u64,
     /// Concurrent logical clients.
     pub clients: u8,
-    /// Model of `kvd` today: a node restarted with a persisted primary role resumes that
-    /// term (its next seq after the recovered maximum). `false` (the default) models the
-    /// behaviour this harness proposes: it never resumes the term and reports
-    /// `health.failed` until the coordinator pushes a newer assignment.
-    pub resume_term_after_restart: bool,
-    /// Model of `kvc` today when `false`: while a failover waits for the failed primary's
-    /// lease to run out (§23.9 step 4), the leader keeps granting that node leases if it renews
-    /// healthy again, so the wait never ends. `true` (the default) models the proposed fix: no
-    /// lease is granted to the recorded primary of a shard whose failover has fenced a node.
-    pub failover_lease_holdoff: bool,
-    /// Workaround for `MemberStream` ring issue R1 (see the comment in `member_tick`):
-    /// `false` models kv-repl as it is (a debug assertion fires).
-    pub member_ring_fix: bool,
-    /// Workaround for `MemberStream` ring issue R2 (see the comment in `member_frame`).
-    pub member_ring_floor_fix: bool,
 }
 
 /// Length of the quiet phase that ends every run.
@@ -143,10 +137,6 @@ impl ClusterSimCfg {
             },
             fault_every_ms: 1_500,
             clients: 4,
-            resume_term_after_restart: false,
-            failover_lease_holdoff: true,
-            member_ring_fix: true,
-            member_ring_floor_fix: true,
         }
     }
 }
@@ -485,7 +475,6 @@ enum FoStage {
 struct Coord {
     idx: usize,
     up: bool,
-    holdoff: bool,
     core: Core<Arc<ClusterState>>,
     disk: CoordDisk,
     election_at: u64,
@@ -546,7 +535,6 @@ impl Coord {
         Coord {
             idx,
             up: true,
-            holdoff: true,
             core: Core::recover(coord_id(idx), 0, None, peers.clone(), committed, None),
             disk,
             election_at: 0,
@@ -833,7 +821,9 @@ impl Coord {
         let shards: Vec<u16> = l.failovers.keys().copied().collect();
         for sid in shards {
             let Some(sh) = s.shard(ShardId(sid)) else {
-                l.failovers.remove(&sid);
+                if let Some(fo) = l.failovers.remove(&sid) {
+                    l.detector.release_hold(&fo.failed);
+                }
                 continue;
             };
             let fo = l.failovers.get_mut(&sid).expect("present");
@@ -841,7 +831,10 @@ impl Coord {
                 || sh.primary != Some(fo.failed)
                 || sh.term != fo.term
             {
+                // the run ends (`run_failover` returns): its lease hold-off ends with it
+                let failed = fo.failed;
                 l.failovers.remove(&sid);
+                l.detector.release_hold(&failed);
                 continue;
             }
             match &fo.stage {
@@ -870,6 +863,11 @@ impl Coord {
                             let req = l.next_req;
                             l.next_req += 1;
                             let new_term = sh.term + 1;
+                            if n != fo.failed {
+                                // `run_failover`: from the fence on, the failed primary gets no
+                                // new lease (`LeaseHoldOff`)
+                                l.detector.hold_off(fo.failed);
+                            }
                             fx.obs
                                 .fence_attempts
                                 .entry((sid, new_term))
@@ -891,10 +889,11 @@ impl Coord {
                             };
                         }
                         None => {
-                            // NoEligibleMember: kvc ends this run and starts a fresh one (a
-                            // fresh unusable list) 500 ms later
+                            // NoEligibleMember: kvc ends this run (and its lease hold-off) and
+                            // starts a fresh one (a fresh unusable list) 500 ms later
                             fo.unusable.clear();
                             fo.stage = FoStage::Retry { at: now + 500 * MS };
+                            l.detector.release_hold(&fo.failed);
                         }
                     }
                 }
@@ -917,6 +916,8 @@ impl Coord {
                         {
                             proposals.push(t);
                         }
+                        // the hold-off stays until the promotion is committed (the entry is
+                        // then removed above), as `run_failover` holds it across its proposal
                         fo.stage = FoStage::Retry {
                             at: now + 1000 * MS,
                         };
@@ -968,13 +969,9 @@ impl Coord {
                 if health.failed {
                     l.detector.on_reported_failed(nid);
                 }
-                // proposed fix: the recorded primary of a shard whose failover fenced a node gets
-                // no new lease, so the failover's wait for its lease (§23.9 step 4) ends
-                let held_off = self.holdoff
-                    && l.failovers.values().any(|fo| {
-                        fo.failed == nid && matches!(fo.stage, FoStage::LeaseGone { .. })
-                    });
-                if quorum && l.detector.may_grant(&s, &nid) && !held_off {
+                // a failover that fenced another node holds the failed primary's leases off
+                // (`Detector::may_grant`), so its wait for that lease (§23.9 step 4) ends
+                if quorum && l.detector.may_grant(&s, &nid) {
                     l.leases.grant(&nid, now);
                     let lease_ms = s.params.lease_ms;
                     fx.send(
@@ -1027,6 +1024,15 @@ impl Coord {
                 member,
             } => {
                 if let Some(t) = isr::member_ready_transition(&s, &nid, shard, term, member) {
+                    self.enqueue(t);
+                }
+            }
+            NodeToCoord::MemberNeedsResync {
+                shard,
+                term,
+                member,
+            } => {
+                if let Some(t) = isr::needs_resync_transition(&s, &nid, shard, term, member) {
                     self.enqueue(t);
                 }
             }
@@ -1202,6 +1208,9 @@ enum ConnRole {
 
 struct MemberSide {
     stream: MemberStream,
+    /// The backlog of a term this node served as primary (Repair key set (a); kv-node
+    /// `MemberPart::own_groups`).
+    own_groups: Option<Backlog>,
     conn: Option<u64>,
     dial_at: u64,
     /// The stream completed its catch-up (Continue accepted, or Repair images done).
@@ -1215,8 +1224,9 @@ struct RepairState {
 
 struct PrimaryPart {
     sender: ReplSender,
-    /// Received ring of the term this node took over (the Repair key sets (b)).
-    prev_received: Option<Backlog>,
+    /// The groups of the term this node took over (the Repair key sets (b)): its received
+    /// ring, its own backlog when re-promoted, else a ring that was never started.
+    prev_received: Backlog,
     /// Member id -> (conn, repair in progress).
     conns: BTreeMap<MemberId, (u64, Option<RepairState>)>,
 }
@@ -1257,6 +1267,8 @@ struct NodeDisk {
     /// Persisted lower bounds of the durable and commit positions per partition.
     repl_durable: Vec<Seq>,
     repl_commit: Vec<Seq>,
+    /// Persisted `last_term` per partition (partition meta `term`).
+    last_term: Vec<u32>,
 }
 
 struct Node {
@@ -1265,8 +1277,12 @@ struct Node {
     incarnation: u64,
     /// The process restarted after a crash (no clean shutdown happens in the simulation).
     scanned: bool,
-    /// A restarted primary never resumes the term it served before the crash.
-    restart_term: u32,
+    /// After a crash: the persisted fence term; a primary role of a term at or below it is
+    /// never served again (kv-node `ClusterShared::restart_term`).
+    restart_term: Option<u32>,
+    /// Per partition: the term of the last stream that completed its catch-up (Continue
+    /// accepted, Repair done), the handshake's `last_term` (kv-node `PartRepl::last_term`).
+    last_term: Vec<u32>,
     disk: NodeDisk,
     stores: Vec<Store>,
     lease_expiry: u64,
@@ -1277,17 +1293,15 @@ struct Node {
     next_persist: u64,
     role: NodeRole,
     conns: BTreeMap<u64, (ConnRole, StreamEnd)>,
-    /// Received rings kept across a demotion or a promotion (per partition).
-    rings: Vec<Option<Backlog>>,
     disk_slow_until: u64,
     disk_slow_ns: u64,
-    /// Restarted with a persisted primary role: renewals report `health.failed` until an
-    /// assignment newer than the persisted one arrives (a new leader cannot tell a restart
-    /// from the first renewal it sees).
+    /// Renewals report `health.failed`: the node holds an assignment naming it primary of a
+    /// term it must not serve after its restart (or, before the first one, it was a primary
+    /// when it crashed). A new leader cannot tell a restart from the first renewal it sees.
     report_failed: bool,
-    resume_term: bool,
-    ring_fix: bool,
-    ring_floor_fix: bool,
+    /// Primary: when each member's NeedOperatorResync was last reported (kv-node agent
+    /// `resync_sent`, repeated at most once a second).
+    resync_sent: BTreeMap<usize, u64>,
     /// After a restart: the persisted `repl_durable` lower bound per partition, announced by
     /// the first handshake.
     meta_applied: Vec<Option<Seq>>,
@@ -1307,12 +1321,15 @@ impl Node {
             up: true,
             incarnation: 1,
             scanned: false,
-            restart_term: 0,
+            restart_term: None,
+            // the bootstrapped members are in sync at term 1
+            last_term: vec![1; usize::from(P)],
             disk: NodeDisk {
                 assignment: None,
                 fence_term: 1,
                 repl_durable: vec![start; usize::from(P)],
                 repl_commit: vec![start; usize::from(P)],
+                last_term: vec![1; usize::from(P)],
             },
             stores: (0..P).map(|_| Store::new(start)).collect(),
             lease_expiry: 0,
@@ -1323,14 +1340,11 @@ impl Node {
             next_persist: 0,
             role: NodeRole::None,
             conns: BTreeMap::new(),
-            rings: (0..P).map(|_| None).collect(),
             disk_slow_until: 0,
             disk_slow_ns: 0,
             meta_applied: (0..P).map(|_| None).collect(),
             report_failed: false,
-            resume_term: false,
-            ring_fix: true,
-            ring_floor_fix: true,
+            resync_sent: BTreeMap::new(),
         }
     }
 
@@ -1356,7 +1370,6 @@ impl Node {
         }
         self.role = NodeRole::None;
         self.conns.clear();
-        self.rings = (0..P).map(|_| None).collect();
         self.lease_expiry = 0;
         self.renews.clear();
         self.ctrl = None;
@@ -1366,22 +1379,16 @@ impl Node {
         self.up = true;
         self.incarnation = rng.random::<u64>() | 1;
         self.scanned = true;
-        self.restart_term = self
+        // kv-node: an unclean restart holds every primary role of a term up to the persisted
+        // fence term; renewals report failed while the persisted role is a primary
+        self.restart_term = Some(self.disk.fence_term);
+        self.report_failed = self
             .disk
             .assignment
             .as_ref()
             .and_then(|a| a.role.as_ref())
-            .map_or(0, |r| r.term);
-        self.report_failed = !self.resume_term
-            && self
-                .disk
-                .assignment
-                .as_ref()
-                .and_then(|a| a.role.as_ref())
-                .is_some_and(|r| r.is_primary);
-        if self.resume_term {
-            self.scanned = false; // kvd resumes a persisted primary role as if nothing happened
-        }
+            .is_some_and(|r| r.is_primary);
+        self.last_term = self.disk.last_term.clone();
         // the first handshake of each partition announces the persisted lower bound
         self.meta_applied = self.disk.repl_durable.iter().map(|s| Some(*s)).collect();
         self.next_renew = now_l;
@@ -1615,7 +1622,11 @@ impl Node {
             .unwrap_or_default();
         let last_exec = self.stores[usize::from(p)].last_exec;
         let NodeRole::Primary {
-            term, parts, mids, ..
+            shard: my_shard,
+            term,
+            parts,
+            mids,
+            ..
         } = &mut self.role
         else {
             let mut out = Vec::new();
@@ -1648,17 +1659,11 @@ impl Node {
             })
             .is_some_and(|(_, st, _)| *st == MemberState::Syncing);
         let pp = &mut parts[usize::from(p)];
-        // no received ring: an empty one that covers nothing at or below this node's position
-        // (a fresh `Backlog` has floor 0 and would claim to cover all history, R2)
-        let mut empty = Backlog::new(64);
-        if self.ring_floor_fix {
-            empty.start_after(last_exec);
-        }
         let view = PrimaryView {
             term,
             history: &history,
             backlog: pp.sender.backlog(),
-            received: pp.prev_received.as_ref().unwrap_or(&empty),
+            received: &pp.prev_received,
             is_member: mid.is_some(),
             operator_full_sync: operator_full,
             last_executed: last_exec,
@@ -1720,13 +1725,13 @@ impl Node {
                     } else if sync::takeover(&history, term - 1, p).is_none() {
                         2
                     } else if h.applied < sync::takeover(&history, term - 1, p).unwrap_or(Seq::ZERO)
-                        && pp.prev_received.as_ref().is_none_or(|r| {
-                            r.keys_between(
+                        && pp
+                            .prev_received
+                            .keys_between(
                                 h.applied,
                                 sync::takeover(&history, term - 1, p).unwrap_or(Seq::ZERO),
                             )
                             .is_none()
-                        })
                     {
                         3
                     } else if at > start && pp.sender.backlog().keys_between(start, at).is_none() {
@@ -1735,6 +1740,29 @@ impl Node {
                         5
                     };
                     fx.report.resync_why[why] += 1;
+                    // kv-node: the primary reports the member (NeedsFullSync), unless the
+                    // committed assignment already shows it, at most once a second
+                    let recorded = assignment_members.iter().any(|(id, st, _)| {
+                        member_node.is_some_and(|n| *id == node_id(n))
+                            && matches!(st, MemberState::NeedsFullSync | MemberState::Syncing)
+                    });
+                    if let (Some(n), Some((c, _)), false) = (member_node, self.ctrl, recorded) {
+                        let due = self
+                            .resync_sent
+                            .get(&n)
+                            .is_none_or(|t| fx.now_l >= t + 1000 * MS);
+                        if due {
+                            self.resync_sent.insert(n, fx.now_l);
+                            fx.send(
+                                c,
+                                Msg::Report(NodeToCoord::MemberNeedsResync {
+                                    shard: ShardId(*my_shard),
+                                    term,
+                                    member: node_id(n),
+                                }),
+                            );
+                        }
+                    }
                 }
                 frame::encode(&Frame::Reject(r), p, term, &mut out);
             }
@@ -1907,7 +1935,7 @@ impl Node {
                     .collect()
             })
             .unwrap_or_default();
-        let scanned = self.scanned;
+        let last_term = &mut self.last_term[usize::from(p)];
         let NodeRole::Replica { parts, .. } = &mut self.role else {
             return false;
         };
@@ -1979,40 +2007,26 @@ impl Node {
                     store.write(&rec.key, v, at, false, fx.now_g, delay);
                 }
                 MemberAction::SendRepairKeys => {
-                    // (a): keys of this member's own groups after its term's takeover point
-                    let last_term = store.last_exec.term();
-                    let t =
-                        sync::takeover(&history, last_term, p).unwrap_or(Seq::new(last_term, 0));
+                    // (a): keys of this member's own groups after its last term's takeover
+                    // point (kv-node `member_repair_keys`): from a ring that holds every group
+                    // up to the highest position the partition holds, else a walk of the
+                    // partition for keys stored above the takeover point
+                    let takeover = sync::takeover(&history, *last_term, p);
                     let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
-                    // the rings of groups this member received (set-aside ring first)
-                    let ring_keys = (|| {
-                        let mut out: BTreeSet<Vec<u8>> = BTreeSet::new();
-                        let mut from = t;
-                        for ring in [
-                            self.rings[usize::from(p)].as_ref(),
-                            Some(ms.stream.received()),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        {
-                            let Some(last) = ring.last() else { continue };
-                            if last <= from {
-                                continue;
-                            }
-                            let ks = ring.keys_between(from, last)?;
-                            out.extend(ks.into_iter().map(|(_, k)| k.to_vec()));
-                            from = last;
-                        }
-                        Some(out)
-                    })()
-                    .filter(|_| !scanned);
+                    let mut rings: Vec<&Backlog> = Vec::new();
+                    if let Some(b) = ms.own_groups.as_ref() {
+                        rings.push(b);
+                    }
+                    rings.push(ms.stream.received());
+                    let ring_keys = takeover
+                        .and_then(|t| kv_repl::member::own_keys_after(&rings, t, store.pos));
                     match ring_keys {
-                        Some(ks) => keys.extend(ks),
+                        Some(ks) => keys.extend(ks.into_vec().into_iter().map(|(_, k)| k.to_vec())),
                         None => {
-                            // after a restart (the ring is RAM only): the records of the old
-                            // term above its takeover point (DESIGN §18.4 maybe_divergent)
+                            // the walk (DESIGN §18.4 maybe_divergent after a restart)
+                            let above = takeover.unwrap_or(Seq::ZERO);
                             for (k, r) in &store.live {
-                                if r.seq.term() == last_term && r.seq > t {
+                                if r.seq > above {
                                     keys.insert(k.clone());
                                 }
                             }
@@ -2033,6 +2047,9 @@ impl Node {
                     store.advance(end, fx.now_g, delay);
                     store.last_exec = store.last_exec.max(end);
                     ms.ready = true;
+                    if let Some((t, _)) = ms.stream.accepted() {
+                        *last_term = (*last_term).max(t);
+                    }
                 }
                 MemberAction::SyncBegin(_)
                 | MemberAction::Snap(..)
@@ -2051,18 +2068,10 @@ impl Node {
                 MemberAction::Commit(_) | MemberAction::Nothing => {}
             }
         }
-        if let Some((_, AcceptMode::Continue { from })) = ms.stream.accepted() {
-            if !ms.ready
-                && self.ring_floor_fix
-                && ms.stream.received().last().is_none_or(|l| l.0 + 1 < from.0)
-            {
-                // Workaround (kv-repl R2): the received ring does not hold the groups before
-                // `from` (a fresh ring after a restart has floor 0, so `covers_after` says yes
-                // for groups it never saw): its floor moves to `from - 1`, so a later Repair
-                // decision of this node as primary never trusts a gap
-                ms.stream.reset_received(Seq(from.0 - 1));
-            }
+        if let Some((t, AcceptMode::Continue { .. })) = ms.stream.accepted() {
+            // kv-node: a plain Continue on the current term is a ready partition
             ms.ready = true;
+            *last_term = (*last_term).max(t);
         }
         if ms.ready {
             self.meta_applied[usize::from(p)] = None;
@@ -2118,12 +2127,8 @@ impl Node {
                     return;
                 }
                 let version = a.version;
-                if a.role
-                    .as_ref()
-                    .is_none_or(|r| !r.is_primary || r.term > self.restart_term)
-                {
-                    self.report_failed = false;
-                }
+                // kv-node agent: `refusing_primary` follows every applied assignment
+                self.report_failed = self.refuses_primary(&a);
                 // persisted before the ack (§23.4)
                 if let Some(r) = &a.role
                     && r.term > self.disk.fence_term
@@ -2172,11 +2177,21 @@ impl Node {
         }
     }
 
+    /// After a crash, `a` names this node primary of a term it must not serve (kv-node
+    /// `ClusterShared::refuses_primary`).
+    fn refuses_primary(&self, a: &NodeAssignment) -> bool {
+        match (self.restart_term, a.role.as_ref()) {
+            (Some(rt), Some(r)) => r.is_primary && r.term <= rt,
+            _ => false,
+        }
+    }
+
     /// Applies the persisted assignment to the node's roles and streams.
     fn reconfigure(&mut self, fx: &mut Fx<'_>, env: &mut NodeEnv<'_>) {
         let Some(a) = self.disk.assignment.clone() else {
             return;
         };
+        let refused = self.refuses_primary(&a);
         let Some(r) = a.role.clone() else {
             self.drop_role(fx);
             return;
@@ -2188,10 +2203,12 @@ impl Node {
             .filter(|m| m.2)
             .filter_map(|m| node_index(&m.0))
             .collect();
-        if r.is_primary && !fenced && (r.term > self.restart_term || !self.scanned) {
+        if r.is_primary && !fenced && !refused {
             let same = matches!(&self.role, NodeRole::Primary { shard, term, .. } if *shard == r.shard.0 && *term == r.term);
             if !same {
-                // promotion: keep the received rings of the term taken over (Repair (b))
+                // promotion (kv-node `apply_role`): the groups of the term taken over for the
+                // Repair key sets (b): the received ring, or the own backlog of a re-promoted
+                // primary; else (a restart) a ring that was never started
                 let mut rings: Vec<Option<Backlog>> = (0..P).map(|_| None).collect();
                 match std::mem::replace(&mut self.role, NodeRole::None) {
                     NodeRole::Replica { parts, .. } => {
@@ -2199,7 +2216,10 @@ impl Node {
                             rings[p] = Some(ms.stream.into_received());
                         }
                     }
-                    NodeRole::Primary { pending, .. } => {
+                    NodeRole::Primary { parts, pending, .. } => {
+                        for (p, pp) in parts.into_iter().enumerate() {
+                            rings[p] = Some(pp.sender.into_backlog());
+                        }
                         for pd in pending {
                             fx.send(
                                 pd.client,
@@ -2223,16 +2243,9 @@ impl Node {
                         if last.term() == r.term {
                             sender.start_at(last);
                         }
-                        // a promoted node that has no received ring of the term it takes over (it
-                        // was that term's primary, or it restarted) covers nothing below its
-                        // position (R2: a fresh ring's floor is 0)
-                        let prev_received = rings[usize::from(p)].take().or_else(|| {
-                            self.ring_floor_fix.then(|| {
-                                let mut r = Backlog::new(64);
-                                r.start_after(last);
-                                r
-                            })
-                        });
+                        let prev_received = rings[usize::from(p)]
+                            .take()
+                            .unwrap_or_else(|| Backlog::new(64));
                         PrimaryPart {
                             sender,
                             prev_received,
@@ -2298,7 +2311,9 @@ impl Node {
             return;
         }
         let old = std::mem::replace(&mut self.role, NodeRole::None);
-        let mut prev_parts: Vec<Option<MemberStream>> = (0..P).map(|_| None).collect();
+        // kv-node `apply_role`: (received ring, own backlog) carried into the new member role
+        let mut prev: Vec<(Option<Backlog>, Option<Backlog>)> =
+            (0..P).map(|_| (None, None)).collect();
         match old {
             NodeRole::Primary { parts, pending, .. } => {
                 for pd in pending {
@@ -2312,12 +2327,12 @@ impl Node {
                 }
                 // a demoted primary keeps its own groups for its Repair key set (a)
                 for (p, pp) in parts.into_iter().enumerate() {
-                    self.rings[p] = Some(pp.sender.into_backlog());
+                    prev[p].1 = Some(pp.sender.into_backlog());
                 }
             }
             NodeRole::Replica { parts, .. } => {
                 for (p, ms) in parts.into_iter().enumerate() {
-                    prev_parts[p] = Some(ms.stream);
+                    prev[p] = (Some(ms.stream.into_received()), ms.own_groups);
                 }
             }
             NodeRole::None => {}
@@ -2327,22 +2342,13 @@ impl Node {
         }
         let parts = (0..P)
             .map(|p| {
-                let stream = match prev_parts[usize::from(p)].take() {
-                    Some(s) => s,
-                    None => match self.rings[usize::from(p)].take() {
-                        Some(ring) => MemberStream::with_backlog(p, ring),
-                        None => {
-                            // a fresh ring holds nothing up to this node's position (R2)
-                            let mut ring = Backlog::new(RING);
-                            if self.ring_floor_fix {
-                                ring.start_after(self.stores[usize::from(p)].last_exec);
-                            }
-                            MemberStream::with_backlog(p, ring)
-                        }
-                    },
-                };
+                let (ring, own_groups) = std::mem::take(&mut prev[usize::from(p)]);
+                // a fresh ring covers nothing until a stream starts it
+                let stream =
+                    MemberStream::with_backlog(p, ring.unwrap_or_else(|| Backlog::new(RING)));
                 MemberSide {
                     stream,
+                    own_groups,
                     conn: None,
                     dial_at: fx.now_g,
                     ready: false,
@@ -2533,6 +2539,7 @@ impl Node {
             for (p, s) in self.stores.iter().enumerate() {
                 self.disk.repl_durable[p] = self.disk.repl_durable[p].max(s.durable_pos);
             }
+            self.disk.last_term.clone_from(&self.last_term);
         }
         // lease renewals on the control connection
         let renew_ms = self
@@ -2721,7 +2728,6 @@ impl Node {
         let fence = self.disk.fence_term;
         let scanned = self.scanned;
         let ctrl = self.ctrl.map(|c| c.0);
-        let ring_fix = self.ring_fix;
         let mut dials = Vec::new();
         let mut acks = Vec::new();
         let mut all_ready = true;
@@ -2755,14 +2761,6 @@ impl Node {
                         let applied = self.meta_applied[p]
                             .unwrap_or(store.durable_pos)
                             .min(store.durable_pos);
-                        if ring_fix && ms.stream.received().last().is_some_and(|l| l > applied) {
-                            // Workaround (kv-repl R1): `MemberStream::restart` keeps the received
-                            // ring, and a Continue from a durable position below the ring's last
-                            // seq pushes those groups into the ring again (`Backlog::push`:
-                            // "backlog seqs must increase"). Redial once every received group is
-                            // durable, so the handshake position is at the ring's end.
-                            continue;
-                        }
                         ms.stream.restart(applied, store.durable_pos);
                         let h = Hello {
                             cluster_id: [7; 16],
@@ -2771,7 +2769,8 @@ impl Node {
                             shard: *shard,
                             partition: p as u16,
                             fence_term: fence,
-                            last_term: store.last_exec.term().max(applied.term()),
+                            // kv-node: the persisted term of the last completed catch-up
+                            last_term: self.last_term[p],
                             applied,
                             recovered: if scanned {
                                 Recovered::Scanned
@@ -3019,25 +3018,11 @@ impl World {
         let mut net = SimNet::new(cfg.seed, cfg.faults);
         net.add_process(nc + nn);
         let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0x434c_5553_5445_5253);
-        let mut coords: Vec<Coord> = (0..nc)
-            .map(|i| {
-                let mut c = Coord::new(i, &peers, &base);
-                c.holdoff = cfg.failover_lease_holdoff;
-                c
-            })
-            .collect();
+        let mut coords: Vec<Coord> = (0..nc).map(|i| Coord::new(i, &peers, &base)).collect();
         for (i, c) in coords.iter_mut().enumerate() {
             c.election_at = net.after(i, rng.random_range(500 * MS..1000 * MS));
         }
-        let nodes = (0..nn)
-            .map(|i| {
-                let mut n = Node::new(i);
-                n.resume_term = cfg.resume_term_after_restart;
-                n.ring_fix = cfg.member_ring_fix;
-                n.ring_floor_fix = cfg.member_ring_floor_fix;
-                n
-            })
-            .collect();
+        let nodes = (0..nn).map(Node::new).collect();
         let k = usize::from(cfg.clients.max(1));
         let end = cfg.sim_ms * MS + QUIET_MS * MS;
         let mut obs = Obs {
@@ -3896,14 +3881,14 @@ mod tests {
         while m.next_action().is_some() {}
     }
 
-    /// kv-repl R1 (open), minimized from the simulation: a member whose stream broke while
+    /// kv-repl R1 (fixed), minimized from the simulation: a member whose stream broke while
     /// some received groups were not yet durable dials again with its durable position
     /// (kv-node: `m.stream.restart(durable, durable)`); the Continue resends groups the
-    /// received ring already holds and `Backlog::push` gets a seq below its last one (debug
-    /// builds: "backlog seqs must increase"; release: a ring with repeated, unordered seqs).
-    /// Suggested fix (member.rs, GROUPS): push to the ring only when `seq` is above its last.
+    /// received ring already holds. Before the fix `Backlog::push` got a seq below its last
+    /// one (debug builds: "backlog seqs must increase"; release: a ring with repeated,
+    /// unordered seqs). Fix: `MemberStream` stores a group only when its seq is above the
+    /// ring's last (`Backlog::push_after_end`).
     #[test]
-    #[ignore = "kv-repl R1 (open): a Continue below the received ring's end pushes groups again"]
     fn repro_r1_continue_below_ring_end() {
         let mut m = MemberStream::new(0, 1 << 14);
         m.restart(Seq::new(1, 0), Seq::new(1, 0));
@@ -3936,15 +3921,14 @@ mod tests {
         );
     }
 
-    /// kv-repl R2 (open), minimized: a member's received ring that starts empty (after a
+    /// kv-repl R2 (fixed), minimized: a member's received ring that starts empty (after a
     /// restart, or any fresh ring) and is fed by a `Continue { from }` never holds the groups
-    /// before `from`, yet `covers_after` (floor 0) says it does; when that member becomes the
-    /// next primary, `sync::decide` takes this ring as the Repair key source (b) and builds a
-    /// key set that misses the groups of the gap, so a repaired member can keep a state the
-    /// new primary does not have. Suggested fix: on `Accept { Continue { from } }`, when the
-    /// ring does not end at `from - 1`, clear it and raise its floor to `from - 1`.
+    /// before `from`; before the fix `covers_after` (floor 0) said it did, and when that
+    /// member became the next primary `sync::decide` took this ring as the Repair key source
+    /// (b), missing the groups of the gap. Fix: a ring that was never started covers nothing,
+    /// and `Accept { Continue { from } }` restarts the ring after `from - 1` unless it already
+    /// reached it (`Backlog::continue_after`).
     #[test]
-    #[ignore = "kv-repl R2 (open): a received ring claims coverage of groups it never received"]
     fn repro_r2_ring_claims_a_gap() {
         let mut m = MemberStream::new(0, 1 << 14);
         m.restart(Seq::new(1, 49), Seq::new(1, 49));
@@ -3966,21 +3950,20 @@ mod tests {
         );
     }
 
-    /// kv-repl/kv-node R2 (open), found by seeds 40 and 79 (an acknowledged write lost): a
-    /// fresh `Backlog` has floor 0, so `covers_after` holds for every position although the
-    /// ring never received anything. kv-node passes such a ring as the new primary's
+    /// kv-repl/kv-node R2 (fixed), found by seeds 40 and 79 (an acknowledged write lost):
+    /// a fresh `Backlog` had floor 0, so `covers_after` held for every position although the
+    /// ring never received anything. kv-node passed such a ring as the new primary's
     /// received ring when it carried none (`repl_glue.rs`: `carried_ring.unwrap_or_else(||
     /// Backlog::try_new(SMALL_RING))`, e.g. a primary of the previous term that restarted and
-    /// is re-promoted, or a member ring created after a restart). `sync::decide` then accepts
-    /// a Repair whose key set (b) is empty; the repaired member keeps an older value of a key
-    /// whose acknowledged write it never received, and is later promoted. In the simulation:
+    /// is re-promoted, or a member ring created after a restart), and `sync::decide` accepted
+    /// a Repair whose key set (b) was empty; the repaired member kept an older value of a key
+    /// whose acknowledged write it never received, and was later promoted. In the simulation:
     /// term 3 primary n0 acks a write that only n0 and n2 hold; n2 then n0 crash; n0 is
     /// re-promoted (term 4, ISR n0) with a fresh received ring and repairs n1 (last term 1) with
     /// no term-3 keys; n0 expands n1 into the ISR and fails; n1 is promoted (term 5) without
-    /// the write. Suggested fix: a received ring starts with `start_after(<the node's position>)`
-    /// (or `decide` refuses Repair when the received ring never received anything).
+    /// the write. Fix: a ring that was never started covers nothing (`Backlog`), so the
+    /// handshake is refused (NeedOperatorResync) instead.
     #[test]
-    #[ignore = "kv-repl/kv-node R2 (open): an empty received ring is taken as full coverage"]
     fn repro_r2_fresh_received_ring_repairs_without_keys() {
         let mut backlog = Backlog::new(1 << 12);
         backlog.start_after(Seq::new(4, 0));
@@ -4014,23 +3997,19 @@ mod tests {
         );
     }
 
-    /// kv-coord (open), found by seed 17 (seed 33 today; 22 of 300 seeds with this knob off,
-    /// none with it on): both remaining ISR members of a shard and its primary
-    /// are flagged by a new leader's detector in one batch (NoPrimary); the primary renews
-    /// healthy again and its flag is cleared, then a member's flag clears and the shard turns
-    /// Promoting with a healthy primary. `run_failover` fences the member and then waits in
-    /// `lease_gone` for the old primary's lease, which the leader keeps renewing (its
-    /// `may_grant` is true), so the shard stays CLUSTERDOWN forever. Suggested fix: no lease
-    /// grant to the recorded primary of a shard whose failover has fenced a node (what
-    /// `failover_lease_holdoff` models).
+    /// kv-coord (fixed), found by seed 17 (seed 33 before the fix; 22 of 300 seeds failed
+    /// this way): both remaining ISR members of a shard and its primary are flagged by a new
+    /// leader's detector in one batch (NoPrimary); the primary renews healthy again and its
+    /// flag is cleared, then a member's flag clears and the shard turns Promoting with a
+    /// healthy primary. `run_failover` fenced the member and then waited in `lease_gone` for
+    /// the old primary's lease, which the leader kept renewing (its `may_grant` was true), so
+    /// the shard stayed CLUSTERDOWN forever. Fix: from the fence of another node on, the
+    /// failed primary gets no lease (`Detector::hold_off`, `run_failover`'s `LeaseHoldOff`).
     #[test]
-    #[ignore = "kv-coord (open): a failover waits forever on a lease the leader keeps renewing"]
     fn repro_failover_waits_on_a_renewed_lease() {
-        let cfg = ClusterSimCfg {
-            failover_lease_holdoff: false,
-            ..ClusterSimCfg::new(33)
-        };
-        run(&cfg).unwrap();
+        for seed in [17, 33] {
+            run(&ClusterSimCfg::new(seed)).unwrap();
+        }
     }
 
     fn quiet(seed: u64) -> ClusterSimCfg {
@@ -4063,14 +4042,8 @@ mod tests {
             .unwrap_or(1);
         let mut fails = Vec::new();
         let mut total = ClusterSimReport::default();
-        let on = |v: &str| std::env::var_os(v).is_some();
         for seed in start..start + n {
-            let mut cfg = ClusterSimCfg::new(seed);
-            // the behaviour of today's binaries instead of the proposed fixes
-            cfg.resume_term_after_restart = on("KV_SIM_KVD_RESUMES_TERM");
-            cfg.member_ring_fix = !on("KV_SIM_REPL_R1_AS_IS");
-            cfg.member_ring_floor_fix = !on("KV_SIM_REPL_R2_AS_IS");
-            cfg.failover_lease_holdoff = !on("KV_SIM_KVC_NO_HOLDOFF");
+            let cfg = ClusterSimCfg::new(seed);
             match run_report(&cfg) {
                 Ok(r) => total.add(&r),
                 Err(e) => fails.push(e),

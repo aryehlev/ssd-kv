@@ -358,8 +358,10 @@ pub(crate) struct Built {
     /// Keys whose tracked copies elsewhere must be zeroed by foreground writes now (D1, E14).
     pub(crate) foreground: SmallVec<[(u8, Box<[u8]>); 1]>,
     /// Keys whose newest copy in M is durable and committed while copies elsewhere are still
-    /// tracked as protected sources: those sources are superseded (E2 holds) and go stale.
-    pub(crate) sources_durable: SmallVec<[(u8, Box<[u8]>); 1]>,
+    /// tracked: `(db, key, seq of that copy)`. Sources with a lower seq are shadowed by it (E2
+    /// holds) and go stale. Every such source should already have been released by the event
+    /// that made the copy durable; the partition counts each one this check releases.
+    pub(crate) sources_durable: SmallVec<[KeyAt; 1]>,
     /// Tracked copies in this page that N zeroes.
     pub(crate) cleared: SmallVec<[(u8, Box<[u8]>); 1]>,
     /// Records zeroed and placed (counters).
@@ -375,6 +377,9 @@ impl Built {
         !self.spans.is_empty()
     }
 }
+
+/// `(db, key, seq)` of one copy of a key.
+pub(crate) type KeyAt = (u8, Box<[u8]>, Seq);
 
 /// Byte ranges changed by a build, merged on demand.
 #[derive(Default)]
@@ -613,10 +618,15 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     // E14: a further copy waits until the older tracked copy is durably zeroed
                     if others > 0 {
                         out.foreground.push((db, rec.key().into()));
-                        if kept_newest && !newest_txn_open && env.tracked_here(db, rec.key()).is_none() {
-                            // the copy in M is durable, committed and not itself an older
-                            // tracked copy: every tracked copy elsewhere is older and superseded
-                            out.sources_durable.push((db, rec.key().into()));
+                        if let Some(i) = newest
+                            && kept_newest
+                            && !newest_txn_open
+                            && env.tracked_here(db, rec.key()).is_none()
+                        {
+                            // the copy in M is durable and committed: tracked copies elsewhere
+                            // with a lower seq are shadowed by it (only those: a copy here that
+                            // the index no longer names may be older than the tracked ones)
+                            out.sources_durable.push((db, rec.key().into(), keep[i].seq));
                         }
                     }
                     st.pending.push(Pending::Put(rec));

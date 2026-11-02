@@ -62,6 +62,7 @@ fn update_keeps(atomic: bool, sizes: &[usize], seed: u64) -> Result<(), TestCase
             }
         }
     }
+    db.quiesce();
     Ok(())
 }
 
@@ -111,6 +112,7 @@ proptest! {
                 prop_assert!(n <= 2, "key {} has {} copies on media", String::from_utf8_lossy(&kk), n);
             }
         }
+        db.quiesce();
     }
 }
 
@@ -153,6 +155,7 @@ fn prop_holes_reused() {
         let mut sorted = pages.clone();
         sorted.sort_unstable();
         assert_ne!(pages, sorted, "seed {seed}: insert addresses are monotonic");
+        db.quiesce();
     }
 }
 
@@ -195,6 +198,7 @@ fn prop_placement_uncorrelated() {
         assert!(db.eng.settle(200_000));
         let rho = pooled_spearman(&groups(&db, &ext, &seqs));
         assert!(rho.abs() < 0.05, "seed {seed}: extents |Spearman(seq, first page)| = {rho}");
+        db.quiesce();
     }
 }
 
@@ -240,6 +244,7 @@ fn record_single_device() {
     }
     assert_eq!(devs_used.len(), 2, "both devices hold records (the allocator spreads AGs)");
     let _ = AG_PAGES;
+    db.quiesce();
 }
 
 /// LC-10: any write may set, shorten, lengthen or remove a TTL; the result survives restarts.
@@ -262,4 +267,5 @@ fn ttl_shorten() {
     assert_eq!(db.get(0, k).unwrap().unwrap().0.expire_at_ms, Some(T0 + 20_000));
     db.advance(30_000);
     assert!(db.get(0, k).unwrap().is_none(), "shortened TTL not honoured");
+    db.quiesce();
 }

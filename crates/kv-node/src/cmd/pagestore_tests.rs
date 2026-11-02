@@ -473,6 +473,8 @@ fn differential(seeds: &[u64], steps: usize, write_through: bool, multi: bool) {
                 st.recent()
             );
         }
+        // with no new input everything the stream started reaches a terminal state
+        st.eng().assert_quiescent_complete(200_000);
     }
 }
 
@@ -555,12 +557,14 @@ fn restarts(write_through: bool, multi: bool) {
                 st.recent()
             );
         }
+        st.eng().assert_quiescent_complete(200_000);
         if round % 2 == 0 {
             st.restart_clean();
         } else {
             st.restart_unclean();
         }
         assert_same_contents(&mut st, &mut m);
+        st.eng().assert_quiescent_complete(200_000);
     }
 }
 

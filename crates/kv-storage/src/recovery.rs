@@ -666,7 +666,7 @@ fn resolve_group(p: &mut PartitionStore, scan: &mut Scan) {
                 Kind::Small => StaleRef::Small { page: loser.at },
                 _ => StaleRef::Extent { page: loser.at, n_pages: loser.n_pages },
             };
-            p.core.stale.add(db, &found[i].key, at, CopyState::Stale);
+            p.core.stale.add(db, &found[i].key, at, CopyState::Stale, loser.seq);
         }
         if winner.absent && j > i + 1 {
             // the key is absent: its entry goes in step 4a; its bytes stay until the losers

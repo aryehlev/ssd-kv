@@ -133,9 +133,7 @@ fn workload<D: BlockDevice>(db: &mut Db<D>, model: &mut Model, r: &mut Rng, ops:
                     let ts = db.flushdb(Some(1));
                     if wait {
                         for (p, t) in ts {
-                            if let Some(t) = t {
-                                db.eng.wait_ticket(p, t, ack);
-                            }
+                            db.wait_in(p, t, ack);
                         }
                     }
                 } else {
@@ -202,7 +200,13 @@ fn kill9_random_sequences_never_lose_acked_writes() {
             eng.recover().unwrap();
             let mut db = Db::new(eng, T0);
             verify(&mut db, &mut model, keys, seed, round);
+            // post-recovery work (scrubs of stale copies, txn resolution) completes
+            db.quiesce();
             workload(&mut db, &mut model, &mut r, 120, keys, TicketState::Written);
+            if round == 2 {
+                // the last round ends quiescent: nothing it accepted is left non-terminal
+                db.quiesce();
+            }
             devs = db.eng.into_devices();
             for d in &mut devs {
                 d.crash();
@@ -300,7 +304,11 @@ mod power {
                 }
                 let mut db = Db::new(eng, T0);
                 verify(&mut db, &mut model, keys, seed, round);
+                db.quiesce();
                 workload(&mut db, &mut model, &mut r, 100, keys, TicketState::Durable);
+                if round == 2 {
+                    db.quiesce();
+                }
                 devs = db.eng.into_devices();
                 for d in &mut devs {
                     if round % 2 == 0 {

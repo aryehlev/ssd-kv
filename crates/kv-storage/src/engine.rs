@@ -958,14 +958,20 @@ impl<D: BlockDevice> LocalEngine<D> {
     }
 
     /// Pumps until ticket `t` reached `want` (Written or Durable) or failed; returns its state.
+    ///
+    /// Stops early (returning the state reached) when a partition fails
+    /// [`PartitionStore::check_progress`]: the ticket can then never reach `want`.
     pub fn wait_ticket(&mut self, p: u16, t: crate::ticket::TicketId, want: crate::ticket::TicketState) -> crate::ticket::TicketState {
         use crate::ticket::TicketState as S;
-        for _ in 0..1_000_000 {
+        for i in 0..1_000_000u32 {
             match self.ticket_state(p, t) {
                 Some(S::Failed(e)) => return S::Failed(e),
                 Some(S::Durable) => return S::Durable,
                 Some(S::Written) if want == S::Written => return S::Written,
                 _ => {}
+            }
+            if i % 256 == 255 && self.check_progress().is_err() {
+                break;
             }
             self.pump();
         }
@@ -1040,6 +1046,49 @@ impl<D: BlockDevice> LocalEngine<D> {
             }
         }
         false
+    }
+
+    /// Structural liveness check of every partition ([`PartitionStore::check_progress`]).
+    pub fn check_progress(&self) -> Result<(), String> {
+        self.parts.iter().try_for_each(|p| p.check_progress(&self.cache))
+    }
+
+    /// Drives the engine with no new input until every partition passes
+    /// [`PartitionStore::check_quiescent_complete`]: each iteration completes the submitted
+    /// device requests and meta requests, ticks every partition and submits flushes (a fixed
+    /// clock moves 1 ms per iteration, so paced work progresses). Every iteration also checks
+    /// [`PartitionStore::check_progress`], so a lost wakeup fails at once rather than at the
+    /// bound. Returns the iterations taken, or the report of what is still waiting after
+    /// `max_iters`.
+    pub fn drive_to_quiescence(&mut self, max_iters: usize) -> Result<usize, String> {
+        for i in 0..max_iters {
+            if let Some(c) = self.clock.as_mut() {
+                c.mono_ns += 1_000_000;
+                c.boot_ns += 1_000_000;
+            }
+            self.pump();
+            self.check_progress()?;
+            if self.plumb.devs.iter().all(|d| d.stash.is_empty()) && self.parts.iter().all(|p| p.check_quiescent_complete(&self.cache).is_ok()) {
+                return Ok(i + 1);
+            }
+        }
+        let mut report = format!("not quiescent after {max_iters} iterations");
+        for p in &self.parts {
+            if let Err(e) = p.check_quiescent_complete(&self.cache) {
+                report.push('\n');
+                report.push_str(&e);
+            }
+        }
+        Err(report)
+    }
+
+    /// Panics with the waiting items and state dumps unless
+    /// [`LocalEngine::drive_to_quiescence`] reaches quiescence within `max_iters`.
+    pub fn assert_quiescent_complete(&mut self, max_iters: usize) -> usize {
+        match self.drive_to_quiescence(max_iters) {
+            Ok(n) => n,
+            Err(e) => panic!("{e}"),
+        }
     }
 
     /// Clean shutdown: drains, hands every partition's section to the snapshot writer, writes

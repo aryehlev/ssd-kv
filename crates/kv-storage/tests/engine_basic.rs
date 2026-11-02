@@ -48,6 +48,7 @@ fn small_values_round_trip_and_survive_restart() {
         let (_, v) = db.get(0, k.as_bytes()).unwrap().unwrap_or_else(|| panic!("key {i} lost"));
         assert_eq!(v, value(i, 20 + (i as usize % 300)));
     }
+    db.quiesce();
 }
 
 #[test]
@@ -74,7 +75,7 @@ fn updates_deletes_and_extents() {
     assert!(existed);
     db.wait(b"v1", t, TicketState::Durable);
     assert!(db.get(0, b"v1").unwrap().is_none());
-    assert!(db.eng.settle(10_000));
+    db.quiesce();
     let devs = db.eng.into_devices();
     let (mut db, _) = reopen(devs, T0 + 5000);
     assert!(db.get(0, b"v1").unwrap().is_none(), "acked delete resurrected");
@@ -87,6 +88,7 @@ fn updates_deletes_and_extents() {
         let (_, v) = db.get(0, k.as_bytes()).unwrap().unwrap_or_else(|| panic!("v{i} lost"));
         assert_eq!(v, value(100 + i as u64, m), "v{i}");
     }
+    db.quiesce();
 }
 
 #[test]
@@ -108,6 +110,7 @@ fn ttl_lazy_expiry_and_no_return_after_restart() {
     let (mut db, _) = reopen(devs, T0 + 3000);
     assert!(db.get(0, b"short").unwrap().is_none(), "expired key returned");
     assert!(db.get(0, b"long").unwrap().is_none(), "expired key returned");
+    db.quiesce();
 }
 
 #[test]
@@ -139,11 +142,12 @@ fn flushdb_and_flushall() {
     assert!(db.get(0, b"k3").unwrap().is_none());
     let t = db.set(0, b"after", b"z", None).unwrap();
     db.wait(b"after", t, TicketState::Durable);
-    assert!(db.eng.settle(10_000));
+    db.quiesce();
     let devs = db.eng.into_devices();
     let (mut db, _) = reopen(devs, T0 + 2);
     assert!(db.get(0, b"k3").unwrap().is_none());
     assert_eq!(db.get(0, b"after").unwrap().unwrap().1, b"z");
+    db.quiesce();
 }
 
 #[test]
@@ -159,6 +163,7 @@ fn scan_returns_every_key_once() {
     }
     want.sort();
     assert_eq!(db.scan_all(0), want);
+    db.quiesce();
 }
 
 #[test]
@@ -192,6 +197,7 @@ fn clean_shutdown_restores_from_snapshot() {
     assert_eq!(mode, RecoveryMode::FullScan);
     assert_eq!(db.get(0, b"post").unwrap().unwrap().1, b"p");
     assert_eq!(db.get(0, b"s7").unwrap().unwrap().1, value(7, 64));
+    db.quiesce();
 }
 
 #[test]
@@ -205,12 +211,13 @@ fn multi_key_writes_commit_atomically() {
     for (k, v) in &kvs {
         assert_eq!(&db.get(0, k).unwrap().unwrap().1, v);
     }
-    assert!(db.eng.settle(10_000));
+    db.quiesce();
     let devs = db.eng.into_devices();
     let (mut db, _) = reopen(devs, T0 + 1);
     for (k, v) in &kvs {
         assert_eq!(&db.get(0, k).unwrap().unwrap().1, v);
     }
+    db.quiesce();
 }
 
 
@@ -237,4 +244,5 @@ fn corrupt_snapshot_section_falls_back_to_the_full_scan() {
         let k = format!("c{i}");
         assert_eq!(db.get(0, k.as_bytes()).unwrap().unwrap().1, value(i, 80));
     }
+    db.quiesce();
 }

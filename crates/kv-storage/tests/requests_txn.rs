@@ -54,6 +54,7 @@ fn same_key_requests_run_in_arrival_order() {
     assert_eq!(keyed_order, ids, "per-key FIFO (LC-15)");
     assert!(order.contains(&other));
     assert_eq!(db.get(0, k).unwrap().unwrap().1, vec![3u8], "the last arrival wins");
+    db.quiesce();
 }
 
 #[test]
@@ -95,6 +96,19 @@ fn barrier_waits_for_older_requests_and_holds_newer_ones() {
     ready.clear();
     db.eng.ready(&mut ready);
     assert_eq!(ready.iter().map(|r| r.1).collect::<Vec<_>>(), vec![newer]);
+    let mut ran = false;
+    for _ in 0..10_000 {
+        match db.eng.exec(p, newer, &mut |_| Ok(())) {
+            ExecStatus::Done(..) => {
+                ran = true;
+                break;
+            }
+            ExecStatus::Requeued => db.eng.pump(),
+            ExecStatus::Failed(e) => panic!("{e}"),
+        }
+    }
+    assert!(ran);
+    db.quiesce();
 }
 
 /// MSET of three keys of one hash tag, repeated with the iteration number as every value;
@@ -109,6 +123,8 @@ fn txn_rounds<D: BlockDevice>(mut devs: Vec<D>, crash: &mut dyn FnMut(&mut D, u6
         eng.recover().unwrap();
         let mut db = Db::new(eng, T0);
         let got: Vec<Option<Vec<u8>>> = keys.iter().map(|k| db.get(0, k).unwrap().map(|(_, v)| v)).collect();
+        // recovery leaves nothing waiting (aborted txns zeroed, resolution advanced)
+        db.quiesce();
         if let Some(Some(v0)) = got.first() {
             assert!(got.iter().all(|g| g.as_deref() == Some(v0.as_slice())), "round {round}: a multi-key write was applied partly");
             let n = u64::from_le_bytes(v0[..8].try_into().unwrap());

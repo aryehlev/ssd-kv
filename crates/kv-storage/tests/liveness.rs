@@ -40,6 +40,41 @@ fn ticket_handed_from_a_cancelled_staged_write_completes() {
         assert_eq!(db.wait(k, t1, TicketState::Durable), TicketState::Durable, "shape {a}->{b}: first write's ticket");
         let (_, v) = db.get(0, k).unwrap().expect("present");
         assert_eq!(v, value(2, b));
-        assert!(db.eng.settle(100_000), "shape {a}->{b}: engine settles");
+        db.eng.assert_quiescent_complete(100_000);
     }
+}
+
+/// A key expired (lazily, without a write) while its page had an image in flight: the image's
+/// record list, which becomes the page's M when durable, must not bring the expired record back
+/// as Live. It used to, and the next write of the key that came back to that page counted it as a
+/// third copy and waited forever for a source only that write could release.
+#[test]
+fn expiry_during_an_image_in_flight_does_not_revive_the_record() {
+    for seed in 0..8u64 {
+        let mut db = fresh(64 * 4096, 40 + seed);
+        let (a, k): (&[u8], &[u8]) = (b"{t}a", b"{t}k");
+        let t = db.set(0, a, b"a1", None).unwrap();
+        db.wait(a, t, TicketState::Durable);
+        let t = db.set(0, k, b"k1", Some(T0 + 1000)).unwrap();
+        db.wait(k, t, TicketState::Durable);
+        let (pa, pk) = (db.eng.locate(0, a).unwrap().page, db.eng.locate(0, k).unwrap().page);
+        if pa != pk {
+            continue;
+        }
+        // an image of the page in flight (built and submitted, not completed)
+        let _ = db.set(0, a, b"a2", None).unwrap();
+        db.eng.pump();
+        // the key expires and is read: expiry without write
+        db.advance(2000);
+        assert!(db.get(0, k).unwrap().is_none());
+        db.eng.assert_quiescent_complete(10_000);
+        // later writes of the key go anywhere, including back to that page, and complete
+        for i in 0..6u64 {
+            let t = db.set(0, k, &value(i, 40 + 300 * i as usize), None).unwrap();
+            assert_eq!(db.wait(k, t, TicketState::Durable), TicketState::Durable, "seed {seed} write {i}");
+        }
+        db.eng.assert_quiescent_complete(10_000);
+        return;
+    }
+    panic!("no seed put both keys on one page");
 }

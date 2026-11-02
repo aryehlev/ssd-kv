@@ -207,15 +207,47 @@ impl<D: BlockDevice> Db<D> {
         out
     }
 
-    /// Waits until `t` of the key's partition reached `want`.
+    /// Waits until `t` of the key's partition reached `want` (or failed). A ticket that cannot
+    /// get there fails the test with the partition's liveness report: every device request
+    /// completes, so a wait that does not end is a hang.
     pub fn wait(&mut self, key: &[u8], t: Option<TicketId>, want: TicketState) -> TicketState {
         match t {
             None => TicketState::Durable,
             Some(t) => {
                 let p = self.part(key);
-                self.eng.wait_ticket(p, t, want)
+                let got = self.eng.wait_ticket(p, t, want);
+                let reached = match want {
+                    TicketState::Written => matches!(got, TicketState::Written | TicketState::Durable | TicketState::Failed(_)),
+                    _ => matches!(got, TicketState::Durable | TicketState::Failed(_)),
+                };
+                if !reached {
+                    let report = self.eng.check_progress().err().unwrap_or_else(|| self.eng.partition(p).diag_deep(self.eng.cache()));
+                    panic!("ticket {t:?} of partition {p} stuck at {got:?} (wanted {want:?})\n{report}");
+                }
+                got
             }
         }
+    }
+
+    /// [`Db::wait`] for a ticket of partition `p`.
+    pub fn wait_in(&mut self, p: u16, t: Option<TicketId>, want: TicketState) -> TicketState {
+        let Some(t) = t else { return TicketState::Durable };
+        let got = self.eng.wait_ticket(p, t, want);
+        let reached = match want {
+            TicketState::Written => matches!(got, TicketState::Written | TicketState::Durable | TicketState::Failed(_)),
+            _ => matches!(got, TicketState::Durable | TicketState::Failed(_)),
+        };
+        if !reached {
+            let report = self.eng.check_progress().err().unwrap_or_else(|| self.eng.partition(p).diag_deep(self.eng.cache()));
+            panic!("ticket {t:?} of partition {p} stuck at {got:?} (wanted {want:?})\n{report}");
+        }
+        got
+    }
+
+    /// Drives the engine to quiescence and checks that nothing is left non-terminal
+    /// (`LocalEngine::assert_quiescent_complete`).
+    pub fn quiesce(&mut self) {
+        self.eng.assert_quiescent_complete(200_000);
     }
 
     /// Every key of `db` (SCAN to the end, COUNT 10).

@@ -12,8 +12,8 @@
 //! * formats and I/O: [`layout`], [`superblock`], [`agtable`], [`pmeta`], [`intent`],
 //!   [`record`], [`page`], [`extent`], [`io`], `sim` (feature `sim`), [`devprobe`], [`mod@format`];
 //! * engine: [`cache`], [`flush`], [`alloc`], [`stale`], [`ticket`], [`effect`], [`image`],
-//!   [`keyspace`], [`partition`], [`expire`], [`recovery`], [`snapshot`], [`metastore`],
-//!   [`engine`].
+//!   [`keyspace`], [`partition`], [`progress`], [`expire`], [`recovery`], [`snapshot`],
+//!   [`metastore`], [`engine`].
 //!
 //! Runtime structure: one [`partition::PartitionStore`] per partition, driven by its owner
 //! worker (submit / take_ready / exec / tick / I/O completions, see the contract at the top of
@@ -47,6 +47,7 @@ pub mod metastore;
 pub mod page;
 pub mod partition;
 pub mod pmeta;
+pub mod progress;
 pub mod record;
 pub mod recovery;
 #[cfg(feature = "sim")]

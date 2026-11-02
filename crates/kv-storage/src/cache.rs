@@ -390,6 +390,11 @@ impl PageCache {
         let f = self.peek(p)?;
         self.state_mut(f)
     }
+
+    /// Every cached page with its state (liveness checks; any partition's pages).
+    pub(crate) fn page_states(&self) -> impl Iterator<Item = (PageId, &PageState)> + '_ {
+        self.map.iter().filter_map(|(&p, &f)| self.state(f).map(|st| (p, st)))
+    }
 }
 
 #[cfg(test)]

@@ -228,6 +228,15 @@ pub struct PartitionCounters {
     pub flush_reclaim_pending_pages: u64,
     pub corrupt_pages: u64,
     pub unexpected_orphans: u64,
+    /// Tracked sources released by the page writer's newest-durable-copy check rather than by
+    /// the durability event of their newer copy (expected 0; a lost hand-off, liveness I15).
+    pub missed_handoffs: u64,
+    /// Live requests and tickets older than one second (a stall; expected 0).
+    pub requests_waiting_over_1s: u64,
+    /// Age of the oldest live request or ticket, in milliseconds.
+    pub oldest_wait_ms: u64,
+    /// Requests and tickets that ever stayed live for more than one second.
+    pub stalled_total: u64,
     pub index_bytes: u64,
     pub alloc_state_bytes: u64,
     pub dirty_bytes: u64,
@@ -249,50 +258,54 @@ const SWEEP_TABLES_PER_TICK: u32 = 256;
 // -------------------------------------------------------------------------------------------
 // Requests
 
-struct KeyInfo {
-    kh: KeyHash,
-    slot: u16,
+pub(crate) struct KeyInfo {
+    pub(crate) kh: KeyHash,
+    pub(crate) slot: u16,
 }
 
 pub(crate) struct Req {
-    req: Request,
-    keys: SmallVec<[KeyInfo; 2]>,
-    order: u64,
-    generation: u32,
+    pub(crate) req: Request,
+    pub(crate) keys: SmallVec<[KeyInfo; 2]>,
+    pub(crate) order: u64,
+    pub(crate) generation: u32,
     /// Loads and reads outstanding for this request.
-    io: u32,
+    pub(crate) io: u32,
     /// Key queues where it is not at the head.
-    waits: u32,
-    barrier: bool,
-    blocked: bool,
-    queued: bool,
+    pub(crate) waits: u32,
+    pub(crate) barrier: bool,
+    pub(crate) blocked: bool,
+    pub(crate) queued: bool,
     /// Parked until an AG, a seq reservation or a txn id arrives.
-    parked: bool,
-    pins: SmallVec<[PageId; 2]>,
-    fetched: SmallVec<[ExtFetch; 1]>,
-    failed: Option<StoreError>,
+    pub(crate) parked: bool,
+    pub(crate) pins: SmallVec<[PageId; 2]>,
+    pub(crate) fetched: SmallVec<[ExtFetch; 1]>,
+    pub(crate) failed: Option<StoreError>,
+    /// Monotonic submit time (age tracking, stall counters).
+    pub(crate) born_ns: u64,
+    /// Counted once in the stall counter.
+    pub(crate) stalled: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct Requests {
-    slots: Vec<Option<Req>>,
-    gens: Vec<u32>,
-    free: Vec<u32>,
-    busy: HashMap<(u8, u64), VecDeque<ReqId>, foldhash::fast::FixedState>,
-    ready: VecDeque<ReqId>,
-    order: VecDeque<(u64, ReqId)>,
-    barriers: VecDeque<(u64, ReqId)>,
+    pub(crate) slots: Vec<Option<Req>>,
+    pub(crate) gens: Vec<u32>,
+    pub(crate) free: Vec<u32>,
+    pub(crate) busy: HashMap<(u8, u64), VecDeque<ReqId>, foldhash::fast::FixedState>,
+    pub(crate) ready: VecDeque<ReqId>,
+    pub(crate) order: VecDeque<(u64, ReqId)>,
+    pub(crate) barriers: VecDeque<(u64, ReqId)>,
     /// Requests held behind a barrier (re-checked when it finishes).
-    blocked: Vec<ReqId>,
+    pub(crate) blocked: Vec<ReqId>,
     /// Executed local multi-key txns that keep their key queues until the commit is durable
     /// (a later command on one of their keys waits for it, LC-15): `txn -> request`.
-    held: HashMap<u64, ReqId, foldhash::fast::FixedState>,
-    next_order: u64,
-    live: usize,
+    pub(crate) held: HashMap<u64, ReqId, foldhash::fast::FixedState>,
+    pub(crate) next_order: u64,
+    pub(crate) live: usize,
 }
 
 impl Requests {
-    fn get(&self, id: ReqId) -> Option<&Req> {
+    pub(crate) fn get(&self, id: ReqId) -> Option<&Req> {
         self.slots.get(id.0 as usize).and_then(Option::as_ref)
     }
 
@@ -383,10 +396,10 @@ pub(crate) enum Durable {
 /// Why a page is being loaded.
 #[derive(Default)]
 pub(crate) struct Load {
-    waiters: SmallVec<[(ReqId, u32); 2]>,
-    scrub: bool,
+    pub(crate) waiters: SmallVec<[(ReqId, u32); 2]>,
+    pub(crate) scrub: bool,
     /// Active expiry candidates of this page: `(db, slot, fp32, x8)`.
-    expire: SmallVec<[(u8, u16, u32, u8); 2]>,
+    pub(crate) expire: SmallVec<[(u8, u16, u32, u8); 2]>,
 }
 
 // -------------------------------------------------------------------------------------------
@@ -458,15 +471,17 @@ pub(crate) struct ExtTables {
 
 pub(crate) struct OpenTxn {
     /// The command's ticket.
-    ticket: Option<TicketId>,
+    pub(crate) ticket: Option<TicketId>,
     /// The partition requests the commit itself (single-partition txn); XTxn parts are
     /// committed by the coordinating worker.
-    local: bool,
-    requested: bool,
-    keys: SmallVec<[(u8, Box<[u8]>); 2]>,
+    pub(crate) local: bool,
+    pub(crate) requested: bool,
+    pub(crate) keys: SmallVec<[(u8, Box<[u8]>); 2]>,
+    /// The seq every record of the txn carries (one seq per command).
+    pub(crate) seq: Seq,
     /// `(db, key, page, seq)` of the txn delete markers.
-    markers: SmallVec<[MarkerAt; 1]>,
-    pages: SmallVec<[PageId; 2]>,
+    pub(crate) markers: SmallVec<[MarkerAt; 1]>,
+    pub(crate) pages: SmallVec<[PageId; 2]>,
 }
 
 /// A txn delete marker: `(db, key, page, seq)`.
@@ -485,6 +500,7 @@ pub(crate) struct RetireItem {
 }
 
 /// A meta request whose reply is pending (FIFO, §6.1).
+#[derive(Debug)]
 pub(crate) enum MetaWait {
     Ag(AgKind),
     Seq(Seq),
@@ -516,22 +532,22 @@ pub(crate) struct Core {
     pub(crate) next_seq: Seq,
     /// Seqs below this are covered by a durable reservation (E12).
     pub(crate) seq_limit: Seq,
-    seq_asked: bool,
+    pub(crate) seq_asked: bool,
     pub(crate) pmeta: PartitionMeta,
     pub(crate) cutoff: [u64; 16],
     pub(crate) cutoff_durable: [u64; 16],
     pub(crate) dirty: Vec<PageId>,
     pub(crate) ext: ExtTables,
-    io: HashMap<u64, IoKind, foldhash::fast::FixedState>,
-    next_io: u64,
-    durable_wait: HashMap<u64, Durable, foldhash::fast::FixedState>,
-    durable_q: Vec<Durable>,
-    next_wid: u64,
+    pub(crate) io: HashMap<u64, IoKind, foldhash::fast::FixedState>,
+    pub(crate) next_io: u64,
+    pub(crate) durable_wait: HashMap<u64, Durable, foldhash::fast::FixedState>,
+    pub(crate) durable_q: Vec<Durable>,
+    pub(crate) next_wid: u64,
     pub(crate) loads: HashMap<PageId, Load, foldhash::fast::FixedState>,
-    meta_wait: VecDeque<MetaWait>,
-    next_token: u64,
+    pub(crate) meta_wait: VecDeque<MetaWait>,
+    pub(crate) next_token: u64,
     pub(crate) counters: PartitionCounters,
-    bufs: Vec<AlignedBuf>,
+    pub(crate) bufs: Vec<AlignedBuf>,
     pub(crate) expiry: crate::expire::ExpirySweep,
     pub(crate) buckets: Buckets,
     /// Pages whose tracked copies are zeroed by paced scrubs.
@@ -539,24 +555,24 @@ pub(crate) struct Core {
     /// Keys whose older copies a command waits for (foreground, this tick).
     pub(crate) fg_keys: Vec<(u8, Box<[u8]>)>,
     /// Pages holding effects deferred until other copies are zeroed (re-dirtied on change).
-    deferred: HashSet<PageId, foldhash::fast::FixedState>,
+    pub(crate) deferred: HashSet<PageId, foldhash::fast::FixedState>,
     /// Pages to build in the next tick (their build could not run in this one).
-    retry: Vec<PageId>,
+    pub(crate) retry: Vec<PageId>,
     pub(crate) txns: HashMap<u64, OpenTxn, foldhash::fast::FixedState>,
     /// Txns committed this boot whose ids may still be above the durable `resolved_w`.
-    committed: HashSet<u64, foldhash::fast::FixedState>,
+    pub(crate) committed: HashSet<u64, foldhash::fast::FixedState>,
     /// The durable `resolved_w` last seen: every txn id at or below it is valid (§10.7).
     pub(crate) resolved_w: u64,
     /// Ids of txns from before this boot known to be committed (recovery view).
     pub(crate) prior: Arc<crate::intent::CommittedSet>,
     /// FLUSHALL: AGs to release once no write is in flight and the cutoffs are durable.
-    retiring_ags: Vec<AgId>,
-    flushall_wait: bool,
+    pub(crate) retiring_ags: Vec<AgId>,
+    pub(crate) flushall_wait: bool,
     /// FLUSHDB reclaim walk (paced): SMALL pages to load, extent starts to check.
     pub(crate) reclaim_pages: VecDeque<PageId>,
     pub(crate) reclaim_ext: VecDeque<PageId>,
-    space_wait: Vec<ReqId>,
-    seq_wait: Vec<ReqId>,
+    pub(crate) space_wait: Vec<ReqId>,
+    pub(crate) seq_wait: Vec<ReqId>,
     pub(crate) now: Now,
     pub(crate) failed: Option<i32>,
     pub(crate) writes_in_flight: u32,
@@ -564,11 +580,11 @@ pub(crate) struct Core {
     pub(crate) recovery_mode: Option<RecoveryMode>,
     /// Deletes whose newest copy never reached media: waiting until no older copy is left
     /// (D2): `(db, key, tickets)`.
-    gone_wait: Vec<GoneWait>,
+    pub(crate) gone_wait: Vec<GoneWait>,
     /// Absent newest copies waiting for their older copies to be zeroed.
     pub(crate) retire: Vec<RetireItem>,
     /// Barrier tickets waiting for the partition to drain.
-    barrier_tickets: Vec<TicketId>,
+    pub(crate) barrier_tickets: Vec<TicketId>,
     /// Pre-boot uncommitted txn records still on media (pages / extents being zeroed, E10);
     /// `None` once reported to the meta thread.
     pub(crate) prior_txn_zero: Option<u32>,
@@ -577,16 +593,18 @@ pub(crate) struct Core {
     /// The clean-shutdown section was handed to the snapshot writer.
     pub(crate) snapshot_done: bool,
     /// Ticks run (cheap periodic work).
-    ticks: u64,
+    pub(crate) ticks: u64,
+    /// Monotonic time the stall counters were last refreshed.
+    pub(crate) stall_checked_ns: u64,
     /// Relocations in the current tick.
-    relocations: u32,
+    pub(crate) relocations: u32,
     /// The local txn the last commit opened (its request keeps its key queues, see `hold`).
-    last_local_txn: Option<u64>,
+    pub(crate) last_local_txn: Option<u64>,
     /// Tracked locations that also hold an older copy of their key: `(page, db, key)`.
-    older_pages: Vec<(PageId, u8, Box<[u8]>)>,
+    pub(crate) older_pages: Vec<(PageId, u8, Box<[u8]>)>,
     /// Scratch vectors (no per-tick allocation).
-    scratch_pos: Vec<Pos>,
-    scratch_txn: Vec<u64>,
+    pub(crate) scratch_pos: Vec<Pos>,
+    pub(crate) scratch_txn: Vec<u64>,
 }
 
 impl Core {
@@ -773,6 +791,14 @@ impl Core {
     }
 }
 
+/// Seq of the version at `c` (`Seq::ZERO` when absent or unknown).
+fn cur_seq(c: &Cur) -> Seq {
+    match c {
+        Cur::Absent => Seq::ZERO,
+        Cur::Small { seq, .. } | Cur::Extent { seq, .. } => *seq,
+    }
+}
+
 fn cur36(c: &Cur) -> Option<u64> {
     match c {
         Cur::Absent => None,
@@ -905,6 +931,7 @@ impl PartitionStore {
             prior_txn_pages: HashSet::with_hasher(Default::default()),
             snapshot_done: false,
             ticks: 0,
+            stall_checked_ns: 0,
             relocations: 0,
             last_local_txn: None,
             older_pages: Vec::new(),
@@ -960,10 +987,12 @@ impl PartitionStore {
     pub fn diag(&self) -> String {
         let c = &self.core;
         format!(
-            "p{} {:?} live={} ready={} space_wait={} seq_wait={} meta_wait={} txns={} next_seq={:#x} seq_limit={:#x} seq_asked={} dirty={} writes={} ext_w={} ext_z={} stale={} deferred={} loads={} durable_wait={} gone_wait={}",
+            "p{} {:?} live={} tickets={} oldest_ms={} ready={} space_wait={} seq_wait={} meta_wait={} txns={} next_seq={:#x} seq_limit={:#x} seq_asked={} dirty={} writes={} ext_w={} ext_z={} stale={} deferred={} loads={} durable_wait={} gone_wait={} retire={} missed_handoffs={}",
             c.cfg.id,
             c.state,
             self.reqs.live,
+            c.tickets.len(),
+            c.counters.oldest_wait_ms,
             self.reqs.ready.len(),
             c.space_wait.len(),
             c.seq_wait.len(),
@@ -981,6 +1010,8 @@ impl PartitionStore {
             c.loads.len(),
             c.durable_wait.len(),
             c.gone_wait.len(),
+            c.retire.len(),
+            c.counters.missed_handoffs,
         )
     }
 
@@ -1096,6 +1127,7 @@ impl PartitionStore {
 
     pub fn submit(&mut self, cx: &mut StorageCtx<'_>, req: Request) -> ReqId {
         self.core.now = cx.now;
+        self.core.tickets.now_ns = cx.now.mono_ns;
         let seed = self.core.cfg.hash_seed;
         let keys: SmallVec<[KeyInfo; 2]> =
             req.keys.iter().map(|(k, _)| KeyInfo { kh: KeyHash::of(seed, k), slot: key_slot(k) }).collect();
@@ -1117,6 +1149,8 @@ impl PartitionStore {
             pins: SmallVec::new(),
             fetched: SmallVec::new(),
             failed: None,
+            born_ns: cx.now.mono_ns,
+            stalled: false,
         };
         let id = self.reqs.insert(r);
         self.reqs.order.push_back((order, id));
@@ -1384,6 +1418,7 @@ impl PartitionStore {
         f: &mut dyn FnMut(&mut Keyspace<'_>) -> Result<R, StoreError>,
     ) -> ExecStatus<R> {
         self.core.now = cx.now;
+        self.core.tickets.now_ns = cx.now.mono_ns;
         let Some(mut r) = self.take_req(id) else {
             return ExecStatus::Failed(StoreError::Io(-libc::ENOENT));
         };
@@ -1592,6 +1627,7 @@ impl PartitionStore {
             local: local_txn,
             requested: false,
             keys: SmallVec::new(),
+            seq,
             markers: SmallVec::new(),
             pages: SmallVec::new(),
         });
@@ -2019,31 +2055,26 @@ impl PartitionStore {
     }
 
     /// Marks the key's copies in `page` protected (not live): a newer version lives elsewhere
-    /// or is a txn version that is not committed. True when the page holds a copy.
-    fn protect_in_page(&mut self, cache: &mut PageCache, page: PageId, db: u8, h32: u32, key: &[u8]) -> bool {
-        let Some(f) = cache.peek(page) else { return false };
-        let Some(mut st) = cache.take_state(f) else { return false };
-        let mut has = false;
-        {
-            let img = cache.frame(st.m_frame);
-            for r in st.recs.iter_mut() {
+    /// or is a txn version that is not committed. Returns the seq of the newest copy the page
+    /// holds (M or the image in flight), `None` when it holds none.
+    fn protect_in_page(&mut self, cache: &mut PageCache, page: PageId, db: u8, h32: u32, key: &[u8]) -> Option<Seq> {
+        let f = cache.peek(page)?;
+        let mut st = cache.take_state(f)?;
+        let mut newest: Option<Seq> = None;
+        let mut mark = |recs: &mut [RecDesc], img: &[u8; PAGE]| {
+            for r in recs.iter_mut() {
                 if r.db == db && r.h32 == h32 && matches!(r.status, RecStatus::Live | RecStatus::Protected) && r.key(img) == key {
                     r.status = RecStatus::Protected;
-                    has = true;
+                    newest = Some(newest.map_or(r.seq, |n| n.max(r.seq)));
                 }
             }
-        }
+        };
+        mark(&mut st.recs, cache.frame(st.m_frame));
         if let Some(inf) = st.inflight.as_mut() {
-            let img = cache.frame(inf.n_frame);
-            for r in inf.recs.iter_mut() {
-                if r.db == db && r.h32 == h32 && matches!(r.status, RecStatus::Live | RecStatus::Protected) && r.key(img) == key {
-                    r.status = RecStatus::Protected;
-                    has = true;
-                }
-            }
+            mark(&mut inf.recs, cache.frame(inf.n_frame));
         }
         cache.put_state(f, st);
-        has
+        newest
     }
 
     /// The key's version at `s.cur` stops being current (a newer one goes to `new_ext` or a
@@ -2061,8 +2092,8 @@ impl PartitionStore {
                     let mut eff = st.pending.remove(i);
                     out.extend(eff.tickets_mut().drain(..));
                 }
-                if self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
-                    self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source);
+                if let Some(seq) = self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
+                    self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source, seq);
                     self.note_older_copy(cx.cache, page, s.db, h32, &s.key);
                 }
                 self.core.note_page_space(cx.cache, page);
@@ -2089,7 +2120,7 @@ impl PartitionStore {
                         self.core.alloc.free_extent(start, w.hdr.n_pages);
                         self.cancel_chunks(start);
                     }
-                    _ => self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source),
+                    _ => self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source, cur_seq(&s.cur)),
                 }
             }
         }
@@ -2222,8 +2253,8 @@ impl PartitionStore {
                 self.stage_remove(cx.cache, page, s.db, s.kh.h32(), s.key.clone(), tickets);
                 // the deleted copy counts towards the key's copies until it is gone (E14): a
                 // write of the key elsewhere meanwhile waits like a third copy
-                if self.protect_in_page(cx.cache, page, s.db, s.kh.h32(), &s.key) {
-                    self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source);
+                if let Some(seq) = self.protect_in_page(cx.cache, page, s.db, s.kh.h32(), &s.key) {
+                    self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source, seq);
                 }
             }
             Cur::Extent { start, n_pages, .. } => {
@@ -2252,7 +2283,7 @@ impl PartitionStore {
                             start,
                             ExtZero { n_pages, why: ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets }, state: ExtState::Pending, wid: 0 },
                         );
-                        self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source);
+                        self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source, cur_seq(&s.cur));
                     }
                 }
             }
@@ -2284,8 +2315,8 @@ impl PartitionStore {
                 }
                 if others || staged || older_here {
                     self.stage_remove(cx.cache, page, s.db, h32, s.key.clone(), SmallVec::new());
-                    if self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
-                        self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source);
+                    if let Some(seq) = self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
+                        self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source, seq);
                     }
                     return;
                 }
@@ -2324,7 +2355,7 @@ impl PartitionStore {
                 }
                 if !self.core.ext.zeros.contains_key(&start) {
                     self.core.ext.zeros.insert(start, ExtZero::pending(n_pages, ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets: SmallVec::new() }));
-                    self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source);
+                    self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source, cur_seq(&s.cur));
                 }
             }
         }
@@ -3007,7 +3038,7 @@ impl PartitionStore {
                 } else if indexed_elsewhere {
                     // a copy of a key indexed elsewhere that nobody tracks (defensive, §13.3)
                     self.core.counters.unexpected_orphans += 1;
-                    self.core.stale.add(db, key, StaleRef::Small { page }, CopyState::Stale);
+                    self.core.stale.add(db, key, StaleRef::Small { page }, CopyState::Stale, rn.seq);
                     recs[newest].status = RecStatus::Live;
                 } else if open_txn || older || self.core.stale.count(db, key) > 0 {
                     // an absent newest copy (marker or expired) with older copies: kept until
@@ -3216,7 +3247,7 @@ impl PartitionStore {
         image::settle(&mut st.recs, cx.cache.frame(inf.n_frame));
         st.fresh = false;
         st.r#gen = st.r#gen.wrapping_add(1);
-        let mut supersede: SmallVec<[(u8, Box<[u8]>); 2]> = SmallVec::new();
+        let mut supersede: SmallVec<[image::KeyAt; 2]> = SmallVec::new();
         for eff in inf.applied.iter() {
             for &t in eff.tickets() {
                 self.core.tickets.effect_durable(t);
@@ -3224,7 +3255,7 @@ impl PartitionStore {
             if let Pending::Put(rec) = eff
                 && rec.desc.txn == 0
             {
-                supersede.push((rec.desc.db, rec.key().into()));
+                supersede.push((rec.desc.db, rec.key().into(), rec.desc.seq));
             }
         }
         let empty = st.recs.is_empty() && st.pending.is_empty();
@@ -3269,8 +3300,8 @@ impl PartitionStore {
                 }
             }
         }
-        for (db, key) in supersede {
-            self.sources_superseded(cx, db, &key, false);
+        for (db, key, seq) in supersede {
+            self.sources_superseded(cx, db, &key, seq, false);
         }
         if redo {
             if let Some(st) = cx.cache.page_state_mut(page) {
@@ -3300,7 +3331,9 @@ impl PartitionStore {
                     }
                 }
             },
-            _ if w.hdr.txn == 0 => self.sources_superseded(cx, w.db, &w.key, true),
+            _ if w.hdr.txn == 0 => {
+                self.sources_superseded(cx, w.db, &w.key, w.hdr.seq, true);
+            }
             _ => {}
         }
     }
@@ -3333,11 +3366,11 @@ impl PartitionStore {
         self.core.alloc.clear_refusal();
     }
 
-    /// The key's newer copy is durable: its tracked sources become stale and are zeroed
-    /// (extents at once, §14.4 step 3; pages by the paced scrub unless a command waits, or at
-    /// once when `now`).
-    fn sources_superseded(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8], now: bool) {
-        let entries = self.core.stale.sources_superseded(db, key);
+    /// A copy of the key with seq `newer` is durable and committed: the tracked sources it
+    /// shadows become stale and are zeroed (extents at once, §14.4 step 3; pages by the paced
+    /// scrub unless a command waits, or at once when `now`). Returns how many sources changed.
+    fn sources_superseded(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8], newer: Seq, now: bool) -> usize {
+        let (entries, changed) = self.core.stale.sources_superseded(db, key, newer);
         for e in entries {
             match e.at {
                 StaleRef::Extent { page, n_pages } => {
@@ -3357,6 +3390,7 @@ impl PartitionStore {
                 }
             }
         }
+        changed
     }
 
     /// A tracked copy of `(db, key)` is durably gone.
@@ -3498,7 +3532,7 @@ impl PartitionStore {
             self.core.tickets.meta_done(t);
         }
         for (db, key) in &o.keys {
-            self.sources_superseded(cx, *db, key, true);
+            self.sources_superseded(cx, *db, key, o.seq, true);
         }
         for p in &o.pages {
             self.core.mark_dirty(cx.cache, *p);
@@ -3522,6 +3556,7 @@ impl PartitionStore {
 
     pub fn tick(&mut self, cx: &mut StorageCtx<'_>) {
         self.core.now = cx.now;
+        self.core.tickets.now_ns = cx.now.mono_ns;
         if self.core.state == PartState::Loading {
             return;
         }
@@ -3719,8 +3754,11 @@ impl PartitionStore {
             }
         }
         cx.cache.put_state(f, st);
-        for (db, key) in sources_durable {
-            self.sources_superseded(cx, db, &key, true);
+        for (db, key, seq) in sources_durable {
+            if self.sources_superseded(cx, db, &key, seq, true) > 0 {
+                // a source the event that made this copy durable should have released
+                self.core.counters.missed_handoffs += 1;
+            }
         }
         for rec in relocate {
             self.relocate(cx, page, rec);
@@ -3774,8 +3812,8 @@ impl PartitionStore {
         };
         let marker = rec.desc.kind == REC_KIND_TXN_DELETE_MARKER;
         let txn = rec.desc.txn;
-        if self.protect_in_page(cx.cache, from, db, kh.h32(), &key) {
-            self.core.stale.add(db, &key, StaleRef::Small { page: from }, CopyState::Source);
+        if let Some(seq) = self.protect_in_page(cx.cache, from, db, kh.h32(), &key) {
+            self.core.stale.add(db, &key, StaleRef::Small { page: from }, CopyState::Source, seq);
         }
         let vtype = if rec.desc.kind == REC_KIND_HASH { VType::Hash } else { VType::String };
         let expire = rec.desc.expire_at();
@@ -4175,6 +4213,11 @@ impl PartitionStore {
         }
         self.core.counters.stale_copies = self.core.stale.len() as u64;
         self.core.counters.dirty_bytes = self.staged_bytes(cx.cache) as u64;
+        // ages of live requests and tickets: refreshed at most every 10 ms
+        if cx.now.mono_ns.saturating_sub(self.core.stall_checked_ns) >= 10_000_000 {
+            self.core.stall_checked_ns = cx.now.mono_ns;
+            self.update_stall_counters();
+        }
         // memory figures walk every table: refreshed every 1024 ticks
         self.core.ticks = self.core.ticks.wrapping_add(1);
         if self.core.ticks % 1024 == 1 {

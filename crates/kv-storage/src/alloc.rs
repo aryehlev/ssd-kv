@@ -991,6 +991,12 @@ impl Alloc {
         }
     }
 
+    /// True while some AG is wanted or requested and not answered: a request parked on space
+    /// is woken by that answer (liveness).
+    pub(crate) fn ag_outstanding(&self) -> bool {
+        self.slots.iter().any(|s| s.asked || (s.want && s.refused_at_ns.is_none()))
+    }
+
     /// True while an AG of `kind` is requested and not answered.
     #[cfg(test)]
     pub(crate) fn ag_pending(&self, kind: AgKind) -> bool {

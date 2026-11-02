@@ -55,6 +55,32 @@ pub(crate) struct Ticket {
     /// Internal ticket of a txn's effects (§14.6): its completion is reported through
     /// [`Tickets::take_txns_durable`], never to a reply.
     txn_effects: Option<u64>,
+    /// Monotonic time the ticket was created (age tracking, stall counters).
+    pub(crate) born_ns: u64,
+    /// Counted once in the stall counter.
+    pub(crate) stalled: bool,
+}
+
+impl Ticket {
+    /// Effect dependencies whose write has not completed.
+    pub(crate) fn unwritten(&self) -> u32 {
+        self.unwritten
+    }
+
+    /// Effect dependencies whose write is not durable.
+    pub(crate) fn undurable(&self) -> u32 {
+        self.undurable
+    }
+
+    /// Metadata dependencies not durable.
+    pub(crate) fn meta(&self) -> u32 {
+        self.meta
+    }
+
+    /// The txn whose effects this internal ticket counts.
+    pub(crate) fn txn_effects(&self) -> Option<u64> {
+        self.txn_effects
+    }
 }
 
 /// The partition's live tickets.
@@ -67,6 +93,8 @@ pub(crate) struct Tickets {
     txns_durable: Vec<u64>,
     /// Txns whose internal ticket failed: `(txn, errno)`.
     txns_failed: Vec<(u64, i32)>,
+    /// The partition's monotonic clock (set before commands execute; new tickets' birth time).
+    pub(crate) now_ns: u64,
 }
 
 impl Tickets {
@@ -77,6 +105,7 @@ impl Tickets {
             changes: Vec::new(),
             txns_durable: Vec::new(),
             txns_failed: Vec::new(),
+            now_ns: 0,
         }
     }
 
@@ -97,6 +126,8 @@ impl Tickets {
                 meta: 0,
                 open: true,
                 txn_effects: None,
+                born_ns: self.now_ns,
+                stalled: false,
             },
         );
         TicketId(id)
@@ -125,9 +156,19 @@ impl Tickets {
         self.map.contains_key(&t.0)
     }
 
-    #[cfg(test)]
+    /// Live tickets (not Durable or Failed yet).
     pub(crate) fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// Every live ticket (liveness checks and stall counters).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (TicketId, &Ticket)> + '_ {
+        self.map.iter().map(|(&id, k)| (TicketId(id), k))
+    }
+
+    /// Every live ticket, mutable (stall counters).
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Ticket> + '_ {
+        self.map.values_mut()
     }
 
     /// One more effect dependency (one write to complete, one durability to reach).

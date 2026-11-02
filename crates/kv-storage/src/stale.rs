@@ -12,18 +12,28 @@
 //! the newest copy is durably gone or durably superseded. Zeroings no command waits for
 //! (post-move cleanup, post-recovery copies of untouched keys) are background work (§19).
 //!
-//! Each tracked copy has a state: `CopyState::Source` while the key's newer copy (the one the
-//! index names) is not durable yet (the copy is protected, §13.3 d, edge E2), then
-//! `CopyState::Stale` until its zeroing is durable. Every entry counts towards the key's
-//! copies on media, which the third-copy rule (E14) bounds at two. Copies inside the page the
-//! index names are visible in that page's records and are never tracked here.
+//! Each tracked copy has a state: `CopyState::Source` while no newer copy of the key is
+//! durable (the copy is protected, §13.3 d, edge E2), then `CopyState::Stale` until its zeroing
+//! is durable. Every entry counts towards the key's copies on media, which the third-copy rule
+//! (E14) bounds at two. Copies inside the page the index names are visible in that page's
+//! records and are never tracked here.
+//!
+//! Hand-off (liveness): an entry records the seq of the copy it tracks. A Source becomes Stale
+//! when a copy of the key *with a higher seq* is durable (and, for a txn record, committed):
+//! [`StaleCopies::sources_superseded`] takes that seq. Keying the hand-off on the seq rather than
+//! on "some copy of the key became durable" makes it independent of the order in which the
+//! events arrive: an older in-flight image of the tracked location becoming durable after the key
+//! moved on does not release the source early (E2), and a source registered after a newer copy
+//! is already durable is released by the next durable-copy event or by the page writer's check
+//! of the newest durable copy in M (`image::Built::sources_durable`). An entry with seq 0
+//! (unknown, e.g. a copy found by the expiry sweep) is released by any durable copy.
 
 use core::hash::{Hash, Hasher};
 
 use hashbrown::{Equivalent, HashMap};
 use smallvec::SmallVec;
 
-use crate::layout::PageId;
+use crate::layout::{PageId, Seq};
 
 /// Location of one older copy of a key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -60,6 +70,8 @@ pub(crate) struct StaleEntry {
     /// The location also holds an older, superseded copy of the key whose zeroing is not
     /// durable yet (it counts as one more copy for the third-copy rule, E14).
     pub(crate) older: bool,
+    /// Seq of the tracked copy (the newest one at the location; `Seq::ZERO` = unknown).
+    pub(crate) seq: Seq,
 }
 
 /// Owned map key: `(db, exact key bytes)`.
@@ -130,9 +142,10 @@ impl StaleCopies {
         self.entries == 0
     }
 
-    /// Registers a copy of `(db, key)` at `at` (no duplicate entries per location).
-    pub(crate) fn add(&mut self, db: u8, key: &[u8], at: StaleRef, state: CopyState) {
-        let entry = StaleEntry { at, state, foreground: false, older: false };
+    /// Registers a copy of `(db, key)` with seq `seq` at `at` (no duplicate entries per
+    /// location).
+    pub(crate) fn add(&mut self, db: u8, key: &[u8], at: StaleRef, state: CopyState, seq: Seq) {
+        let entry = StaleEntry { at, state, foreground: false, older: false, seq };
         match self.map.get_mut(&KeyRef { db, key }) {
             Some(list) => {
                 if let Some(e) = list.iter_mut().find(|e| e.at == at) {
@@ -140,6 +153,7 @@ impl StaleCopies {
                     if e.state == CopyState::Source {
                         e.state = state;
                     }
+                    e.seq = e.seq.max(seq);
                     return;
                 }
                 list.push(entry);
@@ -193,17 +207,22 @@ impl StaleCopies {
         self.get(db, key).iter().find(|e| e.at.page() == at).map(|e| e.state)
     }
 
-    /// The key's newer copy became durable: its sources become stale. Returns the locations
-    /// whose zeroing may now be built (all of the key's stale copies).
-    pub(crate) fn sources_superseded(&mut self, db: u8, key: &[u8]) -> SmallVec<[StaleEntry; 1]> {
+    /// A copy of the key with seq `newer` is durable (and committed): the sources it shadows
+    /// (seq below `newer`) become stale. Returns the key's stale copies (whose zeroing may now
+    /// be built) and how many sources changed state.
+    pub(crate) fn sources_superseded(&mut self, db: u8, key: &[u8], newer: Seq) -> (SmallVec<[StaleEntry; 1]>, usize) {
         if self.entries == 0 {
-            return SmallVec::new();
+            return (SmallVec::new(), 0);
         }
-        let Some(list) = self.map.get_mut(&KeyRef { db, key }) else { return SmallVec::new() };
+        let Some(list) = self.map.get_mut(&KeyRef { db, key }) else { return (SmallVec::new(), 0) };
+        let mut changed = 0;
         for e in list.iter_mut() {
-            e.state = CopyState::Stale;
+            if e.state == CopyState::Source && e.seq < newer {
+                e.state = CopyState::Stale;
+                changed += 1;
+            }
         }
-        list.clone()
+        (list.iter().filter(|e| e.state == CopyState::Stale).copied().collect(), changed)
     }
 
     /// A command waits for the key's copies to be zeroed: marks them foreground and returns
@@ -300,14 +319,17 @@ mod tests {
     fn lifecycle_source_stale_removed() {
         let mut s = StaleCopies::new();
         assert_eq!(s.count(0, b"k"), 0);
-        s.add(0, b"k", small(7), CopyState::Source);
-        s.add(0, b"k", small(7), CopyState::Source);
+        s.add(0, b"k", small(7), CopyState::Source, Seq(5));
+        s.add(0, b"k", small(7), CopyState::Source, Seq(5));
         assert_eq!(s.len(), 1, "one entry per location");
         assert_eq!(s.count(0, b"k"), 1);
         assert_eq!(s.count(1, b"k"), 0, "db is part of the key");
         assert_eq!(s.state_at(0, b"k", PageId(7)), Some(CopyState::Source));
-        let st = s.sources_superseded(0, b"k");
-        assert_eq!(st.len(), 1);
+        // an equal or older durable copy does not shadow the tracked one (E2)
+        assert_eq!(s.sources_superseded(0, b"k", Seq(5)).1, 0);
+        assert_eq!(s.state_at(0, b"k", PageId(7)), Some(CopyState::Source));
+        let (st, changed) = s.sources_superseded(0, b"k", Seq(6));
+        assert_eq!((st.len(), changed), (1, 1));
         assert_eq!(s.state_at(0, b"k", PageId(7)), Some(CopyState::Stale));
         assert_eq!(s.at_page(PageId(7)), 1);
         assert!(s.remove_at(0, b"k", PageId(7)));
@@ -319,13 +341,13 @@ mod tests {
     #[test]
     fn require_marks_foreground() {
         let mut s = StaleCopies::new();
-        s.add(2, b"a", small(1), CopyState::Stale);
-        s.add(2, b"a", StaleRef::Extent { page: PageId(9), n_pages: 4 }, CopyState::Source);
+        s.add(2, b"a", small(1), CopyState::Stale, Seq::ZERO);
+        s.add(2, b"a", StaleRef::Extent { page: PageId(9), n_pages: 4 }, CopyState::Source, Seq(3));
         let r = s.require(2, b"a", false);
         assert_eq!(r.iter().filter(|e| e.foreground).count(), 1, "sources stay protected");
         let r = s.require(2, b"a", true);
         assert!(r.iter().all(|e| e.foreground && e.state == CopyState::Stale));
-        s.add(3, b"b", small(1), CopyState::Stale);
+        s.add(3, b"b", small(1), CopyState::Stale, Seq::ZERO);
         assert_eq!(s.at_page(PageId(1)), 2);
         s.drop_db(2);
         assert_eq!(s.len(), 1);

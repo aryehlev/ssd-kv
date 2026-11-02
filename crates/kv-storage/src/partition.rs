@@ -449,13 +449,15 @@ pub(crate) struct ExtZero {
     pub(crate) n_pages: u32,
     pub(crate) why: ZeroWhy,
     pub(crate) state: ExtState,
+    /// Tickets besides the delete's that wait for this zeroing (a barrier).
+    pub(crate) waiters: SmallVec<[TicketId; 1]>,
     wid: u64,
 }
 
 impl ExtZero {
     /// A zeroing waiting to be issued.
     pub(crate) fn pending(n_pages: u32, why: ZeroWhy) -> Self {
-        ExtZero { n_pages, why, state: ExtState::Pending, wid: 0 }
+        ExtZero { n_pages, why, state: ExtState::Pending, waiters: SmallVec::new(), wid: 0 }
     }
 }
 
@@ -482,6 +484,8 @@ pub(crate) struct OpenTxn {
     pub(crate) keys: SmallVec<[(u8, Box<[u8]>); 2]>,
     /// The seq every record of the txn carries (one seq per command).
     pub(crate) seq: Seq,
+    /// Barrier tickets waiting for this txn's commit (one metadata dependency each).
+    pub(crate) barriers: SmallVec<[TicketId; 1]>,
     /// `(db, key, page, seq)` of the txn delete markers.
     pub(crate) markers: SmallVec<[MarkerAt; 1]>,
     pub(crate) pages: SmallVec<[PageId; 2]>,
@@ -590,8 +594,6 @@ pub(crate) struct Core {
     pub(crate) gone_wait: Vec<GoneWait>,
     /// Absent newest copies waiting for their older copies to be zeroed.
     pub(crate) retire: Vec<RetireItem>,
-    /// Barrier tickets waiting for the partition to drain.
-    pub(crate) barrier_tickets: Vec<TicketId>,
     /// Pre-boot uncommitted txn records still on media (pages / extents being zeroed, E10);
     /// `None` once reported to the meta thread.
     pub(crate) prior_txn_zero: Option<u32>,
@@ -937,7 +939,6 @@ impl PartitionStore {
             recovery_mode: None,
             gone_wait: Vec::new(),
             retire: Vec::new(),
-            barrier_tickets: Vec::new(),
             prior_txn_zero: Some(0),
             prior_txn_pages: HashSet::with_hasher(Default::default()),
             snapshot_done: false,
@@ -1462,7 +1463,7 @@ impl PartitionStore {
             let out = match (v.is_ok(), r.req.kind) {
                 (false, _) => Ok(ExecOut::none()),
                 (true, ReqKind::FlushDb { db }) => self.exec_flush(cx, db, r.req.origin),
-                (true, _) => Ok(self.exec_barrier()),
+                (true, _) => Ok(self.exec_barrier(cx.cache)),
             };
             self.finish(cx.cache, id, r);
             return match (v, out) {
@@ -1649,6 +1650,7 @@ impl PartitionStore {
             requested: false,
             keys: SmallVec::new(),
             seq,
+            barriers: SmallVec::new(),
             markers: SmallVec::new(),
             pages: SmallVec::new(),
         });
@@ -2307,7 +2309,7 @@ impl PartitionStore {
                     _ => {
                         self.core.ext.zeros.insert(
                             start,
-                            ExtZero { n_pages, why: ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets }, state: ExtState::Pending, wid: 0 },
+                            ExtZero::pending(n_pages, ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets }),
                         );
                         self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source, cur_seq(&s.cur));
                     }
@@ -2538,33 +2540,61 @@ impl PartitionStore {
         self.core.counters.flush_reclaim_pending_pages = (self.core.reclaim_pages.len() + self.core.reclaim_ext.len()) as u64;
     }
 
-    /// A barrier: its ticket is durable once everything staged before it is durable and every
-    /// tracked older copy is zeroed (SHUTDOWN's drain, §16.2).
-    fn exec_barrier(&mut self) -> ExecOut {
+    /// A barrier: its ticket is durable once everything staged before it is durable, every txn
+    /// open at that moment is committed and every older copy tracked at that moment is zeroed
+    /// (SHUTDOWN's drain, SAVE, §16.2). It depends on exactly those effects (one dependency
+    /// each, handed over like any ticket), never on work that arrives later, so a barrier under
+    /// sustained load completes in bounded time.
+    fn exec_barrier(&mut self, cache: &mut PageCache) -> ExecOut {
         let t = self.core.tickets.create(TICKET_HAS_META);
-        self.core.tickets.add_meta(t);
-        self.core.tickets.seal(t);
-        self.core.barrier_tickets.push(t);
-        let keys: Vec<(u8, Box<[u8]>)> = self.core.stale.iter().map(|(db, k, _)| (db, Box::<[u8]>::from(k))).collect();
+        let pages: Vec<PageId> = self.own_pages(cache).filter(|(_, st)| !st.pending.is_empty() || st.inflight.is_some()).map(|(p, _)| p).collect();
+        let mut n = 0u32;
+        for p in pages {
+            let Some(st) = cache.page_state_mut(p) else { continue };
+            for e in st.pending.iter_mut() {
+                e.tickets_mut().push(t);
+                n += 1;
+            }
+            if let Some(inf) = st.inflight.as_mut() {
+                for e in inf.applied.iter_mut() {
+                    e.tickets_mut().push(t);
+                    n += 1;
+                }
+            }
+        }
+        let c = &mut self.core;
+        for w in c.ext.writes.values_mut() {
+            w.tickets.push(t);
+            n += 1;
+        }
+        for z in c.ext.zeros.values_mut() {
+            z.waiters.push(t);
+            n += 1;
+        }
+        for g in c.gone_wait.iter_mut() {
+            g.3.push(t);
+            n += 1;
+        }
+        n += c.stale.watch_all(t);
+        let mut meta = 0;
+        for o in c.txns.values_mut() {
+            o.barriers.push(t);
+            meta += 1;
+        }
+        for _ in 0..n {
+            c.tickets.add_effect(t);
+        }
+        for _ in 0..meta {
+            c.tickets.add_meta(t);
+        }
+        c.tickets.seal(t);
+        // the tracked copies go by foreground writes (the barrier waits for them)
+        let keys: Vec<(u8, Box<[u8]>)> = c.stale.iter().map(|(db, k, _)| (db, Box::<[u8]>::from(k))).collect();
         for (db, k) in keys {
             self.core.stale.require(db, &k, false);
             self.core.fg_keys.push((db, k));
         }
         ExecOut { ticket: Some(t), group: None, seq: None }
-    }
-
-    fn drained(&self) -> bool {
-        self.core.dirty.is_empty()
-            && self.core.retry.is_empty()
-            && self.core.writes_in_flight == 0
-            && self.core.ext.writes.is_empty()
-            && self.core.ext.zeros.is_empty()
-            && self.core.durable_wait.is_empty()
-            && self.core.durable_q.is_empty()
-            && self.core.txns.is_empty()
-            && self.core.gone_wait.is_empty()
-            && self.core.stale.is_empty()
-            && self.core.deferred.is_empty()
     }
 
     // ---------------------------------------------------------------------------------------
@@ -3222,10 +3252,12 @@ impl PartitionStore {
         }
         z.state = ExtState::AwaitFlush;
         let wid = z.wid;
+        let mut written: SmallVec<[TicketId; 2]> = z.waiters.iter().copied().collect();
         if let ZeroWhy::Delete { tickets, .. } = &z.why {
-            for &t in tickets.clone().iter() {
-                self.core.tickets.effect_written(t);
-            }
+            written.extend(tickets.iter().copied());
+        }
+        for t in written {
+            self.core.tickets.effect_written(t);
         }
         self.core.register_durable(cx.flush, start.dev(), wid, Durable::Zero(start));
     }
@@ -3246,7 +3278,7 @@ impl PartitionStore {
                 // a dead VALUE/CHUNKMAP extent of a flushed db is free space (§16.5)
                 let dead = h.kind != EXT_KIND_CHUNK && self.core.dead(h.db, h.seq, h.txn);
                 if dead && !self.core.ext.writes.contains_key(&start) && !self.core.ext.zeros.contains_key(&start) {
-                    self.core.ext.zeros.insert(start, ExtZero { n_pages: h.n_pages, why: ZeroWhy::Dead, state: ExtState::Pending, wid: 0 });
+                    self.core.ext.zeros.insert(start, ExtZero::pending(h.n_pages, ZeroWhy::Dead));
                 }
                 self.reclaim_progress();
             }
@@ -3389,6 +3421,9 @@ impl PartitionStore {
 
     fn ext_zero_durable(&mut self, cx: &mut StorageCtx<'_>, start: PageId) {
         let Some(z) = self.core.ext.zeros.remove(&start) else { return };
+        for &t in &z.waiters {
+            self.core.tickets.effect_durable(t);
+        }
         self.core.alloc.free_extent(start, z.n_pages);
         self.release_chunks(start);
         if self.core.prior_txn_pages.remove(&start)
@@ -3424,12 +3459,7 @@ impl PartitionStore {
         for e in entries {
             match e.at {
                 StaleRef::Extent { page, n_pages } => {
-                    self.core.ext.zeros.entry(page).or_insert(ExtZero {
-                        n_pages,
-                        why: ZeroWhy::Stale { db, key: key.into() },
-                        state: ExtState::Pending,
-                        wid: 0,
-                    });
+                    self.core.ext.zeros.entry(page).or_insert_with(|| ExtZero::pending(n_pages, ZeroWhy::Stale { db, key: key.into() }));
                 }
                 StaleRef::Small { page } => {
                     if now || e.foreground {
@@ -3586,6 +3616,9 @@ impl PartitionStore {
         {
             self.core.tickets.meta_done(t);
         }
+        for &t in &o.barriers {
+            self.core.tickets.meta_done(t);
+        }
         for (db, key) in &o.keys {
             self.sources_superseded(cx, *db, key, o.seq, true);
         }
@@ -3718,12 +3751,7 @@ impl PartitionStore {
                 match e.at {
                     StaleRef::Small { page } => self.ensure_scrub(cx, page),
                     StaleRef::Extent { page, n_pages } => {
-                        self.core.ext.zeros.entry(page).or_insert(ExtZero {
-                            n_pages,
-                            why: ZeroWhy::Stale { db, key: key.clone() },
-                            state: ExtState::Pending,
-                            wid: 0,
-                        });
+                        self.core.ext.zeros.entry(page).or_insert_with(|| ExtZero::pending(n_pages, ZeroWhy::Stale { db, key: key.clone() }));
                     }
                 }
             }
@@ -3762,6 +3790,7 @@ impl PartitionStore {
         st.scrub = false;
         let image::Built { spans, atomic, recs, applied, relocate, foreground, sources_durable, cleared, zeroed, placed, user_bytes } = built;
         self.core.fg_keys.extend(foreground);
+        let mut gone: SmallVec<[(u8, Box<[u8]>); 1]> = SmallVec::new();
         if !spans.is_empty() {
             let wid = self.core.new_wid();
             let dev = page.dev();
@@ -3806,7 +3835,9 @@ impl PartitionStore {
             }
             for (db, key) in cleared {
                 if self.core.stale.remove_at(db, &key, page) {
-                    self.core.fg_keys.push((db, key));
+                    // the copy is gone without a write: whoever waits for it is told below,
+                    // once this page's state is back in the cache
+                    gone.push((db, key));
                 }
             }
             if !st.pending.is_empty() {
@@ -3821,6 +3852,9 @@ impl PartitionStore {
             }
         }
         cx.cache.put_state(f, st);
+        for (db, key) in gone {
+            self.stale_gone(cx, db, &key);
+        }
         for (db, key, seq) in sources_durable {
             if self.sources_superseded(cx, db, &key, seq, true) > 0 {
                 // a source the event that made this copy durable should have released
@@ -4301,12 +4335,12 @@ impl PartitionStore {
         }
     }
 
+    /// Tickets watching tracked copies (barriers) whose copy is gone.
     fn finish_barriers(&mut self) {
-        if self.core.barrier_tickets.is_empty() || !self.drained() {
-            return;
-        }
-        for t in core::mem::take(&mut self.core.barrier_tickets) {
-            self.core.tickets.meta_done(t);
+        let mut done = Vec::new();
+        self.core.stale.take_released(&mut done);
+        for t in done {
+            self.core.tickets.effect_resolved(t);
         }
     }
 

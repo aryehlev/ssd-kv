@@ -34,6 +34,7 @@ use hashbrown::{Equivalent, HashMap};
 use smallvec::SmallVec;
 
 use crate::layout::{PageId, Seq};
+use crate::ticket::TicketId;
 
 /// Location of one older copy of a key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -116,6 +117,11 @@ pub(crate) struct StaleCopies {
     /// Entries per SMALL page or extent first page (eviction, AG release, snapshot rules).
     pages: HashMap<PageId, u32, foldhash::fast::FixedState>,
     entries: usize,
+    /// Tickets waiting for one specific tracked copy to go (a barrier, §16.2 SHUTDOWN drain):
+    /// `(ticket, db, key, location)`; released when that entry is removed.
+    watched: Vec<(TicketId, u8, Box<[u8]>, PageId)>,
+    /// Tickets whose watched copy is gone (drained by the partition).
+    released: Vec<TicketId>,
 }
 
 impl Default for StaleCopies {
@@ -130,6 +136,8 @@ impl StaleCopies {
             map: HashMap::with_hasher(Default::default()),
             pages: HashMap::with_hasher(Default::default()),
             entries: 0,
+            watched: Vec::new(),
+            released: Vec::new(),
         }
     }
 
@@ -281,6 +289,7 @@ impl StaleCopies {
         if list.is_empty() {
             self.map.remove(&KeyRef { db, key });
         }
+        self.release_watchers(|w| w.1 == db && w.3 == at && *w.2 == *key);
         self.entries -= 1;
         if let Some(c) = self.pages.get_mut(&at) {
             *c -= 1;
@@ -324,12 +333,52 @@ impl StaleCopies {
                 }
             }
         }
+        self.release_watchers(|w| w.1 == db);
+    }
+
+    /// Ticket `t` waits until every copy tracked now is gone (one dependency per copy; the
+    /// caller counts them); returns how many copies it watches.
+    pub(crate) fn watch_all(&mut self, t: TicketId) -> u32 {
+        let mut n = 0;
+        for (k, list) in &self.map {
+            for e in list {
+                self.watched.push((t, k.db, k.key.clone(), e.at.page()));
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Tickets whose watched copy went since the last call (one entry per dependency).
+    pub(crate) fn take_released(&mut self, out: &mut Vec<TicketId>) {
+        out.append(&mut self.released);
+    }
+
+    /// Watched copies: `(ticket, location)` (liveness checks).
+    pub(crate) fn watched(&self) -> impl Iterator<Item = (TicketId, PageId)> + '_ {
+        self.watched.iter().map(|w| (w.0, w.3))
+    }
+
+    fn release_watchers(&mut self, gone: impl Fn(&(TicketId, u8, Box<[u8]>, PageId)) -> bool) {
+        if self.watched.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.watched.len() {
+            if gone(&self.watched[i]) {
+                let w = self.watched.swap_remove(i);
+                self.released.push(w.0);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.pages.clear();
         self.entries = 0;
+        self.release_watchers(|_| true);
     }
 
 }

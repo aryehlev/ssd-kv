@@ -112,7 +112,7 @@ struct Holds {
 impl PartitionStore {
     /// Pages of this partition in the cache (owned SMALL pages, and pages the partition still
     /// has queued work for).
-    fn own_pages<'c>(&'c self, cache: &'c PageCache) -> impl Iterator<Item = (PageId, &'c crate::image::PageState)> + 'c {
+    pub(crate) fn own_pages<'c>(&'c self, cache: &'c PageCache) -> impl Iterator<Item = (PageId, &'c crate::image::PageState)> + 'c {
         let c = &self.core;
         cache.page_states().filter(move |(p, _)| {
             c.alloc.owns_small(*p)
@@ -239,16 +239,22 @@ impl PartitionStore {
             }
         }
         for (start, z) in &c.ext.zeros {
+            let w = match z.state {
+                ExtState::Pending => WaitFor::ExtIssue { start: *start },
+                ExtState::Writing => WaitFor::PageWrite { page: *start },
+                ExtState::AwaitFlush => WaitFor::Flush { dev: start.dev() },
+            };
+            for &t in &z.waiters {
+                out.push((t, w));
+            }
             if let ZeroWhy::Delete { tickets, .. } = &z.why {
-                let w = match z.state {
-                    ExtState::Pending => WaitFor::ExtIssue { start: *start },
-                    ExtState::Writing => WaitFor::PageWrite { page: *start },
-                    ExtState::AwaitFlush => WaitFor::Flush { dev: start.dev() },
-                };
                 for &t in tickets {
                     out.push((t, w));
                 }
             }
+        }
+        for (t, at) in c.stale.watched() {
+            out.push((t, WaitFor::OlderCopy { at }));
         }
         for (db, key, _, ts) in &c.gone_wait {
             let at = c.stale.get(*db, key).first().map_or(PageId(0), |e| e.at.page());
@@ -284,7 +290,9 @@ impl PartitionStore {
                 h.meta += 1;
             }
         }
-        h.meta += c.barrier_tickets.iter().filter(|&&b| b == t).count() as u32;
+        for o in c.txns.values() {
+            h.meta += o.barriers.iter().filter(|&&b| b == t).count() as u32;
+        }
         h
     }
 
@@ -381,6 +389,8 @@ impl PartitionStore {
                 let moving = others.iter().any(|x| match (x.state, x.at) {
                     (CopyState::Stale, StaleRef::Small { page: at }) => self.scrub_scheduled(cache, db, key, at),
                     (CopyState::Stale, StaleRef::Extent { page: at, .. }) => c.ext.zeros.contains_key(&at),
+                    // the older copy that location also holds is being zeroed (E14)
+                    (CopyState::Source, StaleRef::Small { page: at }) if x.older && self.scrub_scheduled(cache, db, key, at) => true,
                     (CopyState::Source, _) => self.newer_copy_elsewhere(cache, db, key, x.seq, page),
                 });
                 if !moving {

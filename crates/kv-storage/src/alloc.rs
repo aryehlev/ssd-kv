@@ -354,6 +354,10 @@ struct SpareSlot {
     refused_at_ns: Option<u64>,
     /// Class of the request in flight.
     asked_class: AgClass,
+    /// The request in flight is served from the reserve.
+    asked_class_was_reserved: bool,
+    /// The last request served from the reserve was refused too (the reserve is used up).
+    reserve_refused_at_ns: Option<u64>,
 }
 
 /// Why an AG is requested, least urgent first.
@@ -1032,6 +1036,7 @@ impl Alloc {
                 s.asked = true;
                 let class = if s.want_dev.is_some() { s.class.max(AgClass::Need) } else { s.class };
                 s.asked_class = class;
+                s.asked_class_was_reserved = class == AgClass::Reserved;
                 s.class = AgClass::Spare;
                 out.push((kind, s.want_dev.take(), class));
             }
@@ -1060,14 +1065,30 @@ impl Alloc {
                 self.slots[ki].refused_at_ns = None;
             }
             None if spare => {}
-            None => self.slots[ki].refused_at_ns = Some(now_ns.max(1)),
+            None => {
+                self.slots[ki].refused_at_ns = Some(now_ns.max(1));
+                if self.slots[ki].asked_class_was_reserved {
+                    self.slots[ki].reserve_refused_at_ns = Some(now_ns.max(1));
+                }
+            }
         }
+        self.slots[ki].asked_class_was_reserved = false;
+        if ag.is_some() {
+            self.slots[ki].reserve_refused_at_ns = None;
+        }
+    }
+
+    /// True when the reserve above the fill limit refused an AG of `kind` within the retry
+    /// period: a write that may use the reserve fails with `-OOM` instead of waiting.
+    pub(crate) fn reserve_refused(&self, kind: AgKind, now_ns: u64) -> bool {
+        self.slots[kind_slot(kind)].reserve_refused_at_ns.is_some_and(|t| now_ns.saturating_sub(t) < RETRY_NS)
     }
 
     /// Clears the refusal so that the next need asks again (space was released).
     pub(crate) fn clear_refusal(&mut self) {
         for s in &mut self.slots {
             s.refused_at_ns = None;
+            s.reserve_refused_at_ns = None;
         }
     }
 
@@ -1079,12 +1100,14 @@ impl Alloc {
 
     /// An accepted write needs an AG of `kind` to complete (a staged record moves, §14.3): the
     /// request is served above the fill limit and is sent even while a refusal is latched.
-    pub(crate) fn want_reserved(&mut self, kind: AgKind) {
+    pub(crate) fn want_reserved(&mut self, kind: AgKind) -> bool {
         let s = &mut self.slots[kind_slot(kind)];
         if s.spare.is_none() {
             s.want = true;
             s.class = AgClass::Reserved;
+            return true;
         }
+        false
     }
 
     /// True while an AG of `kind` is requested and not answered.

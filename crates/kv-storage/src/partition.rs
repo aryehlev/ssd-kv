@@ -1654,8 +1654,8 @@ impl PartitionStore {
         let mut plans: SmallVec<[Plan; 2]> = SmallVec::new();
         for s in staged.iter() {
             let p = match &s.change {
-                Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, &mut undo),
-                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, &mut undo),
+                Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some(), &mut undo),
+                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, txn.is_some(), &mut undo),
                 _ => Ok(Plan::None),
             };
             match p {
@@ -1756,8 +1756,25 @@ impl PartitionStore {
         self.core.meta_req(meta, MetaReq::ReserveSeq { partition: id, floor }, MetaWait::Seq(floor));
     }
 
-    /// Chooses where a put of `val_len` value bytes goes.
-    fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, undo: &mut Undo) -> Result<Plan, Commit> {
+    /// Chooses where a put of `val_len` value bytes goes. `reserve`: the put is part of a
+    /// cross-partition txn whose other parts may already be applied; it may use the space
+    /// reserve above the fill limit (like an accepted move, §14.3), and fails with `-OOM` only
+    /// once the reserve refused too. A part that fails leaves its siblings' versions to the
+    /// coordinator to resolve, so failing for space that the reserve still has is avoided.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, reserve: bool, undo: &mut Undo) -> Result<Plan, Commit> {
+        let r = self.plan_put_at(cx, s, key_len, val_len, txn, undo);
+        if reserve && matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) {
+            let small = key_len <= u16::MAX as usize && val_len <= u16::MAX as u64 && small_len(key_len, val_len as usize, txn) <= SMALL_REC_MAX;
+            let kind = if small { AgKind::Small } else { AgKind::Extent };
+            if !self.core.alloc.reserve_refused(kind, cx.now.mono_ns) && self.core.alloc.want_reserved(kind) {
+                return Err(Commit::Park);
+            }
+        }
+        r
+    }
+
+    fn plan_put_at(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, undo: &mut Undo) -> Result<Plan, Commit> {
         let now_ns = cx.now.mono_ns;
         let small = small_len(key_len, val_len as usize, txn);
         if key_len <= u16::MAX as usize && val_len <= u16::MAX as u64 && small <= SMALL_REC_MAX {
@@ -4131,7 +4148,7 @@ impl PartitionStore {
             }
             SmallPlace::NeedAg | SmallPlace::Full => {
                 // the write was accepted: its space comes from above the fill limit
-                self.core.alloc.want_reserved(AgKind::Small);
+                let _ = self.core.alloc.want_reserved(AgKind::Small);
                 None
             }
         };

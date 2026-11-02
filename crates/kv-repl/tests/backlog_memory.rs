@@ -11,7 +11,19 @@ use kv_repl::{Group, Op, Seq};
 fn backlog_never_reaches_disk() {
     let mut b = Backlog::new(3 << 20);
     let mut g = Vec::new();
-    encode_group(&Group { seq: Seq::new(1, 1), ops: vec![Op::Put { db: 0, vtype: 1, expire_at: 0, key: b"k".as_slice().into(), value: vec![7; 100] }] }, &mut g);
+    encode_group(
+        &Group {
+            seq: Seq::new(1, 1),
+            ops: vec![Op::Put {
+                db: 0,
+                vtype: 1,
+                expire_at: 0,
+                key: b"k".as_slice().into(),
+                value: vec![7; 100],
+            }],
+        },
+        &mut g,
+    );
     b.push(Seq::new(1, 1), &g);
     let addr = b.ring_addr();
     let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
@@ -30,8 +42,17 @@ fn backlog_never_reaches_disk() {
             break;
         }
     }
-    let flags: Vec<&str> = flags.expect("the ring's mapping is listed").split_whitespace().collect();
-    assert!(flags.contains(&"dd"), "not excluded from core dumps: {flags:?}");
-    assert!(flags.contains(&"lo") || flags.contains(&"ht"), "neither locked nor huge pages: {flags:?}");
+    let flags: Vec<&str> = flags
+        .expect("the ring's mapping is listed")
+        .split_whitespace()
+        .collect();
+    assert!(
+        flags.contains(&"dd"),
+        "not excluded from core dumps: {flags:?}"
+    );
+    assert!(
+        flags.contains(&"lo") || flags.contains(&"ht"),
+        "neither locked nor huge pages: {flags:?}"
+    );
     assert_eq!(b.is_huge(), flags.contains(&"ht"));
 }

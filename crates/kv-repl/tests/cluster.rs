@@ -37,9 +37,16 @@ fn bin(name: &str, env: &str) -> PathBuf {
     }
     // target/<profile>/deps/cluster-<hash> -> target/<profile>/<name>
     let exe = std::env::current_exe().expect("test executable path");
-    let dir = exe.parent().and_then(Path::parent).expect("target profile directory");
+    let dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("target profile directory");
     let p = dir.join(name);
-    assert!(p.exists(), "{} not found: build it first (cargo build -p kv-node -p kv-coord) or set {env}", p.display());
+    assert!(
+        p.exists(),
+        "{} not found: build it first (cargo build -p kv-node -p kv-coord) or set {env}",
+        p.display()
+    );
     p
 }
 
@@ -59,7 +66,10 @@ fn free_port() -> u16 {
 fn wait_until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while !f() {
-        assert!(Instant::now() < deadline, "timed out after {secs} s waiting for {what}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {secs} s waiting for {what}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -111,12 +121,20 @@ impl Conn {
                     return Ok(v);
                 }
                 Ok(None) => {}
-                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad reply")),
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad reply",
+                    ));
+                }
             }
             let mut chunk = [0u8; 65536];
             let n = self.s.read(&mut chunk)?;
             if n == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "closed",
+                ));
             }
             self.buf.extend_from_slice(&chunk[..n]);
         }
@@ -130,7 +148,9 @@ impl Conn {
 
 fn text(v: &Value) -> String {
     match v {
-        Value::Simple(b) | Value::Bulk(Some(b)) | Value::Error(b) => String::from_utf8_lossy(b).into_owned(),
+        Value::Simple(b) | Value::Bulk(Some(b)) | Value::Error(b) => {
+            String::from_utf8_lossy(b).into_owned()
+        }
         Value::Int(i) => i.to_string(),
         Value::Bulk(None) | Value::Null => "(nil)".into(),
         Value::Array(Some(a)) => a.iter().map(text).collect::<Vec<_>>().join(" "),
@@ -156,7 +176,12 @@ enum Outcome {
 
 impl Routed {
     fn new(coords: Vec<SocketAddr>) -> Self {
-        Routed { coords, route: hashbrown::HashMap::new(), conns: hashbrown::HashMap::new(), next_coord: 0 }
+        Routed {
+            coords,
+            route: hashbrown::HashMap::new(),
+            conns: hashbrown::HashMap::new(),
+            next_coord: 0,
+        }
     }
 
     fn coord(&mut self) -> SocketAddr {
@@ -188,13 +213,18 @@ impl Routed {
                 Ok(Value::Error(e)) => {
                     let e = String::from_utf8_lossy(&e).into_owned();
                     if let Some(rest) = e.strip_prefix("MOVED ") {
-                        if let Some(addr) = rest.split_whitespace().nth(1).and_then(|a| a.parse().ok()) {
+                        if let Some(addr) =
+                            rest.split_whitespace().nth(1).and_then(|a| a.parse().ok())
+                        {
                             self.route.insert(slot, addr);
                         }
                         last = e;
                         continue;
                     }
-                    if e.starts_with("TRYAGAIN") || e.starts_with("CLUSTERDOWN") || e.starts_with("LOADING") {
+                    if e.starts_with("TRYAGAIN")
+                        || e.starts_with("CLUSTERDOWN")
+                        || e.starts_with("LOADING")
+                    {
                         // during a seal or a failover window: retry later at the same place
                         if e.starts_with("CLUSTERDOWN") {
                             self.route.remove(&slot);
@@ -272,7 +302,8 @@ impl Drop for Cluster {
 
 impl Cluster {
     fn start(name: &str, n_nodes: usize, limit: Duration) -> Self {
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("cluster-{name}-{}", std::process::id()));
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cluster-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let kvd = bin("kvd", "KVD_BIN");
@@ -280,35 +311,93 @@ impl Cluster {
         let pids = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicBool::new(false));
         watchdog(limit, done.clone(), pids.clone());
-        let ports: Vec<(u16, u16, u16)> = (0..3).map(|_| (free_port(), free_port(), free_port())).collect();
-        let list = ports.iter().enumerate().map(|(i, (p, c, a))| format!("c{i}=127.0.0.1:{p}/{c}/{a}")).collect::<Vec<_>>().join(",");
-        let mut c = Cluster { root: root.clone(), coords: Vec::new(), nodes: Vec::new(), kvd, kvc, pids, done, ok: false };
+        let ports: Vec<(u16, u16, u16)> = (0..3)
+            .map(|_| (free_port(), free_port(), free_port()))
+            .collect();
+        let list = ports
+            .iter()
+            .enumerate()
+            .map(|(i, (p, c, a))| format!("c{i}=127.0.0.1:{p}/{c}/{a}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut c = Cluster {
+            root: root.clone(),
+            coords: Vec::new(),
+            nodes: Vec::new(),
+            kvd,
+            kvc,
+            pids,
+            done,
+            ok: false,
+        };
         for (i, (_, client, admin)) in ports.iter().enumerate() {
             let dir = root.join(format!("c{i}"));
             let st = Command::new(&c.kvc)
-                .args(["init", "--dir", dir.to_str().unwrap(), "--id", &format!("c{i}"), "--peers", &list, "--half-bytes", "1048576"])
+                .args([
+                    "init",
+                    "--dir",
+                    dir.to_str().unwrap(),
+                    "--id",
+                    &format!("c{i}"),
+                    "--peers",
+                    &list,
+                    "--half-bytes",
+                    "1048576",
+                ])
                 .stdout(Stdio::null())
                 .status()
                 .unwrap();
             assert!(st.success(), "kvc init");
             let log = root.join(format!("c{i}.log"));
             let child = Command::new(&c.kvc)
-                .args(["--dir", dir.to_str().unwrap(), "--cluster-auth-token", TOKEN, "--admin-token", ADMIN, "--logfile", log.to_str().unwrap(), "--loglevel", "debug"])
+                .args([
+                    "--dir",
+                    dir.to_str().unwrap(),
+                    "--cluster-auth-token",
+                    TOKEN,
+                    "--admin-token",
+                    ADMIN,
+                    "--logfile",
+                    log.to_str().unwrap(),
+                    "--loglevel",
+                    "debug",
+                ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::from(std::fs::File::create(root.join(format!("c{i}.err"))).unwrap()))
+                .stderr(Stdio::from(
+                    std::fs::File::create(root.join(format!("c{i}.err"))).unwrap(),
+                ))
                 .spawn()
                 .unwrap();
             c.pids.lock().unwrap().push(child.id());
-            c.coords.push(Coord { child: Some(child), client: *client, admin: *admin });
+            c.coords.push(Coord {
+                child: Some(child),
+                client: *client,
+                admin: *admin,
+            });
         }
         for i in 0..n_nodes {
             let dir = root.join(format!("n{i}"));
-            c.nodes.push(Node { child: None, port: free_port(), ctrl: free_port(), repl: free_port(), dir, id: String::new() });
+            c.nodes.push(Node {
+                child: None,
+                port: free_port(),
+                ctrl: free_port(),
+                repl: free_port(),
+                dir,
+                id: String::new(),
+            });
             c.spawn_node(i);
         }
-        wait_until("a coordinator leader", 30, || c.admin_try(&["STATUS"]).is_ok_and(|s| s.contains("leader c")));
-        for (k, v) in [("partitions", "16"), ("renew_ms", "50"), ("lease_ms", "600"), ("fail_grace_ms", "100")] {
+        wait_until("a coordinator leader", 30, || {
+            c.admin_try(&["STATUS"])
+                .is_ok_and(|s| s.contains("leader c"))
+        });
+        for (k, v) in [
+            ("partitions", "16"),
+            ("renew_ms", "50"),
+            ("lease_ms", "600"),
+            ("fail_grace_ms", "100"),
+        ] {
             c.admin(&["PARAMS", "SET", k, v]);
         }
         for i in 0..n_nodes {
@@ -321,7 +410,12 @@ impl Cluster {
     fn spawn_node(&mut self, i: usize) {
         let n = &self.nodes[i];
         let log = self.root.join(format!("n{i}.log"));
-        let err = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(self.root.join(format!("n{i}.err"))).unwrap();
+        let err = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(self.root.join(format!("n{i}.err")))
+            .unwrap();
         let child = Command::new(&self.kvd)
             .args([
                 "--bind",
@@ -364,7 +458,7 @@ impl Cluster {
         self.nodes[i].child = Some(child);
     }
 
-    /// Whether node `i`'s diagnostics log holds `what`.
+    /// Whether node `i`'s diagnostics file holds `what`.
     fn log_contains(&self, i: usize, what: &str) -> bool {
         std::fs::read_to_string(self.root.join(format!("n{i}.log"))).is_ok_and(|s| s.contains(what))
     }
@@ -377,9 +471,14 @@ impl Cluster {
             if let Some(c) = child.as_mut()
                 && let Ok(Some(st)) = c.try_wait()
             {
-                panic!("node {i} exited ({st}): {}", std::fs::read_to_string(&err).unwrap_or_default());
+                panic!(
+                    "node {i} exited ({st}): {}",
+                    std::fs::read_to_string(&err).unwrap_or_default()
+                );
             }
-            Conn::open(addr).and_then(|mut c| c.call_str(&["PING"])).is_ok()
+            Conn::open(addr)
+                .and_then(|mut c| c.call_str(&["PING"]))
+                .is_ok()
         });
     }
 
@@ -394,7 +493,11 @@ impl Cluster {
             "--repl",
             &format!("127.0.0.1:{}", n.repl),
         ]);
-        let id = r.split_whitespace().nth(2).expect("node id in the reply").to_owned();
+        let id = r
+            .split_whitespace()
+            .nth(2)
+            .expect("node id in the reply")
+            .to_owned();
         self.nodes[i].id = id;
     }
 
@@ -410,7 +513,10 @@ impl Cluster {
     }
 
     fn coord_clients(&self) -> Vec<SocketAddr> {
-        self.coords.iter().map(|c| SocketAddr::from(([127, 0, 0, 1], c.client))).collect()
+        self.coords
+            .iter()
+            .map(|c| SocketAddr::from(([127, 0, 0, 1], c.client)))
+            .collect()
     }
 
     /// One admin command on any coordinator (followers relay to the leader).
@@ -418,7 +524,9 @@ impl Cluster {
         let mut last = String::new();
         for c in &self.coords {
             let addr = SocketAddr::from(([127, 0, 0, 1], c.admin));
-            let Ok(mut conn) = Conn::open(addr) else { continue };
+            let Ok(mut conn) = Conn::open(addr) else {
+                continue;
+            };
             if conn.call_str(&["AUTH", ADMIN]).is_err() {
                 continue;
             }
@@ -455,11 +563,20 @@ impl Cluster {
     fn member_line(&self, i: usize) -> String {
         let s = self.status();
         let id = &self.nodes[i].id;
-        s.lines().find(|l| l.trim_start().starts_with(id.as_str()) && (l.contains("primary") || l.contains("replica")) && !l.contains("ctrl")).unwrap_or("").to_owned()
+        s.lines()
+            .find(|l| {
+                l.trim_start().starts_with(id.as_str())
+                    && (l.contains("primary") || l.contains("replica"))
+                    && !l.contains("ctrl")
+            })
+            .unwrap_or("")
+            .to_owned()
     }
 
     fn wait_member(&self, i: usize, want: &str, secs: u64) {
-        wait_until(&format!("node {i} to be '{want}'"), secs, || self.member_line(i).contains(want));
+        wait_until(&format!("node {i} to be '{want}'"), secs, || {
+            self.member_line(i).contains(want)
+        });
     }
 
     fn wait_primary(&self, i: usize, secs: u64) {
@@ -525,12 +642,18 @@ impl Writer {
             }
             (acked, failed)
         });
-        Writer { stop, acks, handle: Some(handle) }
+        Writer {
+            stop,
+            acks,
+            handle: Some(handle),
+        }
     }
 
     /// Lets the writer run until it has `min` acknowledged writes (the box may be busy).
     fn at_least(&self, min: u32, secs: u64) {
-        wait_until(&format!("{min} acknowledged writes"), secs, || self.acks.load(Ordering::Relaxed) >= min);
+        wait_until(&format!("{min} acknowledged writes"), secs, || {
+            self.acks.load(Ordering::Relaxed) >= min
+        });
     }
 
     fn finish(mut self) -> (Vec<(String, String)>, usize) {
@@ -566,7 +689,13 @@ fn verify_acked(coords: &[SocketAddr], acked: &[(String, String)]) {
             Outcome::Failed(e) => lost.push(format!("{k}: {e}")),
         }
     }
-    assert!(lost.is_empty(), "{} of {} acknowledged writes lost, e.g. {:?}", lost.len(), acked.len(), &lost[..lost.len().min(5)]);
+    assert!(
+        lost.is_empty(),
+        "{} of {} acknowledged writes lost, e.g. {:?}",
+        lost.len(),
+        acked.len(),
+        &lost[..lost.len().min(5)]
+    );
 }
 
 #[test]
@@ -587,7 +716,11 @@ fn replication_failover_and_returning_member() {
     for i in 0..300 {
         set_settled(&mut r, &format!("base:{i}"), &format!("b{i}"));
     }
-    wait_until("the base writes on the replica", 20, || (0..300).step_by(37).all(|i| c.replica_get(1, &format!("base:{i}")) == Some(format!("b{i}"))));
+    wait_until("the base writes on the replica", 20, || {
+        (0..300)
+            .step_by(37)
+            .all(|i| c.replica_get(1, &format!("base:{i}")) == Some(format!("b{i}")))
+    });
 
     // a learner added after the data exists catches up by a merge full sync, under writes
     let w = Writer::start(coords.clone(), "w1", Duration::from_millis(2));
@@ -597,12 +730,25 @@ fn replication_failover_and_returning_member() {
     c.wait_member(2, "in-sync isr", 90);
     w.at_least(100, 60);
     let (acked1, failed1) = w.finish();
-    assert!(acked1.len() > 50, "the writer made progress ({} acked, {failed1} failed)", acked1.len());
+    assert!(
+        acked1.len() > 50,
+        "the writer made progress ({} acked, {failed1} failed)",
+        acked1.len()
+    );
     for (k, v) in acked1.iter().step_by(17) {
-        wait_until("an acknowledged write on the learner", 20, || c.replica_get(2, k).as_deref() == Some(v.as_str()));
+        wait_until("an acknowledged write on the learner", 20, || {
+            c.replica_get(2, k).as_deref() == Some(v.as_str())
+        });
     }
-    assert_eq!(c.replica_get(2, "base:123").as_deref(), Some("b123"), "snapshot data on the learner");
-    assert!(c.log_contains(2, "merge full sync complete"), "the learner caught up by a merge full sync");
+    assert_eq!(
+        c.replica_get(2, "base:123").as_deref(),
+        Some("b123"),
+        "snapshot data on the learner"
+    );
+    assert!(
+        c.log_contains(2, "merge full sync complete"),
+        "the learner caught up by a merge full sync"
+    );
 
     // failover: kill -9 the primary under load; no acknowledged write is lost
     let w = Writer::start(coords.clone(), "w2", Duration::from_millis(1));
@@ -611,21 +757,38 @@ fn replication_failover_and_returning_member() {
     c.kill_node(0);
     wait_until("a promotion", 60, || {
         let s = c.status();
-        s.lines().any(|l| (l.contains(n1.as_str()) || l.contains(n2.as_str())) && l.contains(" primary ") && l.contains("isr") && !l.contains("ctrl"))
+        s.lines().any(|l| {
+            (l.contains(n1.as_str()) || l.contains(n2.as_str()))
+                && l.contains(" primary ")
+                && l.contains("isr")
+                && !l.contains("ctrl")
+        })
     });
-    let promoted = if c.member_line(1).contains(" primary ") { 1 } else { 2 };
-    eprintln!("promotion of node {promoted} committed {:?} after the kill", t0.elapsed());
+    let promoted = if c.member_line(1).contains(" primary ") {
+        1
+    } else {
+        2
+    };
+    eprintln!(
+        "promotion of node {promoted} committed {:?} after the kill",
+        t0.elapsed()
+    );
     std::thread::sleep(Duration::from_millis(1500));
     w.at_least(100, 60);
     let (acked2, failed2) = w.finish();
-    eprintln!("writer during failover: {} acked, {failed2} not acknowledged", acked2.len());
+    eprintln!(
+        "writer during failover: {} acked, {failed2} not acknowledged",
+        acked2.len()
+    );
     assert!(!acked2.is_empty());
     verify_acked(&coords, &acked1);
     verify_acked(&coords, &acked2);
     // the writes acknowledged after the promotion reached the other ISR member too
     let other = 3 - promoted;
     let last = acked2.last().unwrap().clone();
-    wait_until("the other replica follows the new primary", 30, || c.replica_get(other, &last.0).as_deref() == Some(last.1.as_str()));
+    wait_until("the other replica follows the new primary", 30, || {
+        c.replica_get(other, &last.0).as_deref() == Some(last.1.as_str())
+    });
 
     // the old primary returns as a member (repair against the new primary) and converges
     c.spawn_node(0);
@@ -634,14 +797,26 @@ fn replication_failover_and_returning_member() {
     let mut r = Routed::new(coords.clone());
     let k = "after-return";
     set_settled(&mut r, k, "yes");
-    wait_until("the returning member applies new writes", 20, || c.replica_get(0, k).as_deref() == Some("yes"));
+    wait_until("the returning member applies new writes", 20, || {
+        c.replica_get(0, k).as_deref() == Some("yes")
+    });
     for (k, v) in acked2.iter().step_by(13).chain(acked1.iter().step_by(29)) {
-        assert_eq!(c.replica_get(0, k).as_deref(), Some(v.as_str()), "the returning member holds {k}");
+        assert_eq!(
+            c.replica_get(0, k).as_deref(),
+            Some(v.as_str()),
+            "the returning member holds {k}"
+        );
     }
     assert_eq!(c.replica_get(0, "base:7").as_deref(), Some("b7"));
     // writes that were never acknowledged converge: the returning member holds exactly what
     // the new primary holds for them (present or absent), never a divergent copy
-    let unacked: Vec<String> = UNACKED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|k| k.starts_with("w2:")).cloned().collect();
+    let unacked: Vec<String> = UNACKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|k| k.starts_with("w2:"))
+        .cloned()
+        .collect();
     let mut r = Routed::new(coords.clone());
     for k in &unacked {
         let at_primary = match r.exec(k.as_bytes(), &[b"GET", k.as_bytes()]) {
@@ -649,10 +824,20 @@ fn replication_failover_and_returning_member() {
             Outcome::Ok(other) => panic!("GET {k}: {}", text(&other)),
             Outcome::Failed(e) => panic!("GET {k}: {e}"),
         };
-        assert_eq!(c.replica_get(0, k), at_primary, "unacknowledged write {k} converged");
+        assert_eq!(
+            c.replica_get(0, k),
+            at_primary,
+            "unacknowledged write {k} converged"
+        );
     }
-    assert!(c.log_contains(0, "repair complete"), "the returning member repaired against the new primary");
-    assert!(!c.log_contains(0, "merge full sync started"), "no full sync for a returning member");
+    assert!(
+        c.log_contains(0, "repair complete"),
+        "the returning member repaired against the new primary"
+    );
+    assert!(
+        !c.log_contains(0, "merge full sync started"),
+        "no full sync for a returning member"
+    );
 
     // graceful handoff back to node 0 under writes (§23.12): the old primary drains to its
     // own barrier, relinquishes its lease and stays an in-sync member; nothing acknowledged
@@ -665,11 +850,16 @@ fn replication_failover_and_returning_member() {
     c.wait_member(promoted, "in-sync isr", 60);
     w.at_least(150, 60);
     let (acked3, failed3) = w.finish();
-    eprintln!("writer during the handoff: {} acked, {failed3} not acknowledged", acked3.len());
+    eprintln!(
+        "writer during the handoff: {} acked, {failed3} not acknowledged",
+        acked3.len()
+    );
     verify_acked(&coords, &acked3);
     verify_acked(&coords, &acked2);
     let last = acked3.last().unwrap().clone();
-    wait_until("the demoted primary follows", 30, || c.replica_get(promoted, &last.0).as_deref() == Some(last.1.as_str()));
+    wait_until("the demoted primary follows", 30, || {
+        c.replica_get(promoted, &last.0).as_deref() == Some(last.1.as_str())
+    });
     c.ok = true;
 }
 
@@ -693,31 +883,52 @@ fn slot_migration_under_load() {
     let out = c.admin(&["MIGRATE", "0-8191", "--to", "2"]);
     let id: String = out.split_whitespace().nth(2).unwrap_or("").to_owned();
     wait_until("the migration to finish", 120, || {
-        c.admin_try(&["MIGRATIONS"]).is_ok_and(|m| m.lines().any(|l| l.starts_with(&format!("{id} ")) && l.contains("phase=done")))
+        c.admin_try(&["MIGRATIONS"]).is_ok_and(|m| {
+            m.lines()
+                .any(|l| l.starts_with(&format!("{id} ")) && l.contains("phase=done"))
+        })
     });
     // writes after the cutover go to the destination
     std::thread::sleep(Duration::from_millis(1000));
     w.at_least(200, 60);
     let (acked, failed) = w.finish();
-    eprintln!("writer during migration: {} acked, {failed} not acknowledged", acked.len());
+    eprintln!(
+        "writer during migration: {} acked, {failed} not acknowledged",
+        acked.len()
+    );
     assert!(acked.len() > 200, "the writer made progress");
-    let pre: Vec<(String, String)> = (0..400).map(|i| (format!("pre:{i}"), format!("p{i}"))).collect();
+    let pre: Vec<(String, String)> = (0..400)
+        .map(|i| (format!("pre:{i}"), format!("p{i}")))
+        .collect();
     verify_acked(&coords, &pre);
     verify_acked(&coords, &acked);
     // the moved slots are served by the destination; the source purged them
-    let moved: Vec<&(String, String)> = pre.iter().filter(|(k, _)| kv_common::key_slot(k.as_bytes()) <= 8191).collect();
+    let moved: Vec<&(String, String)> = pre
+        .iter()
+        .filter(|(k, _)| kv_common::key_slot(k.as_bytes()) <= 8191)
+        .collect();
     assert!(!moved.is_empty());
     let mut src = Conn::open(c.node_addr(0)).unwrap();
     let mut dst = Conn::open(c.node_addr(1)).unwrap();
     for (k, v) in moved.iter().take(40) {
-        assert_eq!(text(&dst.call_str(&["GET", k]).unwrap()), *v, "destination serves {k}");
+        assert_eq!(
+            text(&dst.call_str(&["GET", k]).unwrap()),
+            *v,
+            "destination serves {k}"
+        );
         let e = text(&src.call_str(&["GET", k]).unwrap());
         assert!(e.starts_with("MOVED"), "source redirects {k}: {e}");
     }
     // the source keeps only the slots it still owns (plus writes that were never acknowledged)
-    let kept = pre.iter().chain(acked.iter()).filter(|(k, _)| kv_common::key_slot(k.as_bytes()) > 8191).count();
+    let kept = pre
+        .iter()
+        .chain(acked.iter())
+        .filter(|(k, _)| kv_common::key_slot(k.as_bytes()) > 8191)
+        .count();
     wait_until("the source to purge the moved slots", 60, || {
-        Conn::open(c.node_addr(0)).and_then(|mut cs| cs.call_str(&["DBSIZE"])).is_ok_and(|v| matches!(v, Value::Int(n) if (n as usize) <= kept + failed))
+        Conn::open(c.node_addr(0))
+            .and_then(|mut cs| cs.call_str(&["DBSIZE"]))
+            .is_ok_and(|v| matches!(v, Value::Int(n) if (n as usize) <= kept + failed))
     });
     c.ok = true;
 }

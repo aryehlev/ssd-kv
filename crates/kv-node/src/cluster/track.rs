@@ -27,7 +27,10 @@ pub struct Prefix {
 impl Prefix {
     /// A prefix in which everything up to `upto` is done.
     pub fn new(upto: Seq) -> Self {
-        Prefix { items: VecDeque::new(), upto }
+        Prefix {
+            items: VecDeque::new(),
+            upto,
+        }
     }
 
     /// The done prefix.
@@ -95,7 +98,13 @@ impl Default for Markers {
 
 impl Markers {
     pub fn new() -> Self {
-        Markers { next: 0, items: VecDeque::new(), executed_below: 0, hwm: Seq::ZERO, markers: VecDeque::new() }
+        Markers {
+            next: 0,
+            items: VecDeque::new(),
+            executed_below: 0,
+            hwm: Seq::ZERO,
+            markers: VecDeque::new(),
+        }
     }
 
     /// A new item in stream order; returns its index.

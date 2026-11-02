@@ -238,7 +238,11 @@ impl ReplSender {
     }
 
     fn trim_produced(&mut self) {
-        let min = self.isr.iter().map(|&m| self.slot(m).map_or(Seq::ZERO, |s| s.acked_durable)).min();
+        let min = self
+            .isr
+            .iter()
+            .map(|&m| self.slot(m).map_or(Seq::ZERO, |s| s.acked_durable))
+            .min();
         match min {
             None => self.produced.clear(),
             Some(min) => {
@@ -260,7 +264,10 @@ impl ReplSender {
     /// The smallest acknowledged durable position over the counted members (`None`: no member
     /// counts).
     pub fn members_durable(&self) -> Option<Seq> {
-        self.isr.iter().map(|&m| self.slot(m).map_or(Seq::ZERO, |s| s.acked_durable)).min()
+        self.isr
+            .iter()
+            .map(|&m| self.slot(m).map_or(Seq::ZERO, |s| s.acked_durable))
+            .min()
     }
 
     pub fn commit_seq(&self) -> Seq {
@@ -282,7 +289,8 @@ impl ReplSender {
     /// The member streams from the backlog and has acknowledged everything up to the commit
     /// point (§23.8 step 5).
     pub fn caught_up(&self, m: MemberId) -> bool {
-        self.slot(m).is_some_and(|s| s.attached && s.streaming && s.acked_durable >= self.commit_seq())
+        self.slot(m)
+            .is_some_and(|s| s.attached && s.streaming && s.acked_durable >= self.commit_seq())
     }
 
     /// The member is attached and fed directly (repair images or a full-sync walk).
@@ -292,7 +300,11 @@ impl ReplSender {
 
     /// Members currently attached.
     pub fn attached(&self) -> SmallVec<[MemberId; 4]> {
-        self.members.iter().filter(|s| s.attached).map(|s| s.id).collect()
+        self.members
+            .iter()
+            .filter(|s| s.attached)
+            .map(|s| s.id)
+            .collect()
     }
 
     /// The backlog no longer holds a group the member still needs: its stream must restart.
@@ -308,11 +320,20 @@ impl ReplSender {
     /// [`ReplSender::fill_send`] with the caller's clock: groups after the member's last sent
     /// seq (up to about `max` bytes, at least one group), then `COMMIT` when the commit point
     /// moved, or a `HEARTBEAT` after `repl-heartbeat-ms` without any frame. Returns whether
-    /// anything was appended.
-    pub fn fill_send_at(&mut self, m: MemberId, out: &mut Vec<u8>, max: usize, now_ns: u64) -> bool {
+    /// anything was written.
+    pub fn fill_send_at(
+        &mut self,
+        m: MemberId,
+        out: &mut Vec<u8>,
+        max: usize,
+        now_ns: u64,
+    ) -> bool {
         let commit = self.commit_seq();
-        let (partition, term, last, heartbeat_ns) = (self.partition, self.term, self.last, self.heartbeat_ns);
-        let Some(i) = self.members.iter().position(|s| s.id == m) else { return false };
+        let (partition, term, last, heartbeat_ns) =
+            (self.partition, self.term, self.last, self.heartbeat_ns);
+        let Some(i) = self.members.iter().position(|s| s.id == m) else {
+            return false;
+        };
         if !self.members[i].attached || self.members[i].overrun {
             return false;
         }
@@ -328,9 +349,19 @@ impl ReplSender {
             let mut at = sent;
             while budget > 0 && at < last {
                 groups.clear();
-                let Some(l) = self.backlog.read_after(at, budget.min(GROUPS_FRAME_BYTES), &mut groups) else { break };
+                let Some(l) =
+                    self.backlog
+                        .read_after(at, budget.min(GROUPS_FRAME_BYTES), &mut groups)
+                else {
+                    break;
+                };
                 budget = budget.saturating_sub(groups.len());
-                frame::encode(&Frame::Groups(std::mem::take(&mut groups)), partition, term, out);
+                frame::encode(
+                    &Frame::Groups(std::mem::take(&mut groups)),
+                    partition,
+                    term,
+                    out,
+                );
                 at = l;
             }
             self.members[i].sent = at;
@@ -340,7 +371,12 @@ impl ReplSender {
             frame::encode(&Frame::Commit(commit), partition, term, out);
             s.commit_sent = commit;
         } else if out.len() == start && now_ns.saturating_sub(s.last_send_ns) >= heartbeat_ns {
-            frame::encode(&Frame::Heartbeat(if s.streaming { commit } else { s.commit_sent }), partition, term, out);
+            frame::encode(
+                &Frame::Heartbeat(if s.streaming { commit } else { s.commit_sent }),
+                partition,
+                term,
+                out,
+            );
         }
         if out.len() > start {
             s.last_send_ns = now_ns;
@@ -377,7 +413,16 @@ mod tests {
 
     fn enc(seq: Seq) -> Vec<u8> {
         let mut b = Vec::new();
-        encode_group(&Group { seq, ops: vec![Op::Del { db: 0, key: b"k".as_slice().into() }] }, &mut b);
+        encode_group(
+            &Group {
+                seq,
+                ops: vec![Op::Del {
+                    db: 0,
+                    key: b"k".as_slice().into(),
+                }],
+            },
+            &mut b,
+        );
         b
     }
 
@@ -401,16 +446,38 @@ mod tests {
             r.on_group_at(&enc(Seq::new(2, i)), Seq::new(2, i), i * 1000);
         }
         r.set_local_durable(Seq::new(2, 8));
-        assert_eq!(r.commit_seq(), Seq::new(2, 8), "no ISR member: local durability alone");
+        assert_eq!(
+            r.commit_seq(),
+            Seq::new(2, 8),
+            "no ISR member: local durability alone"
+        );
         r.set_isr(&[1, 2]);
-        assert_eq!(r.commit_seq(), Seq::ZERO, "ISR members have acknowledged nothing in this term");
-        r.attach(1, &AcceptMode::Continue { from: Seq::new(2, 1) });
-        r.attach(2, &AcceptMode::Continue { from: Seq::new(2, 1) });
+        assert_eq!(
+            r.commit_seq(),
+            Seq::ZERO,
+            "ISR members have acknowledged nothing in this term"
+        );
+        r.attach(
+            1,
+            &AcceptMode::Continue {
+                from: Seq::new(2, 1),
+            },
+        );
+        r.attach(
+            2,
+            &AcceptMode::Continue {
+                from: Seq::new(2, 1),
+            },
+        );
         r.on_ack(1, Seq::new(2, 9), 0);
         r.on_ack(2, Seq::new(2, 5), 0);
         assert_eq!(r.commit_seq(), Seq::new(2, 5));
         r.on_ack(2, Seq::new(2, 10), 0);
-        assert_eq!(r.commit_seq(), Seq::new(2, 8), "bounded by local durability");
+        assert_eq!(
+            r.commit_seq(),
+            Seq::new(2, 8),
+            "bounded by local durability"
+        );
         // a detached ISR member keeps its position; a removed one stops counting
         r.detach(1);
         assert_eq!(r.commit_seq(), Seq::new(2, 8));
@@ -427,12 +494,19 @@ mod tests {
         for i in 1..=5 {
             r.on_group_at(&enc(Seq::new(1, i)), Seq::new(1, i), 0);
         }
-        r.attach(7, &AcceptMode::Continue { from: Seq::new(1, 3) });
+        r.attach(
+            7,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 3),
+            },
+        );
         r.set_local_durable(Seq::new(1, 4));
         let mut out = Vec::new();
         assert!(r.fill_send_at(7, &mut out, 1 << 20, 100));
         let fs = frames(&out);
-        let Frame::Groups(g) = &fs[0] else { panic!("groups first") };
+        let Frame::Groups(g) = &fs[0] else {
+            panic!("groups first")
+        };
         let seqs: Vec<Seq> = crate::codec::iter_groups(g).map(|(s, _)| s).collect();
         assert_eq!(seqs, vec![Seq::new(1, 3), Seq::new(1, 4), Seq::new(1, 5)]);
         assert!(matches!(fs[1], Frame::Commit(s) if s == Seq::new(1, 4)));
@@ -449,24 +523,39 @@ mod tests {
         r.resume(8, Seq::new(1, 5));
         out.clear();
         r.fill_send_at(8, &mut out, 1 << 20, 0);
-        assert!(matches!(&frames(&out)[0], Frame::Groups(g) if crate::codec::peek_seq(g) == Some(Seq::new(1, 6))));
+        assert!(
+            matches!(&frames(&out)[0], Frame::Groups(g) if crate::codec::peek_seq(g) == Some(Seq::new(1, 6)))
+        );
     }
 
     #[test]
     fn lagging_is_an_age_test_and_overrun_restarts_the_stream() {
         let mut r = ReplSender::new(0, 1, 512);
         r.set_isr(&[1]);
-        r.attach(1, &AcceptMode::Continue { from: Seq::new(1, 1) });
+        r.attach(
+            1,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 1),
+            },
+        );
         r.on_group_at(&enc(Seq::new(1, 1)), Seq::new(1, 1), 1_000);
         r.on_group_at(&enc(Seq::new(1, 2)), Seq::new(1, 2), 2_000);
         assert!(r.lagging(100_000, 250_000).is_empty());
         assert_eq!(r.lagging(300_000, 250_000).as_slice(), &[1]);
         r.on_ack(1, Seq::new(1, 1), 0);
-        assert!(r.lagging(251_500, 250_000).is_empty(), "the oldest unacknowledged group is now (1, 2)");
+        assert!(
+            r.lagging(251_500, 250_000).is_empty(),
+            "the oldest unacknowledged group is now (1, 2)"
+        );
         r.on_ack(1, Seq::new(1, 2), 0);
         assert!(r.lagging(u64::MAX, 250_000).is_empty());
         // a tiny backlog: a member that falls behind it is told to restart
-        r.attach(2, &AcceptMode::Continue { from: Seq::new(1, 1) });
+        r.attach(
+            2,
+            &AcceptMode::Continue {
+                from: Seq::new(1, 1),
+            },
+        );
         for i in 3..=40 {
             r.on_group_at(&enc(Seq::new(1, i)), Seq::new(1, i), 0);
         }

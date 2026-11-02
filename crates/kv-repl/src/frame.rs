@@ -119,21 +119,44 @@ pub struct ImageRec {
 
 pub enum Frame {
     Hello(Hello),
-    Accept { term: u32, mode: AcceptMode },
+    Accept {
+        term: u32,
+        mode: AcceptMode,
+    },
     Reject(RejectReason),
     /// A sequence of encoded groups.
     Groups(Vec<u8>),
     Commit(Seq),
     Heartbeat(Seq),
-    Ack { durable: Seq, applied: Seq },
-    SnapBegin { slot: u16 },
+    Ack {
+        durable: Seq,
+        applied: Seq,
+    },
+    SnapBegin {
+        slot: u16,
+    },
     SnapRec(SnapRec),
-    SnapEnd { slot: u16, count: u64 },
-    SyncDone { at: Seq },
+    SnapEnd {
+        slot: u16,
+        count: u64,
+    },
+    SyncDone {
+        at: Seq,
+    },
     RepairKeys(Vec<(u8, Box<[u8]>)>),
     Image(ImageRec),
-    Seal { mig: u64, last: Seq },
-    PutPart { seq: Seq, db: u8, key: Box<[u8]>, offset: u64, total: u64, data: Vec<u8> },
+    Seal {
+        mig: u64,
+        last: Seq,
+    },
+    PutPart {
+        seq: Seq,
+        db: u8,
+        key: Box<[u8]>,
+        offset: u64,
+        total: u64,
+        data: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -196,12 +219,20 @@ impl core::fmt::Debug for Frame {
                 .field("learner", &h.learner)
                 .field("migration", &h.migration)
                 .finish_non_exhaustive(),
-            Frame::Accept { term, mode } => f.debug_struct("Accept").field("term", term).field("mode", mode).finish(),
+            Frame::Accept { term, mode } => f
+                .debug_struct("Accept")
+                .field("term", term)
+                .field("mode", mode)
+                .finish(),
             Frame::Reject(r) => f.debug_tuple("Reject").field(r).finish(),
             Frame::Groups(g) => f.debug_struct("Groups").field("bytes", &g.len()).finish(),
             Frame::Commit(s) => f.debug_tuple("Commit").field(s).finish(),
             Frame::Heartbeat(s) => f.debug_tuple("Heartbeat").field(s).finish(),
-            Frame::Ack { durable, applied } => f.debug_struct("Ack").field("durable", durable).field("applied", applied).finish(),
+            Frame::Ack { durable, applied } => f
+                .debug_struct("Ack")
+                .field("durable", durable)
+                .field("applied", applied)
+                .finish(),
             Frame::SnapBegin { slot } => f.debug_struct("SnapBegin").field("slot", slot).finish(),
             Frame::SnapRec(r) => f
                 .debug_struct("SnapRec")
@@ -210,17 +241,34 @@ impl core::fmt::Debug for Frame {
                 .field("key", &Redacted(&r.key))
                 .field("value", &Redacted(&r.value))
                 .finish_non_exhaustive(),
-            Frame::SnapEnd { slot, count } => f.debug_struct("SnapEnd").field("slot", slot).field("count", count).finish(),
+            Frame::SnapEnd { slot, count } => f
+                .debug_struct("SnapEnd")
+                .field("slot", slot)
+                .field("count", count)
+                .finish(),
             Frame::SyncDone { at } => f.debug_struct("SyncDone").field("at", at).finish(),
-            Frame::RepairKeys(k) => f.debug_struct("RepairKeys").field("keys", &k.len()).finish(),
+            Frame::RepairKeys(k) => f
+                .debug_struct("RepairKeys")
+                .field("keys", &k.len())
+                .finish(),
             Frame::Image(i) => f
                 .debug_struct("Image")
                 .field("db", &i.db)
                 .field("key", &Redacted(&i.key))
                 .field("present", &i.image.is_some())
                 .finish(),
-            Frame::Seal { mig, last } => f.debug_struct("Seal").field("mig", mig).field("last", last).finish(),
-            Frame::PutPart { seq, offset, total, data, .. } => f
+            Frame::Seal { mig, last } => f
+                .debug_struct("Seal")
+                .field("mig", mig)
+                .field("last", last)
+                .finish(),
+            Frame::PutPart {
+                seq,
+                offset,
+                total,
+                data,
+                ..
+            } => f
                 .debug_struct("PutPart")
                 .field("seq", seq)
                 .field("offset", offset)
@@ -334,7 +382,14 @@ fn payload(f: &Frame, o: &mut Vec<u8>) {
             put_u64(o, *mig);
             put_u64(o, last.0);
         }
-        Frame::PutPart { seq, db, key, offset, total, data } => {
+        Frame::PutPart {
+            seq,
+            db,
+            key,
+            offset,
+            total,
+            data,
+        } => {
             put_u64(o, seq.0);
             o.push(*db);
             put_bytes(o, key);
@@ -345,7 +400,7 @@ fn payload(f: &Frame, o: &mut Vec<u8>) {
     }
 }
 
-/// Appends one header + payload.
+/// Writes one header + payload at the end of `out`.
 fn emit(code: u8, partition: u16, term: u32, body: &[u8], out: &mut Vec<u8>) {
     debug_assert!(body.len() <= FRAME_MAX_PAYLOAD);
     out.reserve(FRAME_HDR + body.len());
@@ -361,9 +416,9 @@ fn emit(code: u8, partition: u16, term: u32, body: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(body);
 }
 
-/// Appends `f` as one frame of `partition` stamped with the sender's `term`. A payload above
+/// Writes `f` at the end of `out` as one frame of `partition` stamped with the sender's `term`. A payload above
 /// [`FRAME_MAX_PAYLOAD`] is split into `PUT_PART` fragments of the logical frame's encoding
-/// (several frames are appended then).
+/// (several frames are written then).
 pub fn encode(f: &Frame, partition: u16, term: u32, out: &mut Vec<u8>) {
     let mut body = Vec::new();
     payload(f, &mut body);
@@ -439,7 +494,14 @@ pub fn parse_header(h: &[u8; FRAME_HDR], limit: usize) -> Result<Header, FrameEr
     if len > limit {
         return Err(FrameError::TooLarge);
     }
-    Ok(Header { code: h[3], flags: u16_at(4), partition: u16_at(6), term: u32_at(8), len, crc: u32_at(16) })
+    Ok(Header {
+        code: h[3],
+        flags: u16_at(4),
+        partition: u16_at(6),
+        term: u32_at(8),
+        len,
+        crc: u32_at(16),
+    })
 }
 
 impl FrameDecoder {
@@ -451,13 +513,17 @@ impl FrameDecoder {
     /// more bytes are needed. `buf` must start where the previous call's `consumed` ended (or
     /// at the same place again after `Ok(None)`).
     pub fn feed(&mut self, buf: &[u8]) -> Result<Option<(u16, u32, Frame, usize)>, FrameError> {
-        let Some(h) = buf.get(..FRAME_HDR) else { return Ok(None) };
+        let Some(h) = buf.get(..FRAME_HDR) else {
+            return Ok(None);
+        };
         let mut hb = [0u8; FRAME_HDR];
         hb.copy_from_slice(h);
         let hdr = parse_header(&hb, FRAME_MAX_PAYLOAD)?;
         self.hdr = Some(hb);
         let end = FRAME_HDR + hdr.len;
-        let Some(body) = buf.get(FRAME_HDR..end) else { return Ok(None) };
+        let Some(body) = buf.get(FRAME_HDR..end) else {
+            return Ok(None);
+        };
         self.hdr = None;
         if kv_common::crc::crc32c(body) != hdr.crc {
             return Err(FrameError::BadCrc);
@@ -557,7 +623,10 @@ fn decode_payload(code: u8, b: &[u8]) -> Result<Frame, DecodeError> {
         T_HEARTBEAT => Frame::Heartbeat(Seq(r.u64()?)),
         T_ACK => {
             let durable = Seq(r.u64()?);
-            Frame::Ack { durable, applied: Seq(r.u64()?) }
+            Frame::Ack {
+                durable,
+                applied: Seq(r.u64()?),
+            }
         }
         T_SNAP_BEGIN => Frame::SnapBegin { slot: r.u16()? },
         T_SNAP_REC => {
@@ -566,11 +635,20 @@ fn decode_payload(code: u8, b: &[u8]) -> Result<Frame, DecodeError> {
             let expire_at = r.u64()?;
             let key = r.bytes()?.into();
             let value = r.bytes()?.to_vec();
-            Frame::SnapRec(SnapRec { db, vtype, expire_at, key, value })
+            Frame::SnapRec(SnapRec {
+                db,
+                vtype,
+                expire_at,
+                key,
+                value,
+            })
         }
         T_SNAP_END => {
             let slot = r.u16()?;
-            Frame::SnapEnd { slot, count: r.u64()? }
+            Frame::SnapEnd {
+                slot,
+                count: r.u64()?,
+            }
         }
         T_SYNC_DONE => Frame::SyncDone { at: Seq(r.u64()?) },
         T_REPAIR_KEYS => {
@@ -602,7 +680,10 @@ fn decode_payload(code: u8, b: &[u8]) -> Result<Frame, DecodeError> {
         }
         T_SEAL => {
             let mig = r.u64()?;
-            Frame::Seal { mig, last: Seq(r.u64()?) }
+            Frame::Seal {
+                mig,
+                last: Seq(r.u64()?),
+            }
         }
         T_PUT_PART => {
             let seq = Seq(r.u64()?);
@@ -611,7 +692,14 @@ fn decode_payload(code: u8, b: &[u8]) -> Result<Frame, DecodeError> {
             let offset = r.u64()?;
             let total = r.u64()?;
             let data = r.bytes()?.to_vec();
-            Frame::PutPart { seq, db, key, offset, total, data }
+            Frame::PutPart {
+                seq,
+                db,
+                key,
+                offset,
+                total,
+                data,
+            }
         }
         _ => return Err(DecodeError),
     };
@@ -634,7 +722,12 @@ impl Reassembly {
     }
 
     /// Feeds one fragment; returns the logical frame `(partition, term, frame)` once complete.
-    pub fn push(&mut self, offset: u64, total: u64, data: &[u8]) -> Result<Option<(u16, u32, Frame)>, FrameError> {
+    pub fn push(
+        &mut self,
+        offset: u64,
+        total: u64,
+        data: &[u8],
+    ) -> Result<Option<(u16, u32, Frame)>, FrameError> {
         if total as usize > MAX_REASSEMBLED || (total as usize) < FRAME_HDR {
             return Err(FrameError::TooLarge);
         }
@@ -642,7 +735,10 @@ impl Reassembly {
             self.buf.clear();
             self.total = total;
         }
-        if total != self.total || offset != self.buf.len() as u64 || self.buf.len() + data.len() > total as usize {
+        if total != self.total
+            || offset != self.buf.len() as u64
+            || self.buf.len() + data.len() > total as usize
+        {
             self.buf.clear();
             return Err(FrameError::Malformed);
         }
@@ -713,7 +809,12 @@ mod tests {
             at += n;
             assert_eq!((p, t), (partition, term));
             match g {
-                Frame::PutPart { offset, total, data, .. } => {
+                Frame::PutPart {
+                    offset,
+                    total,
+                    data,
+                    ..
+                } => {
                     if let Some((p, t, g)) = ra.push(offset, total, &data).unwrap() {
                         assert_eq!((p, t), (partition, term));
                         assert_eq!(at, b.len());
@@ -738,22 +839,46 @@ mod tests {
         let v = || proptest::collection::vec(any::<u8>(), 0..64);
         let seq = || any::<u64>().prop_map(Seq);
         prop_oneof![
-            (any::<[u8; 16]>(), v(), any::<[u8; 20]>(), any::<(u16, u16, u32, u32)>(), seq(), 0u8..3, any::<bool>(), proptest::option::of(any::<u64>()))
-                .prop_map(|(cluster_id, auth, node_id, (shard, partition, fence_term, last_term), applied, r, learner, migration)| {
-                    Frame::Hello(Hello {
+            (
+                any::<[u8; 16]>(),
+                v(),
+                any::<[u8; 20]>(),
+                any::<(u16, u16, u32, u32)>(),
+                seq(),
+                0u8..3,
+                any::<bool>(),
+                proptest::option::of(any::<u64>())
+            )
+                .prop_map(
+                    |(
                         cluster_id,
                         auth,
                         node_id,
-                        shard,
-                        partition,
-                        fence_term,
-                        last_term,
+                        (shard, partition, fence_term, last_term),
                         applied,
-                        recovered: [Recovered::Clean, Recovered::Scanned, Recovered::SyncInterrupted][usize::from(r)],
+                        r,
                         learner,
                         migration,
-                    })
-                }),
+                    )| {
+                        Frame::Hello(Hello {
+                            cluster_id,
+                            auth,
+                            node_id,
+                            shard,
+                            partition,
+                            fence_term,
+                            last_term,
+                            applied,
+                            recovered: [
+                                Recovered::Clean,
+                                Recovered::Scanned,
+                                Recovered::SyncInterrupted,
+                            ][usize::from(r)],
+                            learner,
+                            migration,
+                        })
+                    }
+                ),
             (any::<u32>(), 0u8..3, seq()).prop_map(|(term, m, s)| Frame::Accept {
                 term,
                 mode: match m {
@@ -763,25 +888,59 @@ mod tests {
                 }
             }),
             (0usize..5).prop_map(|i| Frame::Reject(
-                [RejectReason::StaleTerm, RejectReason::NotMember, RejectReason::NotPrimary, RejectReason::NeedOperatorResync, RejectReason::BadAuth][i]
+                [
+                    RejectReason::StaleTerm,
+                    RejectReason::NotMember,
+                    RejectReason::NotPrimary,
+                    RejectReason::NeedOperatorResync,
+                    RejectReason::BadAuth
+                ][i]
             )),
             (seq(), v(), v()).prop_map(|(s, k, val)| {
                 let mut g = Vec::new();
-                crate::codec::encode_group(&Group { seq: s, ops: vec![Op::Put { db: 0, vtype: 1, expire_at: 0, key: k.into(), value: val }] }, &mut g);
+                crate::codec::encode_group(
+                    &Group {
+                        seq: s,
+                        ops: vec![Op::Put {
+                            db: 0,
+                            vtype: 1,
+                            expire_at: 0,
+                            key: k.into(),
+                            value: val,
+                        }],
+                    },
+                    &mut g,
+                );
                 Frame::Groups(g)
             }),
             seq().prop_map(Frame::Commit),
             seq().prop_map(Frame::Heartbeat),
             (seq(), seq()).prop_map(|(durable, applied)| Frame::Ack { durable, applied }),
             any::<u16>().prop_map(|slot| Frame::SnapBegin { slot }),
-            (any::<u8>(), 1u8..3, any::<u64>(), v(), v())
-                .prop_map(|(db, vtype, expire_at, k, value)| Frame::SnapRec(SnapRec { db, vtype, expire_at, key: k.into(), value })),
+            (any::<u8>(), 1u8..3, any::<u64>(), v(), v()).prop_map(
+                |(db, vtype, expire_at, k, value)| Frame::SnapRec(SnapRec {
+                    db,
+                    vtype,
+                    expire_at,
+                    key: k.into(),
+                    value
+                })
+            ),
             (any::<u16>(), any::<u64>()).prop_map(|(slot, count)| Frame::SnapEnd { slot, count }),
             seq().prop_map(|at| Frame::SyncDone { at }),
-            proptest::collection::vec((any::<u8>(), v()), 0..8)
-                .prop_map(|ks| Frame::RepairKeys(ks.into_iter().map(|(d, k)| (d, k.into())).collect())),
-            (any::<u8>(), v(), proptest::option::of((1u8..3, any::<u64>(), v())))
-                .prop_map(|(db, k, image)| Frame::Image(ImageRec { db, key: k.into(), image })),
+            proptest::collection::vec((any::<u8>(), v()), 0..8).prop_map(|ks| Frame::RepairKeys(
+                ks.into_iter().map(|(d, k)| (d, k.into())).collect()
+            )),
+            (
+                any::<u8>(),
+                v(),
+                proptest::option::of((1u8..3, any::<u64>(), v()))
+            )
+                .prop_map(|(db, k, image)| Frame::Image(ImageRec {
+                    db,
+                    key: k.into(),
+                    image
+                })),
             (any::<u64>(), seq()).prop_map(|(mig, last)| Frame::Seal { mig, last }),
         ]
     }
@@ -840,8 +999,16 @@ mod tests {
 
     #[test]
     fn large_values_travel_in_fragments() {
-        let value = (0..(9u32 << 20)).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
-        let f = Frame::SnapRec(SnapRec { db: 0, vtype: 1, expire_at: 5, key: b"big".as_slice().into(), value: value.clone() });
+        let value = (0..(9u32 << 20))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>();
+        let f = Frame::SnapRec(SnapRec {
+            db: 0,
+            vtype: 1,
+            expire_at: 5,
+            key: b"big".as_slice().into(),
+            value: value.clone(),
+        });
         let mut b = Vec::new();
         encode(&f, 1, 2, &mut b);
         // every physical frame respects the payload limit
@@ -856,7 +1023,9 @@ mod tests {
             at += n;
         }
         assert!(parts >= 3);
-        let Frame::SnapRec(r) = round_trip(&f, 1, 2) else { panic!("snap rec") };
+        let Frame::SnapRec(r) = round_trip(&f, 1, 2) else {
+            panic!("snap rec")
+        };
         assert_eq!(r.value, value);
         // a fragment out of order is refused
         let mut ra = Reassembly::new();

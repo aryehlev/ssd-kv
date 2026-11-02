@@ -51,7 +51,12 @@ pub struct BootMeta {
 impl BootMeta {
     /// The metadata of a node that never joined (tests, fresh devices).
     pub fn empty(partitions: u16) -> Self {
-        BootMeta { node: NodeMeta::initial(), parts: (0..partitions).map(PartitionMeta::initial).collect(), set_uuid: [0; 16], clean: true }
+        BootMeta {
+            node: NodeMeta::initial(),
+            parts: (0..partitions).map(PartitionMeta::initial).collect(),
+            set_uuid: [0; 16],
+            clean: true,
+        }
     }
 }
 
@@ -59,10 +64,20 @@ impl BootMeta {
 /// before the engine opens (the meta thread owns these blocks afterwards).
 pub fn read_boot_meta(path: &Path, sb: &Superblock) -> std::io::Result<BootMeta> {
     use std::os::unix::fs::FileExt;
-    let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{what} has no valid copy"));
+    let bad = |what: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what} has no valid copy"),
+        )
+    };
     let f = std::fs::File::open(path)?;
-    let layout = DeviceLayout::compute(sb.device_pages, true, sb.snap_region_pages)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("device layout: {e}")))?;
+    let layout =
+        DeviceLayout::compute(sb.device_pages, true, sb.snap_region_pages).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("device layout: {e}"),
+            )
+        })?;
     let read = |page: u64| -> std::io::Result<Vec<u8>> {
         let mut b = vec![0u8; PAGE];
         f.read_exact_at(&mut b, page * PAGE as u64)?;
@@ -70,14 +85,25 @@ pub fn read_boot_meta(path: &Path, sb: &Superblock) -> std::io::Result<BootMeta>
     };
     let a = read(layout.nmeta_copy_page(AbCopy::A))?;
     let b = read(layout.nmeta_copy_page(AbCopy::B))?;
-    let node = NodeMeta::pick(&a, &b).map(|(_, _, m)| m).ok_or_else(|| bad("node meta"))?;
+    let node = NodeMeta::pick(&a, &b)
+        .map(|(_, _, m)| m)
+        .ok_or_else(|| bad("node meta"))?;
     let mut parts = Vec::with_capacity(usize::from(sb.partitions));
     for p in 0..sb.partitions {
         let a = read(layout.pmeta_copy_page(p, AbCopy::A))?;
         let b = read(layout.pmeta_copy_page(p, AbCopy::B))?;
-        parts.push(PartitionMeta::pick(p, sb.partitions, &a, &b).map(|(_, _, m)| m).ok_or_else(|| bad("partition meta"))?);
+        parts.push(
+            PartitionMeta::pick(p, sb.partitions, &a, &b)
+                .map(|(_, _, m)| m)
+                .ok_or_else(|| bad("partition meta"))?,
+        );
     }
-    Ok(BootMeta { node, parts, set_uuid: sb.set_uuid, clean: sb.flags & kv_storage::superblock::SB_CLEAN != 0 })
+    Ok(BootMeta {
+        node,
+        parts,
+        set_uuid: sb.set_uuid,
+        clean: sb.flags & kv_storage::superblock::SB_CLEAN != 0,
+    })
 }
 
 /// Something a worker (or the meta thread's reply path) tells the agent.
@@ -89,12 +115,27 @@ pub enum AgentMsg {
     /// A worker's primary partitions reached their handoff barrier: `(partition, last)`.
     HandoffReached { req: u64, last: Vec<(u16, u64)> },
     /// Primary: on `partition`, `member` is caught up and counted (or no longer).
-    Expand { shard: u16, term: u32, member: NodeId, partition: u16, counted: bool },
+    Expand {
+        shard: u16,
+        term: u32,
+        member: NodeId,
+        partition: u16,
+        counted: bool,
+    },
     /// Primary: `member` has unacknowledged groups older than `repl-ack-timeout-ms`.
-    Shrink { shard: u16, term: u32, member: NodeId },
+    Shrink {
+        shard: u16,
+        term: u32,
+        member: NodeId,
+    },
     /// Member: `partition` streams the current term after any repair or full sync (`ready`),
     /// or started one (`!ready`).
-    PartReady { shard: u16, term: u32, partition: u16, ready: bool },
+    PartReady {
+        shard: u16,
+        term: u32,
+        partition: u16,
+        ready: bool,
+    },
     /// Migration source: `partition` reached its last barrier.
     MigReady { id: u64, partition: u16 },
     /// Migration destination: `partition` committed everything up to the seal.
@@ -153,7 +194,10 @@ impl ClusterShared {
             agent_rx: parking_lot::Mutex::new(Some(rx)),
             identity: parking_lot::RwLock::new(identity),
             assignment: parking_lot::RwLock::new(None),
-            syncing: (0..partitions).map(|_| AtomicBool::new(false)).collect::<Vec<_>>().into(),
+            syncing: (0..partitions)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>()
+                .into(),
             handoff: Arc::new(AtomicBool::new(false)),
             net: std::sync::OnceLock::new(),
             next_token: AtomicU64::new(1),
@@ -206,7 +250,10 @@ pub fn same_token(a: &[u8], b: &[u8]) -> bool {
 pub fn random_u64() -> u64 {
     use std::io::Read;
     let mut b = [0u8; 8];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_ok() {
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_ok()
+    {
         return u64::from_le_bytes(b);
     }
     let n = kv_common::Now::read();
@@ -215,12 +262,14 @@ pub fn random_u64() -> u64 {
 
 /// The cluster control port (`cluster-control-port`, default `port + 10000`).
 pub fn control_port(cfg: &crate::config::Config) -> u16 {
-    cfg.cluster_control_port.unwrap_or_else(|| (u32::from(cfg.port) + 10_000).min(65_535) as u16)
+    cfg.cluster_control_port
+        .unwrap_or_else(|| (u32::from(cfg.port) + 10_000).min(65_535) as u16)
 }
 
 /// The replication port (`cluster-repl-port`, default `port + 20000`).
 pub fn repl_port(cfg: &crate::config::Config) -> u16 {
-    cfg.cluster_repl_port.unwrap_or_else(|| (u32::from(cfg.port) + 20_000).min(65_535) as u16)
+    cfg.cluster_repl_port
+        .unwrap_or_else(|| (u32::from(cfg.port) + 20_000).min(65_535) as u16)
 }
 
 /// The address the node's cluster listeners bind (the first `bind` address).

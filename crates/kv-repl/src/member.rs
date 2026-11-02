@@ -47,12 +47,18 @@ pub enum MemberAction {
     SnapBegin(u16),
     /// Full sync: every record of `slot` was sent (`count` of them); keys of the slot that the
     /// walk did not confirm may now be pruned.
-    SnapEnd { slot: u16, count: u64 },
+    SnapEnd {
+        slot: u16,
+        count: u64,
+    },
     /// Repair: every image was sent; the member's state equals the primary's at `at` once they
     /// are durable.
     RepairDone(Seq),
     /// Migration destination: the source sealed the migration at its position `last`.
-    Seal { mig: u64, last: Seq },
+    Seal {
+        mig: u64,
+        last: Seq,
+    },
 }
 
 pub struct MemberStream {
@@ -234,7 +240,12 @@ impl MemberStream {
                 Some(AcceptMode::Repair { at }) => self.push(MemberAction::Image(i, at)),
                 _ => return Err(FrameError::Malformed),
             },
-            Frame::PutPart { offset, total, data, .. } => {
+            Frame::PutPart {
+                offset,
+                total,
+                data,
+                ..
+            } => {
                 if let Some((p, _term, inner)) = self.parts.push(offset, total, &data)? {
                     if p != self.partition {
                         return Err(FrameError::Malformed);
@@ -243,7 +254,9 @@ impl MemberStream {
                 }
             }
             Frame::Seal { mig, last } => self.push(MemberAction::Seal { mig, last }),
-            Frame::Hello(_) | Frame::Ack { .. } | Frame::RepairKeys(_) => return Err(FrameError::Malformed),
+            Frame::Hello(_) | Frame::Ack { .. } | Frame::RepairKeys(_) => {
+                return Err(FrameError::Malformed);
+            }
         }
         Ok(())
     }
@@ -264,7 +277,10 @@ impl MemberStream {
         }
         self.acked = cur;
         self.last_ack_ns = now_ns;
-        Some(Frame::Ack { durable: cur.0, applied: cur.1 })
+        Some(Frame::Ack {
+            durable: cur.0,
+            applied: cur.1,
+        })
     }
 
     pub fn received(&self) -> &Backlog {
@@ -293,7 +309,16 @@ mod tests {
     fn groups(seqs: &[Seq]) -> Frame {
         let mut b = Vec::new();
         for &s in seqs {
-            encode_group(&Group { seq: s, ops: vec![Op::Del { db: 0, key: b"k".as_slice().into() }] }, &mut b);
+            encode_group(
+                &Group {
+                    seq: s,
+                    ops: vec![Op::Del {
+                        db: 0,
+                        key: b"k".as_slice().into(),
+                    }],
+                },
+                &mut b,
+            );
         }
         Frame::Groups(b)
     }
@@ -309,50 +334,154 @@ mod tests {
     #[test]
     fn continue_applies_groups_in_order_and_acks_durable_prefix() {
         let mut m = MemberStream::new(4, 1 << 16);
-        assert!(m.on_frame(groups(&[Seq::new(1, 1)])).is_err(), "groups before accept");
+        assert!(
+            m.on_frame(groups(&[Seq::new(1, 1)])).is_err(),
+            "groups before accept"
+        );
         m.restart(Seq::new(1, 2), Seq::new(1, 2));
-        assert!(matches!(m.on_frame(Frame::Accept { term: 1, mode: AcceptMode::Continue { from: Seq::new(1, 3) } }).unwrap(), MemberAction::Nothing));
-        let a = m.on_frame(groups(&[Seq::new(1, 2), Seq::new(1, 3), Seq::new(1, 4)])).unwrap();
+        assert!(matches!(
+            m.on_frame(Frame::Accept {
+                term: 1,
+                mode: AcceptMode::Continue {
+                    from: Seq::new(1, 3)
+                }
+            })
+            .unwrap(),
+            MemberAction::Nothing
+        ));
+        let a = m
+            .on_frame(groups(&[Seq::new(1, 2), Seq::new(1, 3), Seq::new(1, 4)]))
+            .unwrap();
         let acts = drain(&mut m, a);
-        let seqs: Vec<Seq> = acts.iter().filter_map(|a| if let MemberAction::Apply(g) = a { Some(g.seq) } else { None }).collect();
-        assert_eq!(seqs, vec![Seq::new(1, 3), Seq::new(1, 4)], "an already applied group is skipped");
+        let seqs: Vec<Seq> = acts
+            .iter()
+            .filter_map(|a| {
+                if let MemberAction::Apply(g) = a {
+                    Some(g.seq)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![Seq::new(1, 3), Seq::new(1, 4)],
+            "an already applied group is skipped"
+        );
         assert_eq!(m.applied(), Seq::new(1, 4));
         assert_eq!(m.received().last(), Some(Seq::new(1, 4)));
         m.note_durable(Seq::new(1, 3));
-        let Some(Frame::Ack { durable, applied }) = m.ack_due(10_000_000) else { panic!("ack due") };
+        let Some(Frame::Ack { durable, applied }) = m.ack_due(10_000_000) else {
+            panic!("ack due")
+        };
         assert_eq!((durable, applied), (Seq::new(1, 3), Seq::new(1, 4)));
         assert!(m.ack_due(10_500_000).is_none(), "nothing changed");
         m.note_durable(Seq::new(1, 4));
-        assert!(m.ack_due(10_500_000).is_none(), "coalesced: at most one per ms");
+        assert!(
+            m.ack_due(10_500_000).is_none(),
+            "coalesced: at most one per ms"
+        );
         assert!(m.ack_due(11_100_000).is_some());
-        assert!(matches!(m.on_frame(Frame::Commit(Seq::new(1, 4))).unwrap(), MemberAction::Commit(_)));
-        assert!(matches!(m.on_frame(Frame::Heartbeat(Seq::new(1, 4))).unwrap(), MemberAction::Nothing));
+        assert!(matches!(
+            m.on_frame(Frame::Commit(Seq::new(1, 4))).unwrap(),
+            MemberAction::Commit(_)
+        ));
+        assert!(matches!(
+            m.on_frame(Frame::Heartbeat(Seq::new(1, 4))).unwrap(),
+            MemberAction::Nothing
+        ));
     }
 
     #[test]
     fn repair_and_full_sync_shapes() {
         let mut m = MemberStream::new(0, 1 << 16);
-        assert!(matches!(m.on_frame(Frame::Accept { term: 3, mode: AcceptMode::Repair { at: Seq::new(3, 9) } }).unwrap(), MemberAction::SendRepairKeys));
+        assert!(matches!(
+            m.on_frame(Frame::Accept {
+                term: 3,
+                mode: AcceptMode::Repair { at: Seq::new(3, 9) }
+            })
+            .unwrap(),
+            MemberAction::SendRepairKeys
+        ));
         assert_eq!(m.applied(), Seq::new(3, 9));
-        let img = ImageRec { db: 0, key: b"a".as_slice().into(), image: None };
-        assert!(matches!(m.on_frame(Frame::Image(img)).unwrap(), MemberAction::Image(_, s) if s == Seq::new(3, 9)));
-        assert!(matches!(m.on_frame(Frame::SyncDone { at: Seq::new(3, 9) }).unwrap(), MemberAction::RepairDone(_)));
-        assert!(m.on_frame(Frame::SnapRec(SnapRec { db: 0, vtype: 1, expire_at: 0, key: b"x".as_slice().into(), value: vec![] })).is_err());
+        let img = ImageRec {
+            db: 0,
+            key: b"a".as_slice().into(),
+            image: None,
+        };
+        assert!(
+            matches!(m.on_frame(Frame::Image(img)).unwrap(), MemberAction::Image(_, s) if s == Seq::new(3, 9))
+        );
+        assert!(matches!(
+            m.on_frame(Frame::SyncDone { at: Seq::new(3, 9) }).unwrap(),
+            MemberAction::RepairDone(_)
+        ));
+        assert!(
+            m.on_frame(Frame::SnapRec(SnapRec {
+                db: 0,
+                vtype: 1,
+                expire_at: 0,
+                key: b"x".as_slice().into(),
+                value: vec![]
+            }))
+            .is_err()
+        );
 
         let mut m = MemberStream::new(0, 1 << 16);
-        assert!(matches!(m.on_frame(Frame::Accept { term: 2, mode: AcceptMode::Full { at: Seq::new(2, 5) } }).unwrap(), MemberAction::SyncBegin(_)));
-        assert!(matches!(m.on_frame(Frame::SnapBegin { slot: 7 }).unwrap(), MemberAction::SnapBegin(7)));
-        let rec = || SnapRec { db: 0, vtype: 1, expire_at: 0, key: b"x".as_slice().into(), value: b"v".to_vec() };
-        assert!(matches!(m.on_frame(Frame::SnapRec(rec())).unwrap(), MemberAction::Snap(_, s) if s == Seq::new(2, 5)));
+        assert!(matches!(
+            m.on_frame(Frame::Accept {
+                term: 2,
+                mode: AcceptMode::Full { at: Seq::new(2, 5) }
+            })
+            .unwrap(),
+            MemberAction::SyncBegin(_)
+        ));
+        assert!(matches!(
+            m.on_frame(Frame::SnapBegin { slot: 7 }).unwrap(),
+            MemberAction::SnapBegin(7)
+        ));
+        let rec = || SnapRec {
+            db: 0,
+            vtype: 1,
+            expire_at: 0,
+            key: b"x".as_slice().into(),
+            value: b"v".to_vec(),
+        };
+        assert!(
+            matches!(m.on_frame(Frame::SnapRec(rec())).unwrap(), MemberAction::Snap(_, s) if s == Seq::new(2, 5))
+        );
         // a flush during the walk raises the stamp of later records
         let mut b = Vec::new();
-        encode_group(&Group { seq: Seq::new(2, 8), ops: vec![Op::FlushDb { db: None }] }, &mut b);
-        assert!(matches!(m.on_frame(Frame::Groups(b)).unwrap(), MemberAction::Apply(_)));
-        assert!(matches!(m.on_frame(Frame::SnapRec(rec())).unwrap(), MemberAction::Snap(_, s) if s == Seq::new(2, 8)));
-        assert!(matches!(m.on_frame(Frame::SnapEnd { slot: 7, count: 2 }).unwrap(), MemberAction::SnapEnd { slot: 7, count: 2 }));
-        assert!(matches!(m.on_frame(Frame::SyncDone { at: Seq::new(2, 9) }).unwrap(), MemberAction::SyncDone(s) if s == Seq::new(2, 9)));
+        encode_group(
+            &Group {
+                seq: Seq::new(2, 8),
+                ops: vec![Op::FlushDb { db: None }],
+            },
+            &mut b,
+        );
+        assert!(matches!(
+            m.on_frame(Frame::Groups(b)).unwrap(),
+            MemberAction::Apply(_)
+        ));
+        assert!(
+            matches!(m.on_frame(Frame::SnapRec(rec())).unwrap(), MemberAction::Snap(_, s) if s == Seq::new(2, 8))
+        );
+        assert!(matches!(
+            m.on_frame(Frame::SnapEnd { slot: 7, count: 2 }).unwrap(),
+            MemberAction::SnapEnd { slot: 7, count: 2 }
+        ));
+        assert!(
+            matches!(m.on_frame(Frame::SyncDone { at: Seq::new(2, 9) }).unwrap(), MemberAction::SyncDone(s) if s == Seq::new(2, 9))
+        );
         assert_eq!(m.applied(), Seq::new(2, 9));
-        assert!(matches!(m.on_frame(Frame::Seal { mig: 5, last: Seq::new(2, 9) }).unwrap(), MemberAction::Seal { mig: 5, .. }));
+        assert!(matches!(
+            m.on_frame(Frame::Seal {
+                mig: 5,
+                last: Seq::new(2, 9)
+            })
+            .unwrap(),
+            MemberAction::Seal { mig: 5, .. }
+        ));
         // the ring restarted after `at`: it holds only the group received since
         assert_eq!(m.received().first(), Some(Seq::new(2, 8)));
         assert!(!m.received().covers_after(Seq::new(2, 4)));
@@ -361,7 +490,8 @@ mod tests {
     #[test]
     fn rejects_are_recorded() {
         let mut m = MemberStream::new(0, 4096);
-        m.on_frame(Frame::Reject(RejectReason::NeedOperatorResync)).unwrap();
+        m.on_frame(Frame::Reject(RejectReason::NeedOperatorResync))
+            .unwrap();
         assert_eq!(m.rejected(), Some(RejectReason::NeedOperatorResync));
         assert!(m.accepted().is_none());
     }

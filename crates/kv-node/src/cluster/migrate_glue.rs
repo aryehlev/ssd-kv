@@ -22,10 +22,10 @@ use std::net::SocketAddr;
 use kv_common::Access;
 use kv_common::pace::TokenBucket;
 use kv_ctrl::{MigPhase, MigrationTask};
+use kv_repl::backlog::Backlog;
 use kv_repl::frame::{AcceptMode, Frame, Hello, Recovered, RejectReason, SnapRec};
 use kv_repl::member::{MemberAction, MemberStream};
 use kv_repl::migrate::{MigrationDest, MigrationSource};
-use kv_repl::backlog::Backlog;
 use kv_storage::effect::{Group, Op};
 use kv_storage::keyspace::StoreError;
 use kv_storage::layout::Seq;
@@ -33,7 +33,9 @@ use kv_storage::partition::{Origin, ReqKind, Request};
 use smallvec::SmallVec;
 
 use super::net::StreamIo;
-use super::repl_glue::{ClusterWorker, KeyWalk, ReplJob, SEND_WINDOW, StreamRef, Then, WALK_KEYS, Walker};
+use super::repl_glue::{
+    ClusterWorker, KeyWalk, ReplJob, SEND_WINDOW, StreamRef, Then, WALK_KEYS, Walker,
+};
 use super::track::Markers;
 use super::{AgentMsg, before, same_token};
 use crate::runtime::backend::{Backend, ReplOut, ReplWork};
@@ -133,7 +135,15 @@ impl MigOut {
 
     /// A group the source partition executed: forwarded when its slot migrates and the walk
     /// passed its key (or finished).
-    pub fn on_group(&mut self, g: &Group, enc: &[u8], slot: Option<u16>, fps: &[(u16, u32)], p: u16, term: u32) {
+    pub fn on_group(
+        &mut self,
+        g: &Group,
+        enc: &[u8],
+        slot: Option<u16>,
+        fps: &[(u16, u32)],
+        p: u16,
+        term: u32,
+    ) {
         let Some(io) = &self.io else { return };
         if self.sealed {
             return;
@@ -143,7 +153,11 @@ impl MigOut {
             return;
         }
         let _ = g;
-        if self.src.is_walk_done() || fps.iter().any(|&(s, fp)| s == slot && self.src.passed(s, fp)) {
+        if self.src.is_walk_done()
+            || fps
+                .iter()
+                .any(|&(s, fp)| s == slot && self.src.passed(s, fp))
+        {
             let mut out = Vec::new();
             kv_repl::frame::encode(&Frame::Groups(enc.to_vec()), p, term, &mut out);
             io.send(out);
@@ -230,8 +244,12 @@ fn ops_keys(ops: &[Op]) -> SmallVec<[(Box<[u8]>, Access); 2]> {
     let mut keys: SmallVec<[(Box<[u8]>, Access); 2]> = SmallVec::new();
     for op in ops {
         let (k, a) = match op {
-            Op::Put { key, .. } | Op::Del { key, .. } | Op::Expired { key, .. } => (key, Access::Write),
-            Op::Expire { key, .. } | Op::Append { key, .. } | Op::SetRange { key, .. } => (key, Access::ReadWrite),
+            Op::Put { key, .. } | Op::Del { key, .. } | Op::Expired { key, .. } => {
+                (key, Access::Write)
+            }
+            Op::Expire { key, .. } | Op::Append { key, .. } | Op::SetRange { key, .. } => {
+                (key, Access::ReadWrite)
+            }
             _ => continue,
         };
         if !keys.iter().any(|(x, _)| x == k) {
@@ -243,12 +261,20 @@ fn ops_keys(ops: &[Op]) -> SmallVec<[(Box<[u8]>, Access); 2]> {
 
 impl<B: Backend> Worker<B> {
     /// Reconciles partition `p`'s migration endpoints with the assignment's tasks.
-    pub(super) fn sync_migrations(&mut self, cw: &mut ClusterWorker, p: u16, tasks: &[MigrationTask]) {
+    pub(super) fn sync_migrations(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        tasks: &[MigrationTask],
+    ) {
         let parts = self.shared.partitions.max(1);
         let rate = cw.sync_iops;
         let Some(pr) = cw.part(p) else { return };
-        let mine = |t: &MigrationTask| -> Vec<u16> { t.slots().iter_slots().filter(|s| s % parts == p).collect() };
-        let active = |ph: MigPhase| matches!(ph, MigPhase::Copy | MigPhase::Ready | MigPhase::Cutover);
+        let mine = |t: &MigrationTask| -> Vec<u16> {
+            t.slots().iter_slots().filter(|s| s % parts == p).collect()
+        };
+        let active =
+            |ph: MigPhase| matches!(ph, MigPhase::Copy | MigPhase::Ready | MigPhase::Cutover);
         let mut keep_out = Vec::new();
         let mut keep_in = Vec::new();
         for t in tasks {
@@ -264,9 +290,18 @@ impl<B: Backend> Worker<B> {
                         None => pr.mig_out.push(MigOut::new(*id, *phase, slots, rate)),
                     }
                 }
-                MigrationTask::In { id, phase, src_repl, .. } if active(*phase) => {
+                MigrationTask::In {
+                    id,
+                    phase,
+                    src_repl,
+                    ..
+                } if active(*phase) => {
                     keep_in.push(*id);
-                    match pr.mig_in.iter_mut().find(|m| m.id == *id && m.src_addr == src_repl.0) {
+                    match pr
+                        .mig_in
+                        .iter_mut()
+                        .find(|m| m.id == *id && m.src_addr == src_repl.0)
+                    {
                         Some(m) => m.phase = *phase,
                         None => {
                             if let Some(i) = pr.mig_in.iter().position(|m| m.id == *id) {
@@ -279,19 +314,30 @@ impl<B: Backend> Worker<B> {
                 _ => {}
             }
         }
-        let (gone_out, kept_out): (Vec<MigOut>, Vec<MigOut>) = pr.mig_out.drain(..).partition(|m| !keep_out.contains(&m.id));
+        let (gone_out, kept_out): (Vec<MigOut>, Vec<MigOut>) = pr
+            .mig_out
+            .drain(..)
+            .partition(|m| !keep_out.contains(&m.id));
         pr.mig_out = kept_out;
         for m in gone_out {
             m.abort();
         }
-        let (gone_in, kept_in): (Vec<MigIn>, Vec<MigIn>) = pr.mig_in.drain(..).partition(|m| !keep_in.contains(&m.id));
+        let (gone_in, kept_in): (Vec<MigIn>, Vec<MigIn>) =
+            pr.mig_in.drain(..).partition(|m| !keep_in.contains(&m.id));
         pr.mig_in = kept_in;
         for m in gone_in {
             m.abort();
         }
-        let live: Vec<u64> = pr.mig_out.iter().filter_map(|m| m.io.as_ref().map(|i| i.id)).chain(pr.mig_in.iter().filter_map(|m| m.io.as_ref().map(|i| i.id))).collect();
+        let live: Vec<u64> = pr
+            .mig_out
+            .iter()
+            .filter_map(|m| m.io.as_ref().map(|i| i.id))
+            .chain(pr.mig_in.iter().filter_map(|m| m.io.as_ref().map(|i| i.id)))
+            .collect();
         cw.streams.retain(|sid, r| match r {
-            StreamRef::MigOut { p: x, .. } | StreamRef::MigIn { p: x, .. } => *x != p || live.contains(sid),
+            StreamRef::MigOut { p: x, .. } | StreamRef::MigIn { p: x, .. } => {
+                *x != p || live.contains(sid)
+            }
             _ => true,
         });
     }
@@ -299,28 +345,63 @@ impl<B: Backend> Worker<B> {
     // -----------------------------------------------------------------------------------------
     // source
 
-    pub(super) fn mig_out_hello(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, io: StreamIo, h: Hello) {
+    pub(super) fn mig_out_hello(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        id: u64,
+        io: StreamIo,
+        h: Hello,
+    ) {
         let ident = cw.cs.identity();
         let last = before(self.backend.next_seq(p));
         let reject = |io: StreamIo, r: RejectReason| io.send(frame_bytes(&Frame::Reject(r), p, 0));
         if !same_token(&h.auth, &cw.cs.auth) || ident.cluster_id != Some(h.cluster_id) {
             return reject(io, RejectReason::BadAuth);
         }
-        let term = cw.assignment().and_then(|a| a.role.as_ref()).filter(|r| r.is_primary).map(|r| r.term);
-        let Some(term) = term else { return reject(io, RejectReason::NotPrimary) };
+        let term = cw
+            .assignment()
+            .and_then(|a| a.role.as_ref())
+            .filter(|r| r.is_primary)
+            .map(|r| r.term);
+        let Some(term) = term else {
+            return reject(io, RejectReason::NotPrimary);
+        };
         let Some(pr) = cw.part(p) else { return };
-        let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else { return reject(io, RejectReason::NotMember) };
+        let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else {
+            return reject(io, RejectReason::NotMember);
+        };
         let sid = io.id;
-        io.send(frame_bytes(&Frame::Accept { term, mode: AcceptMode::Full { at: last } }, p, term));
+        io.send(frame_bytes(
+            &Frame::Accept {
+                term,
+                mode: AcceptMode::Full { at: last },
+            },
+            p,
+            term,
+        ));
         mo.restart(io);
         cw.streams.insert(sid, StreamRef::MigOut { p, id });
-        tracing::info!(partition = p, migration = id, "migration destination connected: copy starts");
+        tracing::info!(
+            partition = p,
+            migration = id,
+            "migration destination connected: copy starts"
+        );
     }
 
-    pub(super) fn mig_out_frame(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, stream: u64, f: Frame) {
+    pub(super) fn mig_out_frame(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        id: u64,
+        stream: u64,
+        f: Frame,
+    ) {
         let last = before(self.backend.next_seq(p));
         let Some(pr) = cw.part(p) else { return };
-        let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else { return };
+        let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else {
+            return;
+        };
         if mo.io.as_ref().is_none_or(|i| i.id != stream) {
             return;
         }
@@ -338,7 +419,10 @@ impl<B: Backend> Worker<B> {
         let now_ns = self.now.mono_ns;
         let now = self.now.boot_ns;
         let last = before(self.backend.next_seq(p));
-        let term = cw.assignment().and_then(|a| a.role.as_ref()).map_or(0, |r| r.term);
+        let term = cw
+            .assignment()
+            .and_then(|a| a.role.as_ref())
+            .map_or(0, |r| r.term);
         let lens = |w: &Self, s: u16| w.backend.slot_len(p, 0, s);
         let cs = cw.cs.clone();
         let mut submits: Vec<(Request, ReplJob)> = Vec::new();
@@ -359,7 +443,10 @@ impl<B: Backend> Worker<B> {
                         io.send(frame_bytes(&Frame::SyncDone { at: last }, p, term));
                         mo.copy_end_sent = true;
                         mo.pos_sent = last;
-                    } else if !mo.sealed && (last > mo.pos_sent || now.saturating_sub(mo.pos_sent_ns) >= POSITION_REPEAT_NS) {
+                    } else if !mo.sealed
+                        && (last > mo.pos_sent
+                            || now.saturating_sub(mo.pos_sent_ns) >= POSITION_REPEAT_NS)
+                    {
                         // a position marker when the source moved, and periodically (liveness)
                         io.send(frame_bytes(&Frame::Commit(last.max(mo.pos_sent)), p, term));
                         mo.pos_sent = last.max(mo.pos_sent);
@@ -374,7 +461,10 @@ impl<B: Backend> Worker<B> {
                     // a destination already past every barrier at the walk end
                     if !mo.ready_reported && mo.src.is_ready() {
                         mo.ready_reported = true;
-                        cs.tell_agent(AgentMsg::MigReady { id: mo.id, partition: p });
+                        cs.tell_agent(AgentMsg::MigReady {
+                            id: mo.id,
+                            partition: p,
+                        });
                     }
                     continue;
                 }
@@ -388,8 +478,28 @@ impl<B: Backend> Worker<B> {
                     mo.count = 0;
                 }
                 mo.walk.busy = true;
-                let req = Request { db: 0, keys: SmallVec::new(), kind: ReqKind::SlotIter { slot, fp_from: mo.walk.fp_from as u32, max_entries: WALK_KEYS }, origin: Origin::Client };
-                submits.push((req, ReplJob { work: ReplWork::Walk, then: Then::Listed { walker: Walker::MigOut { id: mo.id, epoch: mo.epoch } } }));
+                let req = Request {
+                    db: 0,
+                    keys: SmallVec::new(),
+                    kind: ReqKind::SlotIter {
+                        slot,
+                        fp_from: mo.walk.fp_from as u32,
+                        max_entries: WALK_KEYS,
+                    },
+                    origin: Origin::Client,
+                };
+                submits.push((
+                    req,
+                    ReplJob {
+                        work: ReplWork::Walk,
+                        then: Then::Listed {
+                            walker: Walker::MigOut {
+                                id: mo.id,
+                                epoch: mo.epoch,
+                            },
+                        },
+                    },
+                ));
             }
         }
         for (req, rj) in submits {
@@ -398,12 +508,26 @@ impl<B: Backend> Worker<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn mig_out_listed(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, epoch: u64, next: u64, keys: Vec<Box<[u8]>>, failed: bool) {
-        let term = cw.assignment().and_then(|a| a.role.as_ref()).map_or(0, |r| r.term);
+    pub(super) fn mig_out_listed(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        id: u64,
+        epoch: u64,
+        next: u64,
+        keys: Vec<Box<[u8]>>,
+        failed: bool,
+    ) {
+        let term = cw
+            .assignment()
+            .and_then(|a| a.role.as_ref())
+            .map_or(0, |r| r.term);
         let mut submit = None;
         {
             let Some(pr) = cw.part(p) else { return };
-            let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else { return };
+            let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else {
+                return;
+            };
             if mo.epoch != epoch {
                 return;
             }
@@ -421,13 +545,31 @@ impl<B: Backend> Worker<B> {
                 if mo.walk.fp_from == 0
                     && let Some(io) = &mo.io
                 {
-                    io.send(frame_bytes(&Frame::SnapEnd { slot, count: mo.count }, p, term));
+                    io.send(frame_bytes(
+                        &Frame::SnapEnd {
+                            slot,
+                            count: mo.count,
+                        },
+                        p,
+                        term,
+                    ));
                     mo.begun = false;
                 }
             } else {
                 mo.reading = true;
-                let req = Request { db: 0, keys: keys.iter().map(|k| (k.clone(), Access::Read)).collect(), kind: ReqKind::Keyed, origin: Origin::Client };
-                submit = Some((req, ReplJob { work: ReplWork::Read { db: 0, keys }, then: Then::MigOutRead { id, epoch } }));
+                let req = Request {
+                    db: 0,
+                    keys: keys.iter().map(|k| (k.clone(), Access::Read)).collect(),
+                    kind: ReqKind::Keyed,
+                    origin: Origin::Client,
+                };
+                submit = Some((
+                    req,
+                    ReplJob {
+                        work: ReplWork::Read { db: 0, keys },
+                        then: Then::MigOutRead { id, epoch },
+                    },
+                ));
             }
         }
         if let Some((req, rj)) = submit {
@@ -435,15 +577,30 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    pub(super) fn mig_out_read(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, epoch: u64, work: &ReplWork, res: Result<ReplOut, StoreError>) {
-        let term = cw.assignment().and_then(|a| a.role.as_ref()).map_or(0, |r| r.term);
+    pub(super) fn mig_out_read(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        id: u64,
+        epoch: u64,
+        work: &ReplWork,
+        res: Result<ReplOut, StoreError>,
+    ) {
+        let term = cw
+            .assignment()
+            .and_then(|a| a.role.as_ref())
+            .map_or(0, |r| r.term);
         let Some(pr) = cw.part(p) else { return };
-        let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else { return };
+        let Some(mo) = pr.mig_out.iter_mut().find(|m| m.id == id) else {
+            return;
+        };
         if mo.epoch != epoch {
             return;
         }
         mo.reading = false;
-        let (Some(io), ReplWork::Read { db, keys }) = (&mo.io, work) else { return };
+        let (Some(io), ReplWork::Read { db, keys }) = (&mo.io, work) else {
+            return;
+        };
         let Ok(ReplOut::Images(images)) = res else {
             io.abort();
             return;
@@ -451,13 +608,32 @@ impl<B: Backend> Worker<B> {
         let mut out = Vec::new();
         for (k, img) in keys.iter().zip(images) {
             if let Some((vtype, expire_at, value)) = img {
-                kv_repl::frame::encode(&Frame::SnapRec(SnapRec { db: *db, vtype, expire_at, key: k.clone(), value }), p, term, &mut out);
+                kv_repl::frame::encode(
+                    &Frame::SnapRec(SnapRec {
+                        db: *db,
+                        vtype,
+                        expire_at,
+                        key: k.clone(),
+                        value,
+                    }),
+                    p,
+                    term,
+                    &mut out,
+                );
                 mo.count += 1;
             }
         }
         if mo.walk.fp_from == 0 && mo.begun {
             let slot = mo.walk.slots[mo.walk.idx.saturating_sub(1)];
-            kv_repl::frame::encode(&Frame::SnapEnd { slot, count: mo.count }, p, term, &mut out);
+            kv_repl::frame::encode(
+                &Frame::SnapEnd {
+                    slot,
+                    count: mo.count,
+                },
+                p,
+                term,
+                &mut out,
+            );
             mo.begun = false;
         }
         io.send(out);
@@ -470,7 +646,10 @@ impl<B: Backend> Worker<B> {
         let now = self.now.boot_ns;
         let ident = cw.cs.identity();
         let auth = cw.cs.auth.clone();
-        let (shard, term) = cw.assignment().and_then(|a| a.role.as_ref()).map_or((0, 0), |r| (r.shard.0, r.term));
+        let (shard, term) = cw
+            .assignment()
+            .and_then(|a| a.role.as_ref())
+            .map_or((0, 0), |r| (r.shard.0, r.term));
         let cs = cw.cs.clone();
         let net = cs.net.get();
         let mut tag = cw.next_tag;
@@ -484,7 +663,11 @@ impl<B: Backend> Worker<B> {
                         if mi.dial_tag.is_some() || now < mi.next_dial_ns {
                             continue;
                         }
-                        let (Some(cluster_id), Some(node), Some(net)) = (ident.cluster_id, ident.node_id, net) else { continue };
+                        let (Some(cluster_id), Some(node), Some(net)) =
+                            (ident.cluster_id, ident.node_id, net)
+                        else {
+                            continue;
+                        };
                         let h = Hello {
                             cluster_id,
                             auth: auth.clone(),
@@ -500,12 +683,22 @@ impl<B: Backend> Worker<B> {
                         };
                         mi.dial_tag = Some(tag);
                         mi.next_dial_ns = now + REDIAL_NS;
-                        net.dial(self.id, p, tag, mi.src_addr, frame_bytes(&Frame::Hello(h), p, term));
+                        net.dial(
+                            self.id,
+                            p,
+                            tag,
+                            mi.src_addr,
+                            frame_bytes(&Frame::Hello(h), p, term),
+                        );
                         tag += 1;
                     }
                     Some(io) => {
                         if now.saturating_sub(mi.last_rx_ns) >= DEST_IDLE_NS {
-                            tracing::info!(partition = p, migration = mi.id, "no frame from the migration source: redialing");
+                            tracing::info!(
+                                partition = p,
+                                migration = mi.id,
+                                "no frame from the migration source: redialing"
+                            );
                             io.abort();
                             continue;
                         }
@@ -515,13 +708,27 @@ impl<B: Backend> Worker<B> {
                             mi.dest.on_src_seq_committed(pos);
                             if pos > mi.acked {
                                 mi.acked = pos;
-                                io.send(frame_bytes(&Frame::Ack { durable: pos, applied: pos }, p, term));
+                                io.send(frame_bytes(
+                                    &Frame::Ack {
+                                        durable: pos,
+                                        applied: pos,
+                                    },
+                                    p,
+                                    term,
+                                ));
                             }
                         }
                         if mi.dest.sealed() && !mi.sealed_reported {
                             mi.sealed_reported = true;
-                            tracing::info!(partition = p, migration = mi.id, "migration seal committed");
-                            reports.push(AgentMsg::Sealed { id: mi.id, partition: p });
+                            tracing::info!(
+                                partition = p,
+                                migration = mi.id,
+                                "migration seal committed"
+                            );
+                            reports.push(AgentMsg::Sealed {
+                                id: mi.id,
+                                partition: p,
+                            });
                         }
                     }
                 }
@@ -533,18 +740,32 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    pub(super) fn mig_in_frame(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, stream: u64, _term: u32, f: Frame) {
+    pub(super) fn mig_in_frame(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        id: u64,
+        stream: u64,
+        _term: u32,
+        f: Frame,
+    ) {
         let now = self.now.boot_ns;
         let mut submits: Vec<(Request, ReplJob)> = Vec::new();
         {
             let Some(pr) = cw.part(p) else { return };
-            let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else { return };
+            let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else {
+                return;
+            };
             if mi.io.as_ref().is_none_or(|i| i.id != stream) {
                 return;
             }
             mi.last_rx_ns = now;
             if let Frame::Reject(r) = &f {
-                tracing::info!(partition = p, migration = id, "the migration source refused the stream: {r:?}");
+                tracing::info!(
+                    partition = p,
+                    migration = id,
+                    "the migration source refused the stream: {r:?}"
+                );
                 if let Some(io) = mi.io.take() {
                     io.abort();
                 }
@@ -566,8 +787,20 @@ impl<B: Backend> Worker<B> {
             }
             for a in acts {
                 let ops = match a {
-                    MemberAction::Snap(rec, _) => vec![Op::Put { db: rec.db, vtype: rec.vtype, expire_at: rec.expire_at, key: rec.key, value: rec.value }],
-                    MemberAction::Apply(g) => g.ops.into_iter().filter(|o| !matches!(o, Op::FlushDb { .. } | Op::FlushSlot { .. } | Op::Noop)).collect(),
+                    MemberAction::Snap(rec, _) => vec![Op::Put {
+                        db: rec.db,
+                        vtype: rec.vtype,
+                        expire_at: rec.expire_at,
+                        key: rec.key,
+                        value: rec.value,
+                    }],
+                    MemberAction::Apply(g) => g
+                        .ops
+                        .into_iter()
+                        .filter(|o| {
+                            !matches!(o, Op::FlushDb { .. } | Op::FlushSlot { .. } | Op::Noop)
+                        })
+                        .collect(),
                     MemberAction::SyncDone(at) | MemberAction::Commit(at) => {
                         mi.markers.marker(at);
                         continue;
@@ -583,8 +816,19 @@ impl<B: Backend> Worker<B> {
                     continue;
                 }
                 let item = mi.markers.item();
-                let req = Request { db: 0, keys: ops_keys(&ops), kind: ReqKind::Keyed, origin: Origin::Client };
-                submits.push((req, ReplJob { work: ReplWork::Own { ops }, then: Then::MigInApply { id, epoch, item } }));
+                let req = Request {
+                    db: 0,
+                    keys: ops_keys(&ops),
+                    kind: ReqKind::Keyed,
+                    origin: Origin::Client,
+                };
+                submits.push((
+                    req,
+                    ReplJob {
+                        work: ReplWork::Own { ops },
+                        then: Then::MigInApply { id, epoch, item },
+                    },
+                ));
             }
         }
         for (req, rj) in submits {
@@ -593,9 +837,20 @@ impl<B: Backend> Worker<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn mig_in_applied(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, epoch: u64, item: u64, wrote: Option<Seq>, ok: bool) {
+    pub(super) fn mig_in_applied(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        id: u64,
+        epoch: u64,
+        item: u64,
+        wrote: Option<Seq>,
+        ok: bool,
+    ) {
         let Some(pr) = cw.part(p) else { return };
-        let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else { return };
+        let Some(mi) = pr.mig_in.iter_mut().find(|m| m.id == id) else {
+            return;
+        };
         if mi.epoch != epoch {
             return;
         }

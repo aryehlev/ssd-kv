@@ -76,12 +76,12 @@ fn op_len(op: &Op) -> usize {
     }
 }
 
-/// Bytes `encode_group(g)` appends.
+/// Bytes `encode_group(g)` writes.
 pub fn encoded_len(g: &Group) -> usize {
     GROUP_LEN_PREFIX + GROUP_HDR + g.ops.iter().map(op_len).sum::<usize>()
 }
 
-/// Appends the encoding of `g` (length prefix included) to `out`.
+/// Writes the encoding of `g` (length prefix included) at the end of `out`.
 pub fn encode_group(g: &Group, out: &mut Vec<u8>) {
     let total = encoded_len(g);
     out.reserve(total);
@@ -95,7 +95,13 @@ pub fn encode_group(g: &Group, out: &mut Vec<u8>) {
 
 fn encode_op(op: &Op, out: &mut Vec<u8>) {
     match op {
-        Op::Put { db, vtype, expire_at, key, value } => {
+        Op::Put {
+            db,
+            vtype,
+            expire_at,
+            key,
+            value,
+        } => {
             out.push(TAG_PUT);
             out.push(*db);
             out.push(*vtype);
@@ -125,7 +131,12 @@ fn encode_op(op: &Op, out: &mut Vec<u8>) {
             put_bytes(out, key);
             put_bytes(out, data);
         }
-        Op::SetRange { db, key, offset, data } => {
+        Op::SetRange {
+            db,
+            key,
+            offset,
+            data,
+        } => {
             out.push(TAG_SET_RANGE);
             out.push(*db);
             put_bytes(out, key);
@@ -230,35 +241,62 @@ fn decode_op(r: &mut Rd<'_>) -> Result<Op, DecodeError> {
             let expire_at = r.u64()?;
             let key = r.bytes()?.into();
             let value = r.bytes()?.to_vec();
-            Op::Put { db, vtype, expire_at, key, value }
+            Op::Put {
+                db,
+                vtype,
+                expire_at,
+                key,
+                value,
+            }
         }
         TAG_DEL => {
             let db = r.u8()?;
-            Op::Del { db, key: r.bytes()?.into() }
+            Op::Del {
+                db,
+                key: r.bytes()?.into(),
+            }
         }
         TAG_EXPIRED => {
             let db = r.u8()?;
-            Op::Expired { db, key: r.bytes()?.into() }
+            Op::Expired {
+                db,
+                key: r.bytes()?.into(),
+            }
         }
         TAG_EXPIRE => {
             let db = r.u8()?;
             let key = r.bytes()?.into();
-            Op::Expire { db, key, expire_at: r.u64()? }
+            Op::Expire {
+                db,
+                key,
+                expire_at: r.u64()?,
+            }
         }
         TAG_APPEND => {
             let db = r.u8()?;
             let key = r.bytes()?.into();
-            Op::Append { db, key, data: r.bytes()?.to_vec() }
+            Op::Append {
+                db,
+                key,
+                data: r.bytes()?.to_vec(),
+            }
         }
         TAG_SET_RANGE => {
             let db = r.u8()?;
             let key = r.bytes()?.into();
             let offset = r.u64()?;
-            Op::SetRange { db, key, offset, data: r.bytes()?.to_vec() }
+            Op::SetRange {
+                db,
+                key,
+                offset,
+                data: r.bytes()?.to_vec(),
+            }
         }
         TAG_FLUSH_DB => {
             let db = r.u8()?;
-            Op::FlushDb { db: (db != ALL_DBS).then_some(db) }
+            Op::FlushDb {
+                db: (db != ALL_DBS).then_some(db),
+            }
         }
         TAG_FLUSH_SLOT => Op::FlushSlot { slot: r.u16()? },
         TAG_NOOP => Op::Noop,
@@ -268,7 +306,11 @@ fn decode_op(r: &mut Rd<'_>) -> Result<Op, DecodeError> {
 
 /// Visits the `(db, key)` of every keyed op of one group body, and reports partition-wide ops
 /// (`FlushDb`, `FlushSlot`) through `wide`.
-fn visit_keys<'a>(body: &'a [u8], f: &mut dyn FnMut(u8, &'a [u8]), wide: &mut dyn FnMut(&Op)) -> Result<(), DecodeError> {
+fn visit_keys<'a>(
+    body: &'a [u8],
+    f: &mut dyn FnMut(u8, &'a [u8]),
+    wide: &mut dyn FnMut(&Op),
+) -> Result<(), DecodeError> {
     let mut r = Rd::new(body);
     let _seq = r.u64()?;
     let n = r.u16()?;
@@ -306,7 +348,9 @@ fn visit_keys<'a>(body: &'a [u8], f: &mut dyn FnMut(u8, &'a [u8]), wide: &mut dy
             }
             TAG_FLUSH_DB => {
                 let db = r.u8()?;
-                wide(&Op::FlushDb { db: (db != ALL_DBS).then_some(db) });
+                wide(&Op::FlushDb {
+                    db: (db != ALL_DBS).then_some(db),
+                });
             }
             TAG_FLUSH_SLOT => {
                 let slot = r.u16()?;
@@ -365,7 +409,9 @@ pub fn peek_seq(b: &[u8]) -> Option<Seq> {
 pub fn peek_len(b: &[u8]) -> Option<usize> {
     let len = b.get(..GROUP_LEN_PREFIX)?;
     let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
-    (GROUP_HDR..=MAX_GROUP_BYTES).contains(&len).then_some(GROUP_LEN_PREFIX + len)
+    (GROUP_HDR..=MAX_GROUP_BYTES)
+        .contains(&len)
+        .then_some(GROUP_LEN_PREFIX + len)
 }
 
 /// Iterates `(seq, encoded group)` over a buffer of whole encoded groups; stops at the first
@@ -435,14 +481,33 @@ mod tests {
 
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
-            (any::<u8>(), 1u8..=2, any::<u64>(), bytes(), bytes())
-                .prop_map(|(db, vtype, expire_at, k, value)| Op::Put { db, vtype, expire_at, key: k.into(), value }),
+            (any::<u8>(), 1u8..=2, any::<u64>(), bytes(), bytes()).prop_map(
+                |(db, vtype, expire_at, k, value)| Op::Put {
+                    db,
+                    vtype,
+                    expire_at,
+                    key: k.into(),
+                    value
+                }
+            ),
             (any::<u8>(), bytes()).prop_map(|(db, k)| Op::Del { db, key: k.into() }),
             (any::<u8>(), bytes()).prop_map(|(db, k)| Op::Expired { db, key: k.into() }),
-            (any::<u8>(), bytes(), any::<u64>()).prop_map(|(db, k, e)| Op::Expire { db, key: k.into(), expire_at: e }),
-            (any::<u8>(), bytes(), bytes()).prop_map(|(db, k, d)| Op::Append { db, key: k.into(), data: d }),
-            (any::<u8>(), bytes(), any::<u64>(), bytes())
-                .prop_map(|(db, k, o, d)| Op::SetRange { db, key: k.into(), offset: o, data: d }),
+            (any::<u8>(), bytes(), any::<u64>()).prop_map(|(db, k, e)| Op::Expire {
+                db,
+                key: k.into(),
+                expire_at: e
+            }),
+            (any::<u8>(), bytes(), bytes()).prop_map(|(db, k, d)| Op::Append {
+                db,
+                key: k.into(),
+                data: d
+            }),
+            (any::<u8>(), bytes(), any::<u64>(), bytes()).prop_map(|(db, k, o, d)| Op::SetRange {
+                db,
+                key: k.into(),
+                offset: o,
+                data: d
+            }),
             proptest::option::of(0u8..16).prop_map(|db| Op::FlushDb { db }),
             any::<u16>().prop_map(|slot| Op::FlushSlot { slot }),
             Just(Op::Noop),
@@ -450,7 +515,8 @@ mod tests {
     }
 
     fn group() -> impl Strategy<Value = Group> {
-        (any::<u64>(), proptest::collection::vec(op(), 0..8)).prop_map(|(s, ops)| Group { seq: Seq(s), ops })
+        (any::<u64>(), proptest::collection::vec(op(), 0..8))
+            .prop_map(|(s, ops)| Group { seq: Seq(s), ops })
     }
 
     /// The payload bytes an op must carry in full (LC-29).
@@ -530,7 +596,16 @@ mod tests {
 
     #[test]
     fn truncated_and_trailing_bytes_are_malformed() {
-        let g = Group { seq: Seq::new(3, 9), ops: vec![Op::Put { db: 0, vtype: 1, expire_at: 0, key: b"k".as_slice().into(), value: b"v".to_vec() }] };
+        let g = Group {
+            seq: Seq::new(3, 9),
+            ops: vec![Op::Put {
+                db: 0,
+                vtype: 1,
+                expire_at: 0,
+                key: b"k".as_slice().into(),
+                value: b"v".to_vec(),
+            }],
+        };
         let mut b = Vec::new();
         encode_group(&g, &mut b);
         for cut in 0..b.len() {
@@ -551,7 +626,16 @@ mod tests {
     #[test]
     fn large_values_round_trip() {
         let value = vec![0xA5u8; 5 << 20];
-        let g = Group { seq: Seq::new(1, 1), ops: vec![Op::Put { db: 0, vtype: 1, expire_at: 9, key: b"big".as_slice().into(), value: value.clone() }] };
+        let g = Group {
+            seq: Seq::new(1, 1),
+            ops: vec![Op::Put {
+                db: 0,
+                vtype: 1,
+                expire_at: 9,
+                key: b"big".as_slice().into(),
+                value: value.clone(),
+            }],
+        };
         let mut b = Vec::new();
         encode_group(&g, &mut b);
         let (d, _) = decode_group(&b).unwrap();

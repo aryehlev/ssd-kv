@@ -139,17 +139,26 @@ impl Ownership {
         if r.is_primary {
             o.role = Some(Role::Primary);
             o.owned = r.owned_slots.clone();
-            o.isr_len = (1 + r.members.iter().filter(|(_, _, in_isr)| *in_isr).count()).min(255) as u8;
+            o.isr_len =
+                (1 + r.members.iter().filter(|(_, _, in_isr)| *in_isr).count()).min(255) as u8;
             for t in &r.migrations {
                 match t {
                     // the cutover moved these slots to the destination: never served here again
-                    MigrationTask::Out { slots, phase: MigPhase::Cutover | MigPhase::Done, .. } => {
+                    MigrationTask::Out {
+                        slots,
+                        phase: MigPhase::Cutover | MigPhase::Done,
+                        ..
+                    } => {
                         for s in slots.iter_slots() {
                             o.sealed_out.insert(s);
                         }
                     }
                     // owned since the cutover, served only after the seal is committed
-                    MigrationTask::In { slots, phase: MigPhase::Cutover, .. } => {
+                    MigrationTask::In {
+                        slots,
+                        phase: MigPhase::Cutover,
+                        ..
+                    } => {
                         for s in slots.iter_slots() {
                             o.pending_seal.insert(s);
                         }
@@ -173,15 +182,27 @@ impl Ownership {
 
     fn syncing(&self, slot: u16) -> bool {
         let p = usize::from(slot % self.partitions.max(1));
-        self.syncing.as_ref().and_then(|s| s.get(p)).is_some_and(|f| f.load(Ordering::Acquire))
+        self.syncing
+            .as_ref()
+            .and_then(|s| s.get(p))
+            .is_some_and(|f| f.load(Ordering::Acquire))
     }
 
     fn in_handoff(&self) -> bool {
-        self.handoff.as_ref().is_some_and(|h| h.load(Ordering::Acquire))
+        self.handoff
+            .as_ref()
+            .is_some_and(|h| h.load(Ordering::Acquire))
     }
 
     /// Moved target = coord_addrs[conn_id % n], independent of slot state
-    pub fn gate(&self, slot: Option<u16>, flags: kv_cmd::CmdFlags, readonly_conn: bool, lease_ok: bool, conn_id: u64) -> Gate {
+    pub fn gate(
+        &self,
+        slot: Option<u16>,
+        flags: kv_cmd::CmdFlags,
+        readonly_conn: bool,
+        lease_ok: bool,
+        conn_id: u64,
+    ) -> Gate {
         if self.mode == Mode::Standalone {
             return Gate::Serve;
         }
@@ -204,7 +225,11 @@ impl Ownership {
             return Gate::TryAgain;
         }
         // 3. primary
-        if self.role == Some(Role::Primary) && self.owned.contains(slot) && !self.sealed_out.contains(slot) && lease_ok {
+        if self.role == Some(Role::Primary)
+            && self.owned.contains(slot)
+            && !self.sealed_out.contains(slot)
+            && lease_ok
+        {
             if write && self.in_handoff() {
                 return Gate::TryAgain;
             }
@@ -233,13 +258,22 @@ impl Ownership {
             (Mode::Standalone, _) => SlotFilter { serves: None },
             (Mode::Cluster, Some(Role::Primary)) => {
                 let mut s = self.owned.clone();
-                for x in self.sealed_out.ranges().into_iter().flat_map(|(a, b)| a..=b) {
+                for x in self
+                    .sealed_out
+                    .ranges()
+                    .into_iter()
+                    .flat_map(|(a, b)| a..=b)
+                {
                     s.remove(x);
                 }
                 SlotFilter { serves: Some(s) }
             }
-            (Mode::Cluster, Some(Role::Replica)) => SlotFilter { serves: Some(self.shard_slots.clone()) },
-            (Mode::Cluster, None) => SlotFilter { serves: Some(SlotSet::new()) },
+            (Mode::Cluster, Some(Role::Replica)) => SlotFilter {
+                serves: Some(self.shard_slots.clone()),
+            },
+            (Mode::Cluster, None) => SlotFilter {
+                serves: Some(SlotSet::new()),
+            },
         }
     }
 
@@ -258,13 +292,26 @@ impl Ownership {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kv_ctrl::{CoordEndpoint, CoordId, MemberState, NodeId, NodeParams, ShardId, ShardRole, SlotRanges};
+    use kv_ctrl::{
+        CoordEndpoint, CoordId, MemberState, NodeId, NodeParams, ShardId, ShardRole, SlotRanges,
+    };
 
-    fn assignment(primary: bool, slots: &str, migrations: Vec<MigrationTask>, isr: usize, min_isr: u8) -> NodeAssignment {
+    fn assignment(
+        primary: bool,
+        slots: &str,
+        migrations: Vec<MigrationTask>,
+        isr: usize,
+        min_isr: u8,
+    ) -> NodeAssignment {
         let coords = (0..3)
-            .map(|i| CoordEndpoint { id: CoordId([i; 20]), client: format!("10.0.0.{}:7000", i + 1).parse().unwrap() })
+            .map(|i| CoordEndpoint {
+                id: CoordId([i; 20]),
+                client: format!("10.0.0.{}:7000", i + 1).parse().unwrap(),
+            })
             .collect();
-        let members = (0..2).map(|i| (NodeId([i + 5; 20]), MemberState::InSync, (i as usize) < isr)).collect();
+        let members = (0..2)
+            .map(|i| (NodeId([i + 5; 20]), MemberState::InSync, (i as usize) < isr))
+            .collect();
         NodeAssignment {
             version: 9,
             coord_term: 2,
@@ -282,7 +329,10 @@ mod tests {
                 migrations,
             }),
             client_password: None,
-            params: NodeParams { partitions: 16, ..NodeParams::default() },
+            params: NodeParams {
+                partitions: 16,
+                ..NodeParams::default()
+            },
         }
     }
 
@@ -295,7 +345,11 @@ mod tests {
         assert_eq!(o.gate(Some(5), W, false, true, 7), Gate::Serve);
         assert_eq!(o.gate(Some(5), R, false, true, 7), Gate::Serve);
         let a = "10.0.0.2:7000".parse().unwrap();
-        assert_eq!(o.gate(Some(100), R, false, true, 7), Gate::Moved(100, a), "7 % 3 = 1");
+        assert_eq!(
+            o.gate(Some(100), R, false, true, 7),
+            Gate::Moved(100, a),
+            "7 % 3 = 1"
+        );
         // lease expired: MOVED to a coordinator, never served
         assert_eq!(o.gate(Some(5), R, false, false, 7), Gate::Moved(5, a));
         assert_eq!(o.gate(None, R, false, true, 7), Gate::Serve);
@@ -313,7 +367,10 @@ mod tests {
             Ownership::from_assignment(&assignment(true, "0-99", Vec::new(), 2, 1)),
             Ownership::from_assignment(&assignment(false, "0-99", Vec::new(), 0, 1)),
             Ownership::from_assignment(&assignment(true, "200-300", Vec::new(), 0, 2)),
-            Ownership::from_assignment(&NodeAssignment { role: None, ..assignment(true, "0", Vec::new(), 0, 1) }),
+            Ownership::from_assignment(&NodeAssignment {
+                role: None,
+                ..assignment(true, "0", Vec::new(), 0, 1)
+            }),
         ];
         for conn in [0u64, 1, 2, 3, 11] {
             let mut target = None;
@@ -321,9 +378,15 @@ mod tests {
                 for slot in [1000u16, 5000, 16383] {
                     for flags in [W, R] {
                         let g = o.gate(Some(slot), flags, false, true, conn);
-                        let Gate::Moved(s, addr) = g else { panic!("expected MOVED, got {g:?}") };
+                        let Gate::Moved(s, addr) = g else {
+                            panic!("expected MOVED, got {g:?}")
+                        };
                         assert_eq!(s, slot);
-                        assert_eq!(*target.get_or_insert(addr), addr, "one target per connection");
+                        assert_eq!(
+                            *target.get_or_insert(addr),
+                            addr,
+                            "one target per connection"
+                        );
                     }
                 }
             }
@@ -332,16 +395,41 @@ mod tests {
 
     #[test]
     fn replica_reads_need_readonly_a_lease_and_no_full_sync() {
-        let syncing: Arc<[AtomicBool]> = (0..16).map(|_| AtomicBool::new(false)).collect::<Vec<_>>().into();
-        let flags = GateFlags { syncing: syncing.clone(), handoff: Arc::new(AtomicBool::new(false)) };
-        let o = Ownership::from_assignment_with(&assignment(false, "0-99", Vec::new(), 0, 1), Some(flags));
+        let syncing: Arc<[AtomicBool]> = (0..16)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into();
+        let flags = GateFlags {
+            syncing: syncing.clone(),
+            handoff: Arc::new(AtomicBool::new(false)),
+        };
+        let o = Ownership::from_assignment_with(
+            &assignment(false, "0-99", Vec::new(), 0, 1),
+            Some(flags),
+        );
         assert_eq!(o.gate(Some(5), R, true, true, 0), Gate::Serve);
-        assert!(matches!(o.gate(Some(5), R, false, true, 0), Gate::Moved(..)), "no READONLY");
-        assert!(matches!(o.gate(Some(5), W, true, true, 0), Gate::Moved(..)), "writes");
-        assert!(matches!(o.gate(Some(5), R, true, false, 0), Gate::Moved(..)), "no lease");
+        assert!(
+            matches!(o.gate(Some(5), R, false, true, 0), Gate::Moved(..)),
+            "no READONLY"
+        );
+        assert!(
+            matches!(o.gate(Some(5), W, true, true, 0), Gate::Moved(..)),
+            "writes"
+        );
+        assert!(
+            matches!(o.gate(Some(5), R, true, false, 0), Gate::Moved(..)),
+            "no lease"
+        );
         syncing[5].store(true, Ordering::Release);
-        assert!(matches!(o.gate(Some(5), R, true, true, 0), Gate::Moved(..)), "full sync");
-        assert_eq!(o.gate(Some(6), R, true, true, 0), Gate::Serve, "other partitions");
+        assert!(
+            matches!(o.gate(Some(5), R, true, true, 0), Gate::Moved(..)),
+            "full sync"
+        );
+        assert_eq!(
+            o.gate(Some(6), R, true, true, 0),
+            Gate::Serve,
+            "other partitions"
+        );
         assert_eq!(o.gate(None, W, true, true, 0), Gate::ReadOnlyReplica);
         assert!(!o.is_primary());
     }
@@ -350,16 +438,33 @@ mod tests {
     fn min_isr_handoff_and_migration_windows() {
         let o = Ownership::from_assignment(&assignment(true, "0-99", Vec::new(), 0, 2));
         assert_eq!(o.gate(Some(5), W, false, true, 0), Gate::NoReplicas);
-        assert_eq!(o.gate(Some(5), R, false, true, 0), Gate::Serve, "reads are never refused for replication state");
+        assert_eq!(
+            o.gate(Some(5), R, false, true, 0),
+            Gate::Serve,
+            "reads are never refused for replication state"
+        );
         assert!(o.below_min_isr());
         let handoff = Arc::new(AtomicBool::new(true));
-        let flags = GateFlags { syncing: Arc::new([]), handoff };
-        let o = Ownership::from_assignment_with(&assignment(true, "0-99", Vec::new(), 2, 1), Some(flags));
+        let flags = GateFlags {
+            syncing: Arc::new([]),
+            handoff,
+        };
+        let o = Ownership::from_assignment_with(
+            &assignment(true, "0-99", Vec::new(), 2, 1),
+            Some(flags),
+        );
         assert_eq!(o.gate(Some(5), W, false, true, 0), Gate::TryAgain);
         assert_eq!(o.gate(Some(5), R, false, true, 0), Gate::Serve);
-        let src = MigrationTask::Out { id: 1, slots: SlotRanges::parse("0-9").unwrap(), phase: MigPhase::Cutover };
+        let src = MigrationTask::Out {
+            id: 1,
+            slots: SlotRanges::parse("0-9").unwrap(),
+            phase: MigPhase::Cutover,
+        };
         let o = Ownership::from_assignment(&assignment(true, "0-99", vec![src], 2, 1));
-        assert!(matches!(o.gate(Some(3), R, false, true, 0), Gate::Moved(..)), "sealed out at the source");
+        assert!(
+            matches!(o.gate(Some(3), R, false, true, 0), Gate::Moved(..)),
+            "sealed out at the source"
+        );
         assert!(!o.slot_filter().serves(3) && o.slot_filter().serves(10));
         let dst = MigrationTask::In {
             id: 1,
@@ -368,9 +473,16 @@ mod tests {
             phase: MigPhase::Cutover,
         };
         let o = Ownership::from_assignment(&assignment(true, "0-99", vec![dst], 2, 1));
-        assert_eq!(o.gate(Some(3), W, false, true, 0), Gate::TryAgain, "destination before the seal");
+        assert_eq!(
+            o.gate(Some(3), W, false, true, 0),
+            Gate::TryAgain,
+            "destination before the seal"
+        );
         assert_eq!(o.gate(Some(30), W, false, true, 0), Gate::Serve);
         assert!(Ownership::standalone().slot_filter().serves(16383));
-        assert_eq!(Ownership::unassigned(16, None).gate(Some(1), R, false, true, 0), Gate::ClusterDown);
+        assert_eq!(
+            Ownership::unassigned(16, None).gate(Some(1), R, false, true, 0),
+            Gate::ClusterDown
+        );
     }
 }

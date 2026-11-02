@@ -60,7 +60,9 @@ impl Backlog {
     pub fn new(cap: usize) -> Self {
         match Self::try_new(cap) {
             Ok(b) => b,
-            Err(e) => panic!("replication backlog memory cannot be locked (raise LimitMEMLOCK): {e}"),
+            Err(e) => {
+                panic!("replication backlog memory cannot be locked (raise LimitMEMLOCK): {e}")
+            }
         }
     }
 
@@ -175,7 +177,10 @@ impl Backlog {
 
     /// Stores one encoded group (its seq must be above every seq pushed before).
     pub fn push(&mut self, seq: Seq, encoded: &[u8]) {
-        debug_assert!(self.last.is_none_or(|l| seq > l), "backlog seqs must increase");
+        debug_assert!(
+            self.last.is_none_or(|l| seq > l),
+            "backlog seqs must increase"
+        );
         debug_assert_eq!(codec::peek_seq(encoded), Some(seq));
         let n = encoded.len();
         if n > self.capacity() || codec::peek_len(encoded) != Some(n) {
@@ -245,7 +250,7 @@ impl Backlog {
         None
     }
 
-    /// Appends whole encoded groups after `s` (up to `max_bytes`, at least one group); returns
+    /// Copies whole encoded groups after `s` to the end of `out` (up to `max_bytes`, at least one group); returns
     /// the last seq copied.
     pub fn read_after(&self, s: Seq, max_bytes: usize, out: &mut Vec<u8>) -> Option<Seq> {
         let mut at = self.locate_after(s)?;
@@ -269,7 +274,9 @@ impl Backlog {
 
     /// Visits every retained group with seq in `(after, upto]` as one contiguous buffer.
     fn for_each_between(&self, after: Seq, upto: Seq, f: &mut dyn FnMut(&[u8])) {
-        let Some(mut at) = self.locate_after(after) else { return };
+        let Some(mut at) = self.locate_after(after) else {
+            return;
+        };
         let cap = self.capacity();
         let mut walked = (at + cap - self.head) % cap;
         let mut buf = Vec::new();
@@ -295,7 +302,12 @@ impl Backlog {
 
     /// [`Backlog::keys_between`] into an existing set; `Some(wide)` tells whether any of those
     /// groups holds a partition-wide op (`FlushDb`, `FlushSlot`), `None` if not covered.
-    pub fn keys_between_into(&self, after: Seq, upto: Seq, out: &mut codec::KeySet) -> Option<bool> {
+    pub fn keys_between_into(
+        &self,
+        after: Seq,
+        upto: Seq,
+        out: &mut codec::KeySet,
+    ) -> Option<bool> {
         if upto <= after {
             return Some(false);
         }
@@ -304,10 +316,14 @@ impl Backlog {
         }
         let mut wide = false;
         let mut bad = false;
-        self.for_each_between(after, upto, &mut |g| match codec::group_keys_and_wide(g, out) {
-            Ok(w) => wide |= w,
-            Err(_) => bad = true,
-        });
+        self.for_each_between(
+            after,
+            upto,
+            &mut |g| match codec::group_keys_and_wide(g, out) {
+                Ok(w) => wide |= w,
+                Err(_) => bad = true,
+            },
+        );
         (!bad).then_some(wide)
     }
 }
@@ -319,7 +335,19 @@ mod tests {
 
     fn group(seq: Seq, key: &[u8], vlen: usize) -> Vec<u8> {
         let mut b = Vec::new();
-        codec::encode_group(&Group { seq, ops: vec![Op::Put { db: 0, vtype: 1, expire_at: 0, key: key.into(), value: vec![7; vlen] }] }, &mut b);
+        codec::encode_group(
+            &Group {
+                seq,
+                ops: vec![Op::Put {
+                    db: 0,
+                    vtype: 1,
+                    expire_at: 0,
+                    key: key.into(),
+                    value: vec![7; vlen],
+                }],
+            },
+            &mut b,
+        );
         b
     }
 
@@ -331,7 +359,11 @@ mod tests {
         assert!(!b.covers_after(Seq::ZERO));
         let mut sizes = Vec::new();
         for i in 1..=200u64 {
-            let g = group(Seq::new(1, i), format!("k{i}").as_bytes(), (i % 50) as usize);
+            let g = group(
+                Seq::new(1, i),
+                format!("k{i}").as_bytes(),
+                (i % 50) as usize,
+            );
             sizes.push(g.len());
             b.push(Seq::new(1, i), &g);
             assert!(b.used_bytes() <= b.capacity());
@@ -343,7 +375,9 @@ mod tests {
         assert!(!b.covers_after(Seq(first.0 - 2)));
         // reads return whole groups in order, from right after the asked seq
         let mut out = Vec::new();
-        let last = b.read_after(Seq(first.0 + 3), usize::MAX, &mut out).unwrap();
+        let last = b
+            .read_after(Seq(first.0 + 3), usize::MAX, &mut out)
+            .unwrap();
         assert_eq!(last, Seq::new(1, 200));
         let seqs: Vec<Seq> = codec::iter_groups(&out).map(|(s, _)| s).collect();
         assert_eq!(seqs.first(), Some(&Seq(first.0 + 4)));
@@ -353,10 +387,19 @@ mod tests {
         let l = b.read_after(Seq(first.0 - 1), 1, &mut out).unwrap();
         assert_eq!(l, first);
         assert_eq!(codec::iter_groups(&out).count(), 1);
-        assert!(b.read_after(Seq::new(1, 200), 100, &mut Vec::new()).is_none());
+        assert!(
+            b.read_after(Seq::new(1, 200), 100, &mut Vec::new())
+                .is_none()
+        );
         // keys of a covered range; an uncovered range is None
         let ks = b.keys_between(Seq::new(1, 197), Seq::new(1, 199)).unwrap();
-        assert_eq!(ks, vec![(0, b"k198".as_slice().into()), (0, b"k199".as_slice().into())]);
+        assert_eq!(
+            ks,
+            vec![
+                (0, b"k198".as_slice().into()),
+                (0, b"k199".as_slice().into())
+            ]
+        );
         assert!(b.keys_between(Seq::new(1, 1), Seq::new(1, 199)).is_none());
     }
 
@@ -370,7 +413,10 @@ mod tests {
         assert!(b.covers_after(Seq::new(1, 2)));
         b.push(Seq::new(1, 3), &group(Seq::new(1, 3), b"c", 10));
         let mut out = Vec::new();
-        assert_eq!(b.read_after(Seq::new(1, 2), usize::MAX, &mut out), Some(Seq::new(1, 3)));
+        assert_eq!(
+            b.read_after(Seq::new(1, 2), usize::MAX, &mut out),
+            Some(Seq::new(1, 3))
+        );
     }
 
     #[test]

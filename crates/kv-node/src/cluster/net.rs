@@ -83,11 +83,24 @@ impl StreamIo {
 /// What the transport tells a worker.
 pub enum ReplEvent {
     /// A member or a migration destination dialed in and said `Hello` (`term`: the frame's).
-    Inbound { stream: StreamIo, hello: Box<Hello>, term: u32 },
+    Inbound {
+        stream: StreamIo,
+        hello: Box<Hello>,
+        term: u32,
+    },
     /// A dial of this node connected and sent its `Hello` (`stream`), or failed (`None`).
-    Dialed { tag: u64, partition: u16, stream: Option<StreamIo> },
+    Dialed {
+        tag: u64,
+        partition: u16,
+        stream: Option<StreamIo>,
+    },
     /// A whole frame of `stream` (`bytes` on the wire, to be reported with `consumed`).
-    Frame { stream: u64, term: u32, frame: Frame, bytes: usize },
+    Frame {
+        stream: u64,
+        term: u32,
+        frame: Frame,
+        bytes: usize,
+    },
     /// The stream ended (peer closed, error, or abort).
     Closed { stream: u64 },
 }
@@ -127,11 +140,20 @@ impl ReplNet {
     /// Starts the transport and its listener on `listen` (bound before returning, so a bad
     /// address fails startup).
     pub fn start(node: &Arc<NodeShared>, listen: SocketAddr) -> std::io::Result<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("kvd-repl").enable_all().build()?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("kvd-repl")
+            .enable_all()
+            .build()?;
         let std_l = std::net::TcpListener::bind(listen)?;
         std_l.set_nonblocking(true)?;
         let listen_addr = std_l.local_addr()?;
-        let net = ReplNet { rt, node: Arc::downgrade(node), next_id: Arc::new(AtomicU64::new(1)), listen_addr };
+        let net = ReplNet {
+            rt,
+            node: Arc::downgrade(node),
+            next_id: Arc::new(AtomicU64::new(1)),
+            listen_addr,
+        };
         let weak = net.node.clone();
         let ids = net.next_id.clone();
         net.rt.spawn(async move {
@@ -167,14 +189,30 @@ impl ReplNet {
             let sock = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
                 Ok(Ok(s)) => s,
                 _ => {
-                    deliver(&node, worker, ReplEvent::Dialed { tag, partition, stream: None });
+                    deliver(
+                        &node,
+                        worker,
+                        ReplEvent::Dialed {
+                            tag,
+                            partition,
+                            stream: None,
+                        },
+                    );
                     return;
                 }
             };
             let _ = sock.set_nodelay(true);
             let (io, rx, abort_rx, pipes) = handle(id, worker, addr);
             io.send(hello);
-            if !deliver(&node, worker, ReplEvent::Dialed { tag, partition, stream: Some(io) }) {
+            if !deliver(
+                &node,
+                worker,
+                ReplEvent::Dialed {
+                    tag,
+                    partition,
+                    stream: Some(io),
+                },
+            ) {
                 return;
             }
             pump(sock, Vec::new(), pipes, rx, abort_rx, node).await;
@@ -183,7 +221,16 @@ impl ReplNet {
 }
 
 /// A stream handle and the ends its tasks keep.
-fn handle(id: u64, worker: u16, peer: SocketAddr) -> (StreamIo, mpsc::UnboundedReceiver<Vec<u8>>, watch::Receiver<bool>, Pipes) {
+fn handle(
+    id: u64,
+    worker: u16,
+    peer: SocketAddr,
+) -> (
+    StreamIo,
+    mpsc::UnboundedReceiver<Vec<u8>>,
+    watch::Receiver<bool>,
+    Pipes,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let (abort, abort_rx) = watch::channel(false);
     let pipes = Pipes {
@@ -206,7 +253,12 @@ fn handle(id: u64, worker: u16, peer: SocketAddr) -> (StreamIo, mpsc::UnboundedR
 }
 
 /// An accepted connection: its `Hello`, then the worker owning the Hello's partition serves it.
-async fn inbound(mut sock: TcpStream, peer: SocketAddr, node: Weak<NodeShared>, ids: Arc<AtomicU64>) {
+async fn inbound(
+    mut sock: TcpStream,
+    peer: SocketAddr,
+    node: Weak<NodeShared>,
+    ids: Arc<AtomicU64>,
+) {
     let mut buf = Vec::with_capacity(4096);
     let mut dec = FrameDecoder::new();
     let first = tokio::time::timeout(HELLO_TIMEOUT, async {
@@ -239,7 +291,15 @@ async fn inbound(mut sock: TcpStream, peer: SocketAddr, node: Weak<NodeShared>, 
     let id = ids.fetch_add(1, Ordering::Relaxed);
     let (io, rx, abort_rx, pipes) = handle(id, worker, peer);
     buf.drain(..used);
-    if !deliver(&node, worker, ReplEvent::Inbound { stream: io, hello: Box::new(hello), term }) {
+    if !deliver(
+        &node,
+        worker,
+        ReplEvent::Inbound {
+            stream: io,
+            hello: Box::new(hello),
+            term,
+        },
+    ) {
         return;
     }
     pump(sock, buf, pipes, rx, abort_rx, node).await;
@@ -292,7 +352,12 @@ async fn pump(
                 Ok(Some((_, term, frame, used))) => {
                     buf.drain(..used);
                     let frame = match frame {
-                        Frame::PutPart { offset, total, data, .. } => match parts.push(offset, total, &data) {
+                        Frame::PutPart {
+                            offset,
+                            total,
+                            data,
+                            ..
+                        } => match parts.push(offset, total, &data) {
                             Ok(Some((_, _, whole))) => whole,
                             Ok(None) => continue,
                             Err(_) => break 'outer,
@@ -300,7 +365,16 @@ async fn pump(
                         f => f,
                     };
                     pipes.queued.fetch_add(used, Ordering::AcqRel);
-                    if !deliver(&node, pipes.worker, ReplEvent::Frame { stream: pipes.id, term, frame, bytes: used }) {
+                    if !deliver(
+                        &node,
+                        pipes.worker,
+                        ReplEvent::Frame {
+                            stream: pipes.id,
+                            term,
+                            frame,
+                            bytes: used,
+                        },
+                    ) {
                         break 'outer;
                     }
                 }

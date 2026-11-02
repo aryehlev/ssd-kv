@@ -23,7 +23,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use kv_ctrl::{CoordToNode, Health, MigPhase, MigrationTask, NodeAssignment, NodeError, NodeId, NodeToCoord, ShardId};
+use kv_ctrl::{
+    CoordToNode, Health, MigPhase, MigrationTask, NodeAssignment, NodeError, NodeId, NodeToCoord,
+    ShardId,
+};
 use kv_storage::metastore::{MetaDone, MetaReq};
 use kv_storage::partition::PartState;
 use kv_storage::pmeta::{NodeMeta, ROLE_NONE, ROLE_PRIMARY, ROLE_REPLICA, SHARD_NONE};
@@ -41,10 +44,21 @@ pub enum CtrlEvent {
     /// A newly applied assignment (each worker rebuilds what it needs).
     Assign(Arc<NodeAssignment>),
     /// Fence to `new_term`: close streams of older terms, report applied positions.
-    Fence { req: u64, shard: ShardId, new_term: u32 },
+    Fence {
+        req: u64,
+        shard: ShardId,
+        new_term: u32,
+    },
     /// Graceful handoff to `to`: refuse new writes with TRYAGAIN, drain, report last positions.
-    Handoff { req: u64, shard: ShardId, to: NodeId },
-    MigrationPhase { id: u64, phase: MigPhase },
+    Handoff {
+        req: u64,
+        shard: ShardId,
+        to: NodeId,
+    },
+    MigrationPhase {
+        id: u64,
+        phase: MigPhase,
+    },
 }
 
 /// Time a coordinator has to send its `Hello` after connecting.
@@ -61,13 +75,17 @@ pub fn run(shared: Arc<NodeShared>) -> std::io::Result<()> {
     let Some(cs) = shared.cluster() else {
         return Err(std::io::Error::other("cluster state missing"));
     };
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         let cfg = shared.config();
         let addr = SocketAddr::new(super::bind_ip(&cfg), super::control_port(&cfg));
         let l = TcpListener::bind(addr).await?;
         tracing::info!(%addr, "cluster control port listening");
-        let rx = cs.take_agent_rx().ok_or_else(|| std::io::Error::other("the agent runs once"))?;
+        let rx = cs
+            .take_agent_rx()
+            .ok_or_else(|| std::io::Error::other("the agent runs once"))?;
         Agent::new(shared.clone(), cs).serve(l, rx).await
     })
 }
@@ -81,15 +99,32 @@ struct Session {
 
 /// What a session task reports.
 enum SessionMsg {
-    Open { id: u64, cluster_id: [u8; 16], tx: mpsc::UnboundedSender<NodeToCoord> },
-    Frame { id: u64, msg: CoordToNode },
-    Closed { id: u64 },
+    Open {
+        id: u64,
+        cluster_id: [u8; 16],
+        tx: mpsc::UnboundedSender<NodeToCoord>,
+    },
+    Frame {
+        id: u64,
+        msg: CoordToNode,
+    },
+    Closed {
+        id: u64,
+    },
 }
 
 /// A step that needs node meta durable first.
 enum Persist {
-    Assign { session: u64, a: Box<NodeAssignment> },
-    Fence { session: u64, req: u64, shard: ShardId, new_term: u32 },
+    Assign {
+        session: u64,
+        a: Box<NodeAssignment>,
+    },
+    Fence {
+        session: u64,
+        req: u64,
+        shard: ShardId,
+        new_term: u32,
+    },
 }
 
 /// Per-partition reports gathered for one node-initiated message.
@@ -100,7 +135,10 @@ struct Gather {
 
 impl Gather {
     fn new(n: usize) -> Self {
-        Gather { bits: vec![false; n], last_sent: None }
+        Gather {
+            bits: vec![false; n],
+            last_sent: None,
+        }
     }
 
     fn set(&mut self, i: usize, on: bool) {
@@ -113,7 +151,10 @@ impl Gather {
     }
 
     fn complete_over(&self, want: &[u16]) -> bool {
-        !want.is_empty() && want.iter().all(|&p| self.bits.get(usize::from(p)).copied().unwrap_or(false))
+        !want.is_empty()
+            && want
+                .iter()
+                .all(|&p| self.bits.get(usize::from(p)).copied().unwrap_or(false))
     }
 
     /// Whether a (repeated) report is due now.
@@ -185,7 +226,11 @@ impl Agent {
         usize::from(self.shared.partitions)
     }
 
-    async fn serve(mut self, l: TcpListener, mut rx: mpsc::UnboundedReceiver<AgentMsg>) -> std::io::Result<()> {
+    async fn serve(
+        mut self,
+        l: TcpListener,
+        mut rx: mpsc::UnboundedReceiver<AgentMsg>,
+    ) -> std::io::Result<()> {
         let (stx, mut srx) = mpsc::unbounded_channel::<SessionMsg>();
         let mut tick = tokio::time::interval(Duration::from_millis(self.renew_ms()));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -222,7 +267,9 @@ impl Agent {
     }
 
     fn renew_ms(&self) -> u64 {
-        self.cs.assignment().map_or(100, |a| u64::from(a.params.renew_ms.max(10)))
+        self.cs
+            .assignment()
+            .map_or(100, |a| u64::from(a.params.renew_ms.max(10)))
     }
 
     fn send(&self, session: u64, m: NodeToCoord) {
@@ -255,25 +302,43 @@ impl Agent {
             }
             SessionMsg::Closed { id } => self.sessions.retain(|s| s.id != id),
             SessionMsg::Frame { id, msg } => match msg {
-                CoordToNode::Hello { .. } => self.send(id, NodeToCoord::Error(NodeError::Malformed)),
+                CoordToNode::Hello { .. } => {
+                    self.send(id, NodeToCoord::Error(NodeError::Malformed))
+                }
                 CoordToNode::Assign(a) => {
-                    self.persist_q.push_back(Persist::Assign { session: id, a: Box::new(a) });
+                    self.persist_q.push_back(Persist::Assign {
+                        session: id,
+                        a: Box::new(a),
+                    });
                     self.next_persist();
                 }
                 CoordToNode::LeaseGrant { seq, lease_ms } => self.on_grant(seq, lease_ms),
-                CoordToNode::Fence { req, shard, new_term } => {
-                    self.persist_q.push_back(Persist::Fence { session: id, req, shard, new_term });
+                CoordToNode::Fence {
+                    req,
+                    shard,
+                    new_term,
+                } => {
+                    self.persist_q.push_back(Persist::Fence {
+                        session: id,
+                        req,
+                        shard,
+                        new_term,
+                    });
                     self.next_persist();
                 }
                 CoordToNode::Handoff { req, shard, to } => self.on_handoff(id, req, shard, to),
-                CoordToNode::MigrationPhase { id: mid, phase } => self.broadcast(|| CtrlEvent::MigrationPhase { id: mid, phase }),
+                CoordToNode::MigrationPhase { id: mid, phase } => {
+                    self.broadcast(|| CtrlEvent::MigrationPhase { id: mid, phase })
+                }
                 CoordToNode::Ping => {}
             },
         }
     }
 
     fn on_grant(&mut self, seq: u64, lease_ms: u32) {
-        let Some(&(_, t_send)) = self.sent_renewals.iter().find(|(s, _)| *s == seq) else { return };
+        let Some(&(_, t_send)) = self.sent_renewals.iter().find(|(s, _)| *s == seq) else {
+            return;
+        };
         if self.lease_held_back {
             return;
         }
@@ -289,12 +354,16 @@ impl Agent {
     /// Starts the next persist step unless one is running.
     fn next_persist(&mut self) {
         while self.persist_inflight.is_none() {
-            let Some(step) = self.persist_q.pop_front() else { return };
+            let Some(step) = self.persist_q.pop_front() else {
+                return;
+            };
             let id = self.cs.identity();
             let meta = match &step {
                 Persist::Assign { session, a } => {
                     let key = a.order_key();
-                    if self.current.is_some_and(|c| key < c) || (self.current.is_none() && a.version < id.version) {
+                    if self.current.is_some_and(|c| key < c)
+                        || (self.current.is_none() && a.version < id.version)
+                    {
                         self.send(*session, NodeToCoord::Error(NodeError::StaleAssignment));
                         continue;
                     }
@@ -302,14 +371,34 @@ impl Agent {
                         self.send(*session, NodeToCoord::AssignAck { version: a.version });
                         continue;
                     }
-                    let cluster_id = self.sessions.iter().find(|s| s.id == *session).map(|s| s.cluster_id);
-                    let Some(cluster_id) = cluster_id else { continue };
+                    let cluster_id = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == *session)
+                        .map(|s| s.cluster_id);
+                    let Some(cluster_id) = cluster_id else {
+                        continue;
+                    };
                     let (shard, role) = match &a.role {
                         None => (SHARD_NONE, ROLE_NONE),
-                        Some(r) => (r.shard.0, if r.is_primary { ROLE_PRIMARY } else { ROLE_REPLICA }),
+                        Some(r) => (
+                            r.shard.0,
+                            if r.is_primary {
+                                ROLE_PRIMARY
+                            } else {
+                                ROLE_REPLICA
+                            },
+                        ),
                     };
                     let fence = id.fence_term.max(a.role.as_ref().map_or(0, |r| r.term));
-                    NodeMeta { cluster_id, node_id: a.node_id.0, shard, role, fence_term: fence, assignment_version: a.version }
+                    NodeMeta {
+                        cluster_id,
+                        node_id: a.node_id.0,
+                        shard,
+                        role,
+                        fence_term: fence,
+                        assignment_version: a.version,
+                    }
                 }
                 Persist::Fence { new_term, .. } => {
                     let mut m = self.node_meta_now();
@@ -318,7 +407,9 @@ impl Agent {
                 }
             };
             let token = self.cs.token(AGENT_TOKEN_BIT);
-            self.cs.meta.request(0, token, MetaReq::NodeMeta { m: meta });
+            self.cs
+                .meta
+                .request(0, token, MetaReq::NodeMeta { m: meta });
             self.persist_inflight = Some((token, step, std::time::Instant::now()));
         }
     }
@@ -328,7 +419,14 @@ impl Agent {
         let id = self.cs.identity();
         let (shard, role) = match self.cs.assignment().as_ref().and_then(|a| a.role.clone()) {
             None => (SHARD_NONE, ROLE_NONE),
-            Some(r) => (r.shard.0, if r.is_primary { ROLE_PRIMARY } else { ROLE_REPLICA }),
+            Some(r) => (
+                r.shard.0,
+                if r.is_primary {
+                    ROLE_PRIMARY
+                } else {
+                    ROLE_REPLICA
+                },
+            ),
         };
         NodeMeta {
             cluster_id: id.cluster_id.unwrap_or([0; 16]),
@@ -341,19 +439,29 @@ impl Agent {
     }
 
     fn on_persisted(&mut self, token: u64, done: MetaDone) {
-        let Some((t, step, started)) = self.persist_inflight.take() else { return };
+        let Some((t, step, started)) = self.persist_inflight.take() else {
+            return;
+        };
         if t != token {
             self.persist_inflight = Some((t, step, started));
             return;
         }
         if let MetaDone::Failed(errno) = done {
-            tracing::error!(errno, "node meta write failed: the step is not acknowledged");
+            tracing::error!(
+                errno,
+                "node meta write failed: the step is not acknowledged"
+            );
             self.next_persist();
             return;
         }
         match step {
             Persist::Assign { session, a } => self.apply_assignment(session, a),
-            Persist::Fence { session, req, shard, new_term } => {
+            Persist::Fence {
+                session,
+                req,
+                shard,
+                new_term,
+            } => {
                 {
                     let mut id = self.cs.identity.write();
                     id.fence_term = id.fence_term.max(new_term);
@@ -361,16 +469,29 @@ impl Agent {
                 tracing::info!(shard = shard.0, new_term, "fenced");
                 self.fences.insert(
                     req,
-                    WorkerGather { session, workers_left: self.shared.workers.len(), values: vec![0; self.partitions()], started: std::time::Instant::now() },
+                    WorkerGather {
+                        session,
+                        workers_left: self.shared.workers.len(),
+                        values: vec![0; self.partitions()],
+                        started: std::time::Instant::now(),
+                    },
                 );
-                self.broadcast(|| CtrlEvent::Fence { req, shard, new_term });
+                self.broadcast(|| CtrlEvent::Fence {
+                    req,
+                    shard,
+                    new_term,
+                });
             }
         }
         self.next_persist();
     }
 
     fn apply_assignment(&mut self, session: u64, a: Box<NodeAssignment>) {
-        let cluster_id = self.sessions.iter().find(|s| s.id == session).map(|s| s.cluster_id);
+        let cluster_id = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session)
+            .map(|s| s.cluster_id);
         let old = self.cs.assignment();
         {
             let mut id = self.cs.identity.write();
@@ -381,7 +502,8 @@ impl Agent {
             id.version = a.version;
             id.fence_term = id.fence_term.max(a.role.as_ref().map_or(0, |r| r.term));
         }
-        let role_key = |x: &NodeAssignment| x.role.as_ref().map(|r| (r.shard, r.term, r.is_primary));
+        let role_key =
+            |x: &NodeAssignment| x.role.as_ref().map(|r| (r.shard, r.term, r.is_primary));
         if old.as_ref().is_none_or(|o| role_key(o) != role_key(&a)) {
             // a handoff ends with the assignment that demotes this node (or any role change)
             self.cs.handoff.store(false, Ordering::Release);
@@ -391,7 +513,10 @@ impl Agent {
         let a: Arc<NodeAssignment> = Arc::from(a);
         self.current = Some(a.order_key());
         *self.cs.assignment.write() = Some(a.clone());
-        let flags = GateFlags { syncing: self.cs.syncing.clone(), handoff: self.cs.handoff.clone() };
+        let flags = GateFlags {
+            syncing: self.cs.syncing.clone(),
+            handoff: self.cs.handoff.clone(),
+        };
         *self.shared.ownership.write() = Arc::new(Ownership::from_assignment_with(&a, Some(flags)));
         if let Some(pw) = a.client_password.as_ref()
             && self.shared.config().requirepass != *pw
@@ -410,7 +535,12 @@ impl Agent {
         self.cs.handoff.store(true, Ordering::Release);
         self.handoffs.insert(
             req,
-            WorkerGather { session, workers_left: self.shared.workers.len(), values: vec![0; self.partitions()], started: std::time::Instant::now() },
+            WorkerGather {
+                session,
+                workers_left: self.shared.workers.len(),
+                values: vec![0; self.partitions()],
+                started: std::time::Instant::now(),
+            },
         );
         self.broadcast(|| CtrlEvent::Handoff { req, shard, to });
     }
@@ -435,7 +565,13 @@ impl Agent {
                     None => false,
                 };
                 if done && let Some(g) = self.fences.remove(&req) {
-                    self.send(g.session, NodeToCoord::FenceAck { req, applied: g.values });
+                    self.send(
+                        g.session,
+                        NodeToCoord::FenceAck {
+                            req,
+                            applied: g.values,
+                        },
+                    );
                 }
             }
             AgentMsg::HandoffReached { req, last } => {
@@ -455,27 +591,58 @@ impl Agent {
                     // relinquish the lease before answering (§23.12)
                     self.lease_held_back = true;
                     self.shared.lease.set(0);
-                    self.send(g.session, NodeToCoord::HandoffDone { req, last: g.values });
+                    self.send(
+                        g.session,
+                        NodeToCoord::HandoffDone {
+                            req,
+                            last: g.values,
+                        },
+                    );
                 }
             }
-            AgentMsg::Expand { shard, term, member, partition, counted } => {
+            AgentMsg::Expand {
+                shard,
+                term,
+                member,
+                partition,
+                counted,
+            } => {
                 let n = self.partitions();
-                let e = self.expand.entry(member).or_insert_with(|| (term, Gather::new(n)));
+                let e = self
+                    .expand
+                    .entry(member)
+                    .or_insert_with(|| (term, Gather::new(n)));
                 if e.0 != term {
                     *e = (term, Gather::new(n));
                 }
                 e.1.set(usize::from(partition), counted);
                 self.report_expand(shard, member);
             }
-            AgentMsg::Shrink { shard, term, member } => {
-                let due = self.shrink_sent.get(&member).is_none_or(|t| t.elapsed() >= Duration::from_millis(200));
+            AgentMsg::Shrink {
+                shard,
+                term,
+                member,
+            } => {
+                let due = self
+                    .shrink_sent
+                    .get(&member)
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(200));
                 if due {
                     self.shrink_sent.insert(member, std::time::Instant::now());
                     tracing::info!(member = %member.hex40(), "replica is not acknowledging: ISR shrink requested");
-                    self.send_all(&NodeToCoord::IsrShrink { shard: ShardId(shard), term, member });
+                    self.send_all(&NodeToCoord::IsrShrink {
+                        shard: ShardId(shard),
+                        term,
+                        member,
+                    });
                 }
             }
-            AgentMsg::PartReady { shard, term, partition, ready } => {
+            AgentMsg::PartReady {
+                shard,
+                term,
+                partition,
+                ready,
+            } => {
                 if self.ready.0 != term {
                     self.ready = (term, Gather::new(self.partitions()));
                 }
@@ -484,12 +651,18 @@ impl Agent {
             }
             AgentMsg::MigReady { id, partition } => {
                 let n = self.partitions();
-                self.mig_ready.entry(id).or_insert_with(|| Gather::new(n)).set(usize::from(partition), true);
+                self.mig_ready
+                    .entry(id)
+                    .or_insert_with(|| Gather::new(n))
+                    .set(usize::from(partition), true);
                 self.report_migrations();
             }
             AgentMsg::Sealed { id, partition } => {
                 let n = self.partitions();
-                self.sealed.entry(id).or_insert_with(|| Gather::new(n)).set(usize::from(partition), true);
+                self.sealed
+                    .entry(id)
+                    .or_insert_with(|| Gather::new(n))
+                    .set(usize::from(partition), true);
                 self.report_migrations();
             }
         }
@@ -502,41 +675,63 @@ impl Agent {
     fn report_expand(&mut self, shard: u16, member: NodeId) {
         let all = self.all_partitions();
         let a = self.cs.assignment();
-        let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else { return };
+        let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else {
+            return;
+        };
         if !role.is_primary || role.shard.0 != shard {
             return;
         }
         let in_isr = role.members.iter().any(|(n, _, isr)| *n == member && *isr);
         let term = role.term;
-        let Some((t, g)) = self.expand.get_mut(&member) else { return };
+        let Some((t, g)) = self.expand.get_mut(&member) else {
+            return;
+        };
         if *t != term || in_isr || !g.complete_over(&all) || !g.due() {
             return;
         }
         tracing::info!(member = %member.hex40(), "replica caught up: ISR expand requested");
-        self.send_all(&NodeToCoord::IsrExpand { shard: ShardId(shard), term, member });
+        self.send_all(&NodeToCoord::IsrExpand {
+            shard: ShardId(shard),
+            term,
+            member,
+        });
     }
 
     fn report_ready(&mut self, shard: u16, term: u32) {
         let all = self.all_partitions();
-        let Some(me) = self.cs.identity().node_id else { return };
+        let Some(me) = self.cs.identity().node_id else {
+            return;
+        };
         let a = self.cs.assignment();
-        let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else { return };
+        let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else {
+            return;
+        };
         if role.is_primary || role.term != term || role.shard.0 != shard {
             return;
         }
         if self.ready.0 == term && self.ready.1.complete_over(&all) && self.ready.1.due() {
-            self.send_all(&NodeToCoord::MemberReady { shard: ShardId(shard), term, member: me });
+            self.send_all(&NodeToCoord::MemberReady {
+                shard: ShardId(shard),
+                term,
+                member: me,
+            });
         }
     }
 
     fn report_migrations(&mut self) {
         let a = self.cs.assignment();
-        let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else { return };
+        let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else {
+            return;
+        };
         if !role.is_primary {
             return;
         }
         let parts = |t: &MigrationTask| -> Vec<u16> {
-            let mut v: Vec<u16> = t.slots().iter_slots().map(|s| s % self.shared.partitions.max(1)).collect();
+            let mut v: Vec<u16> = t
+                .slots()
+                .iter_slots()
+                .map(|s| s % self.shared.partitions.max(1))
+                .collect();
             v.sort_unstable();
             v.dedup();
             v
@@ -544,7 +739,11 @@ impl Agent {
         let mut out = Vec::new();
         for t in &role.migrations {
             match t {
-                MigrationTask::Out { id, phase: MigPhase::Copy | MigPhase::Ready, .. } => {
+                MigrationTask::Out {
+                    id,
+                    phase: MigPhase::Copy | MigPhase::Ready,
+                    ..
+                } => {
                     if let Some(g) = self.mig_ready.get_mut(id)
                         && g.complete_over(&parts(t))
                         && g.due()
@@ -552,7 +751,11 @@ impl Agent {
                         out.push(NodeToCoord::MigrationReady { id: *id });
                     }
                 }
-                MigrationTask::In { id, phase: MigPhase::Cutover, .. } => {
+                MigrationTask::In {
+                    id,
+                    phase: MigPhase::Cutover,
+                    ..
+                } => {
                     if let Some(g) = self.sealed.get_mut(id)
                         && g.complete_over(&parts(t))
                         && g.due()
@@ -585,20 +788,35 @@ impl Agent {
                 self.sent_renewals.pop_front();
             }
             let health = self.health();
-            let m = NodeToCoord::Renew { seq: self.renew_seq, incarnation: self.cs.incarnation, version_seen: self.cs.identity().version, health };
+            let m = NodeToCoord::Renew {
+                seq: self.renew_seq,
+                incarnation: self.cs.incarnation,
+                version_seen: self.cs.identity().version,
+                health,
+            };
             self.send_all(&m);
         }
         // a handoff that did not complete in time gives writes back
-        let late: Vec<u64> = self.handoffs.iter().filter(|(_, g)| g.started.elapsed() > HANDOFF_LIMIT).map(|(r, _)| *r).collect();
+        let late: Vec<u64> = self
+            .handoffs
+            .iter()
+            .filter(|(_, g)| g.started.elapsed() > HANDOFF_LIMIT)
+            .map(|(r, _)| *r)
+            .collect();
         for r in late {
             tracing::warn!("graceful handoff did not complete in time: writes are accepted again");
             self.handoffs.remove(&r);
             self.cs.handoff.store(false, Ordering::Release);
         }
-        self.fences.retain(|_, g| g.started.elapsed() < Duration::from_secs(10));
+        self.fences
+            .retain(|_, g| g.started.elapsed() < Duration::from_secs(10));
         // a node-meta write that never completes does not hold every later step forever: the
         // step is dropped unacknowledged (the coordinator pushes again) and the queue moves on
-        if self.persist_inflight.as_ref().is_some_and(|(_, _, t)| t.elapsed() > PERSIST_LIMIT) {
+        if self
+            .persist_inflight
+            .as_ref()
+            .is_some_and(|(_, _, t)| t.elapsed() > PERSIST_LIMIT)
+        {
             tracing::error!("node meta write did not complete: the step is not acknowledged");
             self.persist_inflight = None;
             self.next_persist();
@@ -627,15 +845,33 @@ impl Agent {
                 PartState::Ready => {}
             }
         }
-        Health { ready, failed: false, read_only_partitions: read_only, corrupt_pages: 0 }
+        Health {
+            ready,
+            failed: false,
+            read_only_partitions: read_only,
+            corrupt_pages: 0,
+        }
     }
 }
 
 /// One coordinator connection: handshake, then frames both ways until it closes.
-async fn session(mut sock: TcpStream, peer: SocketAddr, id: u64, shared: Arc<NodeShared>, cs: Arc<ClusterShared>, to_agent: mpsc::UnboundedSender<SessionMsg>) {
+async fn session(
+    mut sock: TcpStream,
+    peer: SocketAddr,
+    id: u64,
+    shared: Arc<NodeShared>,
+    cs: Arc<ClusterShared>,
+    to_agent: mpsc::UnboundedSender<SessionMsg>,
+) {
     let first = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut sock)).await;
     let Ok(Ok(body)) = first else { return };
-    let Ok(CoordToNode::Hello { cluster_id, coord: _, coord_term: _, auth }) = kv_ctrl::decode_body::<CoordToNode>(&body) else {
+    let Ok(CoordToNode::Hello {
+        cluster_id,
+        coord: _,
+        coord_term: _,
+        auth,
+    }) = kv_ctrl::decode_body::<CoordToNode>(&body)
+    else {
         let _ = write_msg(&mut sock, &NodeToCoord::Error(NodeError::Malformed)).await;
         return;
     };
@@ -646,7 +882,13 @@ async fn session(mut sock: TcpStream, peer: SocketAddr, id: u64, shared: Arc<Nod
         return;
     }
     let ready = !shared.loading();
-    let ack = NodeToCoord::HelloAck { node: ident.node_id, incarnation: cs.incarnation, set_uuid: cs.boot.set_uuid, partitions: shared.partitions, ready };
+    let ack = NodeToCoord::HelloAck {
+        node: ident.node_id,
+        incarnation: cs.incarnation,
+        set_uuid: cs.boot.set_uuid,
+        partitions: shared.partitions,
+        ready,
+    };
     if write_msg(&mut sock, &ack).await.is_err() {
         return;
     }
@@ -685,7 +927,8 @@ async fn session(mut sock: TcpStream, peer: SocketAddr, id: u64, shared: Arc<Nod
 async fn read_frame(s: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut h = [0u8; 4];
     s.read_exact(&mut h).await?;
-    let len = kv_ctrl::frame_len(h).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let len = kv_ctrl::frame_len(h)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut b = vec![0u8; len];
     s.read_exact(&mut b).await?;
     Ok(b)
@@ -694,7 +937,8 @@ async fn read_frame(s: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 async fn read_frame_half(s: &mut tokio::net::tcp::OwnedReadHalf) -> std::io::Result<Vec<u8>> {
     let mut h = [0u8; 4];
     s.read_exact(&mut h).await?;
-    let len = kv_ctrl::frame_len(h).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let len = kv_ctrl::frame_len(h)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut b = vec![0u8; len];
     s.read_exact(&mut b).await?;
     Ok(b)

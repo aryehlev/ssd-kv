@@ -79,7 +79,10 @@ pub enum Then {
     /// Member: a part of group `seq`.
     MemberGroup { epoch: u64, seq: Seq },
     /// Member: a repair image or a full-sync record (`key` for the merge confirmations).
-    MemberImage { epoch: u64, confirm: Option<(u8, Box<[u8]>)> },
+    MemberImage {
+        epoch: u64,
+        confirm: Option<(u8, Box<[u8]>)>,
+    },
     /// Member: deletes of the merge-sync prune.
     MemberPrune { epoch: u64 },
     /// Member: stored seqs of a divergent-key walk step (Repair key set after a restart).
@@ -87,7 +90,11 @@ pub enum Then {
     /// A walk step's listing (`SlotIter`) of `walker`.
     Listed { walker: Walker },
     /// Primary: images of keys for a member (Repair) or a full-sync step.
-    PrimaryRead { member: MemberId, epoch: u64, snap: bool },
+    PrimaryRead {
+        member: MemberId,
+        epoch: u64,
+        snap: bool,
+    },
     /// Migration source: values of a walk step's keys.
     MigOutRead { id: u64, epoch: u64 },
     /// Migration destination: item `item` of the stream applied.
@@ -128,7 +135,12 @@ pub(super) struct KeyWalk {
 
 impl KeyWalk {
     pub fn new(slots: Vec<u16>) -> Self {
-        KeyWalk { slots, idx: 0, fp_from: 0, busy: false }
+        KeyWalk {
+            slots,
+            idx: 0,
+            fp_from: 0,
+            busy: false,
+        }
     }
 
     pub fn done(&self) -> bool {
@@ -137,7 +149,11 @@ impl KeyWalk {
 
     /// The position everything below which was listed.
     pub fn pos(&self) -> WalkPos {
-        if self.done() { WalkPos(u64::MAX) } else { WalkPos(((self.idx as u64) << 32) | self.fp_from) }
+        if self.done() {
+            WalkPos(u64::MAX)
+        } else {
+            WalkPos(((self.idx as u64) << 32) | self.fp_from)
+        }
     }
 
     /// A listing step returned `next`: moves on (to the next slot once the table is done).
@@ -184,8 +200,20 @@ struct Peer {
 
 /// A member fed directly in execution order.
 enum Direct {
-    Repair { at: Seq, keys: VecDeque<(u8, Box<[u8]>)>, member_keys: bool, reading: bool },
-    Full { at: Seq, walk: KeyWalk, reading: bool, begun: bool, count: u64, bucket: TokenBucket },
+    Repair {
+        at: Seq,
+        keys: VecDeque<(u8, Box<[u8]>)>,
+        member_keys: bool,
+        reading: bool,
+    },
+    Full {
+        at: Seq,
+        walk: KeyWalk,
+        reading: bool,
+        begun: bool,
+        count: u64,
+        bucket: TokenBucket,
+    },
 }
 
 struct PrimaryPart {
@@ -202,8 +230,20 @@ struct PrimaryPart {
 /// A member's sync with its primary.
 enum MemberSync {
     None,
-    Repair { at: Seq, end: Option<Seq>, open: usize },
-    Full { at: Seq, end: Option<Seq>, open: usize, confirmed: KeySet, prune: Option<KeyWalk>, held: VecDeque<MemberAction>, flag_durable: bool },
+    Repair {
+        at: Seq,
+        end: Option<Seq>,
+        open: usize,
+    },
+    Full {
+        at: Seq,
+        end: Option<Seq>,
+        open: usize,
+        confirmed: KeySet,
+        prune: Option<KeyWalk>,
+        held: VecDeque<MemberAction>,
+        flag_durable: bool,
+    },
 }
 
 struct MemberPart {
@@ -289,7 +329,12 @@ pub struct ClusterWorker {
 }
 
 impl ClusterWorker {
-    pub fn new(cs: Arc<ClusterShared>, owned: &[u16], partitions: u16, cfg: &crate::config::Config) -> Self {
+    pub fn new(
+        cs: Arc<ClusterShared>,
+        owned: &[u16],
+        partitions: u16,
+        cfg: &crate::config::Config,
+    ) -> Self {
         let mut parts: Vec<Option<PartRepl>> = (0..partitions).map(|_| None).collect();
         for &p in owned {
             let boot = cs.boot_part(p);
@@ -308,7 +353,12 @@ impl ClusterWorker {
                 tickets: Default::default(),
                 commit_waits: Vec::new(),
                 syncing,
-                persisted: (durable, commit, if syncing { PMETA_SYNCING } else { 0 }, last_term),
+                persisted: (
+                    durable,
+                    commit,
+                    if syncing { PMETA_SYNCING } else { 0 },
+                    last_term,
+                ),
                 mig_out: Vec::new(),
                 mig_in: Vec::new(),
                 purge: None,
@@ -339,7 +389,11 @@ impl ClusterWorker {
                 || pr.purge.is_some()
                 || match &pr.role {
                     Role::Primary(pp) => pp.peers.iter().any(|x| x.direct.is_some()),
-                    Role::Member(m) => !matches!(m.sync, MemberSync::None) || m.divergent.is_some() || (m.io.is_some() && m.stream.ack_pending()),
+                    Role::Member(m) => {
+                        !matches!(m.sync, MemberSync::None)
+                            || m.divergent.is_some()
+                            || (m.io.is_some() && m.stream.ack_pending())
+                    }
                     Role::Idle => false,
                 }
                 || !pr.mig_out.is_empty()
@@ -350,7 +404,12 @@ impl ClusterWorker {
 
     /// Streams exist (heartbeats, acks and persistence need a periodic tick).
     pub fn active(&self) -> bool {
-        !self.streams.is_empty() || self.parts.iter().flatten().any(|pr| matches!(pr.role, Role::Member(_)))
+        !self.streams.is_empty()
+            || self
+                .parts
+                .iter()
+                .flatten()
+                .any(|pr| matches!(pr.role, Role::Member(_)))
     }
 
     pub(super) fn part(&mut self, p: u16) -> Option<&mut PartRepl> {
@@ -375,8 +434,12 @@ fn op_keys(ops: &[Op], merge: bool) -> SmallVec<[(Box<[u8]>, Access); 2]> {
     for op in ops {
         let (k, a) = match op {
             Op::Put { key, .. } if merge => (key, Access::ReadWrite),
-            Op::Put { key, .. } | Op::Del { key, .. } | Op::Expired { key, .. } => (key, Access::Write),
-            Op::Expire { key, .. } | Op::Append { key, .. } | Op::SetRange { key, .. } => (key, Access::ReadWrite),
+            Op::Put { key, .. } | Op::Del { key, .. } | Op::Expired { key, .. } => {
+                (key, Access::Write)
+            }
+            Op::Expire { key, .. } | Op::Append { key, .. } | Op::SetRange { key, .. } => {
+                (key, Access::ReadWrite)
+            }
             _ => continue,
         };
         if !keys.iter().any(|(x, _)| x == k) {
@@ -389,7 +452,12 @@ fn op_keys(ops: &[Op], merge: bool) -> SmallVec<[(Box<[u8]>, Access); 2]> {
 fn op_db(ops: &[Op]) -> u8 {
     ops.iter()
         .find_map(|o| match o {
-            Op::Put { db, .. } | Op::Del { db, .. } | Op::Expired { db, .. } | Op::Expire { db, .. } | Op::Append { db, .. } | Op::SetRange { db, .. } => Some(*db),
+            Op::Put { db, .. }
+            | Op::Del { db, .. }
+            | Op::Expired { db, .. }
+            | Op::Expire { db, .. }
+            | Op::Append { db, .. }
+            | Op::SetRange { db, .. } => Some(*db),
             _ => None,
         })
         .unwrap_or(0)
@@ -398,9 +466,12 @@ fn op_db(ops: &[Op]) -> u8 {
 /// The slot of a group's keyed ops (cluster commands touch one slot), if any.
 pub(super) fn group_slot(g: &Group) -> Option<u16> {
     g.ops.iter().find_map(|o| match o {
-        Op::Put { key, .. } | Op::Del { key, .. } | Op::Expired { key, .. } | Op::Expire { key, .. } | Op::Append { key, .. } | Op::SetRange { key, .. } => {
-            Some(kv_common::key_slot(key))
-        }
+        Op::Put { key, .. }
+        | Op::Del { key, .. }
+        | Op::Expired { key, .. }
+        | Op::Expire { key, .. }
+        | Op::Append { key, .. }
+        | Op::SetRange { key, .. } => Some(kv_common::key_slot(key)),
         _ => None,
     })
 }
@@ -410,30 +481,49 @@ pub(super) fn group_fps(g: &Group, seed: u64) -> SmallVec<[(u16, u32); 2]> {
     g.ops
         .iter()
         .filter_map(|o| match o {
-            Op::Put { key, .. } | Op::Del { key, .. } | Op::Expired { key, .. } | Op::Expire { key, .. } | Op::Append { key, .. } | Op::SetRange { key, .. } => {
-                Some((kv_common::key_slot(key), kv_common::KeyHash::of(seed, key).fp32()))
-            }
+            Op::Put { key, .. }
+            | Op::Del { key, .. }
+            | Op::Expired { key, .. }
+            | Op::Expire { key, .. }
+            | Op::Append { key, .. }
+            | Op::SetRange { key, .. } => Some((
+                kv_common::key_slot(key),
+                kv_common::KeyHash::of(seed, key).fp32(),
+            )),
             _ => None,
         })
         .collect()
 }
 
 fn is_wide(g: &Group) -> bool {
-    g.ops.iter().any(|o| matches!(o, Op::FlushDb { .. } | Op::FlushSlot { .. }))
+    g.ops
+        .iter()
+        .any(|o| matches!(o, Op::FlushDb { .. } | Op::FlushSlot { .. }))
 }
 
 fn repl_env(now_ms: u64) -> ExecEnv {
-    ExecEnv { proto: kv_resp::Proto::Resp2, db: 0, now_ms, readonly_conn: false, conn_id: 0 }
+    ExecEnv {
+        proto: kv_resp::Proto::Resp2,
+        db: 0,
+        now_ms,
+        readonly_conn: false,
+        conn_id: 0,
+    }
 }
 
 /// The slots of partition `p` among `partitions` (`s % P == p`), in slot order.
 pub(super) fn slots_of(p: u16, partitions: u16) -> Vec<u16> {
-    (0..kv_common::SLOTS as u16).filter(|s| s % partitions.max(1) == p).collect()
+    (0..kv_common::SLOTS as u16)
+        .filter(|s| s % partitions.max(1) == p)
+        .collect()
 }
 
 impl<B: Backend> Worker<B> {
     /// Runs `f` with the worker's cluster state taken out (put back afterwards).
-    pub(crate) fn with_cluster<R>(&mut self, f: impl FnOnce(&mut Self, &mut ClusterWorker) -> R) -> Option<R> {
+    pub(crate) fn with_cluster<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut ClusterWorker) -> R,
+    ) -> Option<R> {
         let mut cw = self.cluster.take()?;
         let r = f(self, &mut cw);
         self.cluster = Some(cw);
@@ -451,7 +541,9 @@ impl<B: Backend> Worker<B> {
     fn ticket_satisfies(&self, st: TicketState) -> bool {
         matches!(
             (self.local_need(), st),
-            (None, _) | (_, TicketState::Durable | TicketState::Failed(_)) | (Some(TicketState::Written), TicketState::Written)
+            (None, _)
+                | (_, TicketState::Durable | TicketState::Failed(_))
+                | (Some(TicketState::Written), TicketState::Written)
         )
     }
 
@@ -459,8 +551,18 @@ impl<B: Backend> Worker<B> {
     /// ones. A write of several keys is crash-atomic like any local multi-key write (§14.6) and
     /// takes a txn credit first; while none is free it waits in the partition's queue, and so
     /// does everything submitted after it (applies must keep the stream's order).
-    pub(crate) fn submit_repl(&mut self, cw: &mut ClusterWorker, p: u16, req: Request, rj: ReplJob) {
-        let needs_credit = req.keys.len() >= 2 && matches!(rj.work, ReplWork::Apply { .. } | ReplWork::Own { .. } | ReplWork::Prune { .. });
+    pub(crate) fn submit_repl(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        req: Request,
+        rj: ReplJob,
+    ) {
+        let needs_credit = req.keys.len() >= 2
+            && matches!(
+                rj.work,
+                ReplWork::Apply { .. } | ReplWork::Own { .. } | ReplWork::Prune { .. }
+            );
         let Some(pr) = cw.part(p) else { return };
         if !pr.queued.is_empty() {
             pr.queued.push_back((req, rj, needs_credit));
@@ -480,7 +582,13 @@ impl<B: Backend> Worker<B> {
         self.submit_repl_now(p, req, rj, credit);
     }
 
-    fn submit_repl_now(&mut self, p: u16, req: Request, rj: ReplJob, credit: Option<crate::runtime::exec::CreditGuard>) {
+    fn submit_repl_now(
+        &mut self,
+        p: u16,
+        req: Request,
+        rj: ReplJob,
+        credit: Option<crate::runtime::exec::CreditGuard>,
+    ) {
         let env = repl_env(self.now.unix_ms);
         let job = Job {
             to: None,
@@ -498,7 +606,9 @@ impl<B: Backend> Worker<B> {
     fn drain_queued(&mut self, cw: &mut ClusterWorker, p: u16) {
         loop {
             let Some(pr) = cw.part(p) else { return };
-            let Some((_, _, needs)) = pr.queued.front() else { return };
+            let Some((_, _, needs)) = pr.queued.front() else {
+                return;
+            };
             let credit = if *needs {
                 match crate::runtime::exec::CreditGuard::try_take(&self.shared) {
                     Some(c) => Some(c),
@@ -507,7 +617,9 @@ impl<B: Backend> Worker<B> {
             } else {
                 None
             };
-            let Some((req, rj, _)) = pr.queued.pop_front() else { return };
+            let Some((req, rj, _)) = pr.queued.pop_front() else {
+                return;
+            };
             self.submit_repl_now(p, req, rj, credit);
         }
     }
@@ -518,12 +630,19 @@ impl<B: Backend> Worker<B> {
     /// A primary partition executed a request that produced `g`: backlog, direct feeds,
     /// migration forwards and local durability tracking. Returns the seq the reply waits for
     /// (`None`: no shard commit applies here).
-    pub(crate) fn cluster_group(&mut self, p: u16, g: &Group, ticket: Option<TicketId>) -> Option<Seq> {
+    pub(crate) fn cluster_group(
+        &mut self,
+        p: u16,
+        g: &Group,
+        ticket: Option<TicketId>,
+    ) -> Option<Seq> {
         let seed = self.backend.hash_seed(p);
         let done_now = ticket.is_none() || self.local_need().is_none();
         self.with_cluster(|_, cw| {
             let pr = cw.part(p)?;
-            let Role::Primary(pp) = &mut pr.role else { return None };
+            let Role::Primary(pp) = &mut pr.role else {
+                return None;
+            };
             let mut enc = Vec::with_capacity(codec::encoded_len(g));
             codec::encode_group(g, &mut enc);
             pp.sender.on_group(&enc, g.seq);
@@ -531,10 +650,14 @@ impl<B: Backend> Worker<B> {
             let fps = group_fps(g, seed);
             let wide = is_wide(g);
             for peer in pp.peers.iter() {
-                let (Some(io), Some(d)) = (&peer.stream, &peer.direct) else { continue };
+                let (Some(io), Some(d)) = (&peer.stream, &peer.direct) else {
+                    continue;
+                };
                 let forward = match d {
                     Direct::Repair { .. } => true,
-                    Direct::Full { walk, .. } => wide || fps.iter().any(|&(s, fp)| walk.passed(s, fp)),
+                    Direct::Full { walk, .. } => {
+                        wide || fps.iter().any(|&(s, fp)| walk.passed(s, fp))
+                    }
                 };
                 if forward {
                     io.send(frame_bytes(&Frame::Groups(enc.clone()), p, term));
@@ -559,11 +682,16 @@ impl<B: Backend> Worker<B> {
             return;
         }
         if matches!(st, TicketState::Failed(_)) {
-            tracing::error!(partition = p, "a replicated write failed on this node's device");
+            tracing::error!(
+                partition = p,
+                "a replicated write failed on this node's device"
+            );
         }
         self.with_cluster(|w, cw| {
             let Some(pr) = cw.part(p) else { return };
-            let Some(what) = pr.tickets.remove(&t.0) else { return };
+            let Some(what) = pr.tickets.remove(&t.0) else {
+                return;
+            };
             match what {
                 TicketFor::Produced(s) => pr.durable.done(s),
                 TicketFor::Group { epoch, seq } => {
@@ -578,7 +706,9 @@ impl<B: Backend> Worker<B> {
                         && m.epoch == epoch
                     {
                         match &mut m.sync {
-                            MemberSync::Repair { open, .. } | MemberSync::Full { open, .. } => *open = open.saturating_sub(1),
+                            MemberSync::Repair { open, .. } | MemberSync::Full { open, .. } => {
+                                *open = open.saturating_sub(1)
+                            }
                             MemberSync::None => {}
                         }
                     }
@@ -618,7 +748,11 @@ impl<B: Backend> Worker<B> {
                     w.apply_roles(cw);
                 });
             }
-            CtrlEvent::Fence { req, shard, new_term } => {
+            CtrlEvent::Fence {
+                req,
+                shard,
+                new_term,
+            } => {
                 let _ = shard;
                 let applied = self
                     .with_cluster(|_, cw| {
@@ -674,7 +808,9 @@ impl<B: Backend> Worker<B> {
 
     /// Brings every owned, recovered partition to the role of the current assignment.
     fn apply_roles(&mut self, cw: &mut ClusterWorker) {
-        let Some(a) = cw.assignment.clone() else { return };
+        let Some(a) = cw.assignment.clone() else {
+            return;
+        };
         let pending = std::mem::take(&mut cw.unapplied);
         for p in pending {
             if self.backend.state(p) == PartState::Loading {
@@ -693,8 +829,15 @@ impl<B: Backend> Worker<B> {
         let want = a.role.as_ref();
         let same = match (&pr.role, want) {
             (Role::Idle, None) => true,
-            (Role::Primary(pp), Some(r)) => r.is_primary && pp.term == r.term && pp.shard == r.shard.0,
-            (Role::Member(m), Some(r)) => !r.is_primary && m.term == r.term && m.shard == r.shard.0 && r.primary_repl.map(|x| x.0) == Some(m.primary),
+            (Role::Primary(pp), Some(r)) => {
+                r.is_primary && pp.term == r.term && pp.shard == r.shard.0
+            }
+            (Role::Member(m), Some(r)) => {
+                !r.is_primary
+                    && m.term == r.term
+                    && m.shard == r.shard.0
+                    && r.primary_repl.map(|x| x.0) == Some(m.primary)
+            }
             _ => false,
         };
         if !same {
@@ -727,9 +870,13 @@ impl<B: Backend> Worker<B> {
             }
             pr.purge = None;
             pr.queued.clear();
-            pr.tickets.retain(|_, t| matches!(t, TicketFor::Produced(_)));
+            pr.tickets
+                .retain(|_, t| matches!(t, TicketFor::Produced(_)));
             cw.streams.retain(|_, r| match r {
-                StreamRef::Member { p: x } | StreamRef::Primary { p: x, .. } | StreamRef::MigOut { p: x, .. } | StreamRef::MigIn { p: x, .. } => *x != p,
+                StreamRef::Member { p: x }
+                | StreamRef::Primary { p: x, .. }
+                | StreamRef::MigOut { p: x, .. }
+                | StreamRef::MigIn { p: x, .. } => *x != p,
             });
             let Some(pr) = cw.part(p) else { return };
             match want {
@@ -741,7 +888,10 @@ impl<B: Backend> Worker<B> {
                     let ring = match Backlog::try_new(backlog_bytes) {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::error!(partition = p, "replication backlog memory cannot be locked: {e}");
+                            tracing::error!(
+                                partition = p,
+                                "replication backlog memory cannot be locked: {e}"
+                            );
                             self.shared.request_shutdown();
                             return;
                         }
@@ -749,7 +899,9 @@ impl<B: Backend> Worker<B> {
                     let mut sender = ReplSender::with_backlog(p, r.term, ring);
                     sender.set_heartbeat_ns(heartbeat_ns);
                     sender.start_at(before(self.backend.next_seq(p)));
-                    let received = carried_ring.unwrap_or_else(|| Backlog::try_new(SMALL_RING).unwrap_or_else(|_| Backlog::new(4096)));
+                    let received = carried_ring.unwrap_or_else(|| {
+                        Backlog::try_new(SMALL_RING).unwrap_or_else(|_| Backlog::new(4096))
+                    });
                     pr.durable.reset(Seq::new(r.term, 0));
                     pr.tickets.clear();
                     pr.last_term = r.term;
@@ -762,7 +914,11 @@ impl<B: Backend> Worker<B> {
                         history: Vec::new(),
                         handoff: None,
                     }));
-                    tracing::info!(partition = p, term = r.term, "partition is the shard primary");
+                    tracing::info!(
+                        partition = p,
+                        term = r.term,
+                        "partition is the shard primary"
+                    );
                 }
                 Some(r) => {
                     self.backend.set_cluster_role(p, false, r.term);
@@ -773,7 +929,10 @@ impl<B: Backend> Worker<B> {
                     let ring = match Backlog::try_new(backlog_bytes) {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::error!(partition = p, "replication ring memory cannot be locked: {e}");
+                            tracing::error!(
+                                partition = p,
+                                "replication ring memory cannot be locked: {e}"
+                            );
                             self.shared.request_shutdown();
                             return;
                         }
@@ -806,7 +965,11 @@ impl<B: Backend> Worker<B> {
         // role facts that change without a role change
         let Some(pr) = cw.part(p) else { return };
         if let (Role::Primary(pp), Some(r)) = (&mut pr.role, want) {
-            pp.history = r.history.iter().map(|t| (t.term, t.takeover.clone())).collect();
+            pp.history = r
+                .history
+                .iter()
+                .map(|t| (t.term, t.takeover.clone()))
+                .collect();
             for x in pp.peers.iter_mut() {
                 x.present = false;
             }
@@ -844,7 +1007,13 @@ impl<B: Backend> Worker<B> {
                     pp.sender.detach(i as MemberId);
                 }
             }
-            let counted: Vec<MemberId> = pp.peers.iter().enumerate().filter(|(_, x)| x.present && (x.in_isr || x.expanding)).map(|(i, _)| i as MemberId).collect();
+            let counted: Vec<MemberId> = pp
+                .peers
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| x.present && (x.in_isr || x.expanding))
+                .map(|(i, _)| i as MemberId)
+                .collect();
             pp.sender.set_isr(&counted);
             let tasks = r.migrations.clone();
             self.sync_migrations(cw, p, &tasks);
@@ -857,10 +1026,25 @@ impl<B: Backend> Worker<B> {
 
     pub(crate) fn on_repl(&mut self, ev: ReplEvent) {
         self.with_cluster(|w, cw| match ev {
-            ReplEvent::Inbound { stream, hello, term } => w.on_inbound(cw, stream, *hello, term),
-            ReplEvent::Dialed { tag, partition, stream } => w.on_dialed(cw, tag, partition, stream),
-            ReplEvent::Frame { stream, term, frame, bytes } => {
-                let Some(r) = cw.streams.get(&stream).copied() else { return };
+            ReplEvent::Inbound {
+                stream,
+                hello,
+                term,
+            } => w.on_inbound(cw, stream, *hello, term),
+            ReplEvent::Dialed {
+                tag,
+                partition,
+                stream,
+            } => w.on_dialed(cw, tag, partition, stream),
+            ReplEvent::Frame {
+                stream,
+                term,
+                frame,
+                bytes,
+            } => {
+                let Some(r) = cw.streams.get(&stream).copied() else {
+                    return;
+                };
                 match r {
                     StreamRef::Member { p } => w.member_frame(cw, p, stream, term, frame),
                     StreamRef::Primary { p, m } => w.primary_frame(cw, p, m, stream, term, frame),
@@ -874,18 +1058,30 @@ impl<B: Backend> Worker<B> {
     }
 
     fn consumed(&self, cw: &mut ClusterWorker, stream: u64, bytes: usize) {
-        let Some(r) = cw.streams.get(&stream).copied() else { return };
+        let Some(r) = cw.streams.get(&stream).copied() else {
+            return;
+        };
         let io = match r {
             StreamRef::Member { p } => cw.part(p).and_then(|pr| match &pr.role {
                 Role::Member(m) => m.io.as_ref().filter(|i| i.id == stream),
                 _ => None,
             }),
             StreamRef::Primary { p, m } => cw.part(p).and_then(|pr| match &pr.role {
-                Role::Primary(pp) => pp.peers.get(usize::from(m)).and_then(|x| x.stream.as_ref()).filter(|i| i.id == stream),
+                Role::Primary(pp) => pp
+                    .peers
+                    .get(usize::from(m))
+                    .and_then(|x| x.stream.as_ref())
+                    .filter(|i| i.id == stream),
                 _ => None,
             }),
-            StreamRef::MigOut { p, id } => cw.part(p).and_then(|pr| pr.mig_out.iter().find(|x| x.id == id)).and_then(|x| x.io.as_ref()),
-            StreamRef::MigIn { p, id } => cw.part(p).and_then(|pr| pr.mig_in.iter().find(|x| x.id == id)).and_then(|x| x.io.as_ref()),
+            StreamRef::MigOut { p, id } => cw
+                .part(p)
+                .and_then(|pr| pr.mig_out.iter().find(|x| x.id == id))
+                .and_then(|x| x.io.as_ref()),
+            StreamRef::MigIn { p, id } => cw
+                .part(p)
+                .and_then(|pr| pr.mig_in.iter().find(|x| x.id == id))
+                .and_then(|x| x.io.as_ref()),
         };
         if let Some(io) = io {
             io.consumed(bytes);
@@ -893,7 +1089,9 @@ impl<B: Backend> Worker<B> {
     }
 
     fn on_closed(&mut self, cw: &mut ClusterWorker, stream: u64) {
-        let Some(r) = cw.streams.remove(&stream) else { return };
+        let Some(r) = cw.streams.remove(&stream) else {
+            return;
+        };
         let now = self.now.boot_ns;
         match r {
             StreamRef::Member { p } => {
@@ -1008,12 +1206,20 @@ impl<B: Backend> Worker<B> {
         let loading = self.backend.state(p) == PartState::Loading;
         let rate = cw.sync_iops.max(1);
         let ClusterWorker { parts, streams, .. } = cw;
-        let Some(pr) = parts.get_mut(usize::from(p)).and_then(Option::as_mut) else { return };
-        let Role::Primary(pp) = &mut pr.role else { return reject(io, RejectReason::NotPrimary, 0) };
+        let Some(pr) = parts.get_mut(usize::from(p)).and_then(Option::as_mut) else {
+            return;
+        };
+        let Role::Primary(pp) = &mut pr.role else {
+            return reject(io, RejectReason::NotPrimary, 0);
+        };
         if loading || pp.shard != h.shard {
             return reject(io, RejectReason::NotPrimary, pp.term);
         }
-        let Some(mi) = pp.peers.iter().position(|x| x.present && x.node.0 == h.node_id) else {
+        let Some(mi) = pp
+            .peers
+            .iter()
+            .position(|x| x.present && x.node.0 == h.node_id)
+        else {
             return reject(io, RejectReason::NotMember, pp.term);
         };
         let m = mi as MemberId;
@@ -1032,9 +1238,18 @@ impl<B: Backend> Worker<B> {
         let mode = match d {
             SyncDecision::Reject(r) => return reject(io, r, term),
             SyncDecision::Continue { from } => AcceptMode::Continue { from },
-            SyncDecision::Repair { at, primary_keys, want_member_keys } => {
+            SyncDecision::Repair {
+                at,
+                primary_keys,
+                want_member_keys,
+            } => {
                 let x = &mut pp.peers[mi];
-                x.direct = Some(Direct::Repair { at, keys: primary_keys.into_iter().collect(), member_keys: !want_member_keys, reading: false });
+                x.direct = Some(Direct::Repair {
+                    at,
+                    keys: primary_keys.into_iter().collect(),
+                    member_keys: !want_member_keys,
+                    reading: false,
+                });
                 AcceptMode::Repair { at }
             }
             SyncDecision::Full { at } => {
@@ -1064,10 +1279,20 @@ impl<B: Backend> Worker<B> {
         x.stream = Some(io);
     }
 
-    fn primary_frame(&mut self, cw: &mut ClusterWorker, p: u16, m: MemberId, stream: u64, term: u32, f: Frame) {
+    fn primary_frame(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        m: MemberId,
+        stream: u64,
+        term: u32,
+        f: Frame,
+    ) {
         let now = self.now.boot_ns;
         let Some(pr) = cw.part(p) else { return };
-        let Role::Primary(pp) = &mut pr.role else { return };
+        let Role::Primary(pp) = &mut pr.role else {
+            return;
+        };
         if term > pp.term {
             // the member saw a newer term: this primary is superseded
             if let Some(x) = pp.peers.get_mut(usize::from(m))
@@ -1077,19 +1302,30 @@ impl<B: Backend> Worker<B> {
             }
             return;
         }
-        let Some(x) = pp.peers.get_mut(usize::from(m)) else { return };
+        let Some(x) = pp.peers.get_mut(usize::from(m)) else {
+            return;
+        };
         if x.stream.as_ref().is_none_or(|i| i.id != stream) {
             return;
         }
         match f {
             Frame::Ack { durable, .. } => pp.sender.on_ack(m, durable, now),
             Frame::RepairKeys(keys) => {
-                if let Some(Direct::Repair { keys: q, member_keys, .. }) = &mut x.direct {
+                if let Some(Direct::Repair {
+                    keys: q,
+                    member_keys,
+                    ..
+                }) = &mut x.direct
+                {
                     q.extend(keys);
                     *member_keys = true;
                 }
             }
-            other => tracing::debug!(partition = p, kind = other.kind(), "unexpected frame from a member"),
+            other => tracing::debug!(
+                partition = p,
+                kind = other.kind(),
+                "unexpected frame from a member"
+            ),
         }
     }
 
@@ -1101,17 +1337,26 @@ impl<B: Backend> Worker<B> {
         let mut submits: Vec<(Request, ReplJob)> = Vec::new();
         {
             let Some(pr) = cw.part(p) else { return };
-            let Role::Primary(pp) = &mut pr.role else { return };
+            let Role::Primary(pp) = &mut pr.role else {
+                return;
+            };
             let term = pp.term;
             for (i, x) in pp.peers.iter_mut().enumerate() {
                 let m = i as MemberId;
-                let (Some(io), Some(d)) = (&x.stream, &mut x.direct) else { continue };
+                let (Some(io), Some(d)) = (&x.stream, &mut x.direct) else {
+                    continue;
+                };
                 if io.unsent() >= SEND_WINDOW {
                     continue;
                 }
                 let epoch = x.epoch;
                 match d {
-                    Direct::Repair { at, keys, member_keys, reading } => {
+                    Direct::Repair {
+                        at,
+                        keys,
+                        member_keys,
+                        reading,
+                    } => {
                         if *reading {
                             continue;
                         }
@@ -1136,9 +1381,26 @@ impl<B: Backend> Worker<B> {
                             origin: Origin::Client,
                         };
                         *reading = true;
-                        submits.push((req, ReplJob { work: ReplWork::Read { db, keys: ks }, then: Then::PrimaryRead { member: m, epoch, snap: false } }));
+                        submits.push((
+                            req,
+                            ReplJob {
+                                work: ReplWork::Read { db, keys: ks },
+                                then: Then::PrimaryRead {
+                                    member: m,
+                                    epoch,
+                                    snap: false,
+                                },
+                            },
+                        ));
                     }
-                    Direct::Full { walk, reading, begun, count, bucket, .. } => {
+                    Direct::Full {
+                        walk,
+                        reading,
+                        begun,
+                        count,
+                        bucket,
+                        ..
+                    } => {
                         if *reading || walk.busy {
                             continue;
                         }
@@ -1165,10 +1427,22 @@ impl<B: Backend> Worker<B> {
                         let req = Request {
                             db: 0,
                             keys: SmallVec::new(),
-                            kind: ReqKind::SlotIter { slot, fp_from: walk.fp_from as u32, max_entries: WALK_KEYS },
+                            kind: ReqKind::SlotIter {
+                                slot,
+                                fp_from: walk.fp_from as u32,
+                                max_entries: WALK_KEYS,
+                            },
                             origin: Origin::Client,
                         };
-                        submits.push((req, ReplJob { work: ReplWork::Walk, then: Then::Listed { walker: Walker::Full { member: m, epoch } } }));
+                        submits.push((
+                            req,
+                            ReplJob {
+                                work: ReplWork::Walk,
+                                then: Then::Listed {
+                                    walker: Walker::Full { member: m, epoch },
+                                },
+                            },
+                        ));
                     }
                 }
             }
@@ -1181,7 +1455,13 @@ impl<B: Backend> Worker<B> {
     // -----------------------------------------------------------------------------------------
     // member side
 
-    fn member_hello(&self, cw: &ClusterWorker, p: u16, pr: &PartRepl, m: &MemberPart) -> Option<Vec<u8>> {
+    fn member_hello(
+        &self,
+        cw: &ClusterWorker,
+        p: u16,
+        pr: &PartRepl,
+        m: &MemberPart,
+    ) -> Option<Vec<u8>> {
         let ident = cw.cs.identity();
         let h = Hello {
             cluster_id: ident.cluster_id?,
@@ -1212,7 +1492,9 @@ impl<B: Backend> Worker<B> {
         }
         let tag = cw.next_tag;
         let hello = {
-            let Some(pr) = cw.parts.get(usize::from(p)).and_then(Option::as_ref) else { return };
+            let Some(pr) = cw.parts.get(usize::from(p)).and_then(Option::as_ref) else {
+                return;
+            };
             let Role::Member(m) = &pr.role else { return };
             if m.io.is_some() || m.dial_tag.is_some() || now < m.next_dial_ns {
                 return;
@@ -1223,8 +1505,12 @@ impl<B: Backend> Worker<B> {
             }
         };
         let Some(net) = cw.cs.net.get() else { return };
-        let Some(pr) = cw.parts.get_mut(usize::from(p)).and_then(Option::as_mut) else { return };
-        let Role::Member(m) = &mut pr.role else { return };
+        let Some(pr) = cw.parts.get_mut(usize::from(p)).and_then(Option::as_mut) else {
+            return;
+        };
+        let Role::Member(m) = &mut pr.role else {
+            return;
+        };
         cw.next_tag += 1;
         m.dial_tag = Some(tag);
         m.next_dial_ns = now + REDIAL_NS;
@@ -1236,7 +1522,9 @@ impl<B: Backend> Worker<B> {
         let now = self.now.boot_ns;
         let actions = {
             let Some(pr) = cw.part(p) else { return };
-            let Role::Member(m) = &mut pr.role else { return };
+            let Role::Member(m) = &mut pr.role else {
+                return;
+            };
             if m.io.as_ref().is_none_or(|i| i.id != stream) {
                 return;
             }
@@ -1281,8 +1569,15 @@ impl<B: Backend> Worker<B> {
         // actions after SyncBegin wait until the SYNCING flag is durable
         {
             let Some(pr) = cw.part(p) else { return };
-            let Role::Member(m) = &mut pr.role else { return };
-            if let MemberSync::Full { held, flag_durable: false, .. } = &mut m.sync {
+            let Role::Member(m) = &mut pr.role else {
+                return;
+            };
+            if let MemberSync::Full {
+                held,
+                flag_durable: false,
+                ..
+            } = &mut m.sync
+            {
                 held.push_back(a);
                 return;
             }
@@ -1297,8 +1592,18 @@ impl<B: Backend> Worker<B> {
                 let token = cw.cs.token(REPL_TOKEN_BIT);
                 let (shard, term) = {
                     let Some(pr) = cw.part(p) else { return };
-                    let Role::Member(m) = &mut pr.role else { return };
-                    m.sync = MemberSync::Full { at, end: None, open: 0, confirmed: KeySet::default(), prune: None, held: VecDeque::new(), flag_durable: false };
+                    let Role::Member(m) = &mut pr.role else {
+                        return;
+                    };
+                    m.sync = MemberSync::Full {
+                        at,
+                        end: None,
+                        open: 0,
+                        confirmed: KeySet::default(),
+                        prune: None,
+                        held: VecDeque::new(),
+                        flag_durable: false,
+                    };
                     m.ready_reported = Some(false);
                     let st = (m.shard, m.term);
                     pr.syncing = true;
@@ -1311,14 +1616,22 @@ impl<B: Backend> Worker<B> {
                 cw.cs.syncing[usize::from(p)].store(true, Ordering::Release);
                 // SYNCING is durable before the first record is applied (§23.7)
                 let pm = self.part_meta(cw, p);
-                self.backend.meta_request(p, token, MetaReq::PartitionMeta { m: pm });
-                cw.cs.tell_agent(AgentMsg::PartReady { shard, term, partition: p, ready: false });
+                self.backend
+                    .meta_request(p, token, MetaReq::PartitionMeta { m: pm });
+                cw.cs.tell_agent(AgentMsg::PartReady {
+                    shard,
+                    term,
+                    partition: p,
+                    ready: false,
+                });
                 tracing::info!(partition = p, "merge full sync started");
             }
             MemberAction::SendRepairKeys => self.member_repair_keys(cw, p),
             MemberAction::RepairDone(end) => {
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Member(m) = &mut pr.role else { return };
+                let Role::Member(m) = &mut pr.role else {
+                    return;
+                };
                 if let MemberSync::Repair { end: e, .. } = &mut m.sync {
                     *e = Some(end);
                 }
@@ -1327,7 +1640,9 @@ impl<B: Backend> Worker<B> {
             MemberAction::SyncDone(end) => {
                 let slots = slots_of(p, self.shared.partitions);
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Member(m) = &mut pr.role else { return };
+                let Role::Member(m) = &mut pr.role else {
+                    return;
+                };
                 if let MemberSync::Full { end: e, prune, .. } = &mut m.sync {
                     *e = Some(end);
                     *prune = Some(KeyWalk::new(slots));
@@ -1340,7 +1655,9 @@ impl<B: Backend> Worker<B> {
 
     fn member_apply(&mut self, cw: &mut ClusterWorker, p: u16, g: Group) {
         let Some(pr) = cw.part(p) else { return };
-        let Role::Member(m) = &mut pr.role else { return };
+        let Role::Member(m) = &mut pr.role else {
+            return;
+        };
         let epoch = m.epoch;
         let seq = g.seq;
         pr.durable.push(seq, false);
@@ -1352,15 +1669,45 @@ impl<B: Backend> Worker<B> {
                 return;
             }
             let ops = std::mem::take(run);
-            let req = Request { db: op_db(&ops), keys: op_keys(&ops, false), kind: ReqKind::Keyed, origin: Origin::Replicated(seq) };
-            reqs.push((req, ReplJob { work: ReplWork::Apply { ops, seq, mode: ApplyMode::Ordered }, then: Then::MemberGroup { epoch, seq } }));
+            let req = Request {
+                db: op_db(&ops),
+                keys: op_keys(&ops, false),
+                kind: ReqKind::Keyed,
+                origin: Origin::Replicated(seq),
+            };
+            reqs.push((
+                req,
+                ReplJob {
+                    work: ReplWork::Apply {
+                        ops,
+                        seq,
+                        mode: ApplyMode::Ordered,
+                    },
+                    then: Then::MemberGroup { epoch, seq },
+                },
+            ));
         };
         for op in g.ops {
             match op {
                 Op::FlushDb { db } => {
                     flush_run(&mut run, &mut reqs);
-                    let req = Request { db: db.unwrap_or(0), keys: SmallVec::new(), kind: ReqKind::FlushDb { db }, origin: Origin::Replicated(seq) };
-                    reqs.push((req, ReplJob { work: ReplWork::Apply { ops: Vec::new(), seq, mode: ApplyMode::Ordered }, then: Then::MemberGroup { epoch, seq } }));
+                    let req = Request {
+                        db: db.unwrap_or(0),
+                        keys: SmallVec::new(),
+                        kind: ReqKind::FlushDb { db },
+                        origin: Origin::Replicated(seq),
+                    };
+                    reqs.push((
+                        req,
+                        ReplJob {
+                            work: ReplWork::Apply {
+                                ops: Vec::new(),
+                                seq,
+                                mode: ApplyMode::Ordered,
+                            },
+                            then: Then::MemberGroup { epoch, seq },
+                        },
+                    ));
                 }
                 Op::FlushSlot { .. } | Op::Noop => {}
                 op => run.push(op),
@@ -1379,57 +1726,139 @@ impl<B: Backend> Worker<B> {
 
     fn member_image(&mut self, cw: &mut ClusterWorker, p: u16, rec: ImageRec, at: Seq) {
         let Some(pr) = cw.part(p) else { return };
-        let Role::Member(m) = &mut pr.role else { return };
+        let Role::Member(m) = &mut pr.role else {
+            return;
+        };
         let epoch = m.epoch;
         if let MemberSync::Repair { open, .. } = &mut m.sync {
             *open += 1;
         }
         let op = match rec.image {
-            Some((vtype, expire_at, value)) => Op::Put { db: rec.db, vtype, expire_at, key: rec.key, value },
-            None => Op::Del { db: rec.db, key: rec.key },
+            Some((vtype, expire_at, value)) => Op::Put {
+                db: rec.db,
+                vtype,
+                expire_at,
+                key: rec.key,
+                value,
+            },
+            None => Op::Del {
+                db: rec.db,
+                key: rec.key,
+            },
         };
         let ops = vec![op];
-        let req = Request { db: op_db(&ops), keys: op_keys(&ops, false), kind: ReqKind::Keyed, origin: Origin::Image(at) };
-        self.submit_repl(cw, p, req, ReplJob { work: ReplWork::Apply { ops, seq: at, mode: ApplyMode::Image }, then: Then::MemberImage { epoch, confirm: None } });
+        let req = Request {
+            db: op_db(&ops),
+            keys: op_keys(&ops, false),
+            kind: ReqKind::Keyed,
+            origin: Origin::Image(at),
+        };
+        self.submit_repl(
+            cw,
+            p,
+            req,
+            ReplJob {
+                work: ReplWork::Apply {
+                    ops,
+                    seq: at,
+                    mode: ApplyMode::Image,
+                },
+                then: Then::MemberImage {
+                    epoch,
+                    confirm: None,
+                },
+            },
+        );
     }
 
     fn member_snap(&mut self, cw: &mut ClusterWorker, p: u16, rec: SnapRec, stamp: Seq) {
         let Some(pr) = cw.part(p) else { return };
-        let Role::Member(m) = &mut pr.role else { return };
+        let Role::Member(m) = &mut pr.role else {
+            return;
+        };
         let epoch = m.epoch;
         if let MemberSync::Full { open, .. } = &mut m.sync {
             *open += 1;
         }
         let confirm = Some((rec.db, rec.key.clone()));
-        let ops = vec![Op::Put { db: rec.db, vtype: rec.vtype, expire_at: rec.expire_at, key: rec.key, value: rec.value }];
-        let req = Request { db: op_db(&ops), keys: op_keys(&ops, true), kind: ReqKind::Keyed, origin: Origin::Snapshot(stamp) };
-        self.submit_repl(cw, p, req, ReplJob { work: ReplWork::Apply { ops, seq: stamp, mode: ApplyMode::SnapshotMerge }, then: Then::MemberImage { epoch, confirm } });
+        let ops = vec![Op::Put {
+            db: rec.db,
+            vtype: rec.vtype,
+            expire_at: rec.expire_at,
+            key: rec.key,
+            value: rec.value,
+        }];
+        let req = Request {
+            db: op_db(&ops),
+            keys: op_keys(&ops, true),
+            kind: ReqKind::Keyed,
+            origin: Origin::Snapshot(stamp),
+        };
+        self.submit_repl(
+            cw,
+            p,
+            req,
+            ReplJob {
+                work: ReplWork::Apply {
+                    ops,
+                    seq: stamp,
+                    mode: ApplyMode::SnapshotMerge,
+                },
+                then: Then::MemberImage { epoch, confirm },
+            },
+        );
     }
 
     /// `REPAIR_KEYS`: the keys of this member's own groups after its term's takeover point.
     fn member_repair_keys(&mut self, cw: &mut ClusterWorker, p: u16) {
-        let history: Vec<(u32, Vec<u64>)> =
-            cw.assignment().and_then(|a| a.role.as_ref()).map(|r| r.history.iter().map(|t| (t.term, t.takeover.clone())).collect()).unwrap_or_default();
+        let history: Vec<(u32, Vec<u64>)> = cw
+            .assignment()
+            .and_then(|a| a.role.as_ref())
+            .map(|r| {
+                r.history
+                    .iter()
+                    .map(|t| (t.term, t.takeover.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let slots = slots_of(p, self.shared.partitions);
         let cs = cw.cs.clone();
         let Some(pr) = cw.part(p) else { return };
         let last_term = pr.last_term;
-        let Role::Member(m) = &mut pr.role else { return };
+        let Role::Member(m) = &mut pr.role else {
+            return;
+        };
         let Some(io) = m.io.as_ref() else { return };
-        let Some((_, AcceptMode::Repair { at })) = m.stream.accepted() else { return };
+        let Some((_, AcceptMode::Repair { at })) = m.stream.accepted() else {
+            return;
+        };
         let takeover = sync::takeover(&history, last_term, p);
         let mut ks = KeySet::default();
         let from_ring = takeover.and_then(|t| {
-            let ring = m.own_groups.as_ref().filter(|b| b.covers_after(t)).or(Some(m.stream.received()).filter(|b| b.covers_after(t)))?;
-            ring.keys_between_into(t, Seq(u64::MAX), &mut ks).filter(|wide| !wide)
+            let ring = m
+                .own_groups
+                .as_ref()
+                .filter(|b| b.covers_after(t))
+                .or(Some(m.stream.received()).filter(|b| b.covers_after(t)))?;
+            ring.keys_between_into(t, Seq(u64::MAX), &mut ks)
+                .filter(|wide| !wide)
         });
-        m.sync = MemberSync::Repair { at, end: None, open: 0 };
+        m.sync = MemberSync::Repair {
+            at,
+            end: None,
+            open: 0,
+        };
         let up = pr.durable.upto().min(before(at));
         pr.durable.reset(up);
         pr.durable.push(at, false);
         let shard = m.shard;
         let term = m.term;
-        cs.tell_agent(AgentMsg::PartReady { shard, term, partition: p, ready: false });
+        cs.tell_agent(AgentMsg::PartReady {
+            shard,
+            term,
+            partition: p,
+            ready: false,
+        });
         if from_ring.is_some() {
             io.send(frame_bytes(&Frame::RepairKeys(ks.into_vec()), p, term));
             m.stream.reset_received(at);
@@ -1442,16 +1871,28 @@ impl<B: Backend> Worker<B> {
     }
 
     fn drive_divergent(&mut self, cw: &mut ClusterWorker, p: u16) {
-        let history: Vec<(u32, Vec<u64>)> =
-            cw.assignment().and_then(|a| a.role.as_ref()).map(|r| r.history.iter().map(|t| (t.term, t.takeover.clone())).collect()).unwrap_or_default();
+        let history: Vec<(u32, Vec<u64>)> = cw
+            .assignment()
+            .and_then(|a| a.role.as_ref())
+            .map(|r| {
+                r.history
+                    .iter()
+                    .map(|t| (t.term, t.takeover.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let lens = |w: &Self, s: u16| w.backend.slot_len(p, 0, s);
         let submit;
         {
             let Some(pr) = cw.part(p) else { return };
             let last_term = pr.last_term;
-            let Role::Member(m) = &mut pr.role else { return };
+            let Role::Member(m) = &mut pr.role else {
+                return;
+            };
             let epoch = m.epoch;
-            let Some((walk, ks)) = &mut m.divergent else { return };
+            let Some((walk, ks)) = &mut m.divergent else {
+                return;
+            };
             if walk.busy {
                 return;
             }
@@ -1459,8 +1900,14 @@ impl<B: Backend> Worker<B> {
             if walk.done() {
                 let keys = std::mem::take(ks).into_vec();
                 m.divergent = None;
-                if let (Some(io), Some((_, AcceptMode::Repair { at }))) = (m.io.as_ref(), m.stream.accepted()) {
-                    tracing::info!(partition = p, keys = keys.len(), "repair keys from the partition walk");
+                if let (Some(io), Some((_, AcceptMode::Repair { at }))) =
+                    (m.io.as_ref(), m.stream.accepted())
+                {
+                    tracing::info!(
+                        partition = p,
+                        keys = keys.len(),
+                        "repair keys from the partition walk"
+                    );
                     io.send(frame_bytes(&Frame::RepairKeys(keys), p, m.term));
                     m.stream.reset_received(at);
                 }
@@ -1469,8 +1916,25 @@ impl<B: Backend> Worker<B> {
             let _ = sync::takeover(&history, last_term, p);
             walk.busy = true;
             let slot = walk.slots[walk.idx];
-            let req = Request { db: 0, keys: SmallVec::new(), kind: ReqKind::SlotIter { slot, fp_from: walk.fp_from as u32, max_entries: WALK_KEYS }, origin: Origin::Client };
-            submit = Some((req, ReplJob { work: ReplWork::Walk, then: Then::Listed { walker: Walker::Divergent { epoch } } }));
+            let req = Request {
+                db: 0,
+                keys: SmallVec::new(),
+                kind: ReqKind::SlotIter {
+                    slot,
+                    fp_from: walk.fp_from as u32,
+                    max_entries: WALK_KEYS,
+                },
+                origin: Origin::Client,
+            };
+            submit = Some((
+                req,
+                ReplJob {
+                    work: ReplWork::Walk,
+                    then: Then::Listed {
+                        walker: Walker::Divergent { epoch },
+                    },
+                },
+            ));
         }
         if let Some((req, rj)) = submit {
             self.submit_repl(cw, p, req, rj);
@@ -1484,13 +1948,25 @@ impl<B: Backend> Worker<B> {
         let mut finished = None;
         {
             let Some(pr) = cw.part(p) else { return };
-            let Role::Member(m) = &mut pr.role else { return };
+            let Role::Member(m) = &mut pr.role else {
+                return;
+            };
             let epoch = m.epoch;
             match &mut m.sync {
                 MemberSync::None => return,
-                MemberSync::Repair { at, end: Some(end), open: 0 } => finished = Some((*at, *end, false)),
+                MemberSync::Repair {
+                    at,
+                    end: Some(end),
+                    open: 0,
+                } => finished = Some((*at, *end, false)),
                 MemberSync::Repair { .. } => {}
-                MemberSync::Full { at, end: Some(end), open, prune: Some(walk), .. } => {
+                MemberSync::Full {
+                    at,
+                    end: Some(end),
+                    open,
+                    prune: Some(walk),
+                    ..
+                } => {
                     if walk.busy {
                         return;
                     }
@@ -1502,8 +1978,25 @@ impl<B: Backend> Worker<B> {
                     } else {
                         walk.busy = true;
                         let slot = walk.slots[walk.idx];
-                        let req = Request { db: 0, keys: SmallVec::new(), kind: ReqKind::SlotIter { slot, fp_from: walk.fp_from as u32, max_entries: WALK_KEYS }, origin: Origin::Client };
-                        submit = Some((req, ReplJob { work: ReplWork::Walk, then: Then::Listed { walker: Walker::Prune { epoch } } }));
+                        let req = Request {
+                            db: 0,
+                            keys: SmallVec::new(),
+                            kind: ReqKind::SlotIter {
+                                slot,
+                                fp_from: walk.fp_from as u32,
+                                max_entries: WALK_KEYS,
+                            },
+                            origin: Origin::Client,
+                        };
+                        submit = Some((
+                            req,
+                            ReplJob {
+                                work: ReplWork::Walk,
+                                then: Then::Listed {
+                                    walker: Walker::Prune { epoch },
+                                },
+                            },
+                        ));
                     }
                 }
                 MemberSync::Full { .. } => {}
@@ -1516,7 +2009,9 @@ impl<B: Backend> Worker<B> {
             let token = cw.cs.token(REPL_TOKEN_BIT);
             let (shard, term) = {
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Member(m) = &mut pr.role else { return };
+                let Role::Member(m) = &mut pr.role else {
+                    return;
+                };
                 m.sync = MemberSync::None;
                 m.ready_reported = Some(true);
                 let st = (m.shard, m.term);
@@ -1534,12 +2029,18 @@ impl<B: Backend> Worker<B> {
             if full {
                 cw.cs.syncing[usize::from(p)].store(false, Ordering::Release);
                 let pm = self.part_meta(cw, p);
-                self.backend.meta_request(p, token, MetaReq::PartitionMeta { m: pm });
+                self.backend
+                    .meta_request(p, token, MetaReq::PartitionMeta { m: pm });
                 tracing::info!(partition = p, "merge full sync complete");
             } else {
                 tracing::info!(partition = p, "repair complete");
             }
-            cw.cs.tell_agent(AgentMsg::PartReady { shard, term, partition: p, ready: true });
+            cw.cs.tell_agent(AgentMsg::PartReady {
+                shard,
+                term,
+                partition: p,
+                ready: true,
+            });
         }
     }
 
@@ -1547,7 +2048,13 @@ impl<B: Backend> Worker<B> {
     // job completions
 
     /// A replication request finished (`res`: its output, or the error it failed with).
-    pub(crate) fn repl_job_done(&mut self, p: u16, rj: ReplJob, res: Result<ReplOut, StoreError>, eo: Option<&ExecOut>) {
+    pub(crate) fn repl_job_done(
+        &mut self,
+        p: u16,
+        rj: ReplJob,
+        res: Result<ReplOut, StoreError>,
+        eo: Option<&ExecOut>,
+    ) {
         if let Some(eo) = eo
             && let Some(g) = &eo.group
         {
@@ -1559,7 +2066,15 @@ impl<B: Backend> Worker<B> {
         self.with_cluster(|w, cw| w.repl_continue(cw, p, rj, res, ticket, wrote));
     }
 
-    fn repl_continue(&mut self, cw: &mut ClusterWorker, p: u16, rj: ReplJob, res: Result<ReplOut, StoreError>, ticket: Option<TicketId>, wrote: Option<Seq>) {
+    fn repl_continue(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        rj: ReplJob,
+        res: Result<ReplOut, StoreError>,
+        ticket: Option<TicketId>,
+        wrote: Option<Seq>,
+    ) {
         let need = self.local_need();
         let durable_now = ticket.is_none() || need.is_none();
         if let Err(e) = &res {
@@ -1568,7 +2083,9 @@ impl<B: Backend> Worker<B> {
         match rj.then {
             Then::MemberGroup { epoch, seq } => {
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Member(m) = &mut pr.role else { return };
+                let Role::Member(m) = &mut pr.role else {
+                    return;
+                };
                 if m.epoch != epoch {
                     return;
                 }
@@ -1588,11 +2105,14 @@ impl<B: Backend> Worker<B> {
             }
             Then::MemberImage { epoch, confirm } => {
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Member(m) = &mut pr.role else { return };
+                let Role::Member(m) = &mut pr.role else {
+                    return;
+                };
                 if m.epoch != epoch {
                     return;
                 }
-                if let (Ok(ReplOut::Applied(o)), Some(k), MemberSync::Full { confirmed, .. }) = (&res, confirm, &mut m.sync)
+                if let (Ok(ReplOut::Applied(o)), Some(k), MemberSync::Full { confirmed, .. }) =
+                    (&res, confirm, &mut m.sync)
                     && o.first() == Some(&ApplyOutcome::Confirmed)
                 {
                     confirmed.insert(k.0, &k.1);
@@ -1608,7 +2128,9 @@ impl<B: Backend> Worker<B> {
                         pr.tickets.insert(t.0, TicketFor::Sync { epoch });
                     }
                     _ => {
-                        if let MemberSync::Repair { open, .. } | MemberSync::Full { open, .. } = &mut m.sync {
+                        if let MemberSync::Repair { open, .. } | MemberSync::Full { open, .. } =
+                            &mut m.sync
+                        {
                             *open = open.saturating_sub(1);
                         }
                     }
@@ -1617,11 +2139,18 @@ impl<B: Backend> Worker<B> {
             }
             Then::MemberPrune { epoch } => {
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Member(m) = &mut pr.role else { return };
+                let Role::Member(m) = &mut pr.role else {
+                    return;
+                };
                 if m.epoch != epoch {
                     return;
                 }
-                if let MemberSync::Full { open, prune: Some(walk), .. } = &mut m.sync {
+                if let MemberSync::Full {
+                    open,
+                    prune: Some(walk),
+                    ..
+                } = &mut m.sync
+                {
                     walk.busy = false;
                     if let (false, Some(t)) = (durable_now, ticket) {
                         *open += 1;
@@ -1632,11 +2161,15 @@ impl<B: Backend> Worker<B> {
             }
             Then::MemberSeqs { epoch, above } => {
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Member(m) = &mut pr.role else { return };
+                let Role::Member(m) = &mut pr.role else {
+                    return;
+                };
                 if m.epoch != epoch {
                     return;
                 }
-                if let (Some((walk, ks)), ReplWork::Seqs { db, keys }) = (&mut m.divergent, &rj.work) {
+                if let (Some((walk, ks)), ReplWork::Seqs { db, keys }) =
+                    (&mut m.divergent, &rj.work)
+                {
                     walk.busy = false;
                     if let Ok(ReplOut::Seqs(seqs)) = &res {
                         for (k, s) in keys.iter().zip(seqs) {
@@ -1648,15 +2181,25 @@ impl<B: Backend> Worker<B> {
                 }
             }
             Then::Listed { walker } => self.walk_listed(cw, p, walker, res),
-            Then::PrimaryRead { member, epoch, snap } => {
+            Then::PrimaryRead {
+                member,
+                epoch,
+                snap,
+            } => {
                 let Some(pr) = cw.part(p) else { return };
-                let Role::Primary(pp) = &mut pr.role else { return };
+                let Role::Primary(pp) = &mut pr.role else {
+                    return;
+                };
                 let term = pp.term;
-                let Some(x) = pp.peers.get_mut(usize::from(member)) else { return };
+                let Some(x) = pp.peers.get_mut(usize::from(member)) else {
+                    return;
+                };
                 if x.epoch != epoch {
                     return;
                 }
-                let (Some(io), ReplWork::Read { db, keys }) = (&x.stream, &rj.work) else { return };
+                let (Some(io), ReplWork::Read { db, keys }) = (&x.stream, &rj.work) else {
+                    return;
+                };
                 let images = match res {
                     Ok(ReplOut::Images(v)) => v,
                     _ => {
@@ -1670,23 +2213,56 @@ impl<B: Backend> Worker<B> {
                 for (k, img) in keys.iter().zip(images) {
                     if snap {
                         if let Some((vtype, expire_at, value)) = img {
-                            frame::encode(&Frame::SnapRec(SnapRec { db: *db, vtype, expire_at, key: k.clone(), value }), p, term, &mut out);
+                            frame::encode(
+                                &Frame::SnapRec(SnapRec {
+                                    db: *db,
+                                    vtype,
+                                    expire_at,
+                                    key: k.clone(),
+                                    value,
+                                }),
+                                p,
+                                term,
+                                &mut out,
+                            );
                             n += 1;
                         }
                     } else {
-                        frame::encode(&Frame::Image(ImageRec { db: *db, key: k.clone(), image: img }), p, term, &mut out);
+                        frame::encode(
+                            &Frame::Image(ImageRec {
+                                db: *db,
+                                key: k.clone(),
+                                image: img,
+                            }),
+                            p,
+                            term,
+                            &mut out,
+                        );
                     }
                 }
                 io.send(out);
                 match &mut x.direct {
                     Some(Direct::Repair { reading, .. }) => *reading = false,
-                    Some(Direct::Full { reading, walk, begun, count, .. }) => {
+                    Some(Direct::Full {
+                        reading,
+                        walk,
+                        begun,
+                        count,
+                        ..
+                    }) => {
                         *reading = false;
                         *count += n;
                         if walk.fp_from == 0 && *begun {
                             // the walk moved past this slot when it was listed
                             let slot = walk.slots[walk.idx.saturating_sub(1)];
-                            io.send(frame_bytes(&Frame::SnapEnd { slot, count: *count }, p, term));
+                            io.send(frame_bytes(
+                                &Frame::SnapEnd {
+                                    slot,
+                                    count: *count,
+                                },
+                                p,
+                                term,
+                            ));
                             *begun = false;
                         }
                     }
@@ -1694,7 +2270,9 @@ impl<B: Backend> Worker<B> {
                 }
             }
             Then::MigOutRead { id, epoch } => self.mig_out_read(cw, p, id, epoch, &rj.work, res),
-            Then::MigInApply { id, epoch, item } => self.mig_in_applied(cw, p, id, epoch, item, wrote, res.is_ok()),
+            Then::MigInApply { id, epoch, item } => {
+                self.mig_in_applied(cw, p, id, epoch, item, wrote, res.is_ok())
+            }
             Then::Purged => {
                 if let Some(pr) = cw.part(p)
                     && let Some((walk, _)) = &mut pr.purge
@@ -1705,7 +2283,13 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    fn walk_listed(&mut self, cw: &mut ClusterWorker, p: u16, walker: Walker, res: Result<ReplOut, StoreError>) {
+    fn walk_listed(
+        &mut self,
+        cw: &mut ClusterWorker,
+        p: u16,
+        walker: Walker,
+        res: Result<ReplOut, StoreError>,
+    ) {
         let (next, keys) = match res {
             Ok(ReplOut::Listed { next, keys }) => (next, keys),
             Ok(_) | Err(_) => (u64::MAX, Vec::new()),
@@ -1716,13 +2300,26 @@ impl<B: Backend> Worker<B> {
                 let mut submit = None;
                 {
                     let Some(pr) = cw.part(p) else { return };
-                    let Role::Primary(pp) = &mut pr.role else { return };
+                    let Role::Primary(pp) = &mut pr.role else {
+                        return;
+                    };
                     let term = pp.term;
-                    let Some(x) = pp.peers.get_mut(usize::from(member)) else { return };
+                    let Some(x) = pp.peers.get_mut(usize::from(member)) else {
+                        return;
+                    };
                     if x.epoch != epoch {
                         return;
                     }
-                    let Some(Direct::Full { walk, reading, begun, count, .. }) = &mut x.direct else { return };
+                    let Some(Direct::Full {
+                        walk,
+                        reading,
+                        begun,
+                        count,
+                        ..
+                    }) = &mut x.direct
+                    else {
+                        return;
+                    };
                     walk.busy = false;
                     if failed {
                         if let Some(io) = &x.stream {
@@ -1736,13 +2333,35 @@ impl<B: Backend> Worker<B> {
                         if walk.fp_from == 0
                             && let Some(io) = &x.stream
                         {
-                            io.send(frame_bytes(&Frame::SnapEnd { slot, count: *count }, p, term));
+                            io.send(frame_bytes(
+                                &Frame::SnapEnd {
+                                    slot,
+                                    count: *count,
+                                },
+                                p,
+                                term,
+                            ));
                             *begun = false;
                         }
                     } else {
                         *reading = true;
-                        let req = Request { db: 0, keys: keys.iter().map(|k| (k.clone(), Access::Read)).collect(), kind: ReqKind::Keyed, origin: Origin::Client };
-                        submit = Some((req, ReplJob { work: ReplWork::Read { db: 0, keys }, then: Then::PrimaryRead { member, epoch, snap: true } }));
+                        let req = Request {
+                            db: 0,
+                            keys: keys.iter().map(|k| (k.clone(), Access::Read)).collect(),
+                            kind: ReqKind::Keyed,
+                            origin: Origin::Client,
+                        };
+                        submit = Some((
+                            req,
+                            ReplJob {
+                                work: ReplWork::Read { db: 0, keys },
+                                then: Then::PrimaryRead {
+                                    member,
+                                    epoch,
+                                    snap: true,
+                                },
+                            },
+                        ));
                     }
                 }
                 if let Some((req, rj)) = submit {
@@ -1753,22 +2372,51 @@ impl<B: Backend> Worker<B> {
                 let mut submit = None;
                 {
                     let Some(pr) = cw.part(p) else { return };
-                    let Role::Member(m) = &mut pr.role else { return };
+                    let Role::Member(m) = &mut pr.role else {
+                        return;
+                    };
                     if m.epoch != epoch {
                         return;
                     }
-                    let MemberSync::Full { at, confirmed, prune: Some(walk), .. } = &mut m.sync else { return };
+                    let MemberSync::Full {
+                        at,
+                        confirmed,
+                        prune: Some(walk),
+                        ..
+                    } = &mut m.sync
+                    else {
+                        return;
+                    };
                     walk.busy = false;
                     if failed {
                         return;
                     }
                     walk.listed(next);
-                    let doomed: Vec<Box<[u8]>> = keys.into_iter().filter(|k| !confirmed.contains(0, k)).collect();
+                    let doomed: Vec<Box<[u8]>> = keys
+                        .into_iter()
+                        .filter(|k| !confirmed.contains(0, k))
+                        .collect();
                     if !doomed.is_empty() {
                         walk.busy = true;
                         let at = *at;
-                        let req = Request { db: 0, keys: doomed.iter().map(|k| (k.clone(), Access::Write)).collect(), kind: ReqKind::Keyed, origin: Origin::Snapshot(at) };
-                        submit = Some((req, ReplJob { work: ReplWork::Prune { db: 0, keys: doomed, below: at, at }, then: Then::MemberPrune { epoch } }));
+                        let req = Request {
+                            db: 0,
+                            keys: doomed.iter().map(|k| (k.clone(), Access::Write)).collect(),
+                            kind: ReqKind::Keyed,
+                            origin: Origin::Snapshot(at),
+                        };
+                        submit = Some((
+                            req,
+                            ReplJob {
+                                work: ReplWork::Prune {
+                                    db: 0,
+                                    keys: doomed,
+                                    below: at,
+                                    at,
+                                },
+                                then: Then::MemberPrune { epoch },
+                            },
+                        ));
                     }
                 }
                 if let Some((req, rj)) = submit {
@@ -1778,17 +2426,29 @@ impl<B: Backend> Worker<B> {
                 }
             }
             Walker::Divergent { epoch } => {
-                let history: Vec<(u32, Vec<u64>)> =
-                    cw.assignment().and_then(|a| a.role.as_ref()).map(|r| r.history.iter().map(|t| (t.term, t.takeover.clone())).collect()).unwrap_or_default();
+                let history: Vec<(u32, Vec<u64>)> = cw
+                    .assignment()
+                    .and_then(|a| a.role.as_ref())
+                    .map(|r| {
+                        r.history
+                            .iter()
+                            .map(|t| (t.term, t.takeover.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let mut submit = None;
                 {
                     let Some(pr) = cw.part(p) else { return };
                     let above = sync::takeover(&history, pr.last_term, p).unwrap_or(Seq::ZERO);
-                    let Role::Member(m) = &mut pr.role else { return };
+                    let Role::Member(m) = &mut pr.role else {
+                        return;
+                    };
                     if m.epoch != epoch {
                         return;
                     }
-                    let Some((walk, _)) = &mut m.divergent else { return };
+                    let Some((walk, _)) = &mut m.divergent else {
+                        return;
+                    };
                     walk.busy = false;
                     if failed {
                         return;
@@ -1796,15 +2456,28 @@ impl<B: Backend> Worker<B> {
                     walk.listed(next);
                     if !keys.is_empty() {
                         walk.busy = true;
-                        let req = Request { db: 0, keys: keys.iter().map(|k| (k.clone(), Access::Meta)).collect(), kind: ReqKind::Keyed, origin: Origin::Client };
-                        submit = Some((req, ReplJob { work: ReplWork::Seqs { db: 0, keys }, then: Then::MemberSeqs { epoch, above } }));
+                        let req = Request {
+                            db: 0,
+                            keys: keys.iter().map(|k| (k.clone(), Access::Meta)).collect(),
+                            kind: ReqKind::Keyed,
+                            origin: Origin::Client,
+                        };
+                        submit = Some((
+                            req,
+                            ReplJob {
+                                work: ReplWork::Seqs { db: 0, keys },
+                                then: Then::MemberSeqs { epoch, above },
+                            },
+                        ));
                     }
                 }
                 if let Some((req, rj)) = submit {
                     self.submit_repl(cw, p, req, rj);
                 }
             }
-            Walker::MigOut { id, epoch } => self.mig_out_listed(cw, p, id, epoch, next, keys, failed),
+            Walker::MigOut { id, epoch } => {
+                self.mig_out_listed(cw, p, id, epoch, next, keys, failed)
+            }
             Walker::Purge => {
                 let mut submit = None;
                 if let Some(pr) = cw.part(p)
@@ -1815,9 +2488,26 @@ impl<B: Backend> Worker<B> {
                         walk.listed(next);
                         if !keys.is_empty() {
                             walk.busy = true;
-                            let ops: Vec<Op> = keys.iter().map(|k| Op::Del { db: 0, key: k.clone() }).collect();
-                            let req = Request { db: 0, keys: keys.iter().map(|k| (k.clone(), Access::Write)).collect(), kind: ReqKind::Keyed, origin: Origin::Client };
-                            submit = Some((req, ReplJob { work: ReplWork::Own { ops }, then: Then::Purged }));
+                            let ops: Vec<Op> = keys
+                                .iter()
+                                .map(|k| Op::Del {
+                                    db: 0,
+                                    key: k.clone(),
+                                })
+                                .collect();
+                            let req = Request {
+                                db: 0,
+                                keys: keys.iter().map(|k| (k.clone(), Access::Write)).collect(),
+                                kind: ReqKind::Keyed,
+                                origin: Origin::Client,
+                            };
+                            submit = Some((
+                                req,
+                                ReplJob {
+                                    work: ReplWork::Own { ops },
+                                    then: Then::Purged,
+                                },
+                            ));
                         }
                     }
                 }
@@ -1840,9 +2530,13 @@ impl<B: Backend> Worker<B> {
                     return None;
                 }
                 pr.meta_wait = None;
-                let Role::Member(m) = &mut pr.role else { return None };
+                let Role::Member(m) = &mut pr.role else {
+                    return None;
+                };
                 match &mut m.sync {
-                    MemberSync::Full { held, flag_durable, .. } if !*flag_durable => {
+                    MemberSync::Full {
+                        held, flag_durable, ..
+                    } if !*flag_durable => {
                         *flag_durable = true;
                         Some(std::mem::take(held))
                     }
@@ -1862,9 +2556,18 @@ impl<B: Backend> Worker<B> {
         let history: Vec<(u32, u64)> = cw
             .assignment()
             .and_then(|a| a.role.as_ref())
-            .map(|r| r.history.iter().rev().take(4).map(|t| (t.term, t.takeover.get(usize::from(p)).copied().unwrap_or(0))).collect())
+            .map(|r| {
+                r.history
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .map(|t| (t.term, t.takeover.get(usize::from(p)).copied().unwrap_or(0)))
+                    .collect()
+            })
             .unwrap_or_default();
-        let Some(pr) = cw.part(p) else { return PartitionMeta::initial(p) };
+        let Some(pr) = cw.part(p) else {
+            return PartitionMeta::initial(p);
+        };
         let commit = match &pr.role {
             Role::Primary(pp) => pp.sender.commit_seq(),
             Role::Member(m) => m.stream.commit().min(pr.durable.upto()),
@@ -1928,7 +2631,10 @@ impl<B: Backend> Worker<B> {
                         let m = i as MemberId;
                         let Some(io) = &x.stream else { continue };
                         if pp.sender.overrun(m) {
-                            tracing::info!(partition = p, "a member fell behind the backlog: its stream restarts");
+                            tracing::info!(
+                                partition = p,
+                                "a member fell behind the backlog: its stream restarts"
+                            );
                             io.abort();
                             continue;
                         }
@@ -1943,11 +2649,17 @@ impl<B: Backend> Worker<B> {
                     let lag = pp.sender.lagging(now, ack_timeout);
                     let mut recount = false;
                     for m in lag {
-                        let Some(x) = pp.peers.get_mut(usize::from(m)) else { continue };
+                        let Some(x) = pp.peers.get_mut(usize::from(m)) else {
+                            continue;
+                        };
                         if x.in_isr {
                             if now.saturating_sub(x.last_shrink_ns) >= 100_000_000 {
                                 x.last_shrink_ns = now;
-                                reports.push(AgentMsg::Shrink { shard, term, member: x.node });
+                                reports.push(AgentMsg::Shrink {
+                                    shard,
+                                    term,
+                                    member: x.node,
+                                });
                             }
                         } else if x.expanding {
                             x.expanding = false;
@@ -1956,7 +2668,12 @@ impl<B: Backend> Worker<B> {
                     }
                     for (i, x) in pp.peers.iter_mut().enumerate() {
                         let m = i as MemberId;
-                        let eligible = x.present && !x.in_isr && !matches!(x.state, MemberState::Syncing | MemberState::NeedsFullSync);
+                        let eligible = x.present
+                            && !x.in_isr
+                            && !matches!(
+                                x.state,
+                                MemberState::Syncing | MemberState::NeedsFullSync
+                            );
                         if eligible && !x.expanding && pp.sender.caught_up(m) {
                             x.expanding = true;
                             recount = true;
@@ -1968,12 +2685,23 @@ impl<B: Backend> Worker<B> {
                         let counted = x.expanding || x.in_isr;
                         if counted != x.reported_counted && !x.in_isr {
                             x.reported_counted = counted;
-                            reports.push(AgentMsg::Expand { shard, term, member: x.node, partition: p, counted });
+                            reports.push(AgentMsg::Expand {
+                                shard,
+                                term,
+                                member: x.node,
+                                partition: p,
+                                counted,
+                            });
                         }
                     }
                     if recount {
-                        let counted: Vec<MemberId> =
-                            pp.peers.iter().enumerate().filter(|(_, x)| x.present && (x.in_isr || x.expanding)).map(|(i, _)| i as MemberId).collect();
+                        let counted: Vec<MemberId> = pp
+                            .peers
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, x)| x.present && (x.in_isr || x.expanding))
+                            .map(|(i, _)| i as MemberId)
+                            .collect();
                         pp.sender.set_isr(&counted);
                     }
                     // committed replies
@@ -2011,7 +2739,10 @@ impl<B: Backend> Worker<B> {
                     if refused.is_some() {
                         self.commit_released(w, refused);
                     } else if below_min {
-                        self.commit_released(w, Some(b"NOREPLICAS Not enough good replicas to write."));
+                        self.commit_released(
+                            w,
+                            Some(b"NOREPLICAS Not enough good replicas to write."),
+                        );
                     } else {
                         self.commit_released(w, None);
                     }
@@ -2024,7 +2755,10 @@ impl<B: Backend> Worker<B> {
                     && let Role::Member(m) = &mut pr.role
                 {
                     if m.io.is_some() && now.saturating_sub(m.last_rx_ns) >= MEMBER_IDLE_NS {
-                        tracing::info!(partition = p, "no frame from the primary: the stream is redialed");
+                        tracing::info!(
+                            partition = p,
+                            "no frame from the primary: the stream is redialed"
+                        );
                         if let Some(io) = &m.io {
                             io.abort();
                         }
@@ -2043,7 +2777,12 @@ impl<B: Backend> Worker<B> {
                     {
                         m.ready_reported = Some(true);
                         pr.last_term = pr.last_term.max(t);
-                        cs.tell_agent(AgentMsg::PartReady { shard: m.shard, term: m.term, partition: p, ready: true });
+                        cs.tell_agent(AgentMsg::PartReady {
+                            shard: m.shard,
+                            term: m.term,
+                            partition: p,
+                            ready: true,
+                        });
                     }
                 }
             }
@@ -2056,12 +2795,14 @@ impl<B: Backend> Worker<B> {
                         Role::Idle => pr.persisted.1,
                     };
                     let flags = if pr.syncing { PMETA_SYNCING } else { 0 };
-                    pr.meta_wait.is_none() && (pr.durable.upto(), commit, flags, pr.last_term) != pr.persisted
+                    pr.meta_wait.is_none()
+                        && (pr.durable.upto(), commit, flags, pr.last_term) != pr.persisted
                 });
                 if changed {
                     let token = cw.cs.token(REPL_TOKEN_BIT);
                     let pm = self.part_meta(cw, p);
-                    self.backend.meta_request(p, token, MetaReq::PartitionMeta { m: pm });
+                    self.backend
+                        .meta_request(p, token, MetaReq::PartitionMeta { m: pm });
                 }
             }
         }
@@ -2069,7 +2810,10 @@ impl<B: Backend> Worker<B> {
             && !handoff_open
         {
             cw.handoff = None;
-            cw.cs.tell_agent(AgentMsg::HandoffReached { req, last: handoff_last });
+            cw.cs.tell_agent(AgentMsg::HandoffReached {
+                req,
+                last: handoff_last,
+            });
         }
     }
 
@@ -2077,8 +2821,12 @@ impl<B: Backend> Worker<B> {
     // purge of slots this primary does not serve
 
     fn plan_purge(&mut self, cw: &mut ClusterWorker, p: u16) {
-        let Some(a) = cw.assignment().cloned() else { return };
-        let Some(r) = a.role.as_ref().filter(|r| r.is_primary) else { return };
+        let Some(a) = cw.assignment().cloned() else {
+            return;
+        };
+        let Some(r) = a.role.as_ref().filter(|r| r.is_primary) else {
+            return;
+        };
         let mut keep = r.owned_slots.clone();
         for t in &r.migrations {
             let active = match t {
@@ -2091,12 +2839,19 @@ impl<B: Backend> Worker<B> {
                 }
             }
         }
-        let doomed: Vec<u16> = slots_of(p, self.shared.partitions).into_iter().filter(|&s| !keep.contains(s) && self.backend.slot_len(p, 0, s) > 0).collect();
+        let doomed: Vec<u16> = slots_of(p, self.shared.partitions)
+            .into_iter()
+            .filter(|&s| !keep.contains(s) && self.backend.slot_len(p, 0, s) > 0)
+            .collect();
         let Some(pr) = cw.part(p) else { return };
         if doomed.is_empty() {
             pr.purge = None;
         } else if pr.purge.is_none() {
-            tracing::info!(partition = p, slots = doomed.len(), "purging keys of slots this shard no longer serves");
+            tracing::info!(
+                partition = p,
+                slots = doomed.len(),
+                "purging keys of slots this shard no longer serves"
+            );
             pr.purge = Some((KeyWalk::new(doomed), false));
         }
     }
@@ -2105,7 +2860,9 @@ impl<B: Backend> Worker<B> {
         let submit;
         {
             let Some(pr) = cw.part(p) else { return };
-            let Some((walk, _)) = &mut pr.purge else { return };
+            let Some((walk, _)) = &mut pr.purge else {
+                return;
+            };
             if walk.busy {
                 return;
             }
@@ -2115,8 +2872,25 @@ impl<B: Backend> Worker<B> {
             }
             walk.busy = true;
             let slot = walk.slots[walk.idx];
-            let req = Request { db: 0, keys: SmallVec::new(), kind: ReqKind::SlotIter { slot, fp_from: walk.fp_from as u32, max_entries: WALK_KEYS }, origin: Origin::Client };
-            submit = Some((req, ReplJob { work: ReplWork::Walk, then: Then::Listed { walker: Walker::Purge } }));
+            let req = Request {
+                db: 0,
+                keys: SmallVec::new(),
+                kind: ReqKind::SlotIter {
+                    slot,
+                    fp_from: walk.fp_from as u32,
+                    max_entries: WALK_KEYS,
+                },
+                origin: Origin::Client,
+            };
+            submit = Some((
+                req,
+                ReplJob {
+                    work: ReplWork::Walk,
+                    then: Then::Listed {
+                        walker: Walker::Purge,
+                    },
+                },
+            ));
         }
         if let Some((req, rj)) = submit {
             self.submit_repl(cw, p, req, rj);
@@ -2125,9 +2899,20 @@ impl<B: Backend> Worker<B> {
 
     /// Whether a write on `slot` may still execute here as the shard primary (the owner-side
     /// re-check of the gate at execution time).
-    pub(crate) fn owner_refuses(&self, flags: CmdFlags, slot: Option<u16>, env: &ExecEnv) -> Option<super::ownership::Gate> {
+    pub(crate) fn owner_refuses(
+        &self,
+        flags: CmdFlags,
+        slot: Option<u16>,
+        env: &ExecEnv,
+    ) -> Option<super::ownership::Gate> {
         let lease_ok = self.shared.lease.valid(self.now.boot_ns);
-        let g = self.shared.ownership.read().gate(slot, flags, env.readonly_conn, lease_ok, env.conn_id);
+        let g = self.shared.ownership.read().gate(
+            slot,
+            flags,
+            env.readonly_conn,
+            lease_ok,
+            env.conn_id,
+        );
         (g != super::ownership::Gate::Serve).then_some(g)
     }
 }
@@ -2172,7 +2957,10 @@ mod tests {
         assert!(w.passed(3, u32::MAX) && !w.passed(19, 0));
         w.skip_empty(&|s| if s == 19 { 0 } else { 5 });
         assert_eq!(w.idx, 2);
-        assert!(w.passed(19, u32::MAX), "an empty slot is passed when skipped");
+        assert!(
+            w.passed(19, u32::MAX),
+            "an empty slot is passed when skipped"
+        );
         w.listed(1 << 32);
         assert!(w.done());
         assert!(w.passed(35, u32::MAX));
@@ -2182,13 +2970,38 @@ mod tests {
 
     #[test]
     fn group_facts() {
-        let g = Group { seq: Seq(9), ops: vec![Op::Put { db: 0, vtype: 1, expire_at: 0, key: b"{a}1".as_slice().into(), value: vec![1] }] };
+        let g = Group {
+            seq: Seq(9),
+            ops: vec![Op::Put {
+                db: 0,
+                vtype: 1,
+                expire_at: 0,
+                key: b"{a}1".as_slice().into(),
+                value: vec![1],
+            }],
+        };
         assert_eq!(group_slot(&g), Some(kv_common::key_slot(b"a")));
         assert!(!is_wide(&g));
         assert_eq!(group_fps(&g, 7).len(), 1);
-        let f = Group { seq: Seq(10), ops: vec![Op::FlushDb { db: None }] };
+        let f = Group {
+            seq: Seq(10),
+            ops: vec![Op::FlushDb { db: None }],
+        };
         assert!(is_wide(&f) && group_slot(&f).is_none());
-        let ops = vec![Op::Put { db: 0, vtype: 1, expire_at: 0, key: b"k".as_slice().into(), value: vec![] }, Op::Append { db: 0, key: b"k".as_slice().into(), data: vec![] }];
+        let ops = vec![
+            Op::Put {
+                db: 0,
+                vtype: 1,
+                expire_at: 0,
+                key: b"k".as_slice().into(),
+                value: vec![],
+            },
+            Op::Append {
+                db: 0,
+                key: b"k".as_slice().into(),
+                data: vec![],
+            },
+        ];
         assert_eq!(op_keys(&ops, false).len(), 1, "one entry per key");
     }
 }

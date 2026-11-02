@@ -44,7 +44,15 @@ impl MigrationSource {
         let mut slots = slots.to_vec();
         slots.sort_unstable();
         slots.dedup();
-        MigrationSource { id, slots, pos: WalkPos(0), barriers_total: barriers, recorded: Vec::new(), walk_complete: false, ready: false }
+        MigrationSource {
+            id,
+            slots,
+            pos: WalkPos(0),
+            barriers_total: barriers,
+            recorded: Vec::new(),
+            walk_complete: false,
+            ready: false,
+        }
     }
 
     pub fn id(&self) -> u64 {
@@ -120,7 +128,9 @@ impl MigrationSource {
             return false;
         }
         while !self.ready {
-            let Some(&current) = self.recorded.last() else { return false };
+            let Some(&current) = self.recorded.last() else {
+                return false;
+            };
             if acked < current {
                 break;
             }
@@ -141,7 +151,11 @@ impl MigrationSource {
 
 impl MigrationDest {
     pub fn new(id: u64) -> Self {
-        MigrationDest { id, committed_src: Seq(0), seal_at: None }
+        MigrationDest {
+            id,
+            committed_src: Seq(0),
+            seal_at: None,
+        }
     }
 
     pub fn id(&self) -> u64 {
@@ -183,7 +197,10 @@ mod tests {
         assert!(!m.passed(7, 0), "nothing passed yet");
         m.advance(MigrationSource::position(0, 1000));
         assert!(m.passed(7, 999) && !m.passed(7, 1000));
-        assert!(!m.passed(12, 0) && !m.passed(5, 0), "later slots and other slots");
+        assert!(
+            !m.passed(12, 0) && !m.passed(5, 0),
+            "later slots and other slots"
+        );
         m.advance(MigrationSource::slot_start(0));
         assert!(m.passed(7, 999), "the walk never moves back");
         m.advance(MigrationSource::position(1, 1 << 32));
@@ -196,7 +213,10 @@ mod tests {
     #[test]
     fn barriers_complete_in_order_and_are_fixed_when_recorded() {
         let mut m = MigrationSource::new(1, &[3], 2);
-        assert!(!m.on_dest_committed(Seq::new(1, 1000), Seq::new(1, 1000)), "walk not done");
+        assert!(
+            !m.on_dest_committed(Seq::new(1, 1000), Seq::new(1, 1000)),
+            "walk not done"
+        );
         m.walk_done(Seq::new(1, 100));
         assert_eq!(m.barriers(), &[Seq::new(1, 100)]);
         // the destination is behind copy_end: nothing moves however far ahead the source is
@@ -209,7 +229,10 @@ mod tests {
         assert!(!m.on_dest_committed(Seq::new(1, 139), Seq::new(1, 900)));
         assert_eq!(m.barriers()[1], Seq::new(1, 140));
         assert!(!m.on_dest_committed(Seq::new(1, 140), Seq::new(1, 150)));
-        assert_eq!(m.barriers(), &[Seq::new(1, 100), Seq::new(1, 140), Seq::new(1, 150)]);
+        assert_eq!(
+            m.barriers(),
+            &[Seq::new(1, 100), Seq::new(1, 140), Seq::new(1, 150)]
+        );
         assert!(m.on_dest_committed(Seq::new(1, 150), Seq::new(1, 151)));
         assert!(m.is_ready());
         assert_eq!(m.barriers().len(), 3, "1 + k barriers");

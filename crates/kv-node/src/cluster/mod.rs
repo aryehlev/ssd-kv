@@ -122,11 +122,16 @@ pub enum AgentMsg {
         partition: u16,
         counted: bool,
     },
-    /// Primary: `member` has unacknowledged groups older than `repl-ack-timeout-ms`.
+    /// Primary: `member` has unacknowledged groups older than `repl-ack-timeout-ms` (the
+    /// oldest is `age_ns` old on the stall clock). The agent decides node-wide which lagging
+    /// members to ask the coordinator to drop (`kv_repl::primary::shrink_choice`).
     Shrink {
         shard: u16,
         term: u32,
         member: NodeId,
+        age_ns: u64,
+        /// How old a member that holds the ISR at `min_isr` may get before it is dropped.
+        keep_age_ns: u64,
     },
     /// Member: `partition` streams the current term after any repair or full sync (`ready`),
     /// or started one (`!ready`).

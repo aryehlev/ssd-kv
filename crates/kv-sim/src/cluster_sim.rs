@@ -2717,6 +2717,12 @@ impl Node {
                     .collect()
             })
             .unwrap_or_default();
+        let min_isr = self
+            .disk
+            .assignment
+            .as_ref()
+            .and_then(|a| a.role.as_ref())
+            .map_or(1, |r| usize::from(r.min_isr.max(1)));
         let ctrl = self.ctrl.map(|c| c.0);
         let NodeRole::Primary {
             shard,
@@ -2796,13 +2802,35 @@ impl Node {
         {
             *last_isr_msg = fx.now_l;
             let mut lag = BTreeSet::new();
+            // kv-node agent: node-wide, the oldest age of each lagging member over the
+            // partitions; it asks to drop only the members the ISR can lose while it keeps
+            // min_isr members, the others once they pass the keep bound
+            // (`kv_repl::primary::shrink_choice`)
+            let mut oldest: BTreeMap<MemberId, u64> = BTreeMap::new();
             for pp in parts.iter() {
-                lag.extend(pp.sender.lagging(run_now, ack_timeout));
+                for (m, age_ns) in pp.sender.lagging_ages(run_now, ack_timeout) {
+                    let e = oldest.entry(m).or_insert(0);
+                    *e = (*e).max(age_ns);
+                    lag.insert(m);
+                }
             }
+            let isr_ages: Vec<(MemberId, u64)> = mids
+                .iter()
+                .filter(|(n, _)| committed_isr.contains(n))
+                .filter_map(|(_, mid)| oldest.get(mid).map(|a| (*mid, *a)))
+                .collect();
+            let drop: BTreeSet<MemberId> = kv_repl::primary::shrink_choice(
+                &isr_ages,
+                1 + committed_isr.len(),
+                min_isr,
+                ack_timeout.saturating_mul(7) / 4,
+            )
+            .into_iter()
+            .collect();
             let mut recount = false;
             for (n, mid) in mids.iter() {
                 let in_isr = committed_isr.contains(n);
-                if in_isr && lag.contains(mid) {
+                if in_isr && drop.contains(mid) {
                     if trace_on() {
                         let at: Vec<String> = parts
                             .iter()

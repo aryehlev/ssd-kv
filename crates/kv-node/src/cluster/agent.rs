@@ -82,6 +82,9 @@ const HANDOFF_STUCK: Duration = Duration::from_secs(10);
 /// Longest wait of a primary that handed off to itself (a term raise) for the assignment of the
 /// new term; it serves writes again after it.
 const TERM_RAISE_LIMIT: Duration = Duration::from_secs(2);
+/// How long a partition's lag report of a member counts for the node-wide shrink choice (each
+/// lagging partition reports every 100 ms).
+const LAG_REPORT_WINDOW: Duration = Duration::from_millis(150);
 /// Longest wait of a shutting-down primary for its handoff (the coordinator's handoff bound is
 /// 5 s): after it the node shuts down anyway and its shard fails over by lease expiry.
 const SHUTDOWN_HANDOFF_LIMIT: Duration = Duration::from_secs(8);
@@ -218,6 +221,8 @@ struct Agent {
     /// committed ISR does not show it; readiness itself is in `ClusterShared::expand_gate`).
     expand_sent: hashbrown::HashMap<NodeId, std::time::Instant, foldhash::fast::RandomState>,
     shrink_sent: hashbrown::HashMap<NodeId, std::time::Instant, foldhash::fast::RandomState>,
+    /// Lagging ISR members as the partitions reported them lately: `(oldest age, when)`.
+    lagging: hashbrown::HashMap<NodeId, (u64, std::time::Instant), foldhash::fast::RandomState>,
     /// When the last `HandoffRequest` of a shutting-down primary was sent.
     handoff_requested: Option<std::time::Instant>,
     resync_sent: hashbrown::HashMap<NodeId, std::time::Instant, foldhash::fast::RandomState>,
@@ -246,6 +251,7 @@ impl Agent {
             handoffs: Default::default(),
             expand_sent: Default::default(),
             shrink_sent: Default::default(),
+            lagging: Default::default(),
             handoff_requested: None,
             resync_sent: Default::default(),
             ready: (0, Gather::new(p)),
@@ -710,19 +716,57 @@ impl Agent {
                 shard,
                 term,
                 member,
+                age_ns,
+                keep_age_ns,
             } => {
-                let due = self
-                    .shrink_sent
-                    .get(&member)
-                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(200));
-                if due {
-                    self.shrink_sent.insert(member, std::time::Instant::now());
-                    tracing::info!(member = %member.hex40(), "replica is not acknowledging: ISR shrink requested");
-                    self.send_all(&NodeToCoord::IsrShrink {
-                        shard: ShardId(shard),
-                        term,
-                        member,
-                    });
+                let a = self.cs.assignment();
+                let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) else {
+                    return;
+                };
+                if !role.is_primary || role.shard.0 != shard || role.term != term {
+                    return;
+                }
+                // node-wide: the oldest age any partition reported lately for each member, so
+                // that every partition's report leads to the same choice
+                let now = std::time::Instant::now();
+                self.lagging
+                    .retain(|_, (_, at)| now.duration_since(*at) < LAG_REPORT_WINDOW);
+                let e = self.lagging.entry(member).or_insert((0, now));
+                if age_ns >= e.0 {
+                    *e = (age_ns, now);
+                }
+                let ages: Vec<(u16, u64)> = role
+                    .members
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, in_isr))| *in_isr)
+                    .filter_map(|(i, (n, _, _))| self.lagging.get(n).map(|(age, _)| (i as u16, *age)))
+                    .collect();
+                let isr_len = 1 + role.members.iter().filter(|(_, _, in_isr)| *in_isr).count();
+                let chosen = kv_repl::primary::shrink_choice(
+                    &ages,
+                    isr_len,
+                    usize::from(role.min_isr.max(1)),
+                    keep_age_ns,
+                );
+                for i in chosen {
+                    let Some((member, _, _)) = role.members.get(usize::from(i)) else {
+                        continue;
+                    };
+                    let member = *member;
+                    let due = self
+                        .shrink_sent
+                        .get(&member)
+                        .is_none_or(|t| t.elapsed() >= Duration::from_millis(200));
+                    if due {
+                        self.shrink_sent.insert(member, now);
+                        tracing::info!(member = %member.hex40(), "replica is not acknowledging: ISR shrink requested");
+                        self.send_all(&NodeToCoord::IsrShrink {
+                            shard: ShardId(shard),
+                            term,
+                            member,
+                        });
+                    }
                 }
             }
             AgentMsg::NeedsResync {

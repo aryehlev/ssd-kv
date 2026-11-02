@@ -25,6 +25,9 @@
 //!   purge advance by position barriers on their own shard's commit point, so neither shard's
 //!   members ever lag past `repl-ack-timeout-ms` (no ISR shrink), and a kill -9 of the source
 //!   primary right after it fails over at once.
+//! * `both_members_stalling_together_cost_latency_not_errors`: SIGSTOP of both members of a
+//!   `min_isr` 2 shard for 800 ms under writes fails no write (the member that holds the ISR
+//!   at `min_isr` is dropped only after a longer bound).
 //! * `a_replica_moved_to_a_shard_of_a_lower_term_syncs`: a node removed from a shard whose term
 //!   was raised by failovers and added to a shard of a lower term syncs with the new primary
 //!   and serves it (fence terms count per shard).
@@ -1424,6 +1427,95 @@ fn migration_resume_prunes_keys_deleted_at_the_source() {
 }
 
 /// The coordinator a data node's MOVED reply names for `key`, on one fresh connection.
+/// Both members of a shard with `min_isr` 2 stall together for a fraction of a second (a
+/// host disk or scheduling hiccup, SIGSTOP here) under writes: the writes wait for them and
+/// none fails. The primary used to ask for both members to leave the ISR at
+/// `repl-ack-timeout-ms`, leaving it below `min_isr` (every write `-NOREPLICAS`) until they
+/// expanded back; now the member that holds the ISR at `min_isr` stays until a longer bound.
+#[test]
+fn both_members_stalling_together_cost_latency_not_errors() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("stall2", 3, Duration::from_secs(300));
+    let ids: Vec<String> = c.nodes.iter().map(|n| n.id.clone()).collect();
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &ids[0], "--min-isr", "2"]);
+    c.admin(&["SLOTS", "ASSIGN", "0-16383", "1"]);
+    c.wait_primary(0, 30);
+    c.admin(&["REPLICA", "ADD", "1", &ids[1]]);
+    c.admin(&["REPLICA", "ADD", "1", &ids[2]]);
+    c.wait_member(1, "in-sync isr", 60);
+    c.wait_member(2, "in-sync isr", 60);
+    let coords = c.coord_clients();
+    let stop = Arc::new(AtomicBool::new(false));
+    // four writers keep writes in flight on many partitions throughout the stalls
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let (s2, cl) = (stop.clone(), coords.clone());
+            std::thread::spawn(move || {
+                let mut r = Routed::new(cl);
+                let mut errors: Vec<String> = Vec::new();
+                let mut acked = Vec::new();
+                let mut slowest = Duration::ZERO;
+                let mut i = 0u64;
+                while !s2.load(Ordering::Acquire) {
+                    i += 1;
+                    let k = format!("st2:{w}:{}", i % 300);
+                    let v = format!("v{i}");
+                    let t0 = Instant::now();
+                    match r.exec(k.as_bytes(), &[b"SET", k.as_bytes(), v.as_bytes()]) {
+                        Outcome::Ok(Value::Simple(ok)) if ok == b"OK" => {
+                            slowest = slowest.max(t0.elapsed());
+                            acked.push((k, v));
+                        }
+                        Outcome::Ok(other) => errors.push(text(&other)),
+                        Outcome::Failed(e) => errors.push(e),
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (acked, errors, slowest)
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(1500));
+    for _ in 0..2 {
+        c.pause_node(1, true);
+        c.pause_node(2, true);
+        std::thread::sleep(Duration::from_millis(800));
+        c.pause_node(1, false);
+        c.pause_node(2, false);
+        std::thread::sleep(Duration::from_millis(1500));
+        c.wait_member(1, "in-sync isr", 30);
+        c.wait_member(2, "in-sync isr", 30);
+    }
+    stop.store(true, Ordering::Release);
+    let (mut acked, mut errors, mut slowest) = (Vec::new(), Vec::new(), Duration::ZERO);
+    for w in writers {
+        let (a, e, sl) = w.join().unwrap();
+        acked.extend(a);
+        errors.extend(e);
+        slowest = slowest.max(sl);
+    }
+    eprintln!(
+        "writes: {} acknowledged, {} failed, slowest acknowledged {slowest:?}",
+        acked.len(),
+        errors.len()
+    );
+    assert!(
+        errors.is_empty(),
+        "{} writes failed during the stalls, e.g. {:?}",
+        errors.len(),
+        &errors[..errors.len().min(3)]
+    );
+    assert!(slowest < Duration::from_secs(1), "slowest write {slowest:?}");
+    // the last acknowledged value of every key is readable
+    let mut last: hashbrown::HashMap<String, String> = hashbrown::HashMap::new();
+    for (k, v) in acked {
+        last.insert(k, v);
+    }
+    let last: Vec<(String, String)> = last.into_iter().collect();
+    verify_acked(&coords, &last);
+    c.ok = true;
+}
+
 /// The committed term of shard `sid` (`kvadm status --json`).
 fn shard_term(c: &Cluster, sid: u16) -> u32 {
     let s = c.admin(&["STATUS", "--json"]);

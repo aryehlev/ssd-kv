@@ -1987,7 +1987,12 @@ RANDOMKEY), `slot_filter()`, which return decisions, not slot sets (lint, LC-24)
    still have taken effect: unacked). The 500 ms default leaves room for the sub-second stalls a busy or shared host
    gives a healthy member (a shrink there costs `-NOREPLICAS` under `min_isr` 2, and a shard with no promotable member
    if its primary then fails) while a write waiting on a dead member is still answered well within 1 s (timeout +
-   one coordinator commit + push).
+   one coordinator commit + push). The node decides which lagging members to report as one choice over all its
+   partitions (`kv_repl::primary::shrink_choice`, each member's oldest age over the partitions): members the committed
+   ISR can lose while it keeps `min_isr` members are reported at the timeout, oldest first; the youngest members that
+   hold the ISR at `min_isr` are reported only once they pass `1.75 x repl-ack-timeout-ms` (875 ms by default), since
+   dropping them would fail every write with `-NOREPLICAS`. A sub-second stall of every member together (a host disk
+   or scheduling hiccup) therefore costs latency, not errors; a dead member is still dropped within a second.
 5. **ISR expand:** a caught-up member (acked_durable >= commit_seq) -> the primary starts counting its acks, then
    sends `IsrExpand{shard, term, member}`; the coordinator commits; only then is the member promotable/advertised.
 6. `min_isr` counts the primary; defaults: RF1 1, RF2 1, RF3 2. `WAIT n t` replies the number of ISR members other

@@ -577,6 +577,15 @@ impl ReplSender {
     /// counting, so it is reported like any other. `now_ns` is the reading of the caller's
     /// [`StallClock`], the clock every stamp of this sender's age test was taken with.
     pub fn lagging(&self, now_ns: u64, timeout_ns: u64) -> SmallVec<[MemberId; 2]> {
+        self.lagging_ages(now_ns, timeout_ns)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect()
+    }
+
+    /// [`ReplSender::lagging`] with each member's age: how long ago (stall clock) the oldest
+    /// group it has not acknowledged was covered by the primary's own durability.
+    pub fn lagging_ages(&self, now_ns: u64, timeout_ns: u64) -> SmallVec<[(MemberId, u64); 2]> {
         let mut out = SmallVec::new();
         for &m in &self.isr {
             let (acked, since) = self
@@ -594,12 +603,40 @@ impl ReplSender {
                 Some(&(_, _, d)) if d != 0 => d.max(since),
                 _ => since,
             };
-            if now_ns.saturating_sub(t) > timeout_ns {
-                out.push(m);
+            let age_ns = now_ns.saturating_sub(t);
+            if age_ns > timeout_ns {
+                out.push((m, age_ns));
             }
         }
         out
     }
+}
+
+/// The members of [`ReplSender::lagging_ages`] a primary asks the coordinator to drop from the
+/// ISR (§23.8 step 4). Dropping a member costs nothing while the committed ISR keeps `min_isr`
+/// members (writes go on without it); dropping one of the members that hold the ISR at
+/// `min_isr` makes every write fail with NOREPLICAS until it is back, so those (the youngest:
+/// the ones that acknowledged most recently) are dropped only once their age passes
+/// `keep_age_ns`. A sub-second stall of every member (a host disk or scheduling hiccup) then
+/// costs latency, not errors, and a dead member is still dropped well within a second.
+/// `isr_len` counts the committed ISR with the primary. Ages are failure-detection times, never
+/// load figures (LC-36).
+pub fn shrink_choice(
+    ages: &[(MemberId, u64)],
+    isr_len: usize,
+    min_isr: usize,
+    keep_age_ns: u64,
+) -> SmallVec<[MemberId; 2]> {
+    let mut by_age: SmallVec<[(MemberId, u64); 4]> = ages.iter().copied().collect();
+    // oldest first; equal ages in member order, so that every partition picks alike
+    by_age.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let spare = isr_len.saturating_sub(min_isr.max(1));
+    by_age
+        .into_iter()
+        .enumerate()
+        .filter(|&(i, (_, age_ns))| i < spare || age_ns > keep_age_ns)
+        .map(|(_, (m, _))| m)
+        .collect()
 }
 
 #[cfg(test)]
@@ -634,6 +671,43 @@ mod tests {
             out.push(f);
         }
         out
+    }
+
+    /// Lagging members beyond `min_isr` go at once; the ones that hold the ISR at `min_isr`
+    /// stay until their age passes the keep bound (writes wait instead of failing).
+    #[test]
+    fn shrink_keeps_the_members_min_isr_needs_until_the_keep_bound() {
+        let ms = 1_000_000;
+        // RF3, min ISR 2: one of two lagging members may go (the older one)
+        assert_eq!(
+            shrink_choice(&[(1, 600 * ms), (2, 700 * ms)], 3, 2, 875 * ms).as_slice(),
+            &[2]
+        );
+        assert_eq!(
+            shrink_choice(&[(1, 900 * ms), (2, 700 * ms)], 3, 2, 875 * ms).as_slice(),
+            &[1],
+            "the younger one holds the ISR at min_isr"
+        );
+        assert_eq!(
+            shrink_choice(&[(1, 900 * ms), (2, 880 * ms)], 3, 2, 875 * ms).as_slice(),
+            &[1, 2],
+            "past the keep bound"
+        );
+        // one lagging member of RF3 min 2: it may go
+        assert_eq!(shrink_choice(&[(2, 600 * ms)], 3, 2, 875 * ms).as_slice(), &[2]);
+        // RF2 min 2: the only member stays until the keep bound
+        assert!(shrink_choice(&[(1, 600 * ms)], 2, 2, 875 * ms).is_empty());
+        assert_eq!(shrink_choice(&[(1, 876 * ms)], 2, 2, 875 * ms).as_slice(), &[1]);
+        // min ISR 1: every lagging member goes at once
+        assert_eq!(
+            shrink_choice(&[(1, 600 * ms), (2, 501 * ms)], 3, 1, 875 * ms).as_slice(),
+            &[1, 2]
+        );
+        // equal ages: member order decides, alike in every partition
+        assert_eq!(
+            shrink_choice(&[(2, 600 * ms), (1, 600 * ms)], 3, 2, 875 * ms).as_slice(),
+            &[1]
+        );
     }
 
     #[test]

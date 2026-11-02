@@ -2893,10 +2893,10 @@ impl<B: Backend> Worker<B> {
                         }
                     }
                     // ISR shrink requests and expands (age tests and position tests only)
-                    let lag = pp.sender.lagging(run_now, ack_timeout);
+                    let ages = pp.sender.lagging_ages(run_now, ack_timeout);
                     let mut recount = false;
                     let gate = &cs.expand_gate;
-                    for m in lag {
+                    for (m, age_ns) in ages {
                         let Some(x) = pp.peers.get_mut(usize::from(m)) else {
                             continue;
                         };
@@ -2916,6 +2916,8 @@ impl<B: Backend> Worker<B> {
                                     shard,
                                     term,
                                     member: x.node,
+                                    age_ns,
+                                    keep_age_ns: ack_timeout.saturating_mul(7) / 4,
                                 });
                             }
                         } else if x.expanding && gate.set(x.node, term, p, partitions, false) {

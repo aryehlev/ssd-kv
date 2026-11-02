@@ -93,10 +93,10 @@ fn spare_ags_never_take_the_space_of_a_first_write() {
     let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
     eng.recover().unwrap();
     let mut db = Db::new(eng, T0);
-    let mut parts = std::collections::BTreeSet::new();
+    let mut parts = [false; 64];
     for i in 0..1200u64 {
         let k = format!("key:{i}");
-        parts.insert(db.eng.partition_of(k.as_bytes()));
+        parts[usize::from(db.eng.partition_of(k.as_bytes()))] = true;
         let len = if i % 2 == 0 { 2048 + (i as usize * 37) % 14_000 } else { 1 + (i as usize * 13) % 300 };
         match db.set(0, k.as_bytes(), &value(i, len), None) {
             Ok(t) => {
@@ -105,7 +105,7 @@ fn spare_ags_never_take_the_space_of_a_first_write() {
             Err(e) => panic!("write {i} ({len} bytes, partition {}): {e:?}", db.eng.partition_of(k.as_bytes())),
         }
     }
-    assert_eq!(parts.len(), 64, "every partition wrote");
+    assert!(parts.iter().all(|&w| w), "every partition wrote");
     let (used, total) = db.eng.meta().ag_usage();
     assert!(used <= total, "{used} of {total}");
     db.quiesce();

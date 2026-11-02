@@ -1139,8 +1139,33 @@ impl PartitionStore {
             }
         }
         for (db, k, e) in self.core.stale.iter() {
-            let h = KeyHash::of(self.core.cfg.hash_seed, k).h32() & 0xffff;
+            let kh = KeyHash::of(self.core.cfg.hash_seed, k);
+            let h = kh.h32() & 0xffff;
             out.push_str(&format!("\n  stale db={db} k={h:04x} klen={} at={:#x} {:?} seq={:#x} older={} fg={}", k.len(), e.at.page().0, e.state, e.seq.0, e.older, e.foreground));
+            // the page behind a tracked small copy: what its writer would do with the copy
+            if let StaleRef::Small { page } = e.at {
+                match cache.page_state(page) {
+                    None => out.push_str(&format!(" page=uncached load={}", self.core.loads.contains_key(&page))),
+                    Some(st) => {
+                        let fmt = |recs: &[RecDesc], img: &[u8; PAGE]| {
+                            recs.iter().filter(|r| r.db == db && r.h32 == kh.h32() && r.key(img) == k).map(|r| format!("{:?}@{:#x}/txn{}", r.status, r.seq.0, r.txn)).collect::<Vec<_>>().join(",")
+                        };
+                        let m = fmt(&st.recs, cache.frame(st.m_frame));
+                        let n = st.inflight.as_ref().map(|i| fmt(&i.recs, cache.frame(i.n_frame)));
+                        out.push_str(&format!(
+                            " page: m=[{m}] inflight={:?} pending={} dirty={} scrub={} queued={} retry={} deferred={} corrupt={}",
+                            n,
+                            st.pending.len(),
+                            st.dirty,
+                            st.scrub,
+                            self.core.dirty.contains(&page),
+                            self.core.retry.contains(&page),
+                            self.core.deferred.contains(&page),
+                            st.corrupt
+                        ));
+                    }
+                }
+            }
         }
         for (t, o) in &self.core.txns {
             out.push_str(&format!("\n  txn {t} keys={} pages={} requested={} local={}", o.keys.len(), o.pages.len(), o.requested, o.local));

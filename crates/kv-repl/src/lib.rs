@@ -16,7 +16,6 @@
 //!   [`migrate`]: migration source/destination state.
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
-#![allow(dead_code, unused_variables)]
 
 pub use kv_storage::effect::{Group, Op};
 pub use kv_storage::layout::Seq;

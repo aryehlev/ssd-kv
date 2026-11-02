@@ -9,10 +9,13 @@
 //! to an `IsrShrink` request to the coordinator; the primary keeps waiting for that member until
 //! the committed assignment drops it (§23.8).
 //!
-//! Members are attached when their handshake completes: `Continue { from }` and
-//! `Repair { at }` stream groups from the backlog (from `from`, respectively `at + 1`, after the
-//! repair images); `Full { at }` attaches the member without streaming (the full-sync walk
-//! feeds it) until [`ReplSender::resume`] starts the backlog stream after the walk.
+//! Members are attached when their handshake completes: `Continue { from }` streams groups from
+//! the backlog from `from`. `Repair { at }` and `Full { at }` attach the member without backlog
+//! streaming: during the repair images or the full-sync walk the caller writes every frame in
+//! the partition's execution order (images or snapshot records as they are read, groups as they
+//! are executed), so that nothing a later frame already contains is applied twice;
+//! [`ReplSender::resume`] then starts the backlog stream after the position the direct frames
+//! reached.
 
 use std::collections::VecDeque;
 
@@ -166,12 +169,8 @@ impl ReplSender {
                 // the member's handshake position is durable there (a persisted lower bound)
                 s.acked_durable = s.acked_durable.max(before);
             }
-            AcceptMode::Repair { at } => {
-                // the images bring the member to `at`; groups follow from `at + 1`
-                s.streaming = true;
-                s.sent = at;
-            }
-            AcceptMode::Full { at } => {
+            AcceptMode::Repair { at } | AcceptMode::Full { at } => {
+                // fed directly by the caller until `resume`
                 s.streaming = false;
                 s.sent = at;
             }
@@ -268,6 +267,16 @@ impl ReplSender {
     /// point (§23.8 step 5).
     pub fn caught_up(&self, m: MemberId) -> bool {
         self.slot(m).is_some_and(|s| s.attached && s.streaming && s.acked_durable >= self.commit_seq())
+    }
+
+    /// The member is attached and fed directly (repair images or a full-sync walk).
+    pub fn direct(&self, m: MemberId) -> bool {
+        self.slot(m).is_some_and(|s| s.attached && !s.streaming)
+    }
+
+    /// Members currently attached.
+    pub fn attached(&self) -> SmallVec<[MemberId; 4]> {
+        self.members.iter().filter(|s| s.attached).map(|s| s.id).collect()
     }
 
     /// The backlog no longer holds a group the member still needs: its stream must restart.

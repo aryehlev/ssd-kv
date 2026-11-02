@@ -9,13 +9,20 @@
 //!
 //! Stream shapes after `Accept`:
 //! * `Continue { from }`: `GROUPS`/`COMMIT`/`HEARTBEAT` frames.
-//! * `Repair { at }`: `IMAGE` frames (applied with seq `at`), `SYNC_DONE { at }` (the images are
-//!   complete: [`MemberAction::RepairDone`]), then groups after `at`.
+//! * `Repair { at }`: the member answers with `REPAIR_KEYS` ([`MemberAction::SendRepairKeys`]:
+//!   the keys of its own groups after its term's takeover point); then `IMAGE` frames (applied
+//!   unconditionally, stamped `at`) interleaved, in the primary's execution order, with every
+//!   group the primary executes meanwhile; `SYNC_DONE { end }` (the images are complete:
+//!   [`MemberAction::RepairDone`]); then groups after `end`.
 //! * `Full { at }`: per slot `SNAP_BEGIN`, `SNAP_REC`s, `SNAP_END`, interleaved with the groups of
 //!   keys the walk has passed, then `SYNC_DONE { end }` and groups after `end`.
+//! * Migration destination (§23.13): like `Full`; after `SYNC_DONE { copy_end }` the source's
+//!   `COMMIT { position }` frames are position markers, and `SEAL` ends the stream.
 //!
 //! Snapshot records are stamped `max(at, seq of the last FlushDb received during the walk)`, so
-//! a flush cutoff never hides a record written after it.
+//! a flush cutoff never hides a record written after it. Accepting a `Repair` or `Full` stream
+//! resets the received-groups ring to start after `at` (the ring then covers only groups this
+//! member really received; images and snapshot records are not groups).
 
 use std::collections::VecDeque;
 
@@ -44,6 +51,8 @@ pub enum MemberAction {
     /// Repair: every image was sent; the member's state equals the primary's at `at` once they
     /// are durable.
     RepairDone(Seq),
+    /// Migration destination: the source sealed the migration at its position `last`.
+    Seal { mig: u64, last: Seq },
 }
 
 pub struct MemberStream {
@@ -158,12 +167,19 @@ impl MemberStream {
                 self.mode = Some(mode);
                 match mode {
                     AcceptMode::Continue { from } => {
-                        self.applied = Seq(from.0.saturating_sub(1)).max(self.applied.min(Seq(from.0.saturating_sub(1))));
+                        // groups from `from` follow; the member applied everything before it
                         self.applied = Seq(from.0.saturating_sub(1));
                     }
-                    AcceptMode::Repair { .. } => {}
+                    AcceptMode::Repair { at } => {
+                        // groups after `at` follow (interleaved with the images)
+                        self.applied = at;
+                        self.push(MemberAction::SendRepairKeys);
+                    }
                     AcceptMode::Full { at } => {
+                        self.applied = at;
                         self.snap_seq = at;
+                        self.received.clear();
+                        self.received.start_after(at);
                         self.push(MemberAction::SyncBegin(at));
                     }
                 }
@@ -224,7 +240,7 @@ impl MemberStream {
                     self.handle(inner)?;
                 }
             }
-            Frame::Seal { .. } => {}
+            Frame::Seal { mig, last } => self.push(MemberAction::Seal { mig, last }),
             Frame::Hello(_) | Frame::Ack { .. } | Frame::RepairKeys(_) => return Err(FrameError::Malformed),
         }
         Ok(())
@@ -246,6 +262,19 @@ impl MemberStream {
 
     pub fn received(&self) -> &Backlog {
         &self.received
+    }
+
+    /// After the member computed its `REPAIR_KEYS` from the ring: the ring restarts after `at`
+    /// (groups at or below `at` are now represented by images, not by groups).
+    pub fn reset_received(&mut self, at: Seq) {
+        self.received.clear();
+        self.received.start_after(at);
+    }
+
+    /// Takes the received-groups ring (a member promoted to primary keeps it for Repair key
+    /// sets of members of the term it took over, §23.7 (b)).
+    pub fn into_received(self) -> Backlog {
+        self.received
     }
 }
 
@@ -296,7 +325,8 @@ mod tests {
     #[test]
     fn repair_and_full_sync_shapes() {
         let mut m = MemberStream::new(0, 1 << 16);
-        m.on_frame(Frame::Accept { term: 3, mode: AcceptMode::Repair { at: Seq::new(3, 9) } }).unwrap();
+        assert!(matches!(m.on_frame(Frame::Accept { term: 3, mode: AcceptMode::Repair { at: Seq::new(3, 9) } }).unwrap(), MemberAction::SendRepairKeys));
+        assert_eq!(m.applied(), Seq::new(3, 9));
         let img = ImageRec { db: 0, key: b"a".as_slice().into(), image: None };
         assert!(matches!(m.on_frame(Frame::Image(img)).unwrap(), MemberAction::Image(_, s) if s == Seq::new(3, 9)));
         assert!(matches!(m.on_frame(Frame::SyncDone { at: Seq::new(3, 9) }).unwrap(), MemberAction::RepairDone(_)));
@@ -315,6 +345,10 @@ mod tests {
         assert!(matches!(m.on_frame(Frame::SnapEnd { slot: 7, count: 2 }).unwrap(), MemberAction::SnapEnd { slot: 7, count: 2 }));
         assert!(matches!(m.on_frame(Frame::SyncDone { at: Seq::new(2, 9) }).unwrap(), MemberAction::SyncDone(s) if s == Seq::new(2, 9)));
         assert_eq!(m.applied(), Seq::new(2, 9));
+        assert!(matches!(m.on_frame(Frame::Seal { mig: 5, last: Seq::new(2, 9) }).unwrap(), MemberAction::Seal { mig: 5, .. }));
+        // the ring restarted after `at`: it holds only the group received since
+        assert_eq!(m.received().first(), Some(Seq::new(2, 8)));
+        assert!(!m.received().covers_after(Seq::new(2, 4)));
     }
 
     #[test]

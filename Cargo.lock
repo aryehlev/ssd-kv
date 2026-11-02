@@ -892,11 +892,16 @@ dependencies = [
 name = "kv-repl"
 version = "0.1.0"
 dependencies = [
+ "foldhash",
+ "hashbrown 0.16.1",
  "kv-common",
+ "kv-index",
  "kv-storage",
  "proptest",
+ "redis",
  "smallvec",
  "static_assertions",
+ "tempfile",
 ]
 
 [[package]]

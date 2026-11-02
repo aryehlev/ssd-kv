@@ -179,6 +179,58 @@ impl Frame {
     }
 }
 
+/// Diagnostics show the frame kind, positions and sizes only: key, value and token bytes go
+/// through [`kv_common::Redacted`] (LC-32).
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use kv_common::Redacted;
+        match self {
+            Frame::Hello(h) => f
+                .debug_struct("Hello")
+                .field("shard", &h.shard)
+                .field("partition", &h.partition)
+                .field("fence_term", &h.fence_term)
+                .field("last_term", &h.last_term)
+                .field("applied", &h.applied)
+                .field("recovered", &h.recovered)
+                .field("learner", &h.learner)
+                .field("migration", &h.migration)
+                .finish_non_exhaustive(),
+            Frame::Accept { term, mode } => f.debug_struct("Accept").field("term", term).field("mode", mode).finish(),
+            Frame::Reject(r) => f.debug_tuple("Reject").field(r).finish(),
+            Frame::Groups(g) => f.debug_struct("Groups").field("bytes", &g.len()).finish(),
+            Frame::Commit(s) => f.debug_tuple("Commit").field(s).finish(),
+            Frame::Heartbeat(s) => f.debug_tuple("Heartbeat").field(s).finish(),
+            Frame::Ack { durable, applied } => f.debug_struct("Ack").field("durable", durable).field("applied", applied).finish(),
+            Frame::SnapBegin { slot } => f.debug_struct("SnapBegin").field("slot", slot).finish(),
+            Frame::SnapRec(r) => f
+                .debug_struct("SnapRec")
+                .field("db", &r.db)
+                .field("vtype", &r.vtype)
+                .field("key", &Redacted(&r.key))
+                .field("value", &Redacted(&r.value))
+                .finish_non_exhaustive(),
+            Frame::SnapEnd { slot, count } => f.debug_struct("SnapEnd").field("slot", slot).field("count", count).finish(),
+            Frame::SyncDone { at } => f.debug_struct("SyncDone").field("at", at).finish(),
+            Frame::RepairKeys(k) => f.debug_struct("RepairKeys").field("keys", &k.len()).finish(),
+            Frame::Image(i) => f
+                .debug_struct("Image")
+                .field("db", &i.db)
+                .field("key", &Redacted(&i.key))
+                .field("present", &i.image.is_some())
+                .finish(),
+            Frame::Seal { mig, last } => f.debug_struct("Seal").field("mig", mig).field("last", last).finish(),
+            Frame::PutPart { seq, offset, total, data, .. } => f
+                .debug_struct("PutPart")
+                .field("seq", seq)
+                .field("offset", offset)
+                .field("total", total)
+                .field("bytes", &data.len())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 fn put_u16(o: &mut Vec<u8>, v: u16) {
     o.extend_from_slice(&v.to_le_bytes());
 }
@@ -383,11 +435,11 @@ pub fn parse_header(h: &[u8; FRAME_HDR], limit: usize) -> Result<Header, FrameEr
     if u16_at(0) != FRAME_MAGIC || h[2] != FRAME_VERSION || u32_at(20) != 0 {
         return Err(FrameError::BadMagic);
     }
-    let len = u32_at(16) as usize;
+    let len = u32_at(12) as usize;
     if len > limit {
         return Err(FrameError::TooLarge);
     }
-    Ok(Header { code: h[3], flags: u16_at(4), partition: u16_at(6), term: u32_at(8), len, crc: u32_at(12) })
+    Ok(Header { code: h[3], flags: u16_at(4), partition: u16_at(6), term: u32_at(8), len, crc: u32_at(16) })
 }
 
 impl FrameDecoder {
@@ -420,7 +472,7 @@ impl FrameDecoder {
         match buf.get(..FRAME_HDR) {
             None => FRAME_HDR - buf.len(),
             Some(h) => {
-                let len = u32::from_le_bytes([h[16], h[17], h[18], h[19]]) as usize;
+                let len = u32::from_le_bytes([h[12], h[13], h[14], h[15]]) as usize;
                 (FRAME_HDR + len.min(FRAME_MAX_PAYLOAD)).saturating_sub(buf.len())
             }
         }
@@ -782,7 +834,7 @@ mod tests {
         *bad.last_mut().unwrap() ^= 1;
         assert_eq!(d.feed(&bad).err(), Some(FrameError::BadCrc));
         let mut bad = b.clone();
-        bad[16..20].copy_from_slice(&((FRAME_MAX_PAYLOAD + 1) as u32).to_le_bytes());
+        bad[12..16].copy_from_slice(&((FRAME_MAX_PAYLOAD + 1) as u32).to_le_bytes());
         assert_eq!(d.feed(&bad).err(), Some(FrameError::TooLarge));
     }
 

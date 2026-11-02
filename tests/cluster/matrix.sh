@@ -15,6 +15,8 @@
 #   kill-leader    kill -9 the coordinator leader; a new leader takes over; it restarts
 #   migrate        `kvadm migrate` of a slot range from shard 1 to shard 3 under the load
 #   node-add       `kvadm node add` of n5 + `replica add 3 n5` (learner merge full sync)
+#   coord-replace  coordinator replacement by `coord setpeers` under load: c3 joins
+#                  (`kvadm coord add`), then c0 leaves (`kvadm coord remove`) and stops
 #   readonly       after the writers stop: READONLY replica reads through each library
 #   verify         every client re-reads its keys: zero acknowledged writes lost
 #
@@ -174,7 +176,7 @@ ping_port() { timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1; printf 'PING\r\n
 status() { adm status 2>/dev/null; }
 leader_index() {
   local s; s=$(status) || return 1
-  for i in 0 1 2; do echo "$s" | grep -q "leader c$i\b" && { echo "$i"; return 0; }; done
+  for i in 0 1 2 3; do echo "$s" | grep -q "leader c$i\b" && { echo "$i"; return 0; }; done
   return 1
 }
 has_leader() { leader_index >/dev/null; }
@@ -347,6 +349,25 @@ wait_for 180 "n5 in sync" in_sync 5 || die "n5 not in sync"
 sleep 3
 phase_end
 status >> "$LOG"
+
+phase_begin coord-replace
+rm -rf "$W/c3"
+C3="c3=127.0.0.1:$(pport 3)/$(cport 3)/$(aport 3)"
+"$KVC" init --dir "$W/c3" --id c3 --peers "$C3" --join --half-bytes 1048576 > /dev/null || die "kvc init c3"
+start_coord 3
+ADMINS+=(--coord "127.0.0.1:$(aport 3)")
+wait_for 30 "c3 to listen" ping_port "$(cport 3)" || die "c3 did not start"
+out=$(adm_retry 120 coord add "$C3") || die "coord add c3: $out"
+say "coord add: $(echo "$out" | tail -1)"
+out=$(adm_retry 120 coord remove c0) || die "coord remove c0: $out"
+say "coord remove: $(echo "$out" | tail -1)"
+kill9 "${CPID[0]}"
+CPID[0]=""
+ADMINS=(); for i in 1 2 3; do ADMINS+=(--coord "127.0.0.1:$(aport $i)"); done
+wait_for 30 "a leader among c1-c3" has_leader || die "no leader after the replacement"
+sleep 5
+phase_end
+adm coord peers >> "$LOG" 2>&1
 
 phase_begin readonly-verify
 touch "$CTRL/stop"

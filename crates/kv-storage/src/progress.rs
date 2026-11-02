@@ -249,7 +249,7 @@ impl PartitionStore {
                 }
             }
         }
-        for (db, key, ts) in &c.gone_wait {
+        for (db, key, _, ts) in &c.gone_wait {
             let at = c.stale.get(*db, key).first().map_or(PageId(0), |e| e.at.page());
             for &t in ts {
                 out.push((t, WaitFor::OlderCopy { at }));

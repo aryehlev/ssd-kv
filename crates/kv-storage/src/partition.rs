@@ -490,8 +490,10 @@ pub(crate) struct OpenTxn {
 /// A txn delete marker: `(db, key, page, seq)`.
 type MarkerAt = (u8, Box<[u8]>, PageId, Seq);
 
-/// A delete waiting for older copies: `(db, key, tickets)`.
-type GoneWait = (u8, Box<[u8]>, SmallVec<[TicketId; 1]>);
+/// A delete waiting for older copies: `(db, key, seq of the delete, tickets)`. It waits only
+/// for tracked copies older than the delete (D1), and ends early when a later write of the key
+/// is durable (D2); copies that later writes create never extend it.
+pub(crate) type GoneWait = (u8, Box<[u8]>, Seq, SmallVec<[TicketId; 1]>);
 
 /// A newest copy that stands for "absent" (a committed txn marker, or an expired record that
 /// still has older copies) and is dropped once it is the key's only copy (D1, §16.2, §18.3).
@@ -842,6 +844,9 @@ impl BuildEnv for Env<'_> {
     }
     fn others(&self, db: u8, key: &[u8]) -> usize {
         self.core.stale.count_outside(db, key, self.page)
+    }
+    fn others_older(&self, db: u8, key: &[u8], seq: Seq) -> usize {
+        self.core.stale.count_older_outside(db, key, self.page, seq)
     }
     fn tracked_here(&self, db: u8, key: &[u8]) -> Option<CopyState> {
         self.core.stale.state_at(db, key, self.page)
@@ -1935,7 +1940,7 @@ impl PartitionStore {
                     }
                     return;
                 }
-                self.apply_delete(cx, &s, tickets);
+                self.apply_delete(cx, &s, seq, tickets);
             }
         }
     }
@@ -2236,7 +2241,7 @@ impl PartitionStore {
         );
     }
 
-    fn apply_delete(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, tickets: SmallVec<[TicketId; 1]>) {
+    fn apply_delete(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, seq: Seq, tickets: SmallVec<[TicketId; 1]>) {
         for &t in &tickets {
             self.core.tickets.add_effect(t);
         }
@@ -2253,7 +2258,7 @@ impl PartitionStore {
             }
             Cur::Small { page, .. } => {
                 self.core.index_remove(s, page.to36());
-                self.stage_remove(cx.cache, page, s.db, s.kh.h32(), s.key.clone(), tickets);
+                self.stage_remove(cx.cache, page, s.db, s.kh.h32(), s.key.clone(), seq, tickets);
                 // the deleted copy counts towards the key's copies until it is gone (E14): a
                 // write of the key elsewhere meanwhile waits like a third copy
                 if let Some(seq) = self.protect_in_page(cx.cache, page, s.db, s.kh.h32(), &s.key) {
@@ -2272,12 +2277,12 @@ impl PartitionStore {
                         self.wake(w.waiters);
                         self.core.alloc.free_extent(start, w.hdr.n_pages);
                         self.cancel_chunks(start);
-                        if self.core.stale.count(s.db, &s.key) == 0 {
+                        if self.core.stale.count_older(s.db, &s.key, seq) == 0 {
                             for t in all {
                                 self.core.tickets.effect_resolved(t);
                             }
                         } else {
-                            self.core.gone_wait.push((s.db, s.key.clone(), all));
+                            self.core.gone_wait.push((s.db, s.key.clone(), seq, all));
                         }
                     }
                     // on media or in flight (then the zeroing is issued after it is durable)
@@ -2317,7 +2322,9 @@ impl PartitionStore {
                     older_here = recs.iter().filter(|r| r.db == s.db && r.h32 == h32 && r.status != RecStatus::Droppable && r.key(img) == &*s.key).count() > 1;
                 }
                 if others || staged || older_here {
-                    self.stage_remove(cx.cache, page, s.db, h32, s.key.clone(), SmallVec::new());
+                    // later writes of the key get seqs from `next_seq` on
+                    let seq = self.core.next_seq;
+                    self.stage_remove(cx.cache, page, s.db, h32, s.key.clone(), seq, SmallVec::new());
                     if let Some(seq) = self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
                         self.core.stale.add(s.db, &s.key, StaleRef::Small { page }, CopyState::Source, seq);
                     }
@@ -2378,13 +2385,14 @@ impl PartitionStore {
         self.core.note_page_space(cache, page);
     }
 
-    pub(crate) fn stage_remove(&mut self, cache: &mut PageCache, page: PageId, db: u8, h32: u32, key: Box<[u8]>, mut tickets: SmallVec<[TicketId; 1]>) {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_remove(&mut self, cache: &mut PageCache, page: PageId, db: u8, h32: u32, key: Box<[u8]>, seq: Seq, mut tickets: SmallVec<[TicketId; 1]>) {
         if let Some(st) = cache.page_state_mut(page) {
             if let Some(i) = st.pending.iter().position(|p| p.is_change() && p.is_key(db, h32, &key)) {
                 let mut old = st.pending.remove(i);
                 tickets.extend(old.tickets_mut().drain(..));
             }
-            st.pending.push(Pending::Remove { db, h32, key, tickets });
+            st.pending.push(Pending::Remove { db, h32, key, seq, tickets });
         } else {
             for t in tickets {
                 self.core.tickets.effect_resolved(t);
@@ -3214,7 +3222,7 @@ impl PartitionStore {
                 if kh.fp32() != fp32 || key_slot(&key) != slot || !self.core.indexed_at(db, slot, kh, start.to36()) {
                     return;
                 }
-                self.expire_or_rehint(cx, db, &key, kh, slot, start, h.expire_at());
+                self.expire_or_rehint(cx, db, &key, kh, slot, start, h.expire_at(), h.seq);
             }
         }
     }
@@ -3373,6 +3381,7 @@ impl PartitionStore {
     /// shadows become stale and are zeroed (extents at once, §14.4 step 3; pages by the paced
     /// scrub unless a command waits, or at once when `now`). Returns how many sources changed.
     fn sources_superseded(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8], newer: Seq, now: bool) -> usize {
+        self.resolve_gone(db, key, newer);
         let (entries, changed) = self.core.stale.sources_superseded(db, key, newer);
         for e in entries {
             match e.at {
@@ -3396,21 +3405,26 @@ impl PartitionStore {
         changed
     }
 
-    /// A tracked copy of `(db, key)` is durably gone.
-    fn stale_gone(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8]) {
-        if self.core.stale.count(db, key) == 0 {
-            let mut i = 0;
-            while i < self.core.gone_wait.len() {
-                if self.core.gone_wait[i].0 == db && *self.core.gone_wait[i].1 == *key {
-                    let (_, _, ts) = self.core.gone_wait.swap_remove(i);
-                    for t in ts {
-                        self.core.tickets.effect_resolved(t);
-                    }
-                } else {
-                    i += 1;
+    /// Deletes of `(db, key)` waiting for older copies end: those with no tracked copy older
+    /// than themselves left (D1), and those a durable copy with seq `newer` supersedes (D2).
+    fn resolve_gone(&mut self, db: u8, key: &[u8], newer: Seq) {
+        let mut i = 0;
+        while i < self.core.gone_wait.len() {
+            let g = &self.core.gone_wait[i];
+            if g.0 == db && *g.1 == *key && (g.2 < newer || self.core.stale.count_older(db, key, g.2) == 0) {
+                let (_, _, _, ts) = self.core.gone_wait.swap_remove(i);
+                for t in ts {
+                    self.core.tickets.effect_resolved(t);
                 }
+            } else {
+                i += 1;
             }
         }
+    }
+
+    /// A tracked copy of `(db, key)` is durably gone.
+    fn stale_gone(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8]) {
+        self.resolve_gone(db, key, Seq::ZERO);
         // effects deferred behind older copies are tried again
         let pages: Vec<PageId> = self.core.deferred.drain().collect();
         for p in pages {
@@ -3485,7 +3499,7 @@ impl PartitionStore {
                 let mut i = 0;
                 while i < self.core.gone_wait.len() {
                     if dbs & (1 << self.core.gone_wait[i].0) != 0 {
-                        let (_, _, ts) = self.core.gone_wait.swap_remove(i);
+                        let (_, _, _, ts) = self.core.gone_wait.swap_remove(i);
                         for t in ts {
                             self.core.tickets.effect_resolved(t);
                         }
@@ -3888,7 +3902,7 @@ impl PartitionStore {
                     continue;
                 }
                 if let ZeroWhy::Delete { db, key, .. } = &self.core.ext.zeros[&start].why
-                    && self.core.stale.get(*db, key).iter().any(|e| e.at.page() != start)
+                    && self.core.stale.older_than_source_at(*db, key, start)
                 {
                     // D1: the newest copy goes after the older ones
                     let k = (*db, key.clone());
@@ -4117,10 +4131,10 @@ impl PartitionStore {
                 }
                 _ => {
                     if let Some(w) = self.core.ext.writes.get(&page) {
-                        let (key, exp) = (w.key.clone(), w.hdr.expire_at());
+                        let (key, exp, seq) = (w.key.clone(), w.hdr.expire_at(), w.hdr.seq);
                         let kh = KeyHash::of(self.core.cfg.hash_seed, &key);
                         if kh.fp32() == e.fp32 {
-                            self.expire_or_rehint(cx, db, &key, kh, slot, page, exp);
+                            self.expire_or_rehint(cx, db, &key, kh, slot, page, exp, seq);
                         }
                     } else if self.core.buckets.expire.try_take(now_ns, 1) {
                         let tag = self.core.tag(IoKind::HeaderRead { start: page, why: HeaderWhy::Expire { db, slot, fp32: e.fp32 } });
@@ -4152,12 +4166,12 @@ impl PartitionStore {
     /// Verifies active-expiry candidates of a cached page: `(fp32, x8)` of `(db, slot)`.
     fn expire_check_small(&mut self, cx: &mut StorageCtx<'_>, page: PageId, db: u8, slot: u16, fp32: u32, x8: u8) {
         let seed = self.core.cfg.hash_seed;
-        let found: Option<(Box<[u8]>, Option<u64>)> = {
+        let found: Option<(Box<[u8]>, Option<u64>, Seq)> = {
             let Some(st) = cx.cache.page_state(page) else { return };
             let staged = st.pending.iter().rev().find_map(|p| match p {
                 Pending::Put(r) if r.desc.db == db => {
                     let h = KeyHash::of(seed, r.key());
-                    (h.fp32() == fp32 && h.x8() == x8).then(|| (Box::<[u8]>::from(r.key()), r.desc.expire_at()))
+                    (h.fp32() == fp32 && h.x8() == x8).then(|| (Box::<[u8]>::from(r.key()), r.desc.expire_at(), r.desc.seq))
                 }
                 _ => None,
             });
@@ -4167,21 +4181,21 @@ impl PartitionStore {
                 recs.iter().filter(|r| r.status == RecStatus::Live && r.db == db && !r.is_marker()).find_map(|r| {
                     let k = r.key(img);
                     let h = KeyHash::of(seed, k);
-                    (h.fp32() == fp32 && h.x8() == x8).then(|| (Box::<[u8]>::from(k), r.expire_at()))
+                    (h.fp32() == fp32 && h.x8() == x8).then(|| (Box::<[u8]>::from(k), r.expire_at(), r.seq))
                 })
             })
         };
-        let Some((key, exp)) = found else { return };
+        let Some((key, exp, seq)) = found else { return };
         let kh = KeyHash::of(seed, &key);
         if key_slot(&key) != slot || !self.core.indexed_at(db, slot, kh, page.to36()) {
             return;
         }
-        self.expire_or_rehint(cx, db, &key, kh, slot, page, exp);
+        self.expire_or_rehint(cx, db, &key, kh, slot, page, exp, seq);
     }
 
     /// Expires a verified key without a write, or re-encodes its hint (§16.4).
     #[allow(clippy::too_many_arguments)]
-    fn expire_or_rehint(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8], kh: KeyHash, slot: u16, at: PageId, exp: Option<u64>) {
+    fn expire_or_rehint(&mut self, cx: &mut StorageCtx<'_>, db: u8, key: &[u8], kh: KeyHash, slot: u16, at: PageId, exp: Option<u64>, seq: Seq) {
         let now_ms = cx.now.unix_ms;
         match exp {
             Some(t) if t <= now_ms => {
@@ -4192,7 +4206,7 @@ impl PartitionStore {
                     c.iter().find(|c| c.entry.page36 == at.to36()).map(|c| c.entry.kind)
                 });
                 let cur = match kind {
-                    Some(Kind::Small) => Cur::Small { page: at, seq: Seq::ZERO },
+                    Some(Kind::Small) => Cur::Small { page: at, seq },
                     Some(k) => {
                         let n_pages = self.core.ext.writes.get(&at).map_or_else(
                             || self.core.index.table(db, slot).map_or(1, |t| {
@@ -4202,7 +4216,7 @@ impl PartitionStore {
                             }),
                             |w| w.hdr.n_pages,
                         );
-                        Cur::Extent { start: at, n_pages, kind: k, twin: None, seq: Seq::ZERO }
+                        Cur::Extent { start: at, n_pages, kind: k, twin: None, seq }
                     }
                     None => return,
                 };

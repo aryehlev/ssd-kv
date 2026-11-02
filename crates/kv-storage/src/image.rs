@@ -140,7 +140,10 @@ impl EncodedRecord {
 /// A staged change (holds user bytes: no `Debug`, LC-32).
 pub enum Pending {
     Put(EncodedRecord),
-    Remove { db: u8, h32: u32, key: Box<[u8]>, tickets: SmallVec<[TicketId; 1]> },
+    /// Removes the key's copy in this page (a delete, or an expiry with older copies). `seq`:
+    /// copies with a lower seq are older than the removal and must be gone first (D1); copies
+    /// that later writes create (higher seq) never hold it back.
+    Remove { db: u8, h32: u32, key: Box<[u8]>, seq: Seq, tickets: SmallVec<[TicketId; 1]> },
     /// Drops the copy of the key with exactly `seq` (a committed txn delete marker, or an
     /// expired newest copy kept while older copies existed, §16.2) once it is the key's only
     /// copy (D1, E9). A newer version of the key makes it a no-op.
@@ -335,6 +338,9 @@ pub(crate) trait BuildEnv {
     fn atomic_min(&self) -> u32;
     /// Copies of `(db, key)` tracked outside this page (stale registry).
     fn others(&self, db: u8, key: &[u8]) -> usize;
+    /// Copies of `(db, key)` tracked outside this page with a seq below `seq` (unknown seqs
+    /// count): the copies a removal or retirement of seq `seq` waits for (D1).
+    fn others_older(&self, db: u8, key: &[u8], seq: Seq) -> usize;
     /// State of a tracked (moved-away or older) copy of `(db, key)` located in this page.
     fn tracked_here(&self, db: u8, key: &[u8]) -> Option<CopyState>;
     /// The record is dead: below a durable flush cutoff, or of an aborted txn (§16.2).
@@ -560,7 +566,10 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
         // older in-page copies of a key with a staged effect are zeroed now (superseded)
         let older: SmallVec<[usize; 2]> = idx.iter().copied().filter(|&i| Some(i) != newest).collect();
         match eff {
-            Pending::Remove { db, h32, key, tickets } => {
+            Pending::Remove { db, h32, key, seq, tickets } => {
+                // D1 counts only copies older than the removal: later writes of the key made
+                // newer ones, which shadow the removed copy anyway (D2)
+                let others = env.others_older(db, &key, seq);
                 let txn_protected = newest.is_some_and(|i| keep[i].txn != 0 && env.txn_open(keep[i].txn));
                 // a superseded copy of the key zeroed by this very image is an older copy too
                 let older_dropping = drop.iter().any(|r| same(r) && r.key(m) == &*key);
@@ -574,7 +583,7 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     if others > 0 {
                         out.foreground.push((db, key.clone()));
                     }
-                    st.pending.push(Pending::Remove { db, h32, key, tickets });
+                    st.pending.push(Pending::Remove { db, h32, key, seq, tickets });
                 } else {
                     let mut all = older.clone();
                     all.extend(newest);
@@ -583,10 +592,11 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                         // the deleted copy was tracked as a copy of the key: gone when N is
                         out.cleared.push((db, key.clone()));
                     }
-                    out.applied.push(Pending::Remove { db, h32, key, tickets });
+                    out.applied.push(Pending::Remove { db, h32, key, seq, tickets });
                 }
             }
             Pending::Retire { db, h32, key, seq, tickets } => {
+                let others = env.others_older(db, &key, seq);
                 let target = idx.iter().copied().find(|&i| keep[i].seq == seq);
                 let newer = idx.iter().any(|&i| keep[i].seq > seq);
                 let Some(_) = target.filter(|_| !newer) else {
@@ -827,6 +837,9 @@ pub(crate) mod tests {
         fn others(&self, _db: u8, key: &[u8]) -> usize {
             self.others.get(key).copied().unwrap_or(0)
         }
+        fn others_older(&self, db: u8, key: &[u8], _seq: Seq) -> usize {
+            self.others(db, key)
+        }
         fn tracked_here(&self, _db: u8, _key: &[u8]) -> Option<CopyState> {
             None
         }
@@ -1006,7 +1019,7 @@ pub(crate) mod tests {
         let (m1, b) = run(&mut st, &[0; PAGE], &env);
         env.others.insert(b"k".to_vec(), 1);
         let mut st = PageState::loaded(page(), FrameIdx(0), b.recs.clone());
-        st.pending.push(Pending::Remove { db: 0, h32: h32(b"k"), key: (*b"k").into(), tickets: SmallVec::new() });
+        st.pending.push(Pending::Remove { db: 0, h32: h32(b"k"), key: (*b"k").into(), seq: Seq(u64::MAX), tickets: SmallVec::new() });
         let (_n, b2) = run(&mut st, &m1, &env);
         assert!(b2.applied.is_empty() && st.pending.len() == 1, "deferred");
         assert_eq!(b2.foreground.len(), 1);
@@ -1172,7 +1185,7 @@ pub(crate) mod tests {
                     seq += 1;
                     let eff = match s {
                         Step::Put(k, l) => Pending::Put(encoded(&key(k), &vec![seq as u8; usize::from(l)], seq)),
-                        Step::Del(k) => Pending::Remove { db: 0, h32: h32(&key(k)), key: key(k).into(), tickets: SmallVec::new() },
+                        Step::Del(k) => Pending::Remove { db: 0, h32: h32(&key(k)), key: key(k).into(), seq: Seq(u64::MAX), tickets: SmallVec::new() },
                     };
                     // staging coalesces per key
                     if let Some(i) = st.pending.iter().position(|p| p.key() == eff.key()) {

@@ -190,6 +190,33 @@ impl StaleCopies {
         self.get(db, key).iter().filter(|e| e.at.page() != except).map(|e| 1 + usize::from(e.older)).sum()
     }
 
+    /// Tracked copies of `(db, key)` older than `seq` (unknown seqs count as older): the copies
+    /// a delete of seq `seq` must see gone before its newest copy goes (D1).
+    pub(crate) fn count_older(&self, db: u8, key: &[u8], seq: Seq) -> usize {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.get(db, key).iter().filter(|e| e.seq < seq || e.seq == Seq::ZERO).count()
+    }
+
+    /// Copies of `(db, key)` outside `except` that are older than `seq` (an older copy
+    /// sharing a tracked location counts too): what a page's newest copy of seq `seq` waits
+    /// for before it may be dropped (D1).
+    pub(crate) fn count_older_outside(&self, db: u8, key: &[u8], except: PageId, seq: Seq) -> usize {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.get(db, key).iter().filter(|e| e.at.page() != except && (e.seq < seq || e.seq == Seq::ZERO)).map(|e| 1 + usize::from(e.older)).sum()
+    }
+
+    /// True when the copy tracked at `at` is still a source (no newer copy is durable) and an
+    /// older copy of the key is tracked elsewhere: dropping the copy at `at` must wait (D1).
+    pub(crate) fn older_than_source_at(&self, db: u8, key: &[u8], at: PageId) -> bool {
+        let list = self.get(db, key);
+        let Some(here) = list.iter().find(|e| e.at.page() == at) else { return false };
+        here.state == CopyState::Source && list.iter().any(|e| e.at.page() != at && (e.seq < here.seq || e.seq == Seq::ZERO || here.seq == Seq::ZERO))
+    }
+
     /// Sets or clears the older-copy flag of the copy of `(db, key)` at `at`.
     pub(crate) fn set_older(&mut self, db: u8, key: &[u8], at: PageId, on: bool) {
         if let Some(list) = self.map.get_mut(&KeyRef { db, key })

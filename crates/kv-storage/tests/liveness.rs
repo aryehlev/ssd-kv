@@ -120,3 +120,36 @@ fn capacity_floor_is_reported() {
     assert!(e.to_string().contains("too small for 64 partitions"), "{e}");
     assert!(kv_storage::engine::check_capacity(&[small], 16, 0.95).is_ok());
 }
+
+/// A delete waits for the key's older copies (D1), and only for those: writes of the key after
+/// the delete create newer copies that must not extend the wait (D2). Its ticket used to wait
+/// until the key had no tracked copy at all, which under sustained rewrites that move the key
+/// between pages and extents never happened.
+#[test]
+fn delete_is_not_starved_by_later_writes_of_its_key() {
+    for seed in 0..4u64 {
+        let mut db = fresh(64 * 4096, 60 + seed);
+        let k: &[u8] = b"hot";
+        let p = db.eng.partition_of(k);
+        let t = db.set(0, k, &value(0, 20), None).unwrap();
+        db.wait(k, t, TicketState::Durable);
+        // move the key to an extent (its small copy becomes a tracked source), then delete it
+        // before that extent is written
+        let _ = db.set(0, k, &value(1, 6000), None).unwrap();
+        let (_, del) = db.del(0, k).unwrap();
+        let del = del.expect("delete ticket");
+        let mut done_at = None;
+        for i in 0..400u64 {
+            // every rewrite moves the key (small <-> extent) and leaves a tracked copy behind
+            let len = if i % 2 == 0 { 30 } else { 5000 + (i as usize % 7) * 900 };
+            let _ = db.set(0, k, &value(10 + i, len), None).unwrap();
+            db.eng.pump();
+            if done_at.is_none() && matches!(db.eng.ticket_state(p, del), Some(TicketState::Durable | TicketState::Written)) {
+                done_at = Some(i);
+            }
+        }
+        let at = done_at.unwrap_or_else(|| panic!("seed {seed}: the delete was still waiting after 400 later writes of its key\n{}", db.eng.partition(p).diag_deep(db.eng.cache())));
+        assert!(at < 50, "seed {seed}: the delete completed only after {at} later writes");
+        db.quiesce();
+    }
+}

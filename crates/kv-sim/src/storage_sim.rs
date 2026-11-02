@@ -2517,14 +2517,21 @@ impl<'c> Sim<'c> {
             // the newest copy decides; superseded copies in its own page wait for that page's
             // next build (two-image) and lose to it in recovery: allowed, at most two (I11)
             let newest = at.iter().max_by_key(|c| c.1).copied().expect("non-empty");
-            let others_elsewhere = at.iter().any(|c| c.0 != newest.0);
+            // an expiry without write (§16.4) removes the index entry and leaves the record's
+            // bytes as free space: an older expired copy may stay on media after the key is
+            // written again. It loses to every newer copy in recovery and is dead once the
+            // durable clock floor passes its deadline (at most one floor interval later); it
+            // is not one of the copies the third-copy rule bounds
+            let leftover = |c: &(u64, u64, bool, u64, Option<u64>)| c.0 != newest.0 && c.1 < newest.1 && c.4.is_some_and(|t| t <= now);
+            let counted: Vec<_> = at.iter().filter(|c| !leftover(c)).collect();
+            let others_elsewhere = counted.iter().any(|c| c.0 != newest.0);
             let newest_expired = newest.4.is_some_and(|t| t <= now);
             let ok = if live {
-                !others_elsewhere && at.len() <= 2 && !newest_expired
+                !others_elsewhere && counted.len() <= 2 && !newest_expired
             } else {
                 // an expired newest copy stays on media as "absent" (§16.2); anything else of
                 // a deleted key is a copy a crash could bring back
-                newest_expired && !others_elsewhere && at.len() <= 2
+                newest_expired && !others_elsewhere && counted.len() <= 2
             };
             if !ok {
                 if live && !newest_expired && at.iter().all(|c| c.0 == newest.0 || c.4.is_some_and(|t| t <= now)) {

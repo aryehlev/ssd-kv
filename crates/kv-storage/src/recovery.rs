@@ -672,7 +672,10 @@ fn resolve_group(p: &mut PartitionStore, scan: &mut Scan) {
             // the key is absent: its entry goes in step 4a; its bytes stay until the losers
             // are durably zeroed
             match winner.kind {
-                Kind::Small => p.core.retire.push(RetireItem { db, key: winner.key.clone(), page: winner.at, seq: winner.seq }),
+                Kind::Small => {
+                    p.core.stale.note_absent(db, &winner.key, winner.at, winner.seq, 0);
+                    p.core.retire.push(RetireItem { db, key: winner.key.clone(), page: winner.at, seq: winner.seq });
+                }
                 _ => {
                     p.core.ext.zeros.insert(
                         winner.at,

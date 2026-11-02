@@ -111,6 +111,15 @@ impl Equivalent<Key> for KeyRef<'_> {
 /// `(db, exact key) -> older copies`.
 type StaleMap = HashMap<Key, SmallVec<[StaleEntry; 1]>, foldhash::fast::FixedState>;
 
+/// The newest copy of an absent key in a SMALL page that the index does not name: a txn
+/// delete marker that is not retired yet (its txn open or committed, §14.6, D1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AbsentCopy {
+    pub(crate) page: PageId,
+    pub(crate) seq: Seq,
+    pub(crate) txn: u64,
+}
+
 /// The partition's tracked stale copies (exact keys).
 pub(crate) struct StaleCopies {
     map: StaleMap,
@@ -122,6 +131,11 @@ pub(crate) struct StaleCopies {
     watched: Vec<(TicketId, u8, Box<[u8]>, PageId)>,
     /// Tickets whose watched copy is gone (drained by the partition).
     released: Vec<TicketId>,
+    /// Absent newest copies the index does not name (`AbsentCopy`). They are copies of their
+    /// key like any other: a write that creates the key again turns the entry into a tracked
+    /// older copy (`StaleCopies::take_absent`), so that the write never lands on that page and
+    /// counts it towards the key's copies (E14, I11).
+    absent: HashMap<Key, AbsentCopy, foldhash::fast::FixedState>,
 }
 
 impl Default for StaleCopies {
@@ -138,7 +152,54 @@ impl StaleCopies {
             entries: 0,
             watched: Vec::new(),
             released: Vec::new(),
+            absent: HashMap::with_hasher(Default::default()),
         }
+    }
+
+    /// Records the absent newest copy of `(db, key)` (a txn delete marker placed or moved at
+    /// `page`, or found by recovery). A newer one replaces an older one.
+    pub(crate) fn note_absent(&mut self, db: u8, key: &[u8], page: PageId, seq: Seq, txn: u64) {
+        let a = AbsentCopy { page, seq, txn };
+        match self.absent.get_mut(&KeyRef { db, key }) {
+            Some(e) if e.seq > seq => {}
+            Some(e) => *e = a,
+            None => {
+                self.absent.insert(Key { db, key: key.into() }, a);
+            }
+        }
+    }
+
+    /// The absent newest copy of `(db, key)`, if one is on media.
+    pub(crate) fn absent_of(&self, db: u8, key: &[u8]) -> Option<AbsentCopy> {
+        if self.absent.is_empty() {
+            return None;
+        }
+        self.absent.get(&KeyRef { db, key }).copied()
+    }
+
+    /// The key is written again: its absent newest copy becomes an ordinary older copy (the
+    /// caller tracks it). Returns it.
+    pub(crate) fn take_absent(&mut self, db: u8, key: &[u8]) -> Option<AbsentCopy> {
+        if self.absent.is_empty() {
+            return None;
+        }
+        self.absent.remove(&KeyRef { db, key })
+    }
+
+    /// The absent copy of `(db, key)` with seq `seq` at `page` left the page (retired, or
+    /// zeroed by another rule).
+    pub(crate) fn absent_gone(&mut self, db: u8, key: &[u8], page: PageId, seq: Seq) {
+        if self.absent.is_empty() {
+            return;
+        }
+        if self.absent.get(&KeyRef { db, key }).is_some_and(|a| a.page == page && a.seq == seq) {
+            self.absent.remove(&KeyRef { db, key });
+        }
+    }
+
+    /// Absent copies recorded (diagnostics).
+    pub(crate) fn absent_len(&self) -> usize {
+        self.absent.len()
     }
 
     /// Tracked copies (`stale_copies` counter).
@@ -323,6 +384,7 @@ impl StaleCopies {
 
     /// Drops every entry of `db` (FLUSHDB: the copies are dead by the durable cutoff).
     pub(crate) fn drop_db(&mut self, db: u8) {
+        self.absent.retain(|k, _| k.db != db);
         let mut removed: SmallVec<[PageId; 8]> = SmallVec::new();
         self.map.retain(|k, v| {
             if k.db == db {
@@ -385,10 +447,10 @@ impl StaleCopies {
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.pages.clear();
+        self.absent.clear();
         self.entries = 0;
         self.release_watchers(|_| true);
     }
-
 }
 
 #[cfg(test)]

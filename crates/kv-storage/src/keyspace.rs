@@ -210,6 +210,10 @@ pub(crate) struct ExtFetch {
     /// Chunkmap reads: the chunks, read one at a time in order.
     pub(crate) chunks: Option<SmallVec<[ChunkFetch; 4]>>,
     pub(crate) want_chunks: bool,
+    /// The read was asked with its chunks (a value read of a chunkmap). `want_chunks` drops to
+    /// false when the extent read turns out not to be a valid chunkmap; this stays set, so that
+    /// the exec reports the corruption instead of asking for the same read again.
+    pub(crate) chunks_asked: bool,
     /// Read while earlier requests on the request's keys were still queued ahead of it (the
     /// prefetch at submit): those requests may rewrite the extent in place or reuse its run
     /// for a newer version before this one runs, so the buffer is dropped when it runs.
@@ -502,7 +506,10 @@ impl<'p> Keyspace<'p> {
             return Ok(Some((cur, Some(hit))));
         }
         let want_pages = if value { n_pages } else { 1 };
-        let fi = self.fetched.iter().position(|e| e.start == start && e.pages >= want_pages && e.complete());
+        // the value of a chunkmap is in its chunks: a read of the chunkmap pages alone (a
+        // prefetch for a write, a metadata read) does not have it
+        let want_chunks = value && kind == Kind::ChunkMap;
+        let fi = self.fetched.iter().position(|e| e.start == start && e.pages >= want_pages && (!want_chunks || e.chunks_asked) && e.complete());
         let Some(fi) = fi else {
             self.need(Need::Extent { start, pages: want_pages, chunks: value && kind == Kind::ChunkMap });
             *missing = true;

@@ -472,6 +472,10 @@ pub(crate) struct ExtTables {
     pub(crate) chunkmaps: HashMap<PageId, SmallVec<[(PageId, u32); 4]>, foldhash::fast::FixedState>,
     /// CHUNK start -> chunkmaps on media or in flight referencing it.
     pub(crate) chunk_rc: HashMap<PageId, u32, foldhash::fast::FixedState>,
+    /// Active-expiry header reads in flight: extent start -> (reads, written since). A header
+    /// read concurrent with a write of the same run (an in-place rewrite, or a new version
+    /// placed there) may return the old header; its expiry decision is then void.
+    pub(crate) expire_reads: HashMap<PageId, (u32, bool), foldhash::fast::FixedState>,
 }
 
 // -------------------------------------------------------------------------------------------
@@ -487,7 +491,9 @@ pub(crate) struct OpenTxn {
     pub(crate) keys: SmallVec<[(u8, Box<[u8]>); 2]>,
     /// The seq every record of the txn carries (one seq per command).
     pub(crate) seq: Seq,
-    /// Barrier tickets waiting for this txn's commit (one metadata dependency each).
+    /// Tickets waiting for this txn's commit (one metadata dependency each): barriers, and
+    /// the tickets of staged writes outside the txn that an effect of the txn superseded
+    /// (`PartitionStore::inherit_into_txn`).
     pub(crate) barriers: SmallVec<[TicketId; 1]>,
     /// `(db, key, page, seq)` of the txn delete markers.
     pub(crate) markers: SmallVec<[MarkerAt; 1]>,
@@ -614,6 +620,9 @@ pub(crate) struct Core {
     pub(crate) last_local_txn: Option<u64>,
     /// Tracked locations that also hold an older copy of their key: `(page, db, key)`.
     pub(crate) older_pages: Vec<(PageId, u8, Box<[u8]>)>,
+    /// Tickets inherited by an effect of a txn whose `OpenTxn` the executing commit has not
+    /// registered yet: `(txn, ticket)`, moved to its commit waiters at the end of the commit.
+    pub(crate) txn_inherit: Vec<(u64, TicketId)>,
     /// Scratch vectors (no per-tick allocation).
     pub(crate) scratch_pos: Vec<Pos>,
     pub(crate) scratch_txn: Vec<u64>,
@@ -953,6 +962,7 @@ impl PartitionStore {
             relocations: 0,
             last_local_txn: None,
             older_pages: Vec::new(),
+            txn_inherit: Vec::new(),
             scratch_pos: Vec::new(),
             scratch_txn: Vec::new(),
             boot,
@@ -1005,7 +1015,7 @@ impl PartitionStore {
     pub fn diag(&self) -> String {
         let c = &self.core;
         format!(
-            "p{} {:?} live={} tickets={} oldest_ms={} ready={} space_wait={} seq_wait={} meta_wait={} txns={} next_seq={:#x} seq_limit={:#x} seq_asked={} dirty={} writes={} ext_w={} ext_z={} stale={} deferred={} loads={} durable_wait={} gone_wait={} retire={} missed_handoffs={}",
+            "p{} {:?} live={} tickets={} oldest_ms={} ready={} space_wait={} seq_wait={} meta_wait={} txns={} next_seq={:#x} seq_limit={:#x} seq_asked={} dirty={} writes={} ext_w={} ext_z={} stale={} absent={} deferred={} loads={} durable_wait={} gone_wait={} retire={} missed_handoffs={}",
             c.cfg.id,
             c.state,
             self.reqs.live,
@@ -1024,6 +1034,7 @@ impl PartitionStore {
             c.ext.writes.len(),
             c.ext.zeros.len(),
             c.stale.len(),
+            c.stale.absent_len(),
             c.deferred.len(),
             c.loads.len(),
             c.durable_wait.len(),
@@ -1289,13 +1300,13 @@ impl PartitionStore {
             }
             Need::Extent { start, pages, chunks } => {
                 let r = self.reqs.get_mut(id).expect("live");
-                if r.fetched.iter().any(|f| f.start == start && f.pages >= pages && (!chunks || f.want_chunks) && f.err.is_none()) {
+                if r.fetched.iter().any(|f| f.start == start && f.pages >= pages && (!chunks || f.chunks_asked) && f.err.is_none()) {
                     return;
                 }
                 // reads in flight name their fetch by index: an entry is replaced in place,
                 // never removed, so that the other entries keep their indexes
                 let early = r.waits > 0 || r.blocked;
-                let fresh = ExtFetch { start, pages, buf: None, err: None, chunks: None, want_chunks: chunks, early };
+                let fresh = ExtFetch { start, pages, buf: None, err: None, chunks: None, want_chunks: chunks, chunks_asked: chunks, early };
                 let idx = match r.fetched.iter().position(|f| f.start == start) {
                     Some(i) => {
                         r.fetched[i] = fresh;
@@ -1692,13 +1703,17 @@ impl PartitionStore {
             }
             self.apply(cx, s, plan, seq, txn_id, ticket, fx, otx.as_mut());
         }
-        if let Some(o) = otx {
+        if let Some(mut o) = otx {
             if let (Some(t), true) = (ticket, o.local) {
                 // the reply waits for the durable COMMITTED listing (E6)
                 self.core.tickets.add_meta(t);
             }
             if o.local {
                 self.core.last_local_txn = Some(txn_id);
+            }
+            for (x, t) in core::mem::take(&mut self.core.txn_inherit) {
+                debug_assert_eq!(x, txn_id);
+                o.barriers.push(t);
             }
             self.core.txns.insert(txn_id, o);
         }
@@ -1753,7 +1768,8 @@ impl PartitionStore {
             // never stage a key onto a page holding its tracked copy, or onto a corrupt page
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
-            let exclude = |q: PageId| stale.state_at(s.db, &s.key, q).is_some() || cache.page_state(q).is_some_and(|st| st.corrupt);
+            let absent = stale.absent_of(s.db, &s.key).map(|a| a.page);
+            let exclude = |q: PageId| stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt);
             return match self.core.alloc.place_small(need, cache, now_ns, &exclude) {
                 SmallPlace::Cached(q) => Ok(Plan::Small { page: q, fresh: false }),
                 SmallPlace::Fresh(q) => {
@@ -1833,13 +1849,16 @@ impl PartitionStore {
         Ok(Plan::Chunked { map, map_pages, chunks })
     }
 
-    /// True when an extent of `n` pages at `start` can be rewritten in place atomically.
+    /// True when an extent of `n` pages at `start` can be rewritten in place atomically: one
+    /// `RWF_ATOMIC` write, whose length must be a power of two inside the device's atomic unit
+    /// and whose offset must be a multiple of that length (devices refuse anything else with
+    /// `EINVAL`).
     fn atomic_extent(&self, start: PageId, n: u32) -> bool {
         let Some(d) = self.core.boot.devs.get(usize::from(start.dev())) else { return false };
         d.page_update == PageUpdateMode::Atomic
             && d.atomic_unit.is_some_and(|(min, max)| {
                 let len = n * PAGE as u32;
-                len >= min && len <= max && len.is_power_of_two()
+                len >= min && len <= max && len.is_power_of_two() && start.byte_offset().is_multiple_of(u64::from(len))
             })
             && !self.core.ext.writes.contains_key(&start)
             && !self.core.ext.zeros.contains_key(&start)
@@ -1905,6 +1924,9 @@ impl PartitionStore {
             }
             Change::Expired => self.apply_expired(cx, &s),
             Change::Put { vtype, expire_at, ref value } => {
+                if matches!(s.cur, Cur::Absent) {
+                    self.absent_superseded(s.db, &s.key);
+                }
                 let (rec_kind, ext_vtype) = match vtype {
                     VType::Hash => (REC_KIND_HASH, EXT_VTYPE_HASH),
                     VType::String => (REC_KIND_STRING, EXT_VTYPE_STRING),
@@ -2066,6 +2088,7 @@ impl PartitionStore {
             // tickets of a staged effect this version cancels move over with the dependency
             // they already count (D2); counting them again would leave them unwritten forever
             let inherited = self.move_away(cx, s, None, false);
+            self.inherit_into_txn(rec.desc.txn, &inherited);
             rec.tickets.extend(inherited);
             if !matches!(s.cur, Cur::Absent) {
                 self.core.counters.moves += 1;
@@ -2078,13 +2101,19 @@ impl PartitionStore {
             self.core.tickets.note_page(t, page, 0);
         }
         let seq = rec.desc.seq;
+        let txn = rec.desc.txn;
         self.stage_put(cx.cache, page, rec);
         if !marker {
             let e = Entry { fp32: s.kh.fp32(), x8: s.kh.x8(), page36: page.to36(), kind: Kind::Small, vtype, sync_mark: false };
             self.core.index_set(s, cur36(&s.cur), e, expire_at);
-        } else if let Some(c) = cur36(&s.cur) {
-            // a marker means "absent": the key leaves the index
-            self.core.index_remove(s, c);
+        } else {
+            if let Some(c) = cur36(&s.cur) {
+                // a marker means "absent": the key leaves the index
+                self.core.index_remove(s, c);
+            }
+            // the index no longer names the key, but the marker is its newest copy until it
+            // is retired: a later write of the key must see it (E14)
+            self.core.stale.note_absent(s.db, &s.key, page, seq, txn);
         }
         if let Some(o) = otx {
             o.keys.push((s.db, s.key.clone()));
@@ -2095,6 +2124,22 @@ impl PartitionStore {
                 o.markers.push((s.db, s.key.clone(), page, seq));
             }
         }
+    }
+
+    /// A write creates the key again while its absent newest copy (a txn delete marker not
+    /// retired yet) is still on media. The index does not name that copy, but it is a copy of
+    /// the key: from now on it is an older copy, tracked like a moved-away version (E2, E14),
+    /// zeroed once the new version is durable, and its retirement is moot. The placement of
+    /// the new version already avoided its page (`plan_put`). Untracked, it counted as a kept
+    /// in-page copy for a later write of the key placed on its page, and that write's
+    /// third-copy wait needed a hand-off only the waiting write itself could bring.
+    fn absent_superseded(&mut self, db: u8, key: &[u8]) {
+        let Some(a) = self.core.stale.take_absent(db, key) else { return };
+        self.core.retire.retain(|r| !(r.db == db && r.page == a.page && r.seq == a.seq && *r.key == *key));
+        if self.core.dead(db, a.seq, a.txn) {
+            return;
+        }
+        self.core.stale.add(db, key, StaleRef::Small { page: a.page }, CopyState::Source, a.seq);
     }
 
     pub(crate) fn init_fresh(&mut self, cache: &mut PageCache, page: PageId) {
@@ -2182,6 +2227,31 @@ impl PartitionStore {
             }
         }
         out
+    }
+
+    /// An effect of txn `txn` supersedes a staged write that is not part of it and inherits
+    /// that write's tickets (D2). The superseded write never reaches media, and the txn's
+    /// version of the key is valid only once the txn's commit is durable (E6, §17.5): until
+    /// then a crash brings back the key's state from before both. Those tickets therefore also
+    /// wait for the commit (one metadata dependency each, released with the txn's barriers).
+    /// Without it, a write acknowledged as written or durable was lost when the txn that
+    /// superseded it did not commit before a crash, and the key showed the txn's effect while
+    /// its other keys did not.
+    fn inherit_into_txn(&mut self, txn: u64, inherited: &[TicketId]) {
+        if txn == 0 {
+            return;
+        }
+        for &t in inherited {
+            if self.core.tickets.is_internal(t) {
+                continue;
+            }
+            self.core.tickets.add_meta(t);
+            match self.core.txns.get_mut(&txn) {
+                Some(o) => o.barriers.push(t),
+                // the executing commit registers its txn after applying its changes
+                None => self.core.txn_inherit.push((txn, t)),
+            }
+        }
     }
 
     /// A key moves away from `page`, which still holds an older superseded copy of it next to
@@ -2272,17 +2342,24 @@ impl PartitionStore {
         for &t in &tickets {
             self.core.tickets.add_effect(t);
         }
+        self.inherit_into_txn(hdr.txn, &inherited);
         tickets.extend(inherited);
         let mut waiters = SmallVec::new();
         if let Some(old) = self.core.ext.writes.remove(&start) {
             // a staged image of the same run never reached media (callers cancel it through
             // `move_away` first); whatever still waits on it moves to the new image
             debug_assert!(old.state == ExtState::Pending);
+            if old.hdr.txn != hdr.txn {
+                self.inherit_into_txn(hdr.txn, &old.tickets);
+            }
             tickets.extend(old.tickets);
             waiters = old.waiters;
         }
         for &t in &tickets {
             self.core.tickets.note_extent(t, start);
+        }
+        if let Some(r) = self.core.ext.expire_reads.get_mut(&start) {
+            r.1 = true;
         }
         self.core.ext.writes.insert(
             start,
@@ -2423,12 +2500,19 @@ impl PartitionStore {
     pub(crate) fn stage_put(&mut self, cache: &mut PageCache, page: PageId, mut rec: EncodedRecord) {
         if let Some(st) = cache.page_state_mut(page) {
             let (db, h32) = (rec.desc.db, rec.desc.h32);
+            let mut inherited: SmallVec<[TicketId; 1]> = SmallVec::new();
             if let Some(i) = st.pending.iter().position(|p| p.is_change() && p.is_key(db, h32, rec.key())) {
                 // D2: a superseded staged effect hands its tickets to the survivor
                 let mut old = st.pending.remove(i);
+                let same_txn = matches!(&old, Pending::Put(o) if o.desc.txn == rec.desc.txn);
+                if !same_txn {
+                    inherited.extend(old.tickets_mut().iter().copied());
+                }
                 rec.tickets.extend(old.tickets_mut().drain(..));
             }
+            let txn = rec.desc.txn;
             st.pending.push(Pending::Put(rec));
+            self.inherit_into_txn(txn, &inherited);
         }
         self.core.mark_dirty(cache, page);
         self.core.note_page_space(cache, page);
@@ -3171,14 +3255,26 @@ impl PartitionStore {
                 if tracked {
                     recs[newest].status = RecStatus::Live;
                 } else if indexed_elsewhere {
-                    // a copy of a key indexed elsewhere that nobody tracks (defensive, §13.3)
-                    self.core.counters.unexpected_orphans += 1;
+                    // a copy of a key indexed elsewhere that nobody tracks: zeroed as a stale
+                    // copy. An expired one is the expected leftover of an expiry without write
+                    // (§16.4: the index entry went, the bytes stayed) followed by a new write of
+                    // the key; anything else is unexpected (defensive, §13.3)
+                    if rn.expire_at().is_none_or(|t| t > cx.now.unix_ms) {
+                        self.core.counters.unexpected_orphans += 1;
+                    }
                     self.core.stale.add(db, key, StaleRef::Small { page }, CopyState::Stale, rn.seq);
                     recs[newest].status = RecStatus::Live;
+                    // nothing else schedules its zeroing: a paced scrub, like recovery's copies
+                    // (§18.5); left without one, the entry outlived the run and a later write or
+                    // delete of the key counted a copy nothing would remove
+                    if !self.core.scrub_queue.contains(&page) {
+                        self.core.scrub_queue.push_back(page);
+                    }
                 } else if open_txn || older || self.core.stale.count(db, key) > 0 {
                     // an absent newest copy (marker or expired) with older copies: kept until
                     // they are zeroed (D1, v1.2)
                     recs[newest].status = RecStatus::Protected;
+                    self.core.stale.note_absent(db, key, page, rn.seq, rn.txn);
                     if !open_txn {
                         retire.push(RetireItem { db, key: key.into(), page, seq: rn.seq });
                     }
@@ -3325,6 +3421,16 @@ impl PartitionStore {
     }
 
     fn header_read_done(&mut self, cx: &mut StorageCtx<'_>, start: PageId, why: HeaderWhy, d: IoDone) {
+        let mut overtaken = false;
+        if matches!(why, HeaderWhy::Expire { .. })
+            && let Some(r) = self.core.ext.expire_reads.get_mut(&start)
+        {
+            r.0 = r.0.saturating_sub(1);
+            overtaken = r.1;
+            if r.0 == 0 {
+                self.core.ext.expire_reads.remove(&start);
+            }
+        }
         let Some(buf) = d.buf else { return };
         if d.res.is_err() {
             return;
@@ -3347,6 +3453,12 @@ impl PartitionStore {
             HeaderWhy::Expire { db, slot, fp32 } => {
                 let kl = h.key_len as usize;
                 if h.kind == EXT_KIND_CHUNK || h.db != db || EXT_HDR + kl > buf.len() {
+                    return;
+                }
+                if overtaken || self.core.ext.writes.contains_key(&start) {
+                    // the run was written while the header was read: the header may be the
+                    // previous version's (an in-place rewrite keeps the location, so the index
+                    // check below cannot tell); the next sweep pass looks again
                     return;
                 }
                 let key: Box<[u8]> = buf[EXT_HDR..EXT_HDR + kl].into();
@@ -3395,10 +3507,11 @@ impl PartitionStore {
             for &t in eff.tickets() {
                 self.core.tickets.effect_durable(t);
             }
-            if let Pending::Put(rec) = eff
-                && rec.desc.txn == 0
-            {
-                supersede.push((rec.desc.db, rec.key().into(), rec.desc.seq));
+            match eff {
+                Pending::Put(rec) if rec.desc.txn == 0 => supersede.push((rec.desc.db, rec.key().into(), rec.desc.seq)),
+                // the retired marker is off the media
+                Pending::Retire { db, key, seq, .. } => self.core.stale.absent_gone(*db, key, page, *seq),
+                _ => {}
             }
         }
         let empty = st.recs.is_empty() && st.pending.is_empty();
@@ -3897,6 +4010,11 @@ impl PartitionStore {
             for &t in applied.iter().flat_map(|e| e.tickets().iter()) {
                 self.core.tickets.effect_resolved(t);
             }
+            for e in applied.iter() {
+                if let Pending::Retire { db, key, seq, .. } = e {
+                    self.core.stale.absent_gone(*db, key, page, *seq);
+                }
+            }
             for (db, key) in cleared {
                 if self.core.stale.remove_at(db, &key, page) {
                     // the copy is gone without a write: whoever waits for it is told below,
@@ -3952,7 +4070,8 @@ impl PartitionStore {
         let place = {
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
-            let exclude = |q: PageId| q == from || stale.state_at(db, &key, q).is_some() || cache.page_state(q).is_some_and(|st| st.corrupt);
+            let absent = stale.absent_of(db, &key).map(|a| a.page);
+            let exclude = |q: PageId| q == from || stale.state_at(db, &key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt);
             self.core.alloc.place_small(need, cache, now_ns, &exclude)
         };
         let target = match place {
@@ -3999,6 +4118,8 @@ impl PartitionStore {
         if !marker {
             let e = Entry { fp32: kh.fp32(), x8: kh.x8(), page36: q.to36(), kind: Kind::Small, vtype, sync_mark: false };
             self.core.index_set_at(db, slot, kh, Some(from.to36()), e, expire);
+        } else {
+            self.core.stale.note_absent(db, &key, q, seq, txn);
         }
         if txn != 0
             && let Some(o) = self.core.txns.get_mut(&txn)
@@ -4301,6 +4422,7 @@ impl PartitionStore {
                             self.expire_or_rehint(cx, db, &key, kh, slot, page, exp, seq);
                         }
                     } else if self.core.buckets.expire.try_take(now_ns, 1) {
+                        self.core.ext.expire_reads.entry(page).or_insert((0, false)).0 += 1;
                         let tag = self.core.tag(IoKind::HeaderRead { start: page, why: HeaderWhy::Expire { db, slot, fp32: e.fp32 } });
                         cx.io.push(IoReq::read(tag, page.dev(), page.byte_offset(), AlignedBuf::zeroed(PAGE)));
                     }

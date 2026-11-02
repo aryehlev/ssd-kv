@@ -146,7 +146,6 @@ impl Tickets {
     }
 
     /// True for the internal ticket of a txn.
-    #[cfg(test)]
     pub(crate) fn is_internal(&self, t: TicketId) -> bool {
         self.map.get(&t.0).is_some_and(|k| k.txn_effects.is_some())
     }

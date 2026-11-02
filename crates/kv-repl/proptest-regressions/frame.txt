@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 049a0fb59301929cfccd792986dbbfa61373c2b2623041e782daf43cd97387f6 # shrinks to f = Hello { shard: 43758, partition: 3090, fence_term: 4075604207, last_term: 1576259319, applied: Seq(4008178507519601497), recovered: Scanned, learner: false, migration: None, .. }, cut = 79
+cc 42ece6ff0e8f9248a1da71366ad30b52ed5374ab204fe3bbbdb56bd41a29db3f # shrinks to f = Hello { shard: 0, partition: 0, fence_term: 0, last_term: 0, applied: Seq(0), recovered: Clean, learner: false, migration: None, .. }, partition = 0, term = 0

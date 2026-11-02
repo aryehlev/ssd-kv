@@ -66,6 +66,11 @@ const PERSIST_EVERY_NS: u64 = 50_000_000;
 const REDIAL_NS: u64 = 200_000_000;
 /// Pause before redialing after a refusal (the operator or a new assignment must act).
 const REDIAL_REJECTED_NS: u64 = 1_000_000_000;
+/// Longest wait of a reply for the shard commit before it is answered as not acknowledged.
+const COMMIT_WAIT_LIMIT_NS: u64 = 10_000_000_000;
+/// A member stream that delivered no frame for this long is closed and redialed (the primary
+/// sends a heartbeat every `repl-heartbeat-ms`).
+const MEMBER_IDLE_NS: u64 = 3_000_000_000;
 /// Ring kept by an idle or member partition for the groups it receives.
 const SMALL_RING: usize = 64 << 10;
 
@@ -217,6 +222,8 @@ struct MemberPart {
     own_groups: Option<Backlog>,
     divergent: Option<(KeyWalk, KeySet)>,
     ready_reported: Option<bool>,
+    /// When the stream last delivered a frame (boot ns).
+    last_rx_ns: u64,
 }
 
 enum Role {
@@ -243,7 +250,8 @@ pub(super) struct PartRepl {
     /// Primary: produced groups durable locally; member: applied groups durable.
     durable: Prefix,
     tickets: hashbrown::HashMap<u64, TicketFor, foldhash::fast::RandomState>,
-    commit_waits: Vec<(Seq, CommitWaiter)>,
+    /// `(seq, since boot ns, waiter)` of replies waiting for the shard commit.
+    commit_waits: Vec<(Seq, u64, CommitWaiter)>,
     syncing: bool,
     persisted: (Seq, Seq, u32, u32),
     pub(super) mig_out: Vec<MigOut>,
@@ -441,12 +449,10 @@ impl<B: Backend> Worker<B> {
     }
 
     fn ticket_satisfies(&self, st: TicketState) -> bool {
-        match (self.local_need(), st) {
-            (None, _) => true,
-            (_, TicketState::Durable | TicketState::Failed(_)) => true,
-            (Some(TicketState::Written), TicketState::Written) => true,
-            _ => false,
-        }
+        matches!(
+            (self.local_need(), st),
+            (None, _) | (_, TicketState::Durable | TicketState::Failed(_)) | (Some(TicketState::Written), TicketState::Written)
+        )
     }
 
     /// Submits a replication request of partition `p`, in order with the partition's earlier
@@ -584,13 +590,14 @@ impl<B: Backend> Worker<B> {
 
     /// A commit waiter for partition `p` (released by the tick once `commit_seq >= seq`).
     pub(crate) fn commit_wait(&mut self, p: u16, seq: Seq, w: CommitWaiter) {
+        let now = self.now.boot_ns;
         let mut slot = Some(w);
         self.with_cluster(|_, cw| {
             if let Some(pr) = cw.part(p)
                 && matches!(pr.role, Role::Primary(_))
                 && let Some(w) = slot.take()
             {
-                pr.commit_waits.push((seq, w));
+                pr.commit_waits.push((seq, now, w));
             }
         });
         if let Some(w) = slot {
@@ -786,11 +793,12 @@ impl<B: Backend> Worker<B> {
                         own_groups,
                         divergent: None,
                         ready_reported: None,
+                        last_rx_ns: 0,
                     }));
                 }
             }
             // replies of writes this role executed but cannot commit any more
-            for (_, w) in waits.drain(..) {
+            for (_, _, w) in waits.drain(..) {
                 self.commit_released(w, Some(b"TRYAGAIN the shard role of this node changed"));
             }
             let _ = cs;
@@ -943,7 +951,7 @@ impl<B: Backend> Worker<B> {
             let id = mi.id;
             if let Some(io) = stream {
                 let sid = io.id;
-                mi.connected(io);
+                mi.connected(io, now);
                 cw.streams.insert(sid, StreamRef::MigIn { p, id });
             } else {
                 mi.dial_failed(now);
@@ -973,6 +981,7 @@ impl<B: Backend> Worker<B> {
                 m.sync = MemberSync::None;
                 m.groups.clear();
                 m.ready_reported = None;
+                m.last_rx_ns = now;
                 cw.streams.insert(sid, StreamRef::Member { p });
             }
             None => m.next_dial_ns = now + REDIAL_NS,
@@ -1231,6 +1240,7 @@ impl<B: Backend> Worker<B> {
             if m.io.as_ref().is_none_or(|i| i.id != stream) {
                 return;
             }
+            m.last_rx_ns = now;
             if term < fence {
                 // a frame of a fenced term
                 if let Some(io) = m.io.take() {
@@ -1613,12 +1623,9 @@ impl<B: Backend> Worker<B> {
                 }
                 if let MemberSync::Full { open, prune: Some(walk), .. } = &mut m.sync {
                     walk.busy = false;
-                    match (durable_now, ticket) {
-                        (false, Some(t)) => {
-                            *open += 1;
-                            pr.tickets.insert(t.0, TicketFor::Sync { epoch });
-                        }
-                        _ => {}
+                    if let (false, Some(t)) = (durable_now, ticket) {
+                        *open += 1;
+                        pr.tickets.insert(t.0, TicketFor::Sync { epoch });
                     }
                 }
                 self.member_sync_progress(cw, p);
@@ -1907,7 +1914,7 @@ impl<B: Backend> Worker<B> {
                 self.drive_direct(cw, p);
                 self.drive_mig_out(cw, p);
                 self.drive_purge(cw, p);
-                let mut released: Vec<CommitWaiter> = Vec::new();
+                let mut released: Vec<(CommitWaiter, Option<&'static [u8]>)> = Vec::new();
                 let ack_timeout = cw.ack_timeout_ns;
                 let mut reports: Vec<AgentMsg> = Vec::new();
                 if let Some(pr) = cw.part(p)
@@ -1971,11 +1978,17 @@ impl<B: Backend> Worker<B> {
                     }
                     // committed replies
                     let commit = pp.sender.commit_seq();
-                    if lease_ok && !pr.commit_waits.is_empty() {
+                    if !pr.commit_waits.is_empty() {
                         let mut i = 0;
                         while i < pr.commit_waits.len() {
-                            if pr.commit_waits[i].0 <= commit {
-                                released.push(pr.commit_waits.swap_remove(i).1);
+                            let (seq, since) = (pr.commit_waits[i].0, pr.commit_waits[i].1);
+                            if lease_ok && seq <= commit {
+                                released.push((pr.commit_waits.swap_remove(i).2, None));
+                            } else if now.saturating_sub(since) >= COMMIT_WAIT_LIMIT_NS {
+                                // no commit and no committed ISR change within the bound (the
+                                // coordinator is unreachable or the lease is gone): the write
+                                // is answered as not acknowledged rather than held forever
+                                released.push((pr.commit_waits.swap_remove(i).2, Some(&b"TRYAGAIN the write was not acknowledged by the shard in time"[..])));
                             } else {
                                 i += 1;
                             }
@@ -1994,8 +2007,10 @@ impl<B: Backend> Worker<B> {
                 for m in reports {
                     cw.cs.tell_agent(m);
                 }
-                for w in released {
-                    if below_min {
+                for (w, refused) in released {
+                    if refused.is_some() {
+                        self.commit_released(w, refused);
+                    } else if below_min {
                         self.commit_released(w, Some(b"NOREPLICAS Not enough good replicas to write."));
                     } else {
                         self.commit_released(w, None);
@@ -2008,6 +2023,12 @@ impl<B: Backend> Worker<B> {
                 if let Some(pr) = cw.part(p)
                     && let Role::Member(m) = &mut pr.role
                 {
+                    if m.io.is_some() && now.saturating_sub(m.last_rx_ns) >= MEMBER_IDLE_NS {
+                        tracing::info!(partition = p, "no frame from the primary: the stream is redialed");
+                        if let Some(io) = &m.io {
+                            io.abort();
+                        }
+                    }
                     m.stream.note_durable(pr.durable.upto());
                     if let Some(io) = &m.io
                         && let Some(f) = m.stream.ack_due(self.now.mono_ns)

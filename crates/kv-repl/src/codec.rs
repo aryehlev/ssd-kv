@@ -322,9 +322,12 @@ fn visit_keys<'a>(body: &'a [u8], f: &mut dyn FnMut(u8, &'a [u8]), wide: &mut dy
     Ok(())
 }
 
+/// `(db, key)` pairs (Repair key sets).
+pub type KeyList = Vec<(u8, Box<[u8]>)>;
+
 /// The `(db, key)` pairs touched by the encoded groups in `b` (each pair once, in first-touch
 /// order).
-pub fn group_keys(b: &[u8]) -> Result<Vec<(u8, Box<[u8]>)>, DecodeError> {
+pub fn group_keys(b: &[u8]) -> Result<KeyList, DecodeError> {
     let mut out = KeySet::default();
     let mut at = 0;
     while at < b.len() {

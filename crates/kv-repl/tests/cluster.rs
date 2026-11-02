@@ -14,7 +14,6 @@
 //! test (`cargo build -p kv-node -p kv-coord` first). Every wait has a deadline and a watchdog
 //! ends the process if a test runs far longer than it should: a hang fails, it never blocks.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -144,8 +143,8 @@ fn text(v: &Value) -> String {
 /// times within a short budget.
 struct Routed {
     coords: Vec<SocketAddr>,
-    route: HashMap<u16, SocketAddr>,
-    conns: HashMap<SocketAddr, Conn>,
+    route: hashbrown::HashMap<u16, SocketAddr>,
+    conns: hashbrown::HashMap<SocketAddr, Conn>,
     next_coord: usize,
 }
 
@@ -157,7 +156,7 @@ enum Outcome {
 
 impl Routed {
     fn new(coords: Vec<SocketAddr>) -> Self {
-        Routed { coords, route: HashMap::new(), conns: HashMap::new(), next_coord: 0 }
+        Routed { coords, route: hashbrown::HashMap::new(), conns: hashbrown::HashMap::new(), next_coord: 0 }
     }
 
     fn coord(&mut self) -> SocketAddr {
@@ -174,8 +173,8 @@ impl Routed {
                 None => self.coord(),
             };
             let conn = match self.conns.entry(target) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => match Conn::open(target) {
+                hashbrown::hash_map::Entry::Occupied(e) => e.into_mut(),
+                hashbrown::hash_map::Entry::Vacant(e) => match Conn::open(target) {
                     Ok(c) => e.insert(c),
                     Err(err) => {
                         last = format!("connect {target}: {err}");
@@ -394,8 +393,6 @@ impl Cluster {
             &format!("127.0.0.1:{}", n.port),
             "--repl",
             &format!("127.0.0.1:{}", n.repl),
-            "--zone",
-            &format!("z{i}"),
         ]);
         let id = r.split_whitespace().nth(2).expect("node id in the reply").to_owned();
         self.nodes[i].id = id;
@@ -488,8 +485,14 @@ impl Cluster {
 struct Writer {
     stop: Arc<AtomicBool>,
     acks: Arc<AtomicU32>,
-    handle: Option<std::thread::JoinHandle<(Vec<(String, String)>, usize)>>,
+    handle: Option<std::thread::JoinHandle<WriterResult>>,
 }
+
+/// Acknowledged `(key, value)` writes and the number of writes not acknowledged.
+type WriterResult = (Vec<(String, String)>, usize);
+
+/// Keys whose write was not acknowledged, per writer prefix (they may or may not exist, G6).
+static UNACKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 impl Writer {
     fn start(coords: Vec<SocketAddr>, prefix: &str, pause: Duration) -> Self {
@@ -511,7 +514,10 @@ impl Writer {
                         acked.push((k, v));
                         n.fetch_add(1, Ordering::Relaxed);
                     }
-                    _ => failed += 1,
+                    _ => {
+                        failed += 1;
+                        UNACKED.lock().unwrap_or_else(|e| e.into_inner()).push(k);
+                    }
                 }
                 if !pause.is_zero() {
                     std::thread::sleep(pause);
@@ -633,8 +639,37 @@ fn replication_failover_and_returning_member() {
         assert_eq!(c.replica_get(0, k).as_deref(), Some(v.as_str()), "the returning member holds {k}");
     }
     assert_eq!(c.replica_get(0, "base:7").as_deref(), Some("b7"));
+    // writes that were never acknowledged converge: the returning member holds exactly what
+    // the new primary holds for them (present or absent), never a divergent copy
+    let unacked: Vec<String> = UNACKED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|k| k.starts_with("w2:")).cloned().collect();
+    let mut r = Routed::new(coords.clone());
+    for k in &unacked {
+        let at_primary = match r.exec(k.as_bytes(), &[b"GET", k.as_bytes()]) {
+            Outcome::Ok(Value::Bulk(b)) => b.map(|b| String::from_utf8_lossy(&b).into_owned()),
+            Outcome::Ok(other) => panic!("GET {k}: {}", text(&other)),
+            Outcome::Failed(e) => panic!("GET {k}: {e}"),
+        };
+        assert_eq!(c.replica_get(0, k), at_primary, "unacknowledged write {k} converged");
+    }
     assert!(c.log_contains(0, "repair complete"), "the returning member repaired against the new primary");
     assert!(!c.log_contains(0, "merge full sync started"), "no full sync for a returning member");
+
+    // graceful handoff back to node 0 under writes (§23.12): the old primary drains to its
+    // own barrier, relinquishes its lease and stays an in-sync member; nothing acknowledged
+    // is lost
+    let w = Writer::start(coords.clone(), "w3", Duration::from_millis(1));
+    w.at_least(50, 60);
+    let n0 = c.nodes[0].id.clone();
+    c.admin(&["FAILOVER", "1", "--to", &n0]);
+    c.wait_primary(0, 60);
+    c.wait_member(promoted, "in-sync isr", 60);
+    w.at_least(150, 60);
+    let (acked3, failed3) = w.finish();
+    eprintln!("writer during the handoff: {} acked, {failed3} not acknowledged", acked3.len());
+    verify_acked(&coords, &acked3);
+    verify_acked(&coords, &acked2);
+    let last = acked3.last().unwrap().clone();
+    wait_until("the demoted primary follows", 30, || c.replica_get(promoted, &last.0).as_deref() == Some(last.1.as_str()));
     c.ok = true;
 }
 

@@ -51,6 +51,8 @@ pub enum CtrlEvent {
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest graceful handoff before writes are accepted again.
 const HANDOFF_LIMIT: Duration = Duration::from_secs(6);
+/// Longest node-meta write before its step is given up (unacknowledged).
+const PERSIST_LIMIT: Duration = Duration::from_secs(10);
 /// Period of repeated node-initiated reports not yet reflected by an assignment.
 const REPORT_REPEAT: Duration = Duration::from_millis(1000);
 
@@ -140,7 +142,8 @@ struct Agent {
     /// `(coord_term, version)` of the applied assignment.
     current: Option<(u64, u64)>,
     persist_q: VecDeque<Persist>,
-    persist_inflight: Option<(u64, Persist)>,
+    /// `(token, step, started)` of the node-meta write in flight.
+    persist_inflight: Option<(u64, Persist, std::time::Instant)>,
     renew_seq: u64,
     sent_renewals: VecDeque<(u64, u64)>,
     /// After a completed handoff the lease stays relinquished until the demoting assignment.
@@ -316,7 +319,7 @@ impl Agent {
             };
             let token = self.cs.token(AGENT_TOKEN_BIT);
             self.cs.meta.request(0, token, MetaReq::NodeMeta { m: meta });
-            self.persist_inflight = Some((token, step));
+            self.persist_inflight = Some((token, step, std::time::Instant::now()));
         }
     }
 
@@ -338,9 +341,9 @@ impl Agent {
     }
 
     fn on_persisted(&mut self, token: u64, done: MetaDone) {
-        let Some((t, step)) = self.persist_inflight.take() else { return };
+        let Some((t, step, started)) = self.persist_inflight.take() else { return };
         if t != token {
-            self.persist_inflight = Some((t, step));
+            self.persist_inflight = Some((t, step, started));
             return;
         }
         if let MetaDone::Failed(errno) = done {
@@ -593,6 +596,13 @@ impl Agent {
             self.cs.handoff.store(false, Ordering::Release);
         }
         self.fences.retain(|_, g| g.started.elapsed() < Duration::from_secs(10));
+        // a node-meta write that never completes does not hold every later step forever: the
+        // step is dropped unacknowledged (the coordinator pushes again) and the queue moves on
+        if self.persist_inflight.as_ref().is_some_and(|(_, _, t)| t.elapsed() > PERSIST_LIMIT) {
+            tracing::error!("node meta write did not complete: the step is not acknowledged");
+            self.persist_inflight = None;
+            self.next_persist();
+        }
         // repeated reports
         let a = self.cs.assignment();
         if let Some(role) = a.as_ref().and_then(|a| a.role.as_ref()) {

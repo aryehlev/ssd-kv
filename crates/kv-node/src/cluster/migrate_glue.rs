@@ -43,6 +43,10 @@ use crate::runtime::worker::Worker;
 const BARRIERS: u8 = 2;
 /// Pause before a destination redials its source.
 const REDIAL_NS: u64 = 200_000_000;
+/// A source repeats its position marker at least this often.
+const POSITION_REPEAT_NS: u64 = 500_000_000;
+/// A destination stream that delivered no frame for this long is closed and redialed.
+const DEST_IDLE_NS: u64 = 5_000_000_000;
 
 /// One migration endpoint of one partition.
 pub enum MigrationEndpoint {
@@ -68,6 +72,8 @@ pub struct MigOut {
     sealed: bool,
     ready_reported: bool,
     rate: u64,
+    /// When the last position marker was written (boot ns).
+    pos_sent_ns: u64,
 }
 
 impl MigOut {
@@ -90,6 +96,7 @@ impl MigOut {
             sealed: false,
             ready_reported: false,
             rate,
+            pos_sent_ns: 0,
         }
     }
 
@@ -158,6 +165,7 @@ pub struct MigIn {
     stream: MemberStream,
     acked: Seq,
     sealed_reported: bool,
+    last_rx_ns: u64,
 }
 
 impl MigIn {
@@ -176,6 +184,7 @@ impl MigIn {
             stream: MemberStream::with_backlog(p, ring),
             acked: Seq::ZERO,
             sealed_reported: false,
+            last_rx_ns: 0,
         }
     }
 
@@ -185,7 +194,8 @@ impl MigIn {
         }
     }
 
-    pub fn connected(&mut self, io: StreamIo) {
+    pub fn connected(&mut self, io: StreamIo, now: u64) {
+        self.last_rx_ns = now;
         self.dial_tag = None;
         self.io = Some(io);
         self.epoch += 1;
@@ -326,6 +336,7 @@ impl<B: Backend> Worker<B> {
 
     pub(super) fn drive_mig_out(&mut self, cw: &mut ClusterWorker, p: u16) {
         let now_ns = self.now.mono_ns;
+        let now = self.now.boot_ns;
         let last = before(self.backend.next_seq(p));
         let term = cw.assignment().and_then(|a| a.role.as_ref()).map_or(0, |r| r.term);
         let lens = |w: &Self, s: u16| w.backend.slot_len(p, 0, s);
@@ -338,11 +349,9 @@ impl<B: Backend> Worker<B> {
                 if io.unsent() >= SEND_WINDOW || mo.reading || mo.walk.busy {
                     continue;
                 }
-                if !mo.walk.done() {
-                    if !mo.begun {
-                        mo.walk.skip_empty(&|s| lens(self, s));
-                        mo.src.advance(mo.walk.pos());
-                    }
+                if !mo.walk.done() && !mo.begun {
+                    mo.walk.skip_empty(&|s| lens(self, s));
+                    mo.src.advance(mo.walk.pos());
                 }
                 if mo.walk.done() {
                     if !mo.copy_end_sent {
@@ -350,9 +359,11 @@ impl<B: Backend> Worker<B> {
                         io.send(frame_bytes(&Frame::SyncDone { at: last }, p, term));
                         mo.copy_end_sent = true;
                         mo.pos_sent = last;
-                    } else if last > mo.pos_sent && !mo.sealed {
-                        io.send(frame_bytes(&Frame::Commit(last), p, term));
-                        mo.pos_sent = last;
+                    } else if !mo.sealed && (last > mo.pos_sent || now.saturating_sub(mo.pos_sent_ns) >= POSITION_REPEAT_NS) {
+                        // a position marker when the source moved, and periodically (liveness)
+                        io.send(frame_bytes(&Frame::Commit(last.max(mo.pos_sent)), p, term));
+                        mo.pos_sent = last.max(mo.pos_sent);
+                        mo.pos_sent_ns = now;
                     }
                     if mo.phase == MigPhase::Cutover && !mo.sealed {
                         // after every earlier frame of these slots (a single position barrier)
@@ -493,6 +504,11 @@ impl<B: Backend> Worker<B> {
                         tag += 1;
                     }
                     Some(io) => {
+                        if now.saturating_sub(mi.last_rx_ns) >= DEST_IDLE_NS {
+                            tracing::info!(partition = p, migration = mi.id, "no frame from the migration source: redialing");
+                            io.abort();
+                            continue;
+                        }
                         // acknowledge the source positions whose effects are committed here
                         let Some(commit) = commit else { continue };
                         if let Some(pos) = mi.markers.acked(commit) {
@@ -518,6 +534,7 @@ impl<B: Backend> Worker<B> {
     }
 
     pub(super) fn mig_in_frame(&mut self, cw: &mut ClusterWorker, p: u16, id: u64, stream: u64, _term: u32, f: Frame) {
+        let now = self.now.boot_ns;
         let mut submits: Vec<(Request, ReplJob)> = Vec::new();
         {
             let Some(pr) = cw.part(p) else { return };
@@ -525,6 +542,7 @@ impl<B: Backend> Worker<B> {
             if mi.io.as_ref().is_none_or(|i| i.id != stream) {
                 return;
             }
+            mi.last_rx_ns = now;
             if let Frame::Reject(r) = &f {
                 tracing::info!(partition = p, migration = id, "the migration source refused the stream: {r:?}");
                 if let Some(io) = mi.io.take() {

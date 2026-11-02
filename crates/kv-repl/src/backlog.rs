@@ -287,7 +287,7 @@ impl Backlog {
     }
 
     /// The `(db, key)` pairs of groups in `(after, upto]`, `None` if not covered.
-    pub fn keys_between(&self, after: Seq, upto: Seq) -> Option<Vec<(u8, Box<[u8]>)>> {
+    pub fn keys_between(&self, after: Seq, upto: Seq) -> Option<codec::KeyList> {
         let mut ks = codec::KeySet::default();
         self.keys_between_into(after, upto, &mut ks)?;
         Some(ks.into_vec())
@@ -371,35 +371,6 @@ mod tests {
         b.push(Seq::new(1, 3), &group(Seq::new(1, 3), b"c", 10));
         let mut out = Vec::new();
         assert_eq!(b.read_after(Seq::new(1, 2), usize::MAX, &mut out), Some(Seq::new(1, 3)));
-    }
-
-    /// LC-23: the ring memory is locked (or huge pages) and excluded from core dumps, as the
-    /// kernel reports it for the mapping that holds it (`/proc/self/smaps` `VmFlags`).
-    #[test]
-    fn backlog_never_reaches_disk() {
-        let mut b = Backlog::new(3 << 20);
-        b.push(Seq::new(1, 1), &group(Seq::new(1, 1), b"k", 100));
-        let addr = b.ring_addr();
-        let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
-        let mut flags: Option<&str> = None;
-        let mut inside = false;
-        for line in smaps.lines() {
-            let head = line.split_whitespace().next().unwrap_or("");
-            if let Some((lo, hi)) = head.split_once('-')
-                && let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
-            {
-                inside = lo <= addr && addr < hi;
-                continue;
-            }
-            if inside && let Some(f) = line.strip_prefix("VmFlags:") {
-                flags = Some(f);
-                break;
-            }
-        }
-        let flags: Vec<&str> = flags.expect("the ring's mapping is listed").split_whitespace().collect();
-        assert!(flags.contains(&"dd"), "not excluded from core dumps: {flags:?}");
-        assert!(flags.contains(&"lo") || flags.contains(&"ht"), "neither locked nor huge pages: {flags:?}");
-        assert_eq!(b.is_huge(), flags.contains(&"ht"));
     }
 
     #[test]

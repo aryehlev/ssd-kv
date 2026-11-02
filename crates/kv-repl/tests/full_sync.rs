@@ -148,7 +148,7 @@ fn full_sync_keeps_layout() {
     let mut stream = MemberStream::with_backlog(0, Backlog::new(1 << 16));
     let mut dec = FrameDecoder::new();
     let mut off = 0;
-    let mut confirmed = std::collections::HashSet::new();
+    let mut confirmed = hashbrown::HashSet::new();
     let (mut written, mut began, mut done) = (0usize, false, None);
     while off < wire.len() {
         let (_, _, f, n) = dec.feed(&wire[off..]).unwrap().expect("whole frames");

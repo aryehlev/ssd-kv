@@ -283,3 +283,65 @@ fn idle_spare_ags_go_to_a_partition_refused_space() {
     assert!(stored >= 60, "only {stored} MiB stored in the hot partition before -OOM ({used}/{total} AGs used)");
     db.quiesce();
 }
+
+/// A full device must not refuse what makes room: a TTL change of an existing key (EXPIRE,
+/// PERSIST) rewrites the key without growing it, and a multi-key delete only stages markers.
+/// Both used to get `-OOM` once the partition reached the fill limit (they needed a new copy's
+/// space like any write), so on a full device keys could be given a TTL to free space only one
+/// DEL at a time.
+#[test]
+fn ttl_changes_and_deletes_work_on_a_full_partition() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 9);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 9).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    // fill the device through one partition (one hash tag) with values of 2-60 KiB until
+    // it refuses
+    let mut stored = Vec::new();
+    let mut refused = 0;
+    for i in 0..20_000u64 {
+        let k = format!("{{full}}{i}");
+        match db.set(0, k.as_bytes(), &value(i, 2100 + (i as usize * 9973) % 60_000), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                stored.push(k);
+            }
+            Err(StoreError::OutOfSpace) => {
+                refused += 1;
+                if refused > 50 {
+                    break;
+                }
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(refused > 50 && stored.len() > 100, "the partition filled up ({} keys stored)", stored.len());
+    for (i, k) in stored.iter().take(40).enumerate() {
+        let k = k.as_bytes();
+        let at = if i % 2 == 0 { Some(T0 + 3_600_000) } else { None };
+        let (hit, t) = db.expire(0, k, at).unwrap_or_else(|e| panic!("TTL change {i} on a full partition: {e:?}"));
+        assert!(hit);
+        db.wait(k, t, TicketState::Written);
+    }
+    // a multi-key delete (txn markers) frees space on a full partition
+    let keys: Vec<&[u8]> = stored[40..44].iter().map(|k| k.as_bytes()).collect();
+    let p = db.eng.partition_of(keys[0]);
+    let (n, out) = db
+        .eng
+        .run(p, keyed(0, &keys, kv_common::Access::Write), &mut |ks| {
+            ks.select(0);
+            let mut n = 0;
+            for k in &keys {
+                n += u32::from(ks.delete(k)?);
+            }
+            Ok(n)
+        })
+        .unwrap_or_else(|e| panic!("multi-key delete on a full partition: {e:?}"));
+    assert_eq!(n, 4);
+    db.wait_in(p, out.ticket, TicketState::Written);
+    db.quiesce();
+}

@@ -181,6 +181,12 @@ pub(crate) struct Staged {
     pub(crate) op: Option<Op>,
     /// Explicit version (replicated ops carry the primary's seq).
     pub(crate) seq: Option<Seq>,
+    /// The change does not make the key's stored data grow: a TTL change of an existing
+    /// version (same value) or a delete. On a full device it may use the space reserve above
+    /// the fill limit (like an accepted move, §14.3): the copy it replaces is freed once it is
+    /// durable, and EXPIRE / PERSIST / DEL stay available to make room (Redis never refuses
+    /// them for memory).
+    pub(crate) no_growth: bool,
 }
 
 /// Something `exec` needed that was not present.
@@ -380,6 +386,7 @@ impl<'p> Keyspace<'p> {
                         change: Change::Expired,
                         op: Some(Op::Expired { db, key: key.into() }),
                         seq: self.seq,
+                        no_growth: true,
                     });
                 }
                 (cur, None)
@@ -647,11 +654,18 @@ impl<'p> Keyspace<'p> {
     }
 
     fn stage(&mut self, db: u8, key: &[u8], cur: Cur, change: Change, op: Option<Op>) {
+        self.stage_as(db, key, cur, change, op, false);
+    }
+
+    /// [`Keyspace::stage`] of a change that does not make the key grow (`Staged::no_growth`).
+    fn stage_as(&mut self, db: u8, key: &[u8], cur: Cur, change: Change, op: Option<Op>, no_growth: bool) {
         let op = if self.core.cfg.produce_groups { op } else { None };
         if let Some(i) = self.staged_idx(db, key) {
             // one change per key: the newest wins, the location found first stays
             let s = &mut self.staged[i];
             s.change = change;
+            // a request that also wrote the key otherwise may grow it
+            s.no_growth &= no_growth;
             if op.is_some() {
                 // the group carries one op per key, so a key changed twice by one request
                 // replicates as its final state: a relative op (APPEND, SETRANGE, EXPIRE) alone
@@ -679,6 +693,7 @@ impl<'p> Keyspace<'p> {
             change,
             op,
             seq: self.seq,
+            no_growth,
         });
     }
 
@@ -752,7 +767,7 @@ impl<'p> Keyspace<'p> {
         let Some(h) = hit else { return Ok(false) };
         let v = self.value_of(&h).to_vec();
         let op = Op::Expire { db, key: key.into(), expire_at: expire_at_ms.unwrap_or(0) };
-        self.stage(db, key, cur, Change::Put { vtype: h.vtype, expire_at: expire_at_ms, value: v }, Some(op));
+        self.stage_as(db, key, cur, Change::Put { vtype: h.vtype, expire_at: expire_at_ms, value: v }, Some(op), true);
         Ok(true)
     }
 
@@ -763,7 +778,7 @@ impl<'p> Keyspace<'p> {
         if hit.is_none() {
             return Ok(false);
         }
-        self.stage(db, key, cur, Change::Delete, Some(Op::Del { db, key: key.into() }));
+        self.stage_as(db, key, cur, Change::Delete, Some(Op::Del { db, key: key.into() }), true);
         Ok(true)
     }
 

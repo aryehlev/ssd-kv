@@ -1786,8 +1786,9 @@ impl PartitionStore {
         let mut plans: SmallVec<[Plan; 2]> = SmallVec::new();
         for s in staged.iter() {
             let p = match &s.change {
-                Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some(), &mut undo),
-                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, txn.is_some(), &mut undo),
+                // a cross-partition part, a TTL change or a delete (marker) may use the reserve
+                Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some() || s.no_growth, &mut undo),
+                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, true, &mut undo),
                 _ => Ok(Plan::None),
             };
             match p {
@@ -1888,11 +1889,12 @@ impl PartitionStore {
         self.core.meta_req(meta, MetaReq::ReserveSeq { partition: id, floor }, MetaWait::Seq(floor));
     }
 
-    /// Chooses where a put of `val_len` value bytes goes. `reserve`: the put is part of a
-    /// cross-partition txn whose other parts may already be applied; it may use the space
+    /// Chooses where a put of `val_len` value bytes goes. `reserve`: the put may use the space
     /// reserve above the fill limit (like an accepted move, §14.3), and fails with `-OOM` only
-    /// once the reserve refused too. A part that fails leaves its siblings' versions to the
-    /// coordinator to resolve, so failing for space that the reserve still has is avoided.
+    /// once the reserve refused too. Granted to a part of a cross-partition txn whose other
+    /// parts may already be applied (a part that fails leaves its siblings' versions to the
+    /// coordinator to resolve), and to writes that do not grow the key (`Staged::no_growth`:
+    /// TTL changes, txn delete markers), whose old copy is freed once they are durable.
     #[allow(clippy::too_many_arguments)]
     fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, reserve: bool, undo: &mut Undo) -> Result<Plan, Commit> {
         let r = self.plan_put_at(cx, s, key_len, val_len, txn, undo);
@@ -4777,7 +4779,7 @@ impl PartitionStore {
                     }
                     None => return,
                 };
-                let s = Staged { db, key: key.into(), kh, slot, cur, change: Change::Expired, op: None, seq: None };
+                let s = Staged { db, key: key.into(), kh, slot, cur, change: Change::Expired, op: None, seq: None, no_growth: true };
                 self.apply_expired(cx, &s);
             }
             _ => {

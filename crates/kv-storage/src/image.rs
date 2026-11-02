@@ -343,6 +343,8 @@ pub(crate) trait BuildEnv {
     fn others_older(&self, db: u8, key: &[u8], seq: Seq) -> usize;
     /// State of a tracked (moved-away or older) copy of `(db, key)` located in this page.
     fn tracked_here(&self, db: u8, key: &[u8]) -> Option<CopyState>;
+    /// Every key with a tracked copy located in this page.
+    fn tracked_keys(&self) -> SmallVec<[(u8, Box<[u8]>); 2]>;
     /// The record is dead: below a durable flush cutoff, or of an aborted txn (§16.2).
     fn dead(&self, r: &RecDesc) -> bool;
     /// The record belongs to a txn whose commit is not durable yet (§13.3 c).
@@ -718,6 +720,17 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
         }
     }
 
+    // tracked copies of this page that N no longer holds are gone once N is durable, whichever
+    // rule dropped them (superseded, removed, retired, an older copy next to a new version,
+    // dead): every one of them is reported, or its registry entry would outlive the record
+    // and hold back the key's next write or delete forever
+    for (db, key) in env.tracked_keys() {
+        let still = keep.iter().any(|r| r.db == db && r.key(m) == &*key && r.status != RecStatus::Droppable);
+        if !still && !out.cleared.iter().any(|(d, k)| *d == db && **k == *key) {
+            out.cleared.push((db, key));
+        }
+    }
+
     // 5. I/O shape, then R4 inside the written spans
     let (spans, atomic) = io_shape(&ch, env);
     if spans.is_empty() && !out.applied.iter().any(|p| matches!(p, Pending::Put(_))) && !st.fresh {
@@ -842,6 +855,9 @@ pub(crate) mod tests {
         }
         fn tracked_here(&self, _db: u8, _key: &[u8]) -> Option<CopyState> {
             None
+        }
+        fn tracked_keys(&self) -> SmallVec<[(u8, Box<[u8]>); 2]> {
+            SmallVec::new()
         }
         fn dead(&self, _r: &RecDesc) -> bool {
             false

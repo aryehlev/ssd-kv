@@ -300,6 +300,14 @@ impl StaleCopies {
         true
     }
 
+    /// Keys with a tracked copy located at `page` (O(1) when the page holds none).
+    pub(crate) fn keys_at(&self, page: PageId) -> SmallVec<[(u8, Box<[u8]>); 2]> {
+        if self.at_page(page) == 0 {
+            return SmallVec::new();
+        }
+        self.map.iter().filter(|(_, v)| v.iter().any(|e| e.at.page() == page)).map(|(k, _)| (k.db, k.key.clone())).collect()
+    }
+
     /// Tracked copies located at `page` (SMALL page or extent first page).
     pub(crate) fn at_page(&self, page: PageId) -> u32 {
         if self.entries == 0 {

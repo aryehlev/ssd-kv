@@ -855,6 +855,9 @@ impl BuildEnv for Env<'_> {
     fn tracked_here(&self, db: u8, key: &[u8]) -> Option<CopyState> {
         self.core.stale.state_at(db, key, self.page)
     }
+    fn tracked_keys(&self) -> SmallVec<[(u8, Box<[u8]>); 2]> {
+        self.core.stale.keys_at(self.page)
+    }
     fn dead(&self, r: &RecDesc) -> bool {
         self.core.dead(r.db, r.seq, r.txn)
     }
@@ -1301,7 +1304,10 @@ impl PartitionStore {
                 self.core.counters.page_reads += u64::from(pages);
             }
             Need::ExtWrite(start) => {
-                if let Some(w) = self.core.ext.writes.get_mut(&start) {
+                // only a write still to complete wakes its waiters (at `ext_write_done`)
+                if let Some(w) = self.core.ext.writes.get_mut(&start)
+                    && w.state != ExtState::AwaitFlush
+                {
                     w.waiters.push((id, generation));
                     self.reqs.get_mut(id).expect("live").io += 1;
                 }
@@ -1508,7 +1514,9 @@ impl PartitionStore {
                         ExecStatus::Done(v, out)
                     }
                     Commit::Need(needs) => {
-                        self.requeue(id, r);
+                        // the needs are registered before the readiness check: a request is
+                        // never ready while its reads are outstanding
+                        self.reqs.slots[id.0 as usize] = Some(r);
                         for n in needs {
                             self.need(cx, id, n);
                         }
@@ -1535,7 +1543,7 @@ impl PartitionStore {
             }
             Err(StoreError::NeedMore) if !needs.is_empty() => {
                 self.core.counters.fp_false_positive_reads += 1;
-                self.requeue(id, r);
+                self.reqs.slots[id.0 as usize] = Some(r);
                 for n in needs {
                     self.need(cx, id, n);
                 }
@@ -2548,7 +2556,8 @@ impl PartitionStore {
     fn exec_barrier(&mut self, cache: &mut PageCache) -> ExecOut {
         let t = self.core.tickets.create(TICKET_HAS_META);
         let pages: Vec<PageId> = self.own_pages(cache).filter(|(_, st)| !st.pending.is_empty() || st.inflight.is_some()).map(|(p, _)| p).collect();
-        let mut n = 0u32;
+        // `n` effects still to be written, `w` written ones waiting for their flush
+        let (mut n, mut w) = (0u32, 0u32);
         for p in pages {
             let Some(st) = cache.page_state_mut(p) else { continue };
             for e in st.pending.iter_mut() {
@@ -2558,18 +2567,27 @@ impl PartitionStore {
             if let Some(inf) = st.inflight.as_mut() {
                 for e in inf.applied.iter_mut() {
                     e.tickets_mut().push(t);
-                    n += 1;
+                    match inf.state {
+                        InflightState::Writing => n += 1,
+                        InflightState::AwaitFlush => w += 1,
+                    }
                 }
             }
         }
         let c = &mut self.core;
-        for w in c.ext.writes.values_mut() {
-            w.tickets.push(t);
-            n += 1;
+        for x in c.ext.writes.values_mut() {
+            x.tickets.push(t);
+            match x.state {
+                ExtState::AwaitFlush => w += 1,
+                _ => n += 1,
+            }
         }
         for z in c.ext.zeros.values_mut() {
             z.waiters.push(t);
-            n += 1;
+            match z.state {
+                ExtState::AwaitFlush => w += 1,
+                _ => n += 1,
+            }
         }
         for g in c.gone_wait.iter_mut() {
             g.3.push(t);
@@ -2583,6 +2601,9 @@ impl PartitionStore {
         }
         for _ in 0..n {
             c.tickets.add_effect(t);
+        }
+        for _ in 0..w {
+            c.tickets.add_durable_only(t);
         }
         for _ in 0..meta {
             c.tickets.add_meta(t);
@@ -2766,7 +2787,7 @@ impl PartitionStore {
             }
         }
         if !needs.is_empty() {
-            self.requeue(id, r);
+            self.reqs.slots[id.0 as usize] = Some(r);
             for n in needs {
                 self.need(cx, id, n);
             }
@@ -2867,7 +2888,7 @@ impl PartitionStore {
         }
         if !extra_needs.is_empty() {
             out.clear();
-            self.requeue(id, r);
+            self.reqs.slots[id.0 as usize] = Some(r);
             for n in extra_needs {
                 self.need(cx, id, n);
             }
@@ -3394,7 +3415,9 @@ impl PartitionStore {
     }
 
     fn ext_write_durable(&mut self, cx: &mut StorageCtx<'_>, start: PageId) {
-        let Some(w) = self.core.ext.writes.remove(&start) else { return };
+        let Some(mut w) = self.core.ext.writes.remove(&start) else { return };
+        let waiters = core::mem::take(&mut w.waiters);
+        self.wake(waiters);
         for &t in &w.tickets {
             self.core.tickets.effect_durable(t);
         }

@@ -179,6 +179,14 @@ impl Tickets {
         }
     }
 
+    /// One more dependency on an effect whose write completed already (it waits only for
+    /// durability).
+    pub(crate) fn add_durable_only(&mut self, t: TicketId) {
+        if let Some(k) = self.map.get_mut(&t.0) {
+            k.undurable += 1;
+        }
+    }
+
     /// One more metadata dependency.
     pub(crate) fn add_meta(&mut self, t: TicketId) {
         if let Some(k) = self.map.get_mut(&t.0) {

@@ -367,8 +367,9 @@ impl PartitionStore {
                 ));
             }
         }
-        // staged effects: in pages the page writer will build
-        for (page, st) in self.own_pages(cache) {
+        // staged effects: in pages the page writer will build (a read-only partition builds
+        // nothing; its tickets failed)
+        for (page, st) in self.own_pages(cache).filter(|_| !failed) {
             if st.pending.is_empty() || st.corrupt {
                 continue;
             }

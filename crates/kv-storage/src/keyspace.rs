@@ -471,8 +471,12 @@ impl<'p> Keyspace<'p> {
         missing: &mut bool,
     ) -> Result<Option<(Cur, Option<Hit>)>, StoreError> {
         let n_pages = class_pages(class.min((crate::layout::N_CLASSES - 1) as u8));
-        // a write of this extent is staged or in flight: the header and value are in RAM
-        if let Some(w) = self.core.ext.writes.get(&start) {
+        // a write of this extent is staged or in flight: the header and value are in RAM (a
+        // chunked value whose chunkmap write completed is read from the device instead: no
+        // event would wake a reader waiting for that write any more)
+        if let Some(w) = self.core.ext.writes.get(&start)
+            && !(value && w.state == crate::partition::ExtState::AwaitFlush && (w.buf.is_none() || w.hdr.kind != EXT_KIND_VALUE))
+        {
             if w.db != db || *w.key != *key {
                 return Ok(None);
             }

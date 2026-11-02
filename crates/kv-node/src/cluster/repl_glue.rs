@@ -264,6 +264,8 @@ struct MemberPart {
     ready_reported: Option<bool>,
     /// When the stream last delivered a frame (boot ns).
     last_rx_ns: u64,
+    /// The primary's last refusal (repeated refusals are logged once).
+    last_reject: Option<RejectReason>,
 }
 
 enum Role {
@@ -953,6 +955,7 @@ impl<B: Backend> Worker<B> {
                         divergent: None,
                         ready_reported: None,
                         last_rx_ns: 0,
+                        last_reject: None,
                     }));
                 }
             }
@@ -1537,7 +1540,12 @@ impl<B: Backend> Worker<B> {
                 return;
             }
             if let Frame::Reject(r) = &f {
-                tracing::info!(partition = p, "the primary refused the stream: {r:?}");
+                if m.last_reject != Some(*r) {
+                    tracing::info!(partition = p, "the primary refused the stream: {r:?}");
+                } else {
+                    tracing::debug!(partition = p, "the primary refused the stream again: {r:?}");
+                }
+                m.last_reject = Some(*r);
                 m.next_dial_ns = now + REDIAL_REJECTED_NS;
                 if let Some(io) = m.io.take() {
                     io.abort();

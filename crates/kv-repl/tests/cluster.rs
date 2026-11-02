@@ -860,6 +860,38 @@ fn replication_failover_and_returning_member() {
     wait_until("the demoted primary follows", 30, || {
         c.replica_get(promoted, &last.0).as_deref() == Some(last.1.as_str())
     });
+
+    // ISR shrink and expand: a replica dies under writes; the primary stops waiting for it
+    // once the coordinator committed the shrink, and counts it again after it returns
+    let w = Writer::start(coords.clone(), "w4", Duration::from_millis(1));
+    w.at_least(30, 60);
+    c.kill_node(promoted);
+    wait_until("the dead replica leaves the ISR", 30, || {
+        !c.member_line(promoted).contains(" isr")
+    });
+    let before = w.acks.load(Ordering::Relaxed);
+    w.at_least(before + 100, 60);
+    c.spawn_node(promoted);
+    c.wait_serving(promoted);
+    c.wait_member(promoted, "in-sync isr", 90);
+    w.at_least(before + 200, 60);
+    let (acked4, failed4) = w.finish();
+    eprintln!(
+        "writer during the replica restart: {} acked, {failed4} not acknowledged",
+        acked4.len()
+    );
+    verify_acked(&coords, &acked4);
+    let last = acked4.last().unwrap().clone();
+    wait_until("the returned replica follows", 30, || {
+        c.replica_get(promoted, &last.0).as_deref() == Some(last.1.as_str())
+    });
+    for (k, v) in acked4.iter().step_by(11) {
+        assert_eq!(
+            c.replica_get(promoted, k).as_deref(),
+            Some(v.as_str()),
+            "the returned replica holds {k}"
+        );
+    }
     c.ok = true;
 }
 

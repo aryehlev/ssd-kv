@@ -255,6 +255,14 @@ pub fn body_len(buf: &[u8], h: &ExtHeader) -> Option<usize> {
     (len <= room && EXT_HDR + len <= buf.len()).then_some(len)
 }
 
+/// Pages of a verified extent that its checksum covers (header, key and body). The rest of
+/// its run (class rounding) is not covered: once the run is free again, a later write may sit
+/// there while the old header still verifies, so a scan resumes right after the covered pages,
+/// never after the whole run.
+pub fn covered_pages(buf: &[u8], h: &ExtHeader) -> u32 {
+    body_len(buf, h).map_or(1, |len| (EXT_HDR + len).div_ceil(crate::layout::PAGE) as u32).clamp(1, h.n_pages.max(1))
+}
+
 /// The checksum the extent in `buf` should carry (`None` if its body does not fit `buf`).
 pub fn extent_crc(buf: &[u8], h: &ExtHeader, crc: RecordCrc) -> Option<u32> {
     let len = body_len(buf, h)?;

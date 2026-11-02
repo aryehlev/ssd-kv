@@ -515,7 +515,9 @@ fn scan_extent_ag(p: &mut PartitionStore, cx: &mut StorageCtx<'_>, scan: &mut Sc
             let bytes = &first[..n as usize * PAGE];
             if extent::verify_extent(bytes, &h, crc) {
                 accept_extent(p, scan, start, &h, bytes);
-                i += n;
+                // only the pages the checksum covers: the run's tail may hold a later write
+                // if this extent is dead (its run was freed and partly reused)
+                i += extent::covered_pages(bytes, &h);
                 continue;
             }
             i += 1;
@@ -528,7 +530,7 @@ fn scan_extent_ag(p: &mut PartitionStore, cx: &mut StorageCtx<'_>, scan: &mut Sc
         }
         if extent::verify_extent(&whole, &h, crc) {
             accept_extent(p, scan, start, &h, &whole);
-            i += n;
+            i += extent::covered_pages(&whole, &h);
         } else {
             i += 1;
         }
@@ -713,17 +715,26 @@ fn finish_scan(p: &mut PartitionStore, cx: &mut StorageCtx<'_>, scan: &mut Scan)
             }
         }
     }
-    // step 5: every live or stale chunkmap takes its chunks; a missing chunk is corruption
+    // step 5: the indexed (current) chunkmap of a key takes its chunks; a missing chunk is
+    // corruption. A chunkmap that lost to a newer copy, or an absent one kept until its older
+    // copies are zeroed, is never current again (it loses to the winner, and D1 keeps the winner
+    // until it is gone): its chunks are free space. They must not be taken: their runs may have
+    // been free and reused since that chunkmap was written (a crash before its commit or
+    // zeroing), and taking them marked, and once the chunkmap was zeroed freed, the run of a
+    // live extent written there (it was then given out again while still in use)
     for (start, refs, db, slot, kh) in core::mem::take(&mut scan.chunkmaps) {
-        let live = p.core.stale.at_page(start) > 0 || p.core.ext.zeros.contains_key(&start) || p.core.indexed_at(db, slot, kh, start.to36());
-        if !live {
+        if !p.core.indexed_at(db, slot, kh, start.to36()) {
             continue;
         }
         let mut list: SmallVec<[(PageId, u32); 4]> = SmallVec::new();
         for c in &refs {
             match scan.chunks.get(&c.page) {
                 Some(&(n, crc)) if n == c.n_pages && crc == c.crc => {}
-                _ => p.core.counters.corrupt_pages += 1,
+                _ => {
+                    // not on media as written: nothing of it to hold (its run may be in use)
+                    p.core.counters.corrupt_pages += 1;
+                    continue;
+                }
             }
             if !p.core.alloc.extent_allocated(c.page, c.n_pages) {
                 p.core.alloc.mark_extent(c.page, c.n_pages);

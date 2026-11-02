@@ -390,6 +390,11 @@ pub(crate) struct Alloc {
     extent_of: HashMap<AgId, u32, foldhash::fast::FixedState>,
     cached: CachedSpace,
     slots: [SpareSlot; 2],
+    /// Extent starts whose header is read asynchronously (FLUSHDB reclaim walk, active
+    /// expiry): start -> (reads in flight, run written or freed since it was registered). A
+    /// read concurrent with a write of the run, or with its release and reuse, may return the
+    /// previous header; what such a read decides is void (`Alloc::end_header_read`).
+    hdr_watch: HashMap<PageId, (u32, bool), foldhash::fast::FixedState>,
 }
 
 fn kind_slot(k: AgKind) -> usize {
@@ -417,6 +422,7 @@ impl Alloc {
             small_of: HashMap::with_hasher(Default::default()),
             extent: Vec::new(),
             extent_of: HashMap::with_hasher(Default::default()),
+            hdr_watch: HashMap::with_hasher(Default::default()),
             cached: CachedSpace::default(),
             slots: [SpareSlot::default(); 2],
         }
@@ -894,7 +900,51 @@ impl Alloc {
     }
 
     /// Frees an extent run (its first-sector zeroing is durable, or it is dead).
+    /// Registers the run at `start` for a header read issued later (the reclaim walk's
+    /// candidates, recorded when the walk starts): a write or release of the run before the
+    /// read is issued voids it too.
+    pub(crate) fn watch_header(&mut self, start: PageId) {
+        self.hdr_watch.entry(start).or_insert((0, false));
+    }
+
+    /// Forgets every watched run without a read in flight (a new reclaim walk replaces the old).
+    pub(crate) fn unwatch_idle(&mut self) {
+        self.hdr_watch.retain(|_, e| e.0 > 0);
+    }
+
+    /// A header read of the run at `start` is issued. False when the run was written or freed
+    /// since it was registered (the read would decide nothing).
+    pub(crate) fn begin_header_read(&mut self, start: PageId) -> bool {
+        let e = self.hdr_watch.entry(start).or_insert((0, false));
+        if e.1 && e.0 == 0 {
+            self.hdr_watch.remove(&start);
+            return false;
+        }
+        e.0 += 1;
+        true
+    }
+
+    /// A header read of the run at `start` completed: true when nothing wrote or freed the run
+    /// since it was registered, so the header read is the run's current one.
+    pub(crate) fn end_header_read(&mut self, start: PageId) -> bool {
+        let Some(e) = self.hdr_watch.get_mut(&start) else { return false };
+        e.0 = e.0.saturating_sub(1);
+        let valid = !e.1;
+        if e.0 == 0 {
+            self.hdr_watch.remove(&start);
+        }
+        valid
+    }
+
+    /// A write of the run at `start` is staged: header reads of it in flight are void.
+    pub(crate) fn note_run_written(&mut self, start: PageId) {
+        if let Some(e) = self.hdr_watch.get_mut(&start) {
+            e.1 = true;
+        }
+    }
+
     pub(crate) fn free_extent(&mut self, start: PageId, n: u32) {
+        self.note_run_written(start);
         if let Some((ei, off)) = self.extent_slot(start)
             && u32::from(off) + n <= AG_PAGES
         {
@@ -1129,6 +1179,8 @@ impl Alloc {
         self.extent.clear();
         self.extent_of.clear();
         self.cached = CachedSpace::default();
+        // every run is released: header reads in flight decide nothing any more
+        self.hdr_watch.clear();
         for s in &mut self.slots {
             s.spare = None;
             s.want = false;

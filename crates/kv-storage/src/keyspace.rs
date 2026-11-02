@@ -483,7 +483,18 @@ impl<'p> Keyspace<'p> {
         // chunked value whose chunkmap write completed is read from the device instead: no
         // event would wake a reader waiting for that write any more)
         if let Some(w) = self.core.ext.writes.get(&start)
-            && !(value && w.state == crate::partition::ExtState::AwaitFlush && (w.buf.is_none() || w.hdr.kind != EXT_KIND_VALUE))
+            && let Some(e) = w.failed
+            && value
+            && w.db == db
+            && *w.key == *key
+            && (w.hdr.kind != EXT_KIND_VALUE || w.buf.is_none())
+        {
+            // the device failed this write and its value is not in RAM (a chunked value: the
+            // chunks hold it); the media never held it, so the error is what a read reports
+            return Err(StoreError::Io(e));
+        }
+        if let Some(w) = self.core.ext.writes.get(&start)
+            && !(value && w.state == crate::partition::ExtState::AwaitFlush && w.failed.is_none() && (w.buf.is_none() || w.hdr.kind != EXT_KIND_VALUE))
         {
             if w.db != db || *w.key != *key {
                 return Ok(None);

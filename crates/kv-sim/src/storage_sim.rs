@@ -1589,6 +1589,9 @@ struct Sim<'c> {
     by_req: BTreeMap<(u16, u32), (u64, usize)>,
     tickets: Vec<OpenTicket>,
     probes: BTreeMap<u64, Val>,
+    /// Probes that ended with an error reply (runs with injected errors): what they read is
+    /// unknown, not "absent".
+    probe_failed: BTreeSet<u64>,
     scanned: BTreeSet<u32>,
     next_probe: u64,
     rng: Rng,
@@ -1668,6 +1671,7 @@ impl<'c> Sim<'c> {
             by_req: BTreeMap::new(),
             tickets: Vec::new(),
             probes: BTreeMap::new(),
+            probe_failed: BTreeSet::new(),
             scanned: BTreeSet::new(),
             next_probe: PROBE_UID,
             rng: Rng::new(cfg.seed ^ 0xD71F_E400),
@@ -1951,6 +1955,9 @@ impl<'c> Sim<'c> {
                 return Err(Failure::new(FailKind::Engine, format!("{name}-error"), format!("{name} on partition {p} failed: {} (no I/O errors are injected)", fmt_store_err(other))));
             }
         }
+        if self.out[&uid].sink == Sink::Probe {
+            self.probe_failed.insert(uid);
+        }
         let c = self.out.get_mut(&uid).expect("live");
         c.parts[pi].phase = Phase::Done;
         c.parts[pi].id = None;
@@ -2211,7 +2218,8 @@ impl<'c> Sim<'c> {
     // verification
 
     /// Reads every model key (verification GETs, bounded like any request).
-    fn probe_all(&mut self, keys: &[KeyRef], what: &str) -> Result<Vec<Val>, Failure> {
+    /// GETs of `keys`; also returns the keys whose GET failed (injected errors).
+    fn probe_all(&mut self, keys: &[KeyRef], what: &str) -> Result<(Vec<Val>, BTreeSet<KeyRef>), Failure> {
         let mut uids = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(256) {
             for &(db, k) in chunk {
@@ -2222,7 +2230,8 @@ impl<'c> Sim<'c> {
             }
             self.drain(what)?;
         }
-        Ok(uids.iter().map(|u| self.probes.remove(u).unwrap_or(None)).collect())
+        let failed: BTreeSet<KeyRef> = keys.iter().zip(&uids).filter(|(_, u)| self.probe_failed.remove(u)).map(|(k, _)| *k).collect();
+        Ok((uids.iter().map(|u| self.probes.remove(u).unwrap_or(None)).collect(), failed))
     }
 
     /// SCAN of every partition of `db`.
@@ -2268,10 +2277,15 @@ impl<'c> Sim<'c> {
             }
         }
         keys.sort_unstable();
-        let got = self.probe_all(&keys, what)?;
+        let (got, unreadable) = self.probe_all(&keys, what)?;
         let now = self.now_ms;
         let mut matches = BTreeMap::new();
         for (k, v) in keys.iter().zip(&got) {
+            if unreadable.contains(k) {
+                // an error reply (runs with injected errors: a key whose write failed may be
+                // unreadable until a restart) observes nothing
+                continue;
+            }
             let st = v.as_ref().map(|(b, at)| State::of(b, *at));
             match self.model.check(*k, st, loss, now) {
                 Ok(m) => {
@@ -2293,7 +2307,10 @@ impl<'c> Sim<'c> {
         let mut dbs: BTreeSet<u8> = keys.iter().map(|k| k.0).collect();
         dbs.insert(0);
         for db in dbs {
-            let found = self.scan_all(db, what)?;
+            let mut found = self.scan_all(db, what)?;
+            // a key whose GET failed (its value unreadable after a failed write) proves
+            // nothing either way
+            found.retain(|k| !unreadable.contains(&(db, *k)));
             let live: BTreeSet<u32> = keys.iter().zip(&got).filter(|(k, v)| k.0 == db && v.is_some()).map(|(k, _)| k.1).collect();
             if found != live {
                 let missing: Vec<u32> = live.difference(&found).copied().take(8).collect();
@@ -2320,6 +2337,9 @@ impl<'c> Sim<'c> {
         }
         self.stats.keys_checked += keys.len() as u64;
         for (k, v) in keys.into_iter().zip(got) {
+            if unreadable.contains(&k) {
+                continue;
+            }
             if observe_only {
                 self.model.observed(k, v);
             } else if let Some(m) = matches.get(&k).copied() {
@@ -2398,6 +2418,7 @@ impl<'c> Sim<'c> {
         self.by_req.clear();
         self.tickets.clear();
         self.probes.clear();
+        self.probe_failed.clear();
     }
 
     fn run(&mut self, steps: &[Step]) -> Result<(), Failure> {
@@ -2494,7 +2515,9 @@ impl<'c> Sim<'c> {
                             let at = (h.expire_at_ms != 0).then_some(h.expire_at_ms);
                             copies.entry((h.db, key)).or_default().push((id.0, h.seq.0, false, h.txn, at));
                         }
-                        page += n as u64;
+                        // the run's tail past what the checksum covers may hold later writes
+                        // (a dead extent whose run was freed and partly reused)
+                        page += u64::from(extent::covered_pages(&img[at..at + n * PAGE], &h));
                         continue;
                     }
                 }
@@ -5507,6 +5530,427 @@ step cmd rename 0 25 37 0
 step cmd setrange 0 2 69217 256
 step ticks 2
 step cmd set 0 24 813 r479 - 0 0
+"#,
+    ),
+    (
+        "inplace_rewrite_cancelled_leaves_old_extent",
+        r#"kv-sim storage case 1
+seed 100047
+fail I11 9 extra-copies
+cfg partitions 16
+cfg devices 2
+cfg ags 28
+cfg lba 4096
+cfg page_mode atomic
+cfg atomic_unit 8192
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 17
+cfg groups 3
+cfg dbs 1
+cfg profile churn
+cfg steps 920
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 26
+cfg skip_pct 10
+cfg per_poll 2
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 0 2033 r16200372 - 0 0
+step ticks 1
+step ticks 1
+step cmd setrange 0 0 1184 21
+step cmd del 0 0
+step cmd set 0 0 3956 r143 - 0 0
+step cmd expire 0 0 - 1
+step cmd set 0 0 16 - - 0 0
+step cmd set 0 1 2185 - - 0 0
+"#,
+    ),
+    (
+        "get_error_after_failed_write_is_not_absence",
+        r#"kv-sim storage case 1
+seed 327
+fail I2 172 ioerr_scan-end_of_run
+cfg partitions 16
+cfg devices 1
+cfg ags 51
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 16384
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 92
+cfg groups 46
+cfg dbs 1
+cfg profile mixed
+cfg steps 1010
+cfg rounds 2
+cfg tick_permille 450
+cfg delay_max 0
+cfg late_pct 30
+cfg skip_pct 10
+cfg per_poll 8
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 20000
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd expire 0 84 r172 0
+step ticks 45
+step ticks 3
+step ticks 7
+step cmd msetnx 0 3:25,3:60763,3:1163
+step ticks 6
+step cmd append 0 6 216
+step cmd set 0 9 1469 r3112 - 0 0
+step ticks 4
+step ticks 5
+step cmd set 0 8 2714 - - 0 0
+step cmd expire 0 33 - 0
+step ticks 1
+step cmd set 0 2 254 - - 0 0
+step quiesce
+step cmd set 0 50 1341 - - 0 0
+step cmd set 0 4 314 r3106 - 0 0
+step cmd expire 0 8 - 1
+step cmd msetnx 0 24:19,70:683
+step ticks 6
+step ticks 1
+step cmd set 0 5 1092 - xx 0 0
+step cmd get 0 83
+step cmd set 0 7 795839 - - 0 0
+step ticks 29
+step ticks 5
+step ticks 52
+step cmd append 0 91 140
+step ticks 1
+step ticks 8
+step cmd meta 0 58
+step cmd set 0 31 888 - nx 0 0
+step ticks 8
+step ticks 1
+step cmd setrange 0 10 457 160
+step cmd set 0 21 39578 - - 0 0
+step ticks 2
+step cmd set 0 10 733 - - 0 0
+step ticks 30
+step cmd set 0 10 2139 - - 0 0
+step cmd get 0 15
+step cmd expire 0 20 - 0
+step ticks 6
+step cmd get 0 3
+step cmd setrange 0 36 412 586
+step cmd set 0 7 59 r3165 - 0 0
+step ticks 8
+step cmd setrange 0 54 808 536
+step quiesce
+step ticks 2
+step ticks 1
+step ticks 3
+step ticks 8
+step ticks 56
+step cmd set 0 7 32 r5023067 - 0 0
+step cmd set 0 69 14 - - 1 0
+step cmd msetnx 0 17:357,17:1320,17:11701,63:10611
+step cmd append 0 9 224
+step ticks 5
+step cmd set 0 43 1 - - 0 0
+step cmd expire 0 9 - 0
+step cmd setrange 0 82 238 588
+step ticks 1
+step cmd expire 0 13 - 1
+step ticks 4
+step ticks 4
+step cmd expire 0 9 - 0
+step cmd setrange 0 5 529 537
+step cmd setrange 0 58 42886 467
+step ticks 1
+step ticks 1
+step cmd mset 0 45:533,45:11152903,45:1
+step cmd append 0 15 60
+step cmd set 0 9 1961 r30222269 - 0 0
+step ticks 5
+step ticks 3
+step ticks 14
+step ticks 2
+step cmd persist 0 1
+step ticks 6
+step cmd copy 0 33 33 1
+step cmd get 0 31
+step cmd msetnx 0 81:105,35:29,35:1049
+step ticks 1
+step cmd append 0 75 181
+step cmd meta 0 4
+step ticks 7
+step ticks 3
+step cmd set 0 13 300 - - 0 0
+step ticks 1
+step ticks 4
+step ticks 1
+step cmd set 0 15 21 past - 0 0
+step cmd del 0 22,22
+step cmd set 0 9 7401 - - 0 0
+step cmd del 0 2,2
+step ticks 6
+step ticks 52
+step cmd del 0 35,35
+step cmd expire 0 10 - 0
+step ticks 2
+step ticks 2
+step ticks 7
+step cmd setrange 0 35 769 76
+step ticks 5
+step cmd rename 0 1 47 1
+step cmd set 0 74 1359 - nx 0 0
+step cmd mset 0 7:158,7:3
+step cmd rename 0 57 11 0
+step ticks 27
+step ticks 58
+step cmd expire 0 49 r43068580 0
+step cmd setrange 0 9 675 27
+step ticks 7
+step ticks 57
+step ticks 6
+step cmd set 0 6 1142 - - 0 0
+step cmd copy 0 15 61 0
+step ticks 56
+step cmd getdel 0 75
+step ticks 2
+step cmd del 0 26,26,26
+step ticks 6
+step ticks 6
+step cmd get 0 29
+step cmd set 0 9 664 r43902291 - 0 0
+step cmd set 0 49 100 r146 - 1 0
+step ticks 7
+step ticks 2
+step ticks 3
+step cmd persist 0 8
+step ticks 51
+step cmd set 0 30 1985 r13 - 0 0
+step ticks 6
+step ticks 5
+step ticks 2
+step cmd set 0 44 1973 - - 1 0
+step ticks 8
+step cmd set 0 7 1958 - - 0 0
+step cmd set 0 89 15 r182 - 0 0
+step cmd barrier
+step ticks 2
+step ticks 2
+step cmd scan 0 7 29
+step ticks 2
+step cmd append 0 70 295
+step cmd set 0 4 1411 - - 0 0
+step cmd get 0 86
+step ticks 7
+step ticks 48
+step cmd del 0 41,41
+step ticks 17
+step ticks 7
+step ticks 32
+step ticks 7
+step ticks 3
+step cmd get 0 32
+step ticks 3
+step ticks 4
+step ticks 9
+step cmd set 0 53 2044 r97 - 0 0
+step ticks 3
+step cmd set 0 4 829 - - 0 0
+step cmd setrange 0 63 1035 600
+step cmd msetnx 0 47:41164,1:31379
+step cmd append 0 50 146
+step cmd set 0 72 456 - xx 0 0
+step cmd del 0 15,15
+step ticks 57
+step ticks 2
+step cmd setrange 0 3 1050 40
+step cmd setrange 0 76 8389101 277
+"#,
+    ),
+    (
+        "run_tail_of_dead_extent_hides_a_live_page",
+        r#"kv-sim storage case 1
+seed 346
+fail I11 17 copy-missing
+cfg partitions 16
+cfg devices 1
+cfg ags 48
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 38
+cfg groups 6
+cfg dbs 3
+cfg profile large
+cfg steps 324
+cfg rounds 1
+cfg tick_permille 450
+cfg delay_max 32
+cfg late_pct 24
+cfg skip_pct 0
+cfg per_poll 2
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd mset 0 35:72089
+step cmd msetnx 0 1:934,31:2051,25:767
+step cmd set 0 5 15 r56 - 0 0
+step ticks 2
+step cmd set 0 14 3626 - - 0 0
+step cmd set 0 32 10 - - 0 0
+step cmd expire 0 1 - 1
+step ticks 4
+step cmd set 2 0 4997807 - - 1 0
+step cmd setrange 0 31 669 147
+step ticks 1
+step cmd setrange 0 4 1133 451
+step ticks 6
+step cmd set 2 3 10 r8147346 - 0 1
+step cmd set 0 26 14 past - 0 0
+step cmd flush all
+step cmd setrange 0 31 122 493
+"#,
+    ),
+    (
+        "stale_chunkmap_frees_a_live_extent_run",
+        r#"kv-sim storage case 1
+seed 1054
+fail ENGINE 11 GET-corrupt
+cfg partitions 16
+cfg devices 1
+cfg ags 47
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit 512
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 32
+cfg groups 32
+cfg dbs 1
+cfg profile large
+cfg steps 253
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 0
+cfg late_pct 32
+cfg skip_pct 0
+cfg per_poll 2
+cfg shuffle 1
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 4 2746 - - 0 0
+step cmd set 0 23 11012338 r2 - 1 0
+step ticks 7
+step crash kill none 0
+step cmd set 0 3 2608 - - 0 0
+step ticks 4
+step cmd setrange 0 1 68288 81
+step cmd set 0 23 3086 r3269 - 0 0
+step crash power none 4
+step cmd mset 0 1:60038
+step cmd mset 0 1:305897
+"#,
+    ),
+    (
+        "failed_chunkmap_write_read_reports_io_error",
+        r#"kv-sim storage case 1
+seed 565
+fail I1 22 ioerr_end_of_run-Process
+cfg partitions 16
+cfg devices 1
+cfg ags 59
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability async
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 36
+cfg groups 9
+cfg dbs 1
+cfg profile large
+cfg steps 495
+cfg rounds 4
+cfg tick_permille 120
+cfg delay_max 4
+cfg late_pct 17
+cfg skip_pct 10
+cfg per_poll 8
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 20000
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 17 9 - - 0 0
+step ticks 6
+step ticks 3
+step cmd set 0 1 2031 r1085 - 0 0
+step cmd set 0 0 3027 r163 - 0 0
+step cmd msetnx 0 13:77997
+step ticks 7
+step cmd mset 0 3:41507,12:59380
+step cmd del 0 0
+step cmd persist 0 1
+step cmd mset 0 1:308,1:9402
+step cmd rename 0 1 1 0
+step ticks 1
+step ticks 8
+step cmd set 0 2 3366 - - 0 0
+step cmd set 0 33 31 r3414 - 0 0
+step cmd mset 0 3:2024,30:1110,12:8516445
+step cmd mset 0 3:3588,21:492,12:2053,21:9079215
+step cmd persist 0 1
+step cmd persist 0 3
+step cmd expire 0 12 - 1
+step cmd setrange 0 34 778 573
 "#,
     ),
 ];

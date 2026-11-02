@@ -436,6 +436,8 @@ pub(crate) struct ExtWrite {
     /// Requests waiting for this write to complete (reads of a chunked or in-flight value).
     pub(crate) waiters: SmallVec<[(ReqId, u32); 1]>,
     wid: u64,
+    /// The device failed the write (errno): the media never held it.
+    pub(crate) failed: Option<i32>,
 }
 
 /// Why an extent's first sector is zeroed.
@@ -472,10 +474,6 @@ pub(crate) struct ExtTables {
     pub(crate) chunkmaps: HashMap<PageId, SmallVec<[(PageId, u32); 4]>, foldhash::fast::FixedState>,
     /// CHUNK start -> chunkmaps on media or in flight referencing it.
     pub(crate) chunk_rc: HashMap<PageId, u32, foldhash::fast::FixedState>,
-    /// Active-expiry header reads in flight: extent start -> (reads, written since). A header
-    /// read concurrent with a write of the same run (an in-place rewrite, or a new version
-    /// placed there) may return the old header; its expiry decision is then void.
-    pub(crate) expire_reads: HashMap<PageId, (u32, bool), foldhash::fast::FixedState>,
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2213,14 +2211,24 @@ impl PartitionStore {
                     }
                     return out;
                 }
-                match self.core.ext.writes.get(&start).map(|w| w.state) {
-                    Some(ExtState::Pending) => {
+                match self.core.ext.writes.get(&start).map(|w| (w.state, w.atomic)) {
+                    Some((ExtState::Pending, false)) => {
                         // never written: the run goes back at once
                         let w = self.core.ext.writes.remove(&start).expect("present");
                         out.extend(w.tickets);
                         self.wake(w.waiters);
                         self.core.alloc.free_extent(start, w.hdr.n_pages);
                         self.cancel_chunks(start);
+                    }
+                    Some((ExtState::Pending, true)) => {
+                        // an in-place rewrite never issued: the run still holds the version it
+                        // was to replace, an older copy like any other (freeing the run left
+                        // that version on media, untracked: a later delete of the key did not
+                        // wait for it, and a crash could bring it back)
+                        let w = self.core.ext.writes.remove(&start).expect("present");
+                        out.extend(w.tickets);
+                        self.wake(w.waiters);
+                        self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source, cur_seq(&s.cur));
                     }
                     _ => self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source, cur_seq(&s.cur)),
                 }
@@ -2358,12 +2366,11 @@ impl PartitionStore {
         for &t in &tickets {
             self.core.tickets.note_extent(t, start);
         }
-        if let Some(r) = self.core.ext.expire_reads.get_mut(&start) {
-            r.1 = true;
-        }
+        // header reads of this run in flight may return the previous header (§16.4, §16.5)
+        self.core.alloc.note_run_written(start);
         self.core.ext.writes.insert(
             start,
-            ExtWrite { hdr, db, key, buf: Some(buf), tickets, state: ExtState::Pending, wait_chunks: 0, parent, atomic, waiters, wid: 0 },
+            ExtWrite { hdr, db, key, buf: Some(buf), tickets, state: ExtState::Pending, wait_chunks: 0, parent, atomic, waiters, wid: 0, failed: None },
         );
     }
 
@@ -2393,6 +2400,15 @@ impl PartitionStore {
             }
             Cur::Extent { start, n_pages, .. } => {
                 self.core.index_remove(s, start.to36());
+                let mut tickets = tickets;
+                if self.core.ext.writes.get(&start).is_some_and(|w| w.state == ExtState::Pending && w.atomic) {
+                    // an in-place rewrite never issued: the run still holds the version it was
+                    // to replace; that version is zeroed below like any copy on media, and the
+                    // rewrite's tickets wait for that zeroing
+                    let w = self.core.ext.writes.remove(&start).expect("present");
+                    tickets.extend(w.tickets);
+                    self.wake(w.waiters);
+                }
                 match self.core.ext.writes.get(&start).map(|w| w.state) {
                     Some(ExtState::Pending) => {
                         // never written: nothing at `start` to drop; the delete completes when
@@ -2479,6 +2495,15 @@ impl PartitionStore {
             }
             Cur::Extent { start, n_pages, .. } => {
                 self.core.index_remove(s, start.to36());
+                if self.core.ext.writes.get(&start).is_some_and(|w| w.state == ExtState::Pending && w.atomic) {
+                    // an in-place rewrite never issued: the run still holds the version it was
+                    // to replace, removed like a delete (its tickets wait for the zeroing)
+                    let w = self.core.ext.writes.remove(&start).expect("present");
+                    self.wake(w.waiters);
+                    self.core.ext.zeros.insert(start, ExtZero::pending(n_pages, ZeroWhy::Delete { db: s.db, key: s.key.clone(), tickets: w.tickets }));
+                    self.core.stale.add(s.db, &s.key, StaleRef::Extent { page: start, n_pages }, CopyState::Source, cur_seq(&s.cur));
+                    return;
+                }
                 if matches!(self.core.ext.writes.get(&start).map(|w| w.state), Some(ExtState::Pending)) {
                     let w = self.core.ext.writes.remove(&start).expect("present");
                     for t in w.tickets {
@@ -2649,6 +2674,11 @@ impl PartitionStore {
         let pages: Vec<PageId> = self.core.alloc.owned_small_pages().filter(|p| !cache.contains(*p)).collect();
         self.core.reclaim_pages.extend(pages);
         let starts: Vec<PageId> = self.core.alloc.extent_starts().collect();
+        // a run written or freed before its header is read is no dead extent of this walk
+        self.core.alloc.unwatch_idle();
+        for &s in &starts {
+            self.core.alloc.watch_header(s);
+        }
         self.core.reclaim_ext.extend(starts);
         self.core.counters.flush_reclaim_pending_pages = (self.core.reclaim_pages.len() + self.core.reclaim_ext.len()) as u64;
     }
@@ -3384,6 +3414,7 @@ impl PartitionStore {
             // value stays readable from RAM), the partition goes read-only and its tickets fail
             w.buf = d.buf;
             w.state = ExtState::AwaitFlush;
+            w.failed = Some(e);
             let waiters = core::mem::take(&mut w.waiters);
             self.wake(waiters);
             self.write_failed(e);
@@ -3421,18 +3452,20 @@ impl PartitionStore {
     }
 
     fn header_read_done(&mut self, cx: &mut StorageCtx<'_>, start: PageId, why: HeaderWhy, d: IoDone) {
-        let mut overtaken = false;
-        if matches!(why, HeaderWhy::Expire { .. })
-            && let Some(r) = self.core.ext.expire_reads.get_mut(&start)
-        {
-            r.0 = r.0.saturating_sub(1);
-            overtaken = r.1;
-            if r.0 == 0 {
-                self.core.ext.expire_reads.remove(&start);
+        // a write, zeroing or release of the run while the header was read voids the read: it
+        // may have returned the previous occupant's header (an in-place rewrite keeps the
+        // location; a freed run is given out again), and the index checks below cannot tell
+        let overtaken = !self.core.alloc.end_header_read(start) || self.core.ext.writes.contains_key(&start) || self.core.ext.zeros.contains_key(&start);
+        let Some(buf) = d.buf else {
+            if why == HeaderWhy::Reclaim {
+                self.reclaim_progress();
             }
-        }
-        let Some(buf) = d.buf else { return };
-        if d.res.is_err() {
+            return;
+        };
+        if d.res.is_err() || overtaken {
+            if why == HeaderWhy::Reclaim {
+                self.reclaim_progress();
+            }
             return;
         }
         let Some(h) = extent::parse_extent_header(&buf, start) else {
@@ -3455,12 +3488,7 @@ impl PartitionStore {
                 if h.kind == EXT_KIND_CHUNK || h.db != db || EXT_HDR + kl > buf.len() {
                     return;
                 }
-                if overtaken || self.core.ext.writes.contains_key(&start) {
-                    // the run was written while the header was read: the header may be the
-                    // previous version's (an in-place rewrite keeps the location, so the index
-                    // check below cannot tell); the next sweep pass looks again
-                    return;
-                }
+
                 let key: Box<[u8]> = buf[EXT_HDR..EXT_HDR + kl].into();
                 let kh = KeyHash::of(self.core.cfg.hash_seed, &key);
                 if kh.fp32() != fp32 || key_slot(&key) != slot || !self.core.indexed_at(db, slot, kh, start.to36()) {
@@ -4291,6 +4319,11 @@ impl PartitionStore {
                 }
                 self.reclaim_progress();
             } else if let Some(s) = self.core.reclaim_ext.pop_front() {
+                if !self.core.alloc.begin_header_read(s) {
+                    // written or freed since the walk started: not a dead extent to reclaim
+                    self.reclaim_progress();
+                    continue;
+                }
                 let tag = self.core.tag(IoKind::HeaderRead { start: s, why: HeaderWhy::Reclaim });
                 cx.io.push(IoReq::read(tag, s.dev(), s.byte_offset(), AlignedBuf::zeroed(PAGE)));
             }
@@ -4422,7 +4455,7 @@ impl PartitionStore {
                             self.expire_or_rehint(cx, db, &key, kh, slot, page, exp, seq);
                         }
                     } else if self.core.buckets.expire.try_take(now_ns, 1) {
-                        self.core.ext.expire_reads.entry(page).or_insert((0, false)).0 += 1;
+                        self.core.alloc.begin_header_read(page);
                         let tag = self.core.tag(IoKind::HeaderRead { start: page, why: HeaderWhy::Expire { db, slot, fp32: e.fp32 } });
                         cx.io.push(IoReq::read(tag, page.dev(), page.byte_offset(), AlignedBuf::zeroed(PAGE)));
                     }

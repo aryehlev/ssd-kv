@@ -328,6 +328,8 @@ pub struct ClusterWorker {
     heartbeat_ns: u64,
     ack_timeout_ns: u64,
     pub(super) sync_iops: u64,
+    /// The worker is shutting down: no stream is accepted, dialed or driven any more.
+    stopped: bool,
 }
 
 impl ClusterWorker {
@@ -381,6 +383,7 @@ impl ClusterWorker {
             heartbeat_ns: cfg.repl_heartbeat_ms.saturating_mul(1_000_000),
             ack_timeout_ns: cfg.repl_ack_timeout_ms.saturating_mul(1_000_000),
             sync_iops: cfg.sync_iops,
+            stopped: false,
         }
     }
 
@@ -745,6 +748,9 @@ impl<B: Backend> Worker<B> {
         match ev {
             CtrlEvent::Assign(a) => {
                 self.with_cluster(|w, cw| {
+                    if cw.stopped {
+                        return;
+                    }
                     cw.assignment = Some(a);
                     cw.unapplied = w.backend.owned().to_vec();
                     w.apply_roles(cw);
@@ -1029,6 +1035,11 @@ impl<B: Backend> Worker<B> {
 
     pub(crate) fn on_repl(&mut self, ev: ReplEvent) {
         self.with_cluster(|w, cw| match ev {
+            ReplEvent::Inbound { stream, .. }
+            | ReplEvent::Dialed {
+                stream: Some(stream),
+                ..
+            } if cw.stopped => stream.abort(),
             ReplEvent::Inbound {
                 stream,
                 hello,
@@ -2599,7 +2610,59 @@ impl<B: Backend> Worker<B> {
     /// Step 4 of the tick for the cluster glue: applies pending roles, drives streams, walks
     /// and feeds, releases committed replies, acks, persists positions, reports to the agent.
     pub(crate) fn cluster_tick(&mut self) {
-        self.with_cluster(|w, cw| w.cluster_tick_inner(cw));
+        self.with_cluster(|w, cw| {
+            if !cw.stopped {
+                w.cluster_tick_inner(cw);
+            }
+        });
+    }
+
+    /// Shutdown: every stream ends, background sync and migration work stops, and replies
+    /// still waiting for the shard commit are answered as not acknowledged (the drain then
+    /// waits only for the partitions' own writes).
+    pub(crate) fn cluster_stop(&mut self) {
+        let waits = self
+            .with_cluster(|_, cw| {
+                cw.stopped = true;
+                let mut out = Vec::new();
+                for pr in cw.parts.iter_mut().flatten() {
+                    match &mut pr.role {
+                        Role::Primary(pp) => {
+                            for x in pp.peers.iter_mut() {
+                                if let Some(io) = x.stream.take() {
+                                    io.abort();
+                                }
+                                x.direct = None;
+                            }
+                        }
+                        Role::Member(m) => {
+                            if let Some(io) = m.io.take() {
+                                io.abort();
+                            }
+                            m.sync = MemberSync::None;
+                            m.divergent = None;
+                            m.next_dial_ns = u64::MAX;
+                        }
+                        Role::Idle => {}
+                    }
+                    for mo in pr.mig_out.drain(..) {
+                        mo.abort();
+                    }
+                    for mi in pr.mig_in.drain(..) {
+                        mi.abort();
+                    }
+                    pr.purge = None;
+                    pr.queued.clear();
+                    out.extend(pr.commit_waits.drain(..).map(|(_, _, w)| w));
+                }
+                cw.streams.clear();
+                cw.unapplied.clear();
+                out
+            })
+            .unwrap_or_default();
+        for w in waits {
+            self.commit_released(w, Some(b"TRYAGAIN the node is shutting down"));
+        }
     }
 
     fn cluster_tick_inner(&mut self, cw: &mut ClusterWorker) {

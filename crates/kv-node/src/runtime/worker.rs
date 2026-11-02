@@ -671,6 +671,10 @@ impl<B: Backend> Worker<B> {
         self.stopping = Some(self.now.mono_ns);
         // stop accepting: listeners close; multishot accepts complete with errors
         self.listeners.clear();
+        // cluster mode: streams end, replies waiting for the shard commit are answered
+        if self.cluster.is_some() {
+            self.cluster_stop();
+        }
         // drain: every partition writes what it executed (§8.2 SHUTDOWN)
         self.start_local_barrier_for_shutdown();
         tracing::info!(worker = self.id, "worker stopping");

@@ -147,8 +147,9 @@ pub struct ClusterShared {
     /// Random per process start (`HelloAck`, `Renew`).
     pub incarnation: u64,
     pub boot: BootMeta,
-    /// The meta thread (node meta and partition meta writes).
-    pub meta: MetaClient,
+    /// The meta thread (node meta writes); released at shutdown so that the meta thread can
+    /// end once the partitions are gone.
+    meta: parking_lot::Mutex<Option<MetaClient>>,
     /// The cluster token (constant-time compared in every handshake).
     pub auth: Vec<u8>,
     to_agent: tokio::sync::mpsc::UnboundedSender<AgentMsg>,
@@ -188,7 +189,7 @@ impl ClusterShared {
         ClusterShared {
             incarnation: random_u64(),
             boot,
-            meta,
+            meta: parking_lot::Mutex::new(Some(meta)),
             auth,
             to_agent: tx,
             agent_rx: parking_lot::Mutex::new(Some(rx)),
@@ -202,6 +203,27 @@ impl ClusterShared {
             net: std::sync::OnceLock::new(),
             next_token: AtomicU64::new(1),
         }
+    }
+
+    /// A node-meta request; `false` once the node is shutting down.
+    pub fn meta_request(
+        &self,
+        partition: u16,
+        token: u64,
+        r: kv_storage::metastore::MetaReq,
+    ) -> bool {
+        match self.meta.lock().as_ref() {
+            Some(m) => {
+                m.request(partition, token, r);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Shutdown: drops this state's meta client.
+    pub fn release_meta(&self) {
+        self.meta.lock().take();
     }
 
     /// Delivers a message to the agent (never blocks).

@@ -66,6 +66,10 @@ impl NodeHandle {
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
+        // cluster mode: the agent's meta client goes too, so the meta thread can end
+        if let Some(cs) = self.shared.cluster() {
+            cs.release_meta();
+        }
         // the service thread notices the shutdown within its sampling period
         self.shared.request_shutdown();
         if let Some(s) = self.service.take() {

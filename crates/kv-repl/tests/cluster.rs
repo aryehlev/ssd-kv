@@ -508,6 +508,35 @@ impl Cluster {
         }
     }
 
+    /// SIGTERM, then the node must exit within `secs` (a clean shutdown, no drain timeout).
+    fn stop_node(&mut self, i: usize, secs: u64) {
+        let Some(mut child) = self.nodes[i].child.take() else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(secs);
+        loop {
+            if let Ok(Some(st)) = child.try_wait() {
+                assert!(st.success(), "node {i} exited with {st}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("node {i} did not stop within {secs} s of SIGTERM");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("node {i} stopped {:?} after SIGTERM", t0.elapsed());
+        assert!(
+            !self.log_contains(i, "shutdown drain timed out"),
+            "node {i} stopped cleanly"
+        );
+    }
+
     fn node_addr(&self, i: usize) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], self.nodes[i].port))
     }
@@ -962,5 +991,8 @@ fn slot_migration_under_load() {
             .and_then(|mut cs| cs.call_str(&["DBSIZE"]))
             .is_ok_and(|v| matches!(v, Value::Int(n) if (n as usize) <= kept + failed))
     });
+    // a cluster node stops cleanly on SIGTERM while its streams are open
+    c.stop_node(1, 20);
+    c.stop_node(0, 20);
     c.ok = true;
 }

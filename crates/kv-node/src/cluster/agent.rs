@@ -407,9 +407,13 @@ impl Agent {
                 }
             };
             let token = self.cs.token(AGENT_TOKEN_BIT);
-            self.cs
-                .meta
-                .request(0, token, MetaReq::NodeMeta { m: meta });
+            if !self
+                .cs
+                .meta_request(0, token, MetaReq::NodeMeta { m: meta })
+            {
+                // shutting down: nothing is persisted or acknowledged any more
+                return;
+            }
             self.persist_inflight = Some((token, step, std::time::Instant::now()));
         }
     }

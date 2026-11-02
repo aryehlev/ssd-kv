@@ -2011,6 +2011,9 @@ impl<'c> Sim<'c> {
                         return Err(Failure::new(FailKind::Engine, format!("{}-ticket-failed", t.cmd), format!("ticket of {} on partition {} failed with {e} (no I/O errors are injected)", t.cmd, t.p)));
                     }
                     // the write may be lost: whatever it acknowledged before no longer binds
+                    if self.trace {
+                        eprintln!("t{} op {} ticket {} failed {e}", self.ticks, t.op, t.t.0);
+                    }
                     self.model.unack(t.op);
                     self.stats.other_errors += 1;
                     self.tickets.swap_remove(i);
@@ -2234,11 +2237,13 @@ impl<'c> Sim<'c> {
     /// the model (I1, I2, I3), multi-key atomicity (I4), SCAN == live keys, I10; then the
     /// observed state becomes the model's base.
     fn verify(&mut self, loss: Loss, what: &str) -> Result<(), Failure> {
-        // with injected errors a failed write may have left the key old or new
-        let loss = if loss == Loss::Nothing && self.cfg.error_ppm > 0 { Loss::Process } else { loss };
+        // with injected errors a failed write may have left the key old or new; what a read
+        // sees then proves nothing about media
+        let observe_only = loss == Loss::Nothing && self.cfg.error_ppm > 0;
+        let loss = if observe_only { Loss::Process } else { loss };
         self.frozen_clock = true;
         self.set_errors(false);
-        let r = self.verify_frozen(loss, what);
+        let r = self.verify_frozen(loss, what, observe_only);
         self.frozen_clock = false;
         self.set_errors(true);
         r
@@ -2249,7 +2254,7 @@ impl<'c> Sim<'c> {
         c.errors_on = on && c.error_ppm > 0;
     }
 
-    fn verify_frozen(&mut self, loss: Loss, what: &str) -> Result<(), Failure> {
+    fn verify_frozen(&mut self, loss: Loss, what: &str, observe_only: bool) -> Result<(), Failure> {
         let mut keys: Vec<KeyRef> = self.model.keys().map(|(k, _)| *k).collect();
         // every key of the table in db 0 is checked, written or not
         for k in 0..self.cfg.keys {
@@ -2310,7 +2315,9 @@ impl<'c> Sim<'c> {
         }
         self.stats.keys_checked += keys.len() as u64;
         for (k, v) in keys.into_iter().zip(got) {
-            if let Some(m) = matches.get(&k).copied() {
+            if observe_only {
+                self.model.observed(k, v);
+            } else if let Some(m) = matches.get(&k).copied() {
                 self.model.rebase(k, m, loss, v);
             }
         }

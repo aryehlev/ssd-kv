@@ -279,6 +279,14 @@ impl RefModel {
         km.cur = observed;
     }
 
+    /// A read without a crash saw `observed` (runs with failed writes): it becomes the current
+    /// state commands build on; the history and its acknowledgements stay as they are.
+    pub fn observed(&mut self, k: KeyRef, observed: Option<(Vec<u8>, Option<u64>)>) {
+        if let Some(km) = self.keys.get_mut(&k) {
+            km.cur = observed;
+        }
+    }
+
     /// Forgets the operations whose tickets were open at a crash (their connections are gone).
     pub fn crashed(&mut self) {
         self.open_ops.clear();

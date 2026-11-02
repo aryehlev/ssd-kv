@@ -321,3 +321,99 @@ mod power {
         }
     }
 }
+
+
+/// A device whose writes to `hold` (byte range) stay pending until the test lets them go; a
+/// kill -9 drops them.
+struct HoldDev {
+    inner: RamDev,
+    hold: std::rc::Rc<std::cell::Cell<(u64, u64)>>,
+    held: Vec<kv_storage::io::IoReq>,
+}
+
+impl BlockDevice for HoldDev {
+    fn info(&self) -> kv_storage::io::DevInfo {
+        self.inner.info()
+    }
+    fn submit(&mut self, r: kv_storage::io::IoReq) {
+        let (lo, hi) = self.hold.get();
+        if matches!(r.op, kv_storage::io::IoOp::Write { .. }) && r.offset < hi && r.offset + u64::from(r.len) > lo {
+            self.held.push(r);
+        } else {
+            self.inner.submit(r);
+        }
+    }
+    fn poll(&mut self, out: &mut Vec<kv_storage::io::IoDone>, wait: bool) {
+        if self.hold.get().0 >= self.hold.get().1 {
+            for r in self.held.drain(..) {
+                self.inner.submit(r);
+            }
+        }
+        self.inner.poll(out, wait);
+    }
+}
+
+/// A local multi-key write (RENAME a -> b, a txn) whose new version of `b` expires before the
+/// txn is committed: the active expiry sweep, which does not go through key queues, removed it
+/// and zeroed `b`'s older copy although recovery, finding the txn uncommitted, falls back to
+/// that copy. After a kill -9 before the commit `a` kept its old value and `b` was gone: half
+/// of the write was applied (I4). The sweep now leaves keys of uncommitted txns alone.
+#[test]
+fn expiry_of_an_uncommitted_txn_version_never_breaks_atomicity() {
+    use kv_storage::layout::PAGE;
+    let mut bad = Vec::new();
+    for seed in 0..6u64 {
+        let hold = std::rc::Rc::new(std::cell::Cell::new((0u64, 0u64)));
+        let mut inner = RamDev::new(64 * 4096, 512, seed);
+        inner.set_max_completions(1 + (seed % 2) as usize);
+        format_devices(&mut [&mut inner as &mut dyn BlockDevice], 16, false, 0, seed).unwrap();
+        let dev = HoldDev { inner, hold: hold.clone(), held: Vec::new() };
+        let mut eng = LocalEngine::open(vec![dev], &cfg()).unwrap();
+        eng.recover().unwrap();
+        let mut db = Db::new(eng, T0);
+        let (a, b): (&[u8], &[u8]) = (b"{r}a", b"{r}b");
+        let long = value(seed, 6000);
+        let t = db.set(0, a, &long, Some(T0 + 600_000)).unwrap();
+        db.wait(a, t, TicketState::Durable);
+        let t = db.set(0, b, b"B-value", None).unwrap();
+        db.wait(b, t, TicketState::Durable);
+        let p = db.eng.partition_of(a);
+        // RENAME a b, except that the destination's expiry is short (a txn of two keys); the
+        // new version of `b` is an extent whose write is held, so the txn cannot commit
+        let (_, out) = db
+            .eng
+            .run(p, keyed(0, &[a, b], kv_common::Access::Write), &mut |ks| {
+                ks.select(0);
+                ks.delete(a)?;
+                ks.put(b, &long, kv_index::VType::String, Some(T0 + 1_000))
+            })
+            .unwrap();
+        let at = db.eng.locate(0, b).expect("b").page;
+        let off = at.byte_offset();
+        hold.set((off, off + 2 * PAGE as u64));
+        // time passes beyond `b`'s expiry: the sweep runs while the txn waits for that write
+        for _ in 0..400 {
+            db.advance(10);
+            db.eng.pump();
+        }
+        let done = matches!(db.eng.ticket_state(p, out.ticket.unwrap()), Some(TicketState::Written | TicketState::Durable));
+        let mut devs = db.eng.into_devices();
+        let mut dev = devs.pop().unwrap();
+        dev.held.clear();
+        let mut inner = dev.inner;
+        inner.crash();
+        let mut eng = LocalEngine::open(vec![inner], &cfg()).unwrap();
+        eng.recover().unwrap();
+        let mut db = Db::new(eng, T0 + 4_100);
+        let got_a = db.get(0, a).unwrap().map(|x| x.1);
+        let got_b = db.get(0, b).unwrap().map(|x| x.1);
+        // applied: `a` gone and `b` expired; not applied: both old values
+        let applied = got_a.is_none() && got_b.is_none();
+        let reverted = got_a.as_deref() == Some(&long[..]) && got_b.as_deref() == Some(b"B-value");
+        if done || !(applied || reverted) {
+            bad.push(format!("seed {seed}: committed={done} a={:?} b={:?}", got_a.map(|v| v.len()), got_b.map(|v| v.len())));
+        }
+        db.quiesce();
+    }
+    assert!(bad.is_empty(), "multi-key write applied partly after kill -9:\n{}", bad.join("\n"));
+}

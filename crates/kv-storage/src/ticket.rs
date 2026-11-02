@@ -59,6 +59,10 @@ pub(crate) struct Ticket {
     pub(crate) born_ns: u64,
     /// Counted once in the stall counter.
     pub(crate) stalled: bool,
+    /// Reported once by the stall trace (`KVSSD_STALL_TRACE_MS`).
+    pub(crate) traced: bool,
+    /// Reported once by the stall trace's deep dump.
+    pub(crate) deep_traced: bool,
 }
 
 impl Ticket {
@@ -128,6 +132,8 @@ impl Tickets {
                 txn_effects: None,
                 born_ns: self.now_ns,
                 stalled: false,
+                traced: false,
+                deep_traced: false,
             },
         );
         TicketId(id)

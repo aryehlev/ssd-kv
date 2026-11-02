@@ -49,7 +49,7 @@ use crate::image::{InflightState, Pending, RecStatus};
 use crate::layout::{PageId, Seq};
 use crate::partition::{ExtState, IoKind, PartState, PartitionStore, ReqId, ZeroWhy};
 use crate::stale::{CopyState, StaleRef};
-use crate::ticket::TicketId;
+use crate::ticket::{TicketId, TicketState};
 
 /// The concrete event a non-terminal item waits for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -542,7 +542,85 @@ impl PartitionStore {
         c.requests_waiting_over_1s = over;
         c.oldest_wait_ms = oldest / 1_000_000;
         c.stalled_total += newly;
+        if let Some(ms) = stall_trace_ms() {
+            self.trace_stalls(now, ms * 1_000_000);
+        }
     }
+
+    /// The stall trace's deep dump (`KVSSD_STALL_TRACE_MS`): once per partition and stuck
+    /// ticket older than ten times the trace limit, the deferred pages' staged effects and the
+    /// tracked copies (key lengths only).
+    pub(crate) fn trace_stalls_deep(&mut self, cache: &PageCache) {
+        let Some(ms) = stall_trace_ms() else { return };
+        let now = self.core.now.mono_ns;
+        let limit = ms * 10_000_000;
+        let mut hit = false;
+        for k in self.core.tickets.iter_mut() {
+            if k.state == TicketState::Executed && now.saturating_sub(k.born_ns) >= limit && !k.deep_traced {
+                k.deep_traced = true;
+                hit = true;
+            }
+        }
+        if hit {
+            eprintln!("kvssd stall trace deep p{}: {}", self.core.cfg.id, self.diag_deep(cache).replace('\n', " || "));
+        }
+    }
+
+    /// `KVSSD_STALL_TRACE_MS=<ms>`: prints, once per request and per unwritten ticket older
+    /// than `<ms>`, what it waits for (diagnostics on stderr; no key or value bytes).
+    fn trace_stalls(&mut self, now: u64, limit: u64) {
+        let mut lines = Vec::new();
+        for (i, r) in self.reqs.slots.iter_mut().enumerate() {
+            let Some(r) = r else { continue };
+            let age = now.saturating_sub(r.born_ns);
+            if age < limit || r.traced {
+                continue;
+            }
+            r.traced = true;
+            lines.push(format!(
+                "request {i} kind={:?} keys={} age={}ms io={} waits={} parked={} queued={} blocked={} barrier={} failed={:?}",
+                r.req.kind,
+                r.keys.len(),
+                age / 1_000_000,
+                r.io,
+                r.waits,
+                r.parked,
+                r.queued,
+                r.blocked,
+                r.barrier,
+                r.failed
+            ));
+        }
+        for k in self.core.tickets.iter_mut() {
+            let age = now.saturating_sub(k.born_ns);
+            if age < limit || k.traced || k.state != TicketState::Executed {
+                continue;
+            }
+            k.traced = true;
+            lines.push(format!(
+                "ticket age={}ms unwritten={} undurable={} meta={} txn={:?} txn_effects={:?} pages={:?} extents={:?}",
+                age / 1_000_000,
+                k.unwritten(),
+                k.undurable(),
+                k.meta(),
+                k.txn,
+                k.txn_effects(),
+                k.deps.iter().map(|d| d.0.0).collect::<Vec<_>>(),
+                k.extent_deps.iter().map(|p| p.0).collect::<Vec<_>>()
+            ));
+        }
+        if !lines.is_empty() {
+            let d = self.diag();
+            for l in lines {
+                eprintln!("kvssd stall trace p{}: {l} | {d}", self.core.cfg.id);
+            }
+        }
+    }
+}
+
+fn stall_trace_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("KVSSD_STALL_TRACE_MS").ok().and_then(|v| v.parse().ok()))
 }
 
 /// `KVSSD_CHECK_PROGRESS=1` makes every tick run [`PartitionStore::check_progress`] and panic

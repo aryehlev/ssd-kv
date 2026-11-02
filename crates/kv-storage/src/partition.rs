@@ -290,6 +290,8 @@ pub(crate) struct Req {
     pub(crate) born_ns: u64,
     /// Counted once in the stall counter.
     pub(crate) stalled: bool,
+    /// Reported once by the stall trace (`KVSSD_STALL_TRACE_MS`).
+    pub(crate) traced: bool,
 }
 
 #[derive(Default)]
@@ -794,6 +796,11 @@ impl Core {
         tracked.max(self.stale.absent_of(db, key).map_or(Seq::ZERO, |a| a.seq))
     }
 
+    /// True when a txn that is not committed yet wrote or deleted `(db, key)`.
+    pub(crate) fn in_open_txn(&self, db: u8, key: &[u8]) -> bool {
+        !self.txns.is_empty() && self.txns.values().any(|o| o.keys.iter().any(|(d, k)| *d == db && **k == *key))
+    }
+
     /// The position of the entry of `(db, slot, kh)` naming `page36`.
     pub(crate) fn find_entry(&self, db: u8, slot: u16, kh: KeyHash, page36: u64) -> Option<Pos> {
         let t = self.index.table(db, slot)?;
@@ -1270,6 +1277,7 @@ impl PartitionStore {
             failed: None,
             born_ns: cx.now.mono_ns,
             stalled: false,
+            traced: false,
         };
         let id = self.reqs.insert(r);
         self.reqs.order.push_back((order, id));
@@ -2565,6 +2573,14 @@ impl PartitionStore {
     /// is the key's only copy. A key with older copies, or whose current version is still
     /// staged, is removed like a delete (its older copies first, D1, v1.2).
     fn apply_expired(&mut self, cx: &mut StorageCtx<'_>, s: &Staged) {
+        if self.core.in_open_txn(s.db, &s.key) {
+            // the version that expired belongs to a txn not committed yet (the active sweep
+            // and key-less commands such as RANDOMKEY reach it outside its key queue): removed
+            // now, its older copies were zeroed although recovery, finding the txn
+            // uncommitted, falls back to them, while the txn's other keys revert (I4). It is
+            // left for a sweep or a command after the commit.
+            return;
+        }
         self.core.counters.expired_keys += 1;
         self.core.watch.touch(s.db, &s.key);
         let others = self.core.stale.count(s.db, &s.key) > 0;
@@ -4727,6 +4743,7 @@ impl PartitionStore {
         if cx.now.mono_ns.saturating_sub(self.core.stall_checked_ns) >= 10_000_000 {
             self.core.stall_checked_ns = cx.now.mono_ns;
             self.update_stall_counters();
+            self.trace_stalls_deep(cx.cache);
         }
         // memory figures walk every table: refreshed every 1024 ticks
         self.core.ticks = self.core.ticks.wrapping_add(1);

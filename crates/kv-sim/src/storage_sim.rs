@@ -3313,9 +3313,10 @@ pub mod cli {
 // ---------------------------------------------------------------------------------------------
 // Regression cases
 
-/// Minimized cases of the failures the first campaigns found, one per distinct defect (the
-/// `fail` line records what the case showed when it was minimized). Each passes once its
-/// defect is fixed; `kv-sim storage --replay FILE` runs one from a file.
+/// Minimized cases of the failures the campaigns found, one per distinct defect (the `fail`
+/// line records what the case showed when it was minimized). Each passes once its defect is
+/// fixed (the first ones pass already and guard the fixes); `kv-sim storage --replay FILE`
+/// runs one from a file.
 pub const REGRESSION_CASES: &[(&str, &str)] = &[
     (
         "flush_supersedes_unflushed_write",
@@ -3998,6 +3999,1125 @@ step cmd get 0 17
 step cmd expire 0 32 - 0
 step clean
 step cmd expire 0 8 r142 0
+"#,
+    ),
+    (
+        "io_error_open_txn_barrier_hang",
+        r#"kv-sim storage case 1
+seed 50095
+fail HANG 3 ioerr_BARRIER_ticket-Executed-needs-Durable
+cfg partitions 16
+cfg devices 1
+cfg ags 57
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 177
+cfg groups 59
+cfg dbs 3
+cfg profile mixed
+cfg steps 347
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 200
+cfg late_pct 15
+cfg skip_pct 40
+cfg per_poll 8
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 20000
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd mset 0 161:95,161:970,43:942
+step cmd barrier
+step cmd set 1 19 11 - - 1 0
+"#,
+    ),
+    (
+        "large_mset_txn_held_deferred_page_hang",
+        r#"kv-sim storage case 1
+seed 50874
+fail HANG 40 SET_ticket-Executed-needs-Written
+cfg partitions 16
+cfg devices 1
+cfg ags 67
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit 512
+cfg cache wb
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 67108864
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 10
+cfg groups 2
+cfg dbs 3
+cfg profile large
+cfg steps 479
+cfg rounds 2
+cfg tick_permille 120
+cfg delay_max 4
+cfg late_pct 38
+cfg skip_pct 10
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd mset 0 3:9731680,3:405,1:4491750,3:3076
+step cmd meta 2 9
+step cmd get 0 0
+step cmd set 0 2 1532850 - - 0 0
+step ticks 4
+step cmd mset 0 0:3203,0:56193,2:8410
+step cmd set 2 8 49065 - - 0 0
+step cmd del 2 0,0
+step cmd setrange 0 7 63 45
+step cmd del 0 2,6
+step cmd barrier
+step cmd set 1 0 8325248 - - 0 0
+step ticks 7
+step cmd setrange 0 2 339 571
+step cmd rename 0 0 8 0
+step cmd msetnx 0 0:24004,6:1096,2:2792364
+step clock 19
+step cmd scan 0 14 8
+step cmd set 0 7 179 - - 0 0
+step cmd persist 0 3
+step ticks 8
+step cmd get 0 0
+step cmd setrange 0 0 529 446
+step cmd set 0 0 28492 r141 - 0 0
+step cmd get 0 7
+step cmd scan 0 10 27
+step cmd expire 0 3 r180 1
+step cmd set 0 0 448 - xx 0 0
+step cmd mset 0 9:39988,7:65,1:3212
+step cmd set 1 0 833258 r4336 - 0 0
+step cmd set 0 0 5964259 - nx 0 0
+step cmd get 0 9
+step cmd set 1 0 832 - - 0 0
+step ticks 8
+step cmd set 2 0 363 r2858 - 1 0
+step cmd get 0 0
+step cmd set 2 5 56945 r4574 - 0 0
+step cmd mset 0 0:954,2:614476,6:129419,2:3444
+step cmd append 0 1 200
+step cmd persist 0 0
+"#,
+    ),
+    (
+        "delete_behind_rename_never_durable",
+        r#"kv-sim storage case 1
+seed 51224
+fail HANG 151 DEL_ticket-Executed-needs-Durable
+cfg partitions 32
+cfg devices 2
+cfg ags 42
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 21
+cfg groups 5
+cfg dbs 1
+cfg profile churn
+cfg steps 1425
+cfg rounds 2
+cfg tick_permille 120
+cfg delay_max 200
+cfg late_pct 13
+cfg skip_pct 40
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step ticks 8
+step cmd set 0 20 17407 - - 0 0
+step cmd set 0 1 565 - - 0 0
+step ticks 3
+step cmd get 0 1
+step cmd rename 0 0 0 1
+step cmd meta 0 0
+step cmd meta 0 7
+step cmd expire 0 13 - 0
+step cmd del 0 11,16,16
+step cmd append 0 10 144
+step cmd set 0 1 18 - xx 0 0
+step cmd set 0 12 2051 r62463711 xx 0 0
+step cmd set 0 0 538 r193 - 0 0
+step cmd set 0 4 24709 - nx 0 0
+step ticks 5
+step cmd set 0 16 1356 r73163376 nx 0 0
+step ticks 1
+step cmd get 0 0
+step cmd barrier
+step ticks 6
+step cmd del 0 13,8,13
+step cmd expire 0 18 - 1
+step ticks 8
+step cmd getdel 0 17
+step cmd set 0 0 2768 - - 0 0
+step cmd getdel 0 20
+step cmd del 0 5
+step cmd get 0 4
+step cmd append 0 1 99
+step cmd msetnx 0 2:1920,2:659,12:17
+step cmd meta 0 1
+step cmd rename 0 1 6 0
+step cmd del 0 1,6
+step cmd set 0 1 40061 - - 1 0
+step cmd set 0 1 3941 - xx 0 0
+step cmd expire 0 8 r35 0
+step cmd del 0 19
+step ticks 8
+step cmd get 0 4
+step cmd del 0 1,6,16
+step ticks 47
+step cmd get 0 1
+step cmd rename 0 19 9 0
+step cmd set 0 5 28 r175 - 0 0
+step cmd mset 0 1:178,11:380
+step cmd msetnx 0 0:1120,20:832,5:4056
+step cmd set 0 15 2058 - - 0 0
+step ticks 4
+step cmd scan 0 20 44
+step ticks 8
+step cmd set 0 1 28 r55427263 - 0 0
+step cmd copy 0 0 5 0
+step cmd get 0 15
+step cmd set 0 2 1275 - - 0 0
+step cmd meta 0 9
+step cmd append 0 0 287
+step cmd barrier
+step cmd mset 0 0:578,0:3006,5:42195
+step cmd set 0 7 2422 r171 nx 0 0
+step cmd append 0 10 97
+step cmd set 0 1 64111 r2666 - 0 0
+step cmd set 0 4 11 r4966 xx 0 0
+step cmd set 0 13 27 - - 0 0
+step cmd append 0 0 69
+step cmd expire 0 6 r29732414 1
+step cmd rename 0 8 18 0
+step cmd del 0 0
+step cmd copy 0 1 6 0
+step cmd setrange 0 15 473 258
+step cmd del 0 10
+step cmd set 0 19 205 - - 0 0
+step cmd append 0 0 100
+step cmd mset 0 1:398,6:13,6:10
+step ticks 4
+step ticks 6
+step cmd rename 0 0 10 0
+step cmd get 0 0
+step clock 18
+step cmd set 0 1 20 r168 - 0 0
+step cmd set 0 17 957 - - 0 0
+step cmd del 0 2,17,7
+step cmd del 0 15,0
+step cmd mset 0 9:3434,14:864,14:49858
+step cmd set 0 6 1120 r79 - 0 0
+step cmd set 0 1 2925 r4867 xx 0 0
+step cmd msetnx 0 19:210,9:90,19:550,9:2021
+step ticks 4
+step cmd get 0 0
+step cmd get 0 1
+step cmd setrange 0 1 1116 325
+step ticks 4
+step cmd msetnx 0 20:9,0:19,10:4092
+step cmd copy 0 7 12 1
+step cmd setrange 0 4 1105 418
+step cmd scan 0 13 34
+step cmd setrange 0 9 599 244
+step cmd set 0 2 1164 r5289333 xx 0 0
+step cmd set 0 1 611 r18920522 nx 0 0
+step cmd copy 0 20 10 1
+step cmd set 0 11 1260 r74585754 nx 0 0
+step cmd del 0 1,1,1
+step cmd append 0 1 122
+step cmd set 0 20 292 - - 0 0
+step cmd meta 0 5
+step ticks 6
+step cmd set 0 16 1902 - nx 0 0
+step cmd set 0 0 757 - - 0 0
+step cmd append 0 7 131
+step cmd mset 0 0:44286,15:13,15:32
+step cmd del 0 9
+step cmd setrange 0 10 839 510
+step cmd setrange 0 1 305 168
+step cmd del 0 16,6,11
+step cmd del 0 13
+step cmd getdel 0 1
+step cmd append 0 1 88
+step ticks 4
+step cmd del 0 0,15
+step cmd set 0 1 727 r189 - 1 0
+step cmd set 0 0 909 - xx 0 0
+step cmd meta 0 17
+step ticks 4
+step cmd copy 0 1 6 1
+step cmd setrange 0 3 137 405
+step cmd append 0 0 240
+step cmd append 0 0 109
+step ticks 4
+step cmd msetnx 0 16:2025,11:21
+step cmd del 0 1,16,11
+step cmd setrange 0 1 247 318
+step cmd del 0 13
+step cmd get 0 0
+step cmd set 0 0 2674 - - 0 0
+step cmd set 0 0 1058 past - 0 0
+step cmd set 0 16 34124 - - 0 0
+step cmd set 0 6 3868 - - 0 0
+step ticks 1
+step cmd setrange 0 1 34 555
+step cmd setrange 0 1 722 119
+step cmd get 0 1
+step cmd setrange 0 1 984 522
+step cmd msetnx 0 17:869,2:103,2:1
+step ticks 6
+step cmd append 0 12 6
+step ticks 1
+step cmd expire 0 0 r4116 0
+step ticks 8
+step ticks 2
+step cmd getdel 0 1
+step ticks 3
+step quiesce
+step cmd append 0 1 118
+step cmd flush 0
+step cmd set 0 0 2344 - nx 0 0
+step cmd get 0 19
+"#,
+    ),
+    (
+        "get_reports_corrupt_page",
+        r#"kv-sim storage case 1
+seed 50438
+fail ENGINE 26 GET-corrupt
+cfg partitions 16
+cfg devices 1
+cfg ags 57
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 20
+cfg groups 3
+cfg dbs 2
+cfg profile large
+cfg steps 359
+cfg rounds 3
+cfg tick_permille 120
+cfg delay_max 0
+cfg late_pct 53
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 4 1470 r3865 - 0 0
+step cmd msetnx 1 0:837402,15:305,9:98
+step cmd setrange 0 6 94 301
+step cmd set 0 0 340034 past - 0 0
+step cmd meta 0 1
+step ticks 19
+step cmd set 0 0 2524 - - 0 0
+step cmd mset 1 0:17007,6:808
+step cmd getdel 0 0
+step cmd set 1 1 60939 - - 0 0
+step cmd setrange 1 0 903 284
+step cmd get 0 1
+step cmd set 0 1 46689 r107 - 0 0
+step cmd meta 1 13
+step cmd expire 0 13 - 1
+step cmd rename 1 0 18 0
+step cmd expire 0 18 - 1
+step cmd del 0 14
+step cmd expire 1 18 - 1
+step cmd set 1 5 140487 r66 - 0 0
+step cmd msetnx 0 1:12077226,4:1901112,7:384,4:2056
+step cmd meta 0 0
+step cmd getdel 0 19
+step cmd set 0 1 18860 r1855 - 0 1
+step cmd set 0 0 8929709 r83 - 0 0
+step cmd append 0 0 270
+"#,
+    ),
+    (
+        "acked_write_lost_after_power_cut_2",
+        r#"kv-sim storage case 1
+seed 50114
+fail I1 17 power_cut-Power
+cfg partitions 16
+cfg devices 1
+cfg ags 45
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wb
+cfg dsync 1
+cfg durability written
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 11
+cfg groups 5
+cfg dbs 1
+cfg profile churn
+cfg steps 635
+cfg rounds 5
+cfg tick_permille 40
+cfg delay_max 4
+cfg late_pct 58
+cfg skip_pct 10
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd get 0 0
+step cmd set 0 0 956 r4040 - 0 0
+step cmd persist 0 0
+step cmd del 0 0,10
+step cmd scan 0 6 38
+step cmd set 0 0 11 - - 0 0
+step cmd msetnx 0 10:827,10:473,10:2042
+step cmd msetnx 0 6:19366,1:830,1:1973,1:548
+step ticks 4
+step cmd set 0 0 2809 r113 - 0 0
+step cmd msetnx 0 8:2072,8:55906
+step cmd del 0 0,0,10
+step cmd set 0 6 1410 r150 - 0 0
+step cmd set 0 8 2084 - xx 1 0
+step cmd get 0 4
+step ticks 5
+step cmd flush all
+step crash power prefix 11
+"#,
+    ),
+    (
+        "acked_write_lost_after_kill",
+        r#"kv-sim storage case 1
+seed 50037
+fail I1 56 kill_-9-Process
+cfg partitions 16
+cfg devices 2
+cfg ags 27
+cfg lba 4096
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 38
+cfg groups 9
+cfg dbs 1
+cfg profile churn
+cfg steps 834
+cfg rounds 4
+cfg tick_permille 120
+cfg delay_max 4
+cfg late_pct 2
+cfg skip_pct 0
+cfg per_poll 1
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd del 0 32
+step cmd msetnx 0 2:10,29:31
+step cmd setrange 0 21 357 287
+step cmd get 0 0
+step cmd set 0 19 2137 r91 nx 0 0
+step cmd getdel 0 1
+step cmd del 0 1
+step ticks 3
+step cmd get 0 3
+step cmd scan 0 6 16
+step cmd meta 0 2
+step cmd mset 0 1:2655,37:612,37:32
+step cmd set 0 0 694 - - 0 0
+step ticks 58
+step cmd rename 0 14 14 0
+step cmd append 0 1 2150
+step cmd append 0 0 61
+step cmd expire 0 11 - 1
+step cmd get 0 26
+step cmd set 0 35 53414 r1748 - 0 0
+step cmd setrange 0 20 107 368
+step cmd set 0 22 1 r27 - 1 1
+step cmd set 0 35 766 r50 - 0 0
+step cmd set 0 1 768 r83915886 - 0 0
+step cmd del 0 1,37
+step cmd set 0 1 1287 - - 0 0
+step ticks 8
+step cmd del 0 0
+step ticks 4
+step cmd mset 0 1:2981,10:14,10:1487,28:1
+step cmd flush all
+step cmd rename 0 3 3 0
+step cmd set 0 3 817 r3267 - 0 0
+step cmd rename 0 0 27 1
+step ticks 6
+step cmd set 0 6 34710 r41 - 0 0
+step cmd set 0 37 1399 r89 - 0 0
+step cmd setrange 0 32 758 481
+step cmd barrier
+step cmd get 0 1
+step cmd set 0 3 0 - - 0 0
+step cmd set 0 27 1130 - - 1 0
+step cmd scan 0 7 31
+step cmd del 0 32,5,14
+step cmd persist 0 1
+step cmd set 0 27 819 - - 0 0
+step cmd set 0 21 49264 r3099 nx 0 0
+step cmd persist 0 19
+step cmd get 0 28
+step cmd rename 0 0 36 1
+step cmd set 0 22 2007 r132 - 0 0
+step cmd set 0 16 2889 - nx 0 0
+step cmd set 0 3 652 - - 0 0
+step cmd get 0 2
+step cmd mset 0 28:27,19:12,1:1426,37:3568
+step cmd meta 0 3
+step crash kill sectors 0
+"#,
+    ),
+    (
+        "multi_key_write_partial_after_kill",
+        r#"kv-sim storage case 1
+seed 50544
+fail I4 165 kill_-9-Process
+cfg partitions 16
+cfg devices 1
+cfg ags 56
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 16384
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 34
+cfg groups 17
+cfg dbs 1
+cfg profile churn
+cfg steps 352
+cfg rounds 4
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 16
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd rename 0 0 0 0
+step cmd set 0 30 1300 r66600944 - 0 0
+step cmd rename 0 21 4 1
+step cmd get 0 33
+step cmd get 0 0
+step cmd set 0 3 1319 - - 0 0
+step cmd get 0 2
+step cmd rename 0 1 18 0
+step cmd set 0 16 398 r2362 - 0 0
+step ticks 8
+step cmd persist 0 3
+step ticks 8
+step ticks 46
+step cmd scan 0 11 37
+step ticks 1
+step cmd append 0 24 102
+step cmd del 0 22
+step cmd mset 0 2:3962,2:2099,19:1041
+step cmd getdel 0 0
+step cmd getdel 0 1
+step cmd setrange 0 0 805 501
+step cmd del 0 1,18
+step cmd set 0 31 1939 - - 1 0
+step cmd get 0 32
+step cmd set 0 2 42 r78554577 - 0 0
+step cmd set 0 12 24 r879 - 0 0
+step cmd set 0 1 1243 r103 - 0 0
+step cmd set 0 20 17 r26543906 - 0 0
+step cmd set 0 15 2029 past - 0 0
+step cmd set 0 14 8 - - 0 0
+step cmd set 0 3 1924 - - 0 1
+step ticks 59
+step cmd get 0 9
+step cmd setrange 0 30 1131 557
+step cmd setrange 0 4 281 594
+step cmd set 0 15 30952 r86 - 0 0
+step cmd set 0 18 18 r72547593 xx 0 0
+step cmd barrier
+step cmd meta 0 7
+step cmd set 0 2 1278 - - 1 0
+step cmd expire 0 12 r31397142 1
+step cmd get 0 5
+step cmd append 0 30 284
+step ticks 38
+step ticks 8
+step ticks 52
+step cmd setrange 0 30 244 341
+step cmd set 0 26 3571 - - 0 0
+step cmd rename 0 0 0 1
+step cmd setrange 0 22 311 204
+step cmd set 0 1 13653 - - 0 0
+step cmd get 0 33
+step cmd set 0 32 72 r65018922 - 0 0
+step cmd set 0 27 1904 - - 0 0
+step cmd expire 0 20 - 1
+step quiesce
+step ticks 8
+step cmd copy 0 33 16 1
+step cmd append 0 3 295
+step cmd expire 0 29 r415 1
+step cmd del 0 26,26
+step cmd rename 0 22 5 1
+step cmd del 0 0,0
+step cmd mset 0 3:7,3:2016,3:992,20:1996
+step cmd rename 0 31 31 1
+step cmd meta 0 25
+step cmd msetnx 0 3:25,20:1080,20:740,3:1951
+step cmd setrange 0 17 13782 456
+step cmd del 0 1
+step cmd set 0 1 1921 - - 0 0
+step cmd set 0 1 19 - - 0 0
+step ticks 9
+step ticks 4
+step cmd get 0 19
+step cmd append 0 0 85204
+step cmd append 0 0 156
+step cmd append 0 3 120
+step cmd get 0 3
+step cmd flush all
+step cmd set 0 23 2504 r36 - 0 0
+step cmd set 0 2 1083 r73590706 - 0 0
+step cmd get 0 12
+step cmd set 0 2 2030 - nx 0 0
+step ticks 4
+step ticks 1
+step cmd del 0 24,24,7
+step ticks 3
+step cmd set 0 26 2041 - - 0 0
+step crash power bytes 574
+step cmd meta 0 16
+step cmd msetnx 0 2:18,2:900,19:1090,19:9
+step cmd scan 0 0 32
+step cmd rename 0 13 30 0
+step cmd append 0 3 158
+step cmd del 0 3,3,20
+step cmd get 0 2
+step cmd set 0 2 2037 - - 0 0
+step cmd del 0 0,17
+step cmd set 0 0 13814 - - 0 0
+step cmd set 0 25 950 - - 0 0
+step cmd get 0 9
+step cmd expire 0 12 - 1
+step cmd get 0 2
+step cmd setrange 0 12 699 195
+step cmd set 0 26 21 - - 0 0
+step cmd rename 0 20 3 0
+step ticks 5
+step ticks 6
+step cmd scan 0 8 10
+step ticks 6
+step cmd append 0 24 36
+step cmd set 0 21 1494 past - 0 0
+step cmd set 0 1 3 r3676 - 0 0
+step cmd get 0 3
+step cmd set 0 11 2277 - - 0 0
+step cmd set 0 7 1927 - xx 0 0
+step cmd set 0 3 223 r189 - 0 0
+step ticks 48
+step cmd msetnx 0 15:1374,32:18,32:461,15:24
+step cmd del 0 26
+step cmd msetnx 0 1:1938,18:2045,18:63673,18:968
+step cmd del 0 19,2,19
+step cmd mset 0 16:5,33:3285,33:1978
+step cmd getdel 0 0
+step cmd del 0 0
+step cmd append 0 1 54
+step cmd set 0 9 3047 - - 0 0
+step cmd expire 0 17 - 1
+step cmd set 0 0 20128 - xx 1 0
+step cmd set 0 6 3 - - 0 0
+step cmd rename 0 4 21 0
+step cmd set 0 28 25 - - 0 0
+step cmd expire 0 29 - 1
+step cmd copy 0 26 9 1
+step cmd get 0 19
+step ticks 1
+step cmd del 0 10
+step cmd set 0 17 2080 - - 0 0
+step ticks 1
+step cmd append 0 5 4
+step ticks 8
+step ticks 3
+step cmd del 0 0,0
+step cmd set 0 0 0 - - 0 0
+step cmd msetnx 0 8:16,25:742,25:727
+step cmd set 0 5 28 - - 0 0
+step cmd del 0 0
+step cmd copy 0 30 13 0
+step ticks 2
+step cmd set 0 3 15 - - 0 0
+step cmd append 0 0 170
+step cmd append 0 24 88
+step cmd set 0 1 25 - - 0 1
+step cmd set 0 11 2061 r1739 - 0 0
+step cmd del 0 32,32,32
+step cmd mset 0 1:56373,18:1211,1:116,1:8316
+step cmd set 0 9 437 - nx 0 0
+step cmd set 0 18 7 r912 xx 0 0
+step cmd expire 0 4 - 0
+step ticks 3
+step cmd append 0 25 271
+step cmd del 0 0,17,17
+step ticks 4
+step cmd barrier
+step ticks 2
+step crash kill sectors 4
+"#,
+    ),
+    (
+        "two_extent_copies_after_quiesce",
+        r#"kv-sim storage case 1
+seed 50039
+fail I11 28 extra-copies
+cfg partitions 32
+cfg devices 1
+cfg ags 99
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 30
+cfg groups 10
+cfg dbs 1
+cfg profile large
+cfg steps 354
+cfg rounds 4
+cfg tick_permille 250
+cfg delay_max 32
+cfg late_pct 56
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 2 548164 r19 nx 0 0
+step cmd set 0 9 5131012 r4175 - 0 0
+step cmd copy 0 15 5 0
+step cmd set 0 0 6922 r144 - 0 0
+step cmd persist 0 3
+step ticks 6
+step cmd set 0 20 44121 - - 0 0
+step cmd set 0 10 1034818 past - 0 0
+step cmd expire 0 10 r118 0
+step cmd msetnx 0 11:246,11:8144434,1:46836
+step ticks 4
+step cmd get 0 11
+step ticks 4
+step cmd set 0 0 41098 - - 0 0
+step cmd set 0 0 2090 - - 0 0
+step ticks 7
+step cmd meta 0 0
+step cmd set 0 24 944 - - 0 0
+step ticks 1
+step ticks 2
+step cmd append 0 2 220
+step cmd set 0 20 2448200 - - 0 0
+step ticks 7
+step cmd set 0 0 3238 - - 0 0
+step cmd expire 0 2 past 1
+step cmd set 0 1 1922 - nx 1 0
+step cmd get 0 2
+step cmd set 0 0 95189 - - 0 1
+"#,
+    ),
+    (
+        "orphans_after_clean_restart_2",
+        r#"kv-sim storage case 1
+seed 50032
+fail I10 155 clean_restart
+cfg partitions 16
+cfg devices 2
+cfg ags 25
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit 512
+cfg cache wt
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 194
+cfg groups 64
+cfg dbs 1
+cfg profile mixed
+cfg steps 1401
+cfg rounds 2
+cfg tick_permille 450
+cfg delay_max 32
+cfg late_pct 18
+cfg skip_pct 40
+cfg per_poll 2
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step ticks 2
+step ticks 6
+step ticks 53
+step ticks 3
+step cmd set 0 17 401 - - 0 0
+step ticks 2
+step cmd meta 0 8
+step cmd mset 0 10:11,10:2003,138:17,10:268764
+step cmd set 0 35 1941 past - 0 0
+step cmd msetnx 0 7:765,135:759
+step ticks 28
+step ticks 7
+step cmd expire 0 105 r178 0
+step ticks 8
+step cmd del 0 138,138,138
+step ticks 7
+step ticks 5
+step ticks 4
+step ticks 6
+step cmd persist 0 20
+step cmd set 0 185 1105 - - 0 0
+step cmd set 0 96 30 - - 0 0
+step cmd getdel 0 126
+step ticks 3
+step ticks 3
+step ticks 8
+step cmd get 0 135
+step ticks 4
+step cmd mset 0 3:1178,3:181049,131:2031
+step ticks 8
+step ticks 4
+step cmd expire 0 19 r1852 0
+step cmd setrange 0 48 1086 313
+step ticks 2
+step cmd get 0 2
+step cmd expire 0 114 - 1
+step ticks 43
+step ticks 6
+step ticks 14
+step cmd set 0 1 1178 - - 0 0
+step ticks 1
+step ticks 1
+step cmd msetnx 0 14:1991,78:2043
+step cmd persist 0 19
+step ticks 4
+step cmd msetnx 0 153:761,153:17
+step ticks 8
+step cmd copy 0 17 145 0
+step cmd persist 0 104
+step cmd set 0 14 2485 - - 0 0
+step cmd set 0 72 2004 r91 - 0 0
+step cmd getdel 0 143
+step cmd mset 0 174:1276,110:4900917
+step ticks 8
+step ticks 53
+step cmd get 0 9
+step ticks 8
+step ticks 60
+step cmd set 0 6 115 - - 0 0
+step ticks 5
+step cmd set 0 1 215 - - 0 0
+step cmd scan 0 11 28
+step ticks 5
+step cmd set 0 15 61248 - - 0 0
+step ticks 1
+step cmd mset 0 105:45988,169:23
+step cmd get 0 147
+step ticks 3
+step cmd get 0 14
+step ticks 8
+step cmd persist 0 151
+step cmd getdel 0 180
+step ticks 5
+step cmd getdel 0 109
+step ticks 7
+step ticks 1
+step ticks 7
+step cmd append 0 23 21
+step ticks 3
+step ticks 34
+step ticks 2
+step cmd rename 0 6 134 0
+step cmd set 0 9 1408 - - 0 0
+step cmd set 0 23 13 - xx 0 0
+step cmd copy 0 142 78 1
+step cmd set 0 11 371 r136 - 0 0
+step cmd barrier
+step ticks 5
+step cmd set 0 159 1080 - nx 0 0
+step ticks 1
+step cmd expire 0 24 r111 1
+step ticks 54
+step cmd getdel 0 7
+step cmd get 0 13
+step ticks 26
+step ticks 7
+step ticks 2
+step ticks 6
+step ticks 31
+step ticks 4
+step cmd set 0 107 2971 r5791982 - 0 0
+step ticks 2
+step ticks 3
+step ticks 5
+step cmd set 0 26 8 - - 0 0
+step ticks 8
+step cmd del 0 17,145
+step cmd set 0 125 11460932 r30 - 0 0
+step cmd append 0 17 2050
+step ticks 8
+step ticks 56
+step cmd get 0 74
+step cmd get 0 96
+step ticks 6
+step ticks 4
+step cmd set 0 22 20 - - 0 0
+step ticks 4
+step cmd set 0 21 144 r3824023 - 0 1
+step clock 35
+step cmd persist 0 10
+step ticks 21
+step ticks 2
+step cmd expire 0 72 - 1
+step cmd setrange 0 67 64033 346
+step ticks 5
+step cmd msetnx 0 0:27,128:1327,0:1984,128:997
+step cmd rename 0 15 15 0
+step cmd set 0 139 3301 past - 0 0
+step ticks 44
+step ticks 54
+step cmd expire 0 170 - 0
+step cmd get 0 8
+step cmd set 0 8 1351 - - 0 1
+step ticks 1
+step cmd set 0 22 2978 r1306 - 0 0
+step ticks 43
+step clock 6
+step ticks 5
+step cmd append 0 162 299
+step cmd get 0 91
+step cmd setrange 0 8 50 513
+step cmd mset 0 99:3405,35:654,35:806,163:113
+step cmd get 0 26
+step ticks 7
+step ticks 3
+step ticks 6
+step cmd setrange 0 20 84 126
+step cmd set 0 113 424 - - 0 0
+step quiesce
+step cmd mset 0 105:2961,105:942
+step cmd expire 0 164 - 1
+step ticks 27
+step cmd get 0 20
+step cmd get 0 57
+step ticks 3
+step clean
+"#,
+    ),
+    (
+        "expired_copy_left_beside_new_extent",
+        r#"kv-sim storage case 1
+seed 20002
+fail I11 5 expired-leftover
+cfg partitions 16
+cfg devices 1
+cfg ags 46
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 31
+cfg groups 31
+cfg dbs 1
+cfg profile large
+cfg steps 438
+cfg rounds 1
+cfg tick_permille 250
+cfg delay_max 0
+cfg late_pct 25
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd set 0 29 10 r93 - 0 0
+step ticks 3
+step ticks 1
+step clock 150
+step cmd msetnx 0 29:476840
+"#,
+    ),
+    (
+        "persist_after_expire_misses_key",
+        r#"kv-sim storage case 1
+seed 1169
+fail RESULT 4 PERSIST-result
+cfg partitions 16
+cfg devices 1
+cfg ags 49
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 67108864
+cfg fill_pct 95
+cfg snapshot 0
+cfg keys 90
+cfg groups 90
+cfg dbs 1
+cfg profile mixed
+cfg steps 1299
+cfg rounds 2
+cfg tick_permille 40
+cfg delay_max 32
+cfg late_pct 29
+cfg skip_pct 40
+cfg per_poll 0
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd msetnx 0 3:12,3:88473,3:2035
+step ticks 5
+step cmd expire 0 3 r11852688 1
+step cmd persist 0 3
+"#,
+    ),
+    (
+        "get_after_expire_returns_old_value",
+        r#"kv-sim storage case 1
+seed 1032
+fail RESULT 4 GET-result
+cfg partitions 32
+cfg devices 1
+cfg ags 71
+cfg lba 512
+cfg page_mode atomic
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability written
+cfg cache_bytes 1048576
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 36
+cfg groups 7
+cfg dbs 1
+cfg profile mixed
+cfg steps 671
+cfg rounds 3
+cfg tick_permille 40
+cfg delay_max 32
+cfg late_pct 53
+cfg skip_pct 0
+cfg per_poll 8
+cfg shuffle 0
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 1
+cfg max_len 8000000
+cfg unit_cap 4096
+step cmd mset 0 28:0,14:593,14:2073
+step quiesce
+step cmd expire 0 14 r62 1
+step cmd get 0 14
 "#,
     ),
 ];

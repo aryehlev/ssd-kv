@@ -1307,6 +1307,13 @@ impl PartitionStore {
                 self.core.counters.page_reads += u64::from(pages);
             }
             Need::ExtWrite(start) => {
+                if let Some(e) = self.core.failed
+                    && self.core.state == PartState::ReadOnly
+                {
+                    // a read-only partition issues no write any more: the value never arrives
+                    self.reqs.get_mut(id).expect("live").failed = Some(StoreError::Io(e));
+                    return;
+                }
                 // only a write still to complete wakes its waiters (at `ext_write_done`)
                 if let Some(w) = self.core.ext.writes.get_mut(&start)
                     && w.state != ExtState::AwaitFlush
@@ -1472,6 +1479,8 @@ impl PartitionStore {
             let out = match (v.is_ok(), r.req.kind) {
                 (false, _) => Ok(ExecOut::none()),
                 (true, ReqKind::FlushDb { db }) => self.exec_flush(cx, db, r.req.origin),
+                // a read-only partition writes nothing more: a barrier could never complete
+                (true, _) if self.core.state == PartState::ReadOnly => Err(StoreError::ReadOnly),
                 (true, _) => Ok(self.exec_barrier(cx.cache)),
             };
             self.finish(cx.cache, id, r);
@@ -2957,6 +2966,20 @@ impl PartitionStore {
             self.core.state = PartState::ReadOnly;
         }
         self.core.tickets.fail_all(errno);
+        // no write is issued any more: readers waiting for a staged or in-flight extent write
+        // fail now instead of waiting for it
+        let mut waiting: Vec<(ReqId, u32)> = Vec::new();
+        for w in self.core.ext.writes.values_mut() {
+            waiting.extend(w.waiters.drain(..));
+        }
+        for (id, generation) in waiting {
+            if self.reqs.live_gen(id, generation) {
+                let r = self.reqs.get_mut(id).expect("live");
+                r.io = r.io.saturating_sub(1);
+                r.failed = Some(StoreError::Io(errno));
+                self.reqs.check_ready(id);
+            }
+        }
     }
 
     fn page_read_done(&mut self, cx: &mut StorageCtx<'_>, page: PageId, retried: bool, d: IoDone) {
@@ -3252,6 +3275,12 @@ impl PartitionStore {
         self.core.writes_in_flight = self.core.writes_in_flight.saturating_sub(1);
         let Some(w) = self.core.ext.writes.get_mut(&start) else { return };
         if let Err(e) = d.res {
+            // the write will never complete: readers waiting for its buffer get it back (the
+            // value stays readable from RAM), the partition goes read-only and its tickets fail
+            w.buf = d.buf;
+            w.state = ExtState::AwaitFlush;
+            let waiters = core::mem::take(&mut w.waiters);
+            self.wake(waiters);
             self.write_failed(e);
             return;
         }

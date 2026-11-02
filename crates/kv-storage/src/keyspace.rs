@@ -210,6 +210,10 @@ pub(crate) struct ExtFetch {
     /// Chunkmap reads: the chunks, read one at a time in order.
     pub(crate) chunks: Option<SmallVec<[ChunkFetch; 4]>>,
     pub(crate) want_chunks: bool,
+    /// Read while earlier requests on the request's keys were still queued ahead of it (the
+    /// prefetch at submit): those requests may rewrite the extent in place or reuse its run
+    /// for a newer version before this one runs, so the buffer is dropped when it runs.
+    pub(crate) early: bool,
 }
 
 impl ExtFetch {

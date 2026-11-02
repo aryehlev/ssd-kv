@@ -246,3 +246,49 @@ fn corrupt_snapshot_section_falls_back_to_the_full_scan() {
     }
     db.quiesce();
 }
+
+/// A read queued behind writes of its key prefetches the extent the index names at submit;
+/// the writes ahead of it may put a newer version into that very run (twin runs alternate,
+/// §14.4) before the read runs. The read must return the newest version, never the bytes it
+/// prefetched (it used to return the version two writes old).
+#[test]
+fn queued_read_never_returns_a_prefetched_older_extent() {
+    use kv_common::Access;
+    use kv_index::VType;
+    use kv_storage::partition::ExecStatus;
+    let mut db = fresh(64 * 4096, 21);
+    let k: &[u8] = b"twin";
+    let p = db.eng.partition_of(k);
+    let t = db.set(0, k, &value(1, 9000), None).unwrap();
+    db.wait(k, t, TicketState::Durable);
+    db.quiesce();
+    // two writes and a read of the key, queued in this order before any of them runs
+    let a = db.eng.submit(p, keyed(0, &[k], Access::Write));
+    let b = db.eng.submit(p, keyed(0, &[k], Access::Write));
+    let g = db.eng.submit(p, keyed(0, &[k], Access::Read));
+    let mut got = None;
+    let mut todo = vec![(a, 2u64), (b, 3u64)];
+    for _ in 0..100_000 {
+        let mut ready = Vec::new();
+        db.eng.ready(&mut ready);
+        for &(_, id) in &ready {
+            if let Some(i) = todo.iter().position(|(x, _)| *x == id) {
+                let v = value(todo[i].1, 9000);
+                if let ExecStatus::Done(..) = db.eng.exec(p, id, &mut |ks| ks.put(k, &v, VType::String, None)) {
+                    todo.remove(i);
+                }
+            } else if id == g
+                && let ExecStatus::Done(v, _) = db.eng.exec(p, id, &mut |ks| Ok(ks.get(k)?.map(|(_, v)| v.to_vec())))
+            {
+                got = Some(v);
+            }
+        }
+        if got.is_some() {
+            break;
+        }
+        // let each write become durable and free the run it replaced before the next one runs
+        db.eng.settle(1000);
+    }
+    assert_eq!(got.expect("the read ran"), Some(value(3, 9000)), "the read returned an older version");
+    db.quiesce();
+}

@@ -1289,7 +1289,8 @@ impl PartitionStore {
                 }
                 // reads in flight name their fetch by index: an entry is replaced in place,
                 // never removed, so that the other entries keep their indexes
-                let fresh = ExtFetch { start, pages, buf: None, err: None, chunks: None, want_chunks: chunks };
+                let early = r.waits > 0 || r.blocked;
+                let fresh = ExtFetch { start, pages, buf: None, err: None, chunks: None, want_chunks: chunks, early };
                 let idx = match r.fetched.iter().position(|f| f.start == start) {
                     Some(i) => {
                         r.fetched[i] = fresh;
@@ -1491,6 +1492,9 @@ impl PartitionStore {
         }
         let now_ms = cx.now.unix_ms;
         let db = r.req.db;
+        // extents read before the request reached the head of its key queues may hold a
+        // version that the requests ahead of it replaced since: read them again (NeedMore)
+        r.fetched.retain(|f| !f.early);
         let (result, staged, needs, seqo) = {
             let mut ks = Keyspace::new(&mut self.core, cx.cache, &mut r.fetched, db, now_ms);
             match r.req.origin {

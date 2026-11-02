@@ -2804,6 +2804,15 @@ impl<B: Backend> Worker<B> {
                         if x.in_isr {
                             if now.saturating_sub(x.last_shrink_ns) >= 100_000_000 {
                                 x.last_shrink_ns = now;
+                                let acked = pp.sender.acked(m).unwrap_or(Seq::ZERO);
+                                tracing::info!(
+                                    partition = p,
+                                    member = %x.node.hex40(),
+                                    acked_term = acked.term(),
+                                    acked = acked.counter(),
+                                    attached = pp.sender.is_attached(m),
+                                    "an ISR member has not acknowledged for repl-ack-timeout-ms"
+                                );
                                 reports.push(AgentMsg::Shrink {
                                     shard,
                                     term,

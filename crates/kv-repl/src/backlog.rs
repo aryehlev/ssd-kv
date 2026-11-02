@@ -121,7 +121,12 @@ impl Backlog {
     /// `start_after(Seq::new(term, 0))`). The first call starts the ring's coverage; later
     /// calls only raise the floor.
     pub fn start_after(&mut self, s: Seq) {
-        self.floor = Some(self.floor.map_or(s, |f| f.max(s)));
+        // a ring that was never started may have held (and dropped) groups up to its last
+        // seq: it never covers those (they are gone, or a stream may have skipped some)
+        self.floor = Some(match self.floor {
+            Some(f) => f.max(s),
+            None => self.last.map_or(s, |l| l.max(s)),
+        });
     }
 
     /// Whether the ring was started (before that it covers nothing).
@@ -494,6 +499,21 @@ mod tests {
         assert!(!b.covers_after(Seq::new(1, 57)));
         assert!(b.covers_after(Seq::new(1, 80)));
         assert_eq!(b.end(), Some(Seq::new(1, 80)));
+    }
+
+    /// A ring that held groups before it was started (a member's ring during a Repair's key
+    /// walk) and is then cleared and started below its last seq covers nothing up to that seq.
+    #[test]
+    fn starting_a_cleared_ring_never_covers_what_it_dropped() {
+        let mut b = Backlog::new(4096);
+        for i in 5..=9 {
+            b.push_after_end(Seq::new(2, i), &group(Seq::new(2, i), b"k", 1));
+        }
+        b.clear();
+        b.start_after(Seq::new(2, 3));
+        assert!(!b.covers_after(Seq::new(2, 3)), "(2,4]..(2,9] were dropped");
+        assert!(b.covers_after(Seq::new(2, 9)));
+        assert_eq!(b.end(), Some(Seq::new(2, 9)));
     }
 
     #[test]

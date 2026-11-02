@@ -20,6 +20,17 @@
 //! watch channel and tracks the leader's check-quorum lease (from beat rounds answered by a
 //! majority) and the followers' last contact with a leader. A persistence failure stops the
 //! member ([`Wsr::is_failed`]); `kvc` then exits.
+//!
+//! Scheduling delays and slow state writes (a loaded host, a shared disk) never cost the
+//! group its leader on their own:
+//! * while a state write is in progress the leader keeps beating (the core steps only its
+//!   beat timer then, and only the beats are sent: no message of a step whose writes are
+//!   pending goes out), so its followers keep hearing from it and its check-quorum lease is
+//!   renewed by the rounds they answer;
+//! * check-quorum steps the leader down only when no majority answered during a whole window
+//!   of twice the minimum election timeout, and a check or an election timer that fires
+//!   more than [`LATE_TIMER`] late (this member did not run) is postponed by one beat, so the
+//!   replies and beats waiting to be read are handled first.
 
 pub mod core;
 pub mod peers;
@@ -109,6 +120,11 @@ impl std::error::Error for ProposeError {}
 
 type Reply = oneshot::Sender<Result<u64, ProposeError>>;
 
+/// A timer that fires this much later than due means this member did not run meanwhile (a
+/// stopped or descheduled process, a long state write): the decision waits one beat for the
+/// input that queued up.
+pub const LATE_TIMER: Duration = Duration::from_millis(100);
+
 enum Cmd {
     Propose(Vec<Transition>, Reply),
     SetPeers(PeerList, oneshot::Sender<Result<(), String>>),
@@ -138,6 +154,16 @@ pub struct Wsr {
     shared: Mutex<Shared>,
     net: Arc<PeerNet>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Fault injection for tests: milliseconds added to every state-file write.
+    write_delay_ms: AtomicU64,
+}
+
+/// The next peer message (`None` once the channel closed or while the receiver is out).
+async fn recv_peer(rx: &mut Option<mpsc::Receiver<(CoordId, WsrMsg<Blob>)>>) -> Option<(CoordId, WsrMsg<Blob>)> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn io_err(msg: impl Into<String>) -> std::io::Error {
@@ -205,6 +231,7 @@ impl Wsr {
             }),
             net: net.clone(),
             tasks: Mutex::new(Vec::new()),
+            write_delay_ms: AtomicU64::new(0),
         });
         let serve = tokio::spawn({
             let auth = cfg.auth.clone();
@@ -218,6 +245,13 @@ impl Wsr {
         let run = tokio::spawn(driver.run(cmd_rx, peer_rx));
         wsr.tasks_lock().extend([serve, run]);
         Ok(wsr)
+    }
+
+    /// Fault injection for tests: every later state-file write of this member takes `ms`
+    /// milliseconds longer (a slow or contended disk).
+    #[doc(hidden)]
+    pub fn set_write_delay_ms(&self, ms: u64) {
+        self.write_delay_ms.store(ms, Ordering::Release);
     }
 
     fn tasks_lock(&self) -> std::sync::MutexGuard<'_, Vec<tokio::task::JoinHandle<()>>> {
@@ -365,6 +399,12 @@ struct Driver {
     next_check: tokio::time::Instant,
     round: u64,
     round_starts: std::collections::VecDeque<(u64, Instant)>,
+    /// Peer messages (taken out while a state write runs, see [`Driver::persist`]).
+    peer_rx: Option<mpsc::Receiver<(CoordId, WsrMsg<Blob>)>>,
+    /// Peer messages that arrived during a state write, handled in order after it.
+    deferred: std::collections::VecDeque<(CoordId, WsrMsg<Blob>)>,
+    /// The last check-quorum or election timer fired late and was postponed by one beat.
+    postponed: bool,
 }
 
 impl Driver {
@@ -383,9 +423,50 @@ impl Driver {
             next_check: now,
             round: 0,
             round_starts: std::collections::VecDeque::new(),
+            peer_rx: None,
+            deferred: std::collections::VecDeque::new(),
+            postponed: false,
         };
         d.reset_election();
         d
+    }
+
+    fn beat_every(&self) -> Duration {
+        Duration::from_millis(u64::from(self.wsr.cfg.beat_ms.max(1)))
+    }
+
+    /// Check-quorum window: twice the minimum election timeout.
+    fn check_window(&self) -> Duration {
+        Duration::from_millis(self.election_range().0 * 2)
+    }
+
+    /// A beat round starts: the core's beat step (its outputs are returned, not yet carried
+    /// out).
+    fn beat(&mut self, now: tokio::time::Instant) -> Vec<Output<Blob>> {
+        self.round += 1;
+        self.round_starts.push_back((self.round, Instant::now()));
+        while self.round_starts.len() > 64 {
+            self.round_starts.pop_front();
+        }
+        self.next_beat = now + self.beat_every();
+        let mut out = Vec::new();
+        self.core.step(Input::BeatTimeout { round: self.round }, &mut out);
+        out
+    }
+
+    /// The effects of a beat step taken while a state write runs: beats are sent, the
+    /// check-quorum lease is renewed; anything else waits for the next beat after the write.
+    fn beat_effects(&mut self, out: &[Output<Blob>]) {
+        for o in out {
+            match o {
+                Output::Send {
+                    to,
+                    msg: msg @ WsrMsg::Beat { .. },
+                } => self.wsr.net.send(to, msg),
+                Output::QuorumHeard { .. } => self.absorb(std::slice::from_ref(o)),
+                _ => {}
+            }
+        }
     }
 
     fn election_range(&self) -> (u64, u64) {
@@ -399,9 +480,15 @@ impl Driver {
         self.election_at = tokio::time::Instant::now() + Duration::from_millis(ms);
     }
 
-    async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>, mut peer_rx: mpsc::Receiver<(CoordId, WsrMsg<Blob>)>) {
+    async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>, peer_rx: mpsc::Receiver<(CoordId, WsrMsg<Blob>)>) {
+        self.peer_rx = Some(peer_rx);
         let result: std::io::Result<()> = async {
             loop {
+                // what arrived during a state write first, in arrival order
+                if let Some((from, msg)) = self.deferred.pop_front() {
+                    self.process(Some(Input::Msg { from, msg })).await?;
+                    continue;
+                }
                 let leader = self.core.role() == Role::Leader;
                 let deadline = if leader {
                     self.next_beat.min(self.next_check)
@@ -425,7 +512,7 @@ impl Driver {
                             let _ = tx.send(r);
                         }
                     },
-                    m = peer_rx.recv() => {
+                    m = recv_peer(&mut self.peer_rx) => {
                         let Some((from, msg)) = m else { return Ok(()) };
                         self.process(Some(Input::Msg { from, msg })).await?;
                     }
@@ -433,19 +520,27 @@ impl Driver {
                         let now = tokio::time::Instant::now();
                         if leader {
                             if now >= self.next_beat {
-                                self.round += 1;
-                                self.round_starts.push_back((self.round, Instant::now()));
-                                while self.round_starts.len() > 64 {
-                                    self.round_starts.pop_front();
-                                }
-                                self.next_beat = now + Duration::from_millis(u64::from(self.wsr.cfg.beat_ms.max(1)));
-                                self.process(Some(Input::BeatTimeout { round: self.round })).await?;
+                                let out = self.beat(now);
+                                self.process_out(out).await?;
                             }
                             if now >= self.next_check {
-                                self.next_check = now + Duration::from_millis(self.election_range().0);
-                                self.process(Some(Input::CheckQuorum)).await?;
+                                if !self.postponed && now.saturating_duration_since(self.next_check) > LATE_TIMER {
+                                    // this member did not run: the replies that waited first
+                                    // (once: a member that is always late still decides)
+                                    self.postponed = true;
+                                    self.next_check = now + self.beat_every();
+                                } else {
+                                    self.postponed = false;
+                                    self.next_check = now + self.check_window();
+                                    self.process(Some(Input::CheckQuorum)).await?;
+                                }
                             }
+                        } else if !self.postponed && now.saturating_duration_since(self.election_at) > LATE_TIMER {
+                            // this member did not run: the beats that waited first (once)
+                            self.postponed = true;
+                            self.election_at = now + self.beat_every();
                         } else {
+                            self.postponed = false;
                             self.reset_election();
                             self.process(Some(Input::ElectionTimeout)).await?;
                         }
@@ -506,6 +601,11 @@ impl Driver {
         if let Some(i) = input {
             self.core.step(i, &mut out);
         }
+        self.process_out(out).await
+    }
+
+    /// The effects of a step's outputs `out` (see [`Driver::process`]).
+    async fn process_out(&mut self, mut out: Vec<Output<Blob>>) -> std::io::Result<()> {
         self.absorb(&out);
         if self.core.can_propose() && !self.pending.is_empty()
             && let Some(value) = self.build_proposal() {
@@ -536,7 +636,11 @@ impl Driver {
         let peers = self.core.peers_arc();
         let c = self.core.committed().clone();
         let a = self.core.accepted().cloned();
-        let (files, r) = tokio::task::spawn_blocking(move || {
+        let delay = self.wsr.write_delay_ms.load(Ordering::Acquire);
+        let mut task = tokio::task::spawn_blocking(move || {
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
             let r = (|| {
                 if meta {
                     files.write_meta(term, voted_for, &peers)?;
@@ -550,9 +654,42 @@ impl Driver {
                 Ok(())
             })();
             (files, r)
-        })
-        .await
-        .map_err(|e| io_err(format!("state file writer stopped: {e}")))?;
+        });
+        // A leader keeps beating while the files are written (unless its term or vote is
+        // being written: nothing of the new term goes out before it is durable). Only the
+        // beat step and the beat replies of the current term are stepped meanwhile (they touch
+        // the round counters alone), and only the beats are sent: the step that asked for this
+        // write sends nothing before it completes, no proposal acknowledgement is counted
+        // before it, every other message waits for it in arrival order, and the in-flight
+        // proposal is re-sent at the next beat after it.
+        let mut rx = self.peer_rx.take();
+        let joined = loop {
+            let beating = !meta && self.core.role() == Role::Leader;
+            tokio::select! {
+                biased;
+                r = &mut task => break r,
+                _ = sleep_until(self.next_beat), if beating => {
+                    let now = tokio::time::Instant::now();
+                    let out = self.beat(now);
+                    self.beat_effects(&out);
+                }
+                m = recv_peer(&mut rx), if beating => match m {
+                    Some((from, msg)) => {
+                        let current = matches!(&msg, WsrMsg::BeatReply { term, .. } if *term == self.core.term());
+                        if current && self.deferred.is_empty() {
+                            let mut out = Vec::new();
+                            self.core.step(Input::Msg { from, msg }, &mut out);
+                            self.beat_effects(&out);
+                        } else {
+                            self.deferred.push_back((from, msg));
+                        }
+                    }
+                    None => {}
+                },
+            }
+        };
+        self.peer_rx = rx;
+        let (files, r) = joined.map_err(|e| io_err(format!("state file writer stopped: {e}")))?;
         self.files = Some(files);
         r
     }
@@ -566,7 +703,7 @@ impl Driver {
                     tracing::info!(term, "elected coordinator leader");
                     let now = tokio::time::Instant::now();
                     self.next_beat = now;
-                    self.next_check = now + Duration::from_millis(self.election_range().0);
+                    self.next_check = now + self.check_window();
                     {
                         let mut s = self.wsr.shared();
                         s.leader_id = Some(self.core.id());

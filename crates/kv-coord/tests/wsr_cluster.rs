@@ -202,6 +202,61 @@ async fn elect_and_commit() {
     }
 }
 
+/// F3 (fixed): a leader whose state writes are slow (a loaded, shared disk) used to send no
+/// beat while it waited for them, so its followers' election timers fired and the group
+/// elected again (leases stalled meanwhile). Now it keeps beating during the write: no
+/// election, its check-quorum lease stays valid, and the slow proposal still commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_leader_writes_keep_the_leader() {
+    let mut ms = group("slowwrite", 3);
+    for m in &mut ms {
+        start(m).await;
+    }
+    let l = leader(&ms).await;
+    let v0 = propose_lease(&ms, 1600).await;
+    converge(&ms, v0).await;
+    let w = ms[l].wsr.as_ref().unwrap().clone();
+    let term = w.term();
+    // three times the longest election timeout (300 ms) per write
+    w.set_write_delay_ms(900);
+    let t = Transition::Admin(AdminOp::ParamSet {
+        key: "lease_ms".into(),
+        value: "1700".into(),
+    });
+    let p = tokio::spawn({
+        let w = w.clone();
+        async move { w.propose(vec![t]).await }
+    });
+    let start_at = Instant::now();
+    let mut lease_samples = (0u32, 0u32);
+    while !p.is_finished() {
+        assert!(start_at.elapsed() < Duration::from_secs(20), "the slow proposal never finished");
+        for (i, m) in ms.iter().enumerate() {
+            let x = m.wsr.as_ref().unwrap();
+            assert!(i == l || !x.is_leader(), "member {i} was elected while the leader wrote slowly");
+            assert_eq!(x.term(), term, "member {i} moved to another term");
+        }
+        lease_samples.1 += 1;
+        if w.lease_valid() {
+            lease_samples.0 += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let v = p.await.unwrap().expect("the slow proposal commits");
+    w.set_write_delay_ms(0);
+    converge(&ms, v).await;
+    assert!(w.is_leader() && w.term() == term);
+    assert!(
+        lease_samples.0 * 10 >= lease_samples.1 * 9,
+        "the leader's check-quorum lease lapsed during the slow write: valid in {} of {} samples",
+        lease_samples.0,
+        lease_samples.1
+    );
+    for m in &mut ms {
+        stop(m).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_kill_and_restart_from_files() {
     let mut ms = group("kill", 3);

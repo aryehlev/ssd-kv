@@ -1748,7 +1748,12 @@ state; one accepted proposal is held in the inactive half of two fixed state hal
   6. Side effects (assignment pushes, lease grants, redirects, admin replies) are produced only from committed state.
 * Timers: election timeout uniform 500-1000 ms; leader beat (`Beat{term, leader, peer_gen, committed_version}`, no
   value) every 100 ms, among coordinators only. The leader is whoever first gathers a majority; ids are never compared
-  (LC-27).
+  (LC-27). Scheduling delays and slow state writes never cost the group its leader on their own: a leader keeps beating
+  while its state files are written (only the beat step and current-term beat replies are stepped meanwhile, only
+  beats are sent, every other message waits for the write in arrival order; never while its term or vote is being
+  written); check-quorum steps a leader down only when no majority answered during a window of twice the minimum
+  election timeout; a check-quorum or election timer that fires more than 100 ms late (the member did not run) is
+  postponed once by one beat, so the replies and beats that queued up meanwhile are handled first.
 * Followers serve client topology from their committed state if they heard from a leader within 2 s, else reply
   `-CLUSTERDOWN The cluster is down`. Admin commands on a follower are relayed to the leader: the follower forwards
   only the admin command and returns only the leader's reply text to kvadm.

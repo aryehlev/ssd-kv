@@ -409,3 +409,61 @@ fn flushdb_frees_space_for_every_kind_of_write() {
         db.quiesce();
     }
 }
+
+/// Deleting every key of a full partition gives its AGs back to the pool (§11.5, §11.7): a
+/// page whose records are all deleted is fresh once its empty image is durable, and an AG of
+/// fresh pages is released, so extents can use the space again.
+#[test]
+fn deletes_give_ags_back() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 9);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 9).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    let base = db.eng.meta().ag_usage().0;
+    let mut refused = 0;
+    let mut keys = Vec::new();
+    while refused < 200 {
+        let k = format!("{{t}}s{}", keys.len() + refused);
+        match db.set(0, k.as_bytes(), &value(keys.len() as u64, 100), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                keys.push(k);
+            }
+            Err(StoreError::OutOfSpace) => refused += 1,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let (full, total) = db.eng.meta().ag_usage();
+    for k in &keys {
+        let (hit, t) = db.del(0, k.as_bytes()).unwrap();
+        assert!(hit);
+        db.wait(k.as_bytes(), t, TicketState::Written);
+    }
+    for _ in 0..600 {
+        db.advance(100);
+        db.eng.pump();
+    }
+    let (after, _) = db.eng.meta().ag_usage();
+    let mut stored = 0;
+    for i in 0..400u64 {
+        let k = format!("{{t}}x{i}");
+        match db.set(0, k.as_bytes(), &value(i, 1 << 20), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                stored += 1;
+            }
+            Err(StoreError::OutOfSpace) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let (end, _) = db.eng.meta().ag_usage();
+    // every partition keeps a spare SMALL AG; the deleted keys' AGs are back in the pool
+    let parts = u64::from(db.eng.partitions());
+    assert!(after <= base + parts + 2, "{} keys deleted: {after} of {total} AGs still used ({full} when full, {base} before)", keys.len());
+    assert!(stored >= 300, "only {stored} MiB values after the deletes ({after}/{total} AGs used before them, {end} at the end)");
+    db.quiesce();
+}

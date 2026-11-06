@@ -947,6 +947,9 @@ impl BuildEnv for Env<'_> {
     fn txn_open(&self, t: u64) -> bool {
         self.core.txn_open(t)
     }
+    fn fenced_here(&self, db: u8, key: &[u8]) -> bool {
+        self.core.stale.get(db, key).iter().any(|e| e.at.page() == self.page && e.fenced)
+    }
 }
 
 pub struct PartitionStore {

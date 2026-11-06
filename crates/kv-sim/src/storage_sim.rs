@@ -7681,6 +7681,96 @@ step cmd del 0 5
 step cmd get 0 0
 "#,
     ),
+    (
+        "deleted_key_with_two_copies_in_one_page_comes_back_after_a_torn_image",
+        r#"kv-sim storage case 1
+seed 717620
+fail I1 118 power_cut-Power
+cfg partitions 16
+cfg devices 1
+cfg ags 49
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit -
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 113
+cfg groups 113
+cfg dbs 2
+cfg profile small
+cfg steps 465
+cfg rounds 5
+cfg tick_permille 40
+cfg delay_max 200
+cfg late_pct 21
+cfg skip_pct 0
+cfg per_poll 2
+cfg shuffle 0
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd setrange 0 42 178 568
+step cmd set 1 4 15 r1952 - 0 0
+step cmd append 1 14 276
+step cmd set 0 63 316 - - 0 0
+step ticks 8
+step cmd set 1 83 0 - - 0 0
+step cmd set 0 7 22 - - 0 0
+step cmd append 1 8 8
+step cmd msetnx 0 10:1992,10:1114,10:4,10:17
+step cmd append 0 82 179
+step cmd mset 0 58:23,58:248
+step cmd setrange 0 9 592 104
+step cmd msetnx 0 2:1390,2:5,2:2,2:393
+step cmd set 0 87 8 r89 - 0 0
+step ticks 5
+step cmd mset 0 11:15,11:5,11:75,11:28
+step cmd set 0 105 137 - - 1 0
+step cmd mset 0 68:20,68:10,68:197,68:20
+step cmd set 0 4 9 - nx 0 0
+step cmd set 0 5 1277 r9882987 nx 0 0
+step cmd setrange 1 8 444 302
+step cmd set 0 34 867 - - 0 0
+step cmd set 0 5 4 past - 0 0
+step quiesce
+step cmd set 0 103 31 r84507467 - 0 0
+step cmd expire 0 4 - 1
+step cmd msetnx 1 0:30,0:17,0:15
+step cmd set 0 7 1430 r68 - 0 0
+step cmd mset 0 12:20,12:825,12:1112
+step cmd expire 0 4 - 1
+step cmd set 0 97 1016 r13328529 nx 0 0
+step cmd setrange 0 101 490 593
+step cmd set 0 4 2033 - - 0 0
+step cmd meta 0 2
+step cmd mset 0 7:2099,7:8,7:1488
+step cmd set 0 34 1081 - xx 0 0
+step cmd set 0 1 369 - - 0 0
+step cmd set 0 10 884 - - 0 0
+step cmd del 0 7
+step cmd set 1 5 756 - - 0 0
+step cmd set 0 13 16 r3 nx 0 0
+step cmd persist 0 98
+step cmd set 1 1 1369 r16 - 0 0
+step cmd del 0 2,2
+step cmd set 0 98 5 past - 0 0
+step cmd set 0 6 25 r43279451 nx 1 0
+step ticks 3
+step cmd set 0 9 870 r4972 xx 0 0
+step cmd append 0 112 63
+step cmd set 0 5 0 r93 - 0 0
+step ticks 2
+step crash power sectors 12
+"#,
+    ),
 ];
 
 /// Replays a case text.

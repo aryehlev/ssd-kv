@@ -351,6 +351,11 @@ pub(crate) trait BuildEnv {
     fn dead(&self, r: &RecDesc) -> bool;
     /// The record belongs to a txn whose commit is not durable yet (§13.3 c).
     fn txn_open(&self, txn: u64) -> bool;
+    /// The tracked copy of `(db, key)` in this page is fenced: a delete (or an expiry with
+    /// older copies) made it a copy to zero with no durable newer copy shadowing it (D1).
+    fn fenced_here(&self, _db: u8, _key: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Result of [`build`].
@@ -546,6 +551,36 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                 RecStatus::Droppable => {}
                 RecStatus::Live | RecStatus::Protected => keep.push(r),
             }
+        }
+    }
+
+    // 1b. two-image mode: a fenced key (deleted, nothing newer durable) whose every copy in M
+    //     would go in this image keeps its newest one until the older ones are durably zeroed.
+    //     N may tear: zeroing both at once could leave the older copy's sectors from M and the
+    //     newest one's from N, and recovery would bring the older version back (D1, I1).
+    if mode == PageUpdateMode::TwoImage && drop.len() >= 2 {
+        let mut i = 0;
+        while i < drop.len() {
+            let r = drop[i];
+            let key = r.key(m);
+            let same: SmallVec<[usize; 2]> = drop.iter().enumerate().filter(|(_, d)| d.db == r.db && d.h32 == r.h32 && d.key(m) == key).map(|(j, _)| j).collect();
+            let first = same.first() == Some(&i);
+            if first
+                && same.len() >= 2
+                && !env.dead(&r)
+                && env.fenced_here(r.db, key)
+                && !keep.iter().any(|k| k.db == r.db && k.h32 == r.h32 && k.key(m) == key)
+            {
+                let newest = same.iter().copied().max_by_key(|&j| drop[j].seq).expect("non-empty");
+                let mut kept = drop.remove(newest);
+                kept.status = RecStatus::Protected;
+                let k: Box<[u8]> = key.into();
+                out.cleared.retain(|(db, c)| !(*db == kept.db && *c == k));
+                out.foreground.push((kept.db, k));
+                keep.push(kept);
+                continue;
+            }
+            i += 1;
         }
     }
 

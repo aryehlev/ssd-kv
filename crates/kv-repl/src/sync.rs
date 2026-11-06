@@ -97,6 +97,37 @@ fn after(s: Seq) -> Seq {
     Seq(s.0.saturating_add(1))
 }
 
+/// The lowest position from which a member at `applied` can lack groups of partition `p`: a
+/// member that holds the closing point of its term (as the shard's history records it) lacks
+/// nothing until the next term of the history begins, since no group carries a seq between a
+/// term's closing point and the next term's start (the terms a raise skipped carry none at
+/// all). Without this a member behind a term raise (its positions still in the term before
+/// the raise) needed the raised term's ring to reach back into the earlier term, which no ring
+/// started at the raised term does, and was sent to the operator.
+fn past_closed_terms(history: &[(u32, Vec<u64>)], applied: Seq, p: u16, term: u32) -> Seq {
+    let mut s = applied;
+    loop {
+        let t = s.term();
+        let Some(end) = takeover(history, t, p) else {
+            return s;
+        };
+        if s < end {
+            return s;
+        }
+        // the next term of the history below the current one (the current term's groups are
+        // in this primary's own backlog, read from `Seq::new(term, 0)` on)
+        let Some(next) = history
+            .iter()
+            .map(|(u, _)| *u)
+            .filter(|u| *u > t && *u < term)
+            .min()
+        else {
+            return s;
+        };
+        s = Seq::new(next, 0);
+    }
+}
+
 pub fn decide(h: &Hello, v: &PrimaryView<'_>) -> SyncDecision {
     // Both sides reject peers whose term is below their fence: a member that saw a newer term
     // than ours talks to a primary that has been superseded.
@@ -133,8 +164,9 @@ pub fn decide(h: &Hello, v: &PrimaryView<'_>) -> SyncDecision {
     let Some((_, prev_end)) = prev_takeover(v.history, v.term, h.partition) else {
         return SyncDecision::Reject(RejectReason::NeedOperatorResync);
     };
-    if h.applied < prev_end {
-        match v.received.keys_between_into(h.applied, prev_end, &mut keys) {
+    let from = past_closed_terms(v.history, h.applied, h.partition, v.term);
+    if from < prev_end {
+        match v.received.keys_between_into(from, prev_end, &mut keys) {
             Some(false) => {}
             // not covered, or a partition-wide op a key set cannot describe
             _ => return SyncDecision::Reject(RejectReason::NeedOperatorResync),
@@ -325,6 +357,54 @@ mod tests {
         // a member that holds them already gets the current term's keys only
         let d = decide(&hello(2, Seq::new(2, 10)), &v);
         assert_eq!(keys(&d), ["new1", "new2", "new3", "new4"]);
+    }
+
+    #[test]
+    fn a_member_holding_its_terms_closing_point_needs_no_ring_of_that_term() {
+        // shard history: term 4 closed at (4,10); a raise skipped 5 and 6; term 7 (the same
+        // primary after the raise) closed at (7,3); this primary of term 8 was a member in term
+        // 7 and its received ring starts at that term's stream
+        let mut received = Backlog::new(1 << 16);
+        received.start_after(Seq::new(7, 0));
+        for i in 1..=3 {
+            let s = Seq::new(7, i);
+            received.push(s, &put(s, format!("t7-{i}").as_bytes()));
+        }
+        let mut backlog = Backlog::new(1 << 16);
+        backlog.start_after(Seq::new(8, 0));
+        let s = Seq::new(8, 1);
+        backlog.push(s, &put(s, b"t8-1"));
+        let end = |seq: Seq| {
+            let mut v = vec![0u64; 16];
+            v[3] = seq.0;
+            v
+        };
+        let history = vec![(4, end(Seq::new(4, 10))), (7, end(Seq::new(7, 3)))];
+        let v = PrimaryView {
+            term: 8,
+            history: &history,
+            backlog: &backlog,
+            received: &received,
+            is_member: true,
+            operator_full_sync: false,
+            last_executed: Seq::new(8, 1),
+        };
+        // the primary of term 4, restarted after the raise with nothing of term 7 on this
+        // partition: it holds all of term 4, so it lacks only term 7's and term 8's groups
+        let d = decide(&hello(4, Seq::new(4, 10)), &v);
+        assert_eq!(keys(&d), ["t7-1", "t7-2", "t7-3", "t8-1"]);
+        // with groups of its own beyond term 4's closing point (they come from the member)
+        let d = decide(&hello(4, Seq::new(4, 12)), &v);
+        assert_eq!(keys(&d), ["t7-1", "t7-2", "t7-3", "t8-1"]);
+        // behind term 4's closing point: (4,9]..(4,10] is in no ring here
+        let d = decide(&hello(4, Seq::new(4, 9)), &v);
+        assert!(matches!(d, SyncDecision::Reject(RejectReason::NeedOperatorResync)));
+        // a ring started later in term 7 does not cover the term's start
+        let mut late = Backlog::new(1 << 16);
+        late.start_after(Seq::new(7, 2));
+        let v2 = PrimaryView { received: &late, ..v };
+        let d = decide(&hello(4, Seq::new(4, 10)), &v2);
+        assert!(matches!(d, SyncDecision::Reject(RejectReason::NeedOperatorResync)));
     }
 
     #[test]

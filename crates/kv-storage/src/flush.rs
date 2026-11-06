@@ -54,6 +54,8 @@ pub struct FlushTracker {
     /// Completed writes waiting for a covering flush: `(write, epoch needed)`.
     waiting: Vec<(WriteId, u64)>,
     flushes: u64,
+    /// When the flush in flight was submitted, with the writes it covers (stall trace only).
+    traced: Option<(std::time::Instant, usize)>,
 }
 
 impl FlushTracker {
@@ -66,6 +68,7 @@ impl FlushTracker {
             flush_in_flight: false,
             waiting: Vec::new(),
             flushes: 0,
+            traced: None,
         }
     }
 
@@ -96,6 +99,9 @@ impl FlushTracker {
         self.submitted_epoch += 1;
         self.flush_in_flight = true;
         self.flushes += 1;
+        if crate::progress::stall_trace_ms().is_some() {
+            self.traced = Some((std::time::Instant::now(), self.waiting.len()));
+        }
         io.push(IoReq::flush(IoTag { partition: FLUSH_TAG_PARTITION, id: u64::from(self.dev) }, self.dev));
     }
 
@@ -114,6 +120,13 @@ impl FlushTracker {
         self.flush_in_flight = false;
         self.completed_epoch = self.submitted_epoch;
         let done = self.completed_epoch;
+        // `KVSSD_STALL_TRACE_MS`: a flush slower than the limit is printed
+        if let (Some(limit), Some((t0, n))) = (crate::progress::stall_trace_ms(), self.traced.take()) {
+            let ms = t0.elapsed().as_millis() as u64;
+            if ms >= limit {
+                eprintln!("kvssd stall trace flush dev{}: {ms}ms covering {n} writes ({} waiting now)", self.dev, self.waiting.len());
+            }
+        }
         self.waiting.retain(|&(w, need)| {
             if need <= done {
                 out.push(w);

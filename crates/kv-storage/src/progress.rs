@@ -511,7 +511,7 @@ impl PartitionStore {
 
     /// Refreshes the stall counters (`requests_waiting_over_1s`, `oldest_wait_ms`,
     /// `stalled_total`) from the ages of live requests and tickets.
-    pub(crate) fn update_stall_counters(&mut self) {
+    pub(crate) fn update_stall_counters(&mut self, cache: &PageCache) {
         let now = self.core.now.mono_ns;
         let mut over = 0u64;
         let mut oldest = 0u64;
@@ -543,7 +543,7 @@ impl PartitionStore {
         c.oldest_wait_ms = oldest / 1_000_000;
         c.stalled_total += newly;
         if let Some(ms) = stall_trace_ms() {
-            self.trace_stalls(now, ms * 1_000_000);
+            self.trace_stalls(cache, now, ms * 1_000_000);
         }
     }
 
@@ -568,7 +568,7 @@ impl PartitionStore {
 
     /// `KVSSD_STALL_TRACE_MS=<ms>`: prints, once per request and per unwritten ticket older
     /// than `<ms>`, what it waits for (diagnostics on stderr; no key or value bytes).
-    fn trace_stalls(&mut self, now: u64, limit: u64) {
+    fn trace_stalls(&mut self, cache: &PageCache, now: u64, limit: u64) {
         let mut lines = Vec::new();
         for (i, r) in self.reqs.slots.iter_mut().enumerate() {
             let Some(r) = r else { continue };
@@ -605,7 +605,7 @@ impl PartitionStore {
                 k.meta(),
                 k.txn,
                 k.txn_effects(),
-                k.deps.iter().map(|d| d.0.0).collect::<Vec<_>>(),
+                k.deps.iter().map(|d| page_wait(cache, d.0, now)).collect::<Vec<_>>(),
                 k.extent_deps.iter().map(|p| p.0).collect::<Vec<_>>()
             ));
         }
@@ -615,6 +615,25 @@ impl PartitionStore {
                 eprintln!("kvssd stall trace p{}: {l} | {d}", self.core.cfg.id);
             }
         }
+    }
+}
+
+/// What a page a stalled ticket depends on is doing (stall trace): `W<ms>` its image write in
+/// flight for that long, `F<ms>` written and awaiting a covering flush for that long, `D<n>` no
+/// image in flight and `n` staged changes (waiting for a build), `-` not cached.
+fn page_wait(cache: &PageCache, p: crate::layout::PageId, now: u64) -> String {
+    match cache.page_state(p) {
+        None => format!("{}:-", p.0),
+        Some(st) => match &st.inflight {
+            Some(i) => {
+                let ms = now.saturating_sub(i.since_ns) / 1_000_000;
+                match i.state {
+                    InflightState::Writing => format!("{}:W{ms}", p.0),
+                    InflightState::AwaitFlush => format!("{}:F{ms}", p.0),
+                }
+            }
+            None => format!("{}:D{}", p.0, st.pending.len()),
+        },
     }
 }
 

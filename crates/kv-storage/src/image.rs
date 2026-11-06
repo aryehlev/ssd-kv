@@ -229,6 +229,8 @@ pub struct Inflight {
     pub(crate) wid: u64,
     /// First error of a sub-I/O.
     pub(crate) failed: Option<i32>,
+    /// When the image was submitted, then when its write completed (stall trace).
+    pub(crate) since_ns: u64,
 }
 
 impl PageState {

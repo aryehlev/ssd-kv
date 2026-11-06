@@ -3522,6 +3522,7 @@ impl PartitionStore {
         let wid = inf.wid;
         let tickets: SmallVec<[TicketId; 4]> = inf.applied.iter().flat_map(|e| e.tickets().iter().copied()).collect();
         inf.state = InflightState::AwaitFlush;
+        inf.since_ns = cx.now.mono_ns;
         self.core.writes_in_flight = self.core.writes_in_flight.saturating_sub(1);
         if let Some(e) = failed {
             self.write_failed(e);
@@ -4244,7 +4245,7 @@ impl PartitionStore {
             for &t in applied.iter().flat_map(|e| e.tickets().iter()) {
                 self.core.tickets.note_page(t, page, st.r#gen.wrapping_add(1));
             }
-            st.inflight = Some(Inflight { n_frame: n, recs, sub_ios: spans.len() as u8, state: InflightState::Writing, applied, cleared, wid, failed: None });
+            st.inflight = Some(Inflight { n_frame: n, recs, sub_ios: spans.len() as u8, state: InflightState::Writing, applied, cleared, wid, failed: None, since_ns: cx.now.mono_ns });
             self.core.writes_in_flight += 1;
             if !st.pending.is_empty() {
                 // the rest goes into the next image once this one is durable (R5)
@@ -4814,7 +4815,7 @@ impl PartitionStore {
         // ages of live requests and tickets: refreshed at most every 10 ms
         if cx.now.mono_ns.saturating_sub(self.core.stall_checked_ns) >= 10_000_000 {
             self.core.stall_checked_ns = cx.now.mono_ns;
-            self.update_stall_counters();
+            self.update_stall_counters(cx.cache);
             self.trace_stalls_deep(cx.cache);
         }
         // memory figures walk every table: refreshed every 1024 ticks

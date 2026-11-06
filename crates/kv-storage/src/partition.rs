@@ -592,6 +592,13 @@ pub(crate) struct Core {
     /// FLUSHALL: AGs to release once no write is in flight and the cutoffs are durable.
     pub(crate) retiring_ags: Vec<AgId>,
     pub(crate) flushall_wait: bool,
+    /// `next_io` when the AGs in `retiring_ags` were given up: any I/O with a smaller id may
+    /// target them (a value read issued before the FLUSH names no page the partition can map
+    /// back to an AG).
+    pub(crate) retiring_io_mark: u64,
+    /// `Requests::next_order` at that moment: a value read of an older request may still
+    /// target them (chunk reads are issued after the chunkmap's read completes).
+    pub(crate) retiring_req_mark: u64,
     /// FLUSHDB reclaim walk (paced): SMALL pages to load, extent starts to check.
     pub(crate) reclaim_pages: VecDeque<PageId>,
     pub(crate) reclaim_ext: VecDeque<PageId>,
@@ -1063,6 +1070,8 @@ impl PartitionStore {
             prior,
             retiring_ags: Vec::new(),
             flushall_wait: false,
+            retiring_io_mark: 0,
+            retiring_req_mark: 0,
             reclaim_pages: VecDeque::new(),
             reclaim_ext: VecDeque::new(),
             space_wait: Vec::new(),
@@ -1977,6 +1986,13 @@ impl PartitionStore {
     #[allow(clippy::too_many_arguments)]
     fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, reserve: bool, undo: &mut Undo) -> Result<Plan, Commit> {
         let r = self.plan_put_at(cx, s, key_len, val_len, txn, undo);
+        if matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && !self.core.retiring_ags.is_empty() {
+            // a FLUSHALL gave up this partition's AGs and they go back to the pool once their
+            // last writes are done (each tick): the space is coming back, so the write waits
+            // for that release instead of failing (it got -OOM right after every FLUSHALL on a
+            // device whose AGs were all owned)
+            return Err(Commit::Park);
+        }
         if reserve && matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) {
             let small = key_len <= u16::MAX as usize && val_len <= u16::MAX as u64 && small_len(key_len, val_len as usize, txn) <= SMALL_REC_MAX;
             let kind = if small { AgKind::Small } else { AgKind::Extent };
@@ -2895,10 +2911,27 @@ impl PartitionStore {
             self.core.next_seq = cutoff.next().unwrap_or(cutoff);
         }
         let dbs = self.core.cfg.databases.clamp(1, 16);
+        // FLUSHDB of the only db with keys in this partition frees space like FLUSHALL
+        // (§16.5 step 4: the reclaim walk is for a FLUSHDB whose other dbs are non-empty). The
+        // other dbs' cutoffs rise too, which changes nothing they hold (no key, no open txn;
+        // what is left of them, older copies of deleted keys included, is dead either way) and
+        // lets every AG go. A walk paced over the whole partition never finished when FLUSHDB
+        // came more often than the walk took, and the space of the flushed extents (queued
+        // behind every page) was never freed: writes got -OOM on a nearly empty device.
+        let others_empty = db.is_some_and(|x| {
+            (0..dbs).all(|d| d == x || self.core.index.keys(d) == 0)
+                && !self.core.txns.values().any(|o| o.keys.iter().any(|(d, _)| *d != x))
+        });
+        let wide = db.is_none() || others_empty;
         let mut mask = 0u16;
+        let mut touched = 0u16;
         for d in 0..dbs {
             if db.is_some_and(|x| x != d) {
-                continue;
+                if !wide {
+                    continue;
+                }
+            } else {
+                touched |= 1 << d;
             }
             mask |= 1 << d;
             let c = &mut self.core.pmeta.flush_cutoff[usize::from(d)];
@@ -2907,7 +2940,7 @@ impl PartitionStore {
             self.core.index.drop_db(d);
             self.core.stale.drop_db(d);
         }
-        self.core.watch.touch_dbs(mask);
+        self.core.watch.touch_dbs(touched);
         // effects deferred behind copies of the flushed dbs go ahead (those copies are dead
         // by the cutoff; nothing else would wake them)
         let deferred: Vec<PageId> = self.core.deferred.drain().collect();
@@ -2919,13 +2952,15 @@ impl PartitionStore {
         let t = self.core.tickets.create(TICKET_HAS_META | TICKET_HAS_DELETE);
         self.core.tickets.add_meta(t);
         self.core.tickets.seal(t);
-        let all = db.is_none();
+        let all = wide;
         let m = self.core.pmeta.clone();
         self.core.meta_req(cx.meta, MetaReq::PartitionMeta { m }, MetaWait::Cutoff { cutoff: cutoff.0, dbs: mask, ticket: t, all });
         if all {
             // the partition allocator restarts from keyed draws (§16.5 step 4); the old AGs are
             // released once their writes are done and the cutoffs durable
             self.core.retiring_ags.extend(self.core.alloc.release_all());
+            self.core.retiring_io_mark = self.core.next_io;
+            self.core.retiring_req_mark = self.reqs.next_order;
             self.core.ext.chunkmaps.clear();
             self.core.ext.chunk_rc.clear();
             self.core.reclaim_pages.clear();
@@ -2941,18 +2976,26 @@ impl PartitionStore {
     }
 
     /// Queues the paced FLUSHDB reclaim walk over every owned page and extent (§16.5).
+    ///
+    /// A walk started while another is under way puts the old walk's remaining pages and
+    /// extents first: restarted from the beginning by every FLUSHDB, a walk never reached the
+    /// end of the partition when FLUSHDBs came faster than it walked.
     fn start_reclaim(&mut self, cache: &PageCache) {
-        self.core.reclaim_pages.clear();
-        self.core.reclaim_ext.clear();
+        let left_pages: HashSet<PageId, foldhash::fast::FixedState> = self.core.reclaim_pages.drain(..).collect();
+        let left_ext: HashSet<PageId, foldhash::fast::FixedState> = self.core.reclaim_ext.drain(..).collect();
         let pages: Vec<PageId> = self.core.alloc.owned_small_pages().filter(|p| !cache.contains(*p)).collect();
-        self.core.reclaim_pages.extend(pages);
+        let (first, rest): (Vec<PageId>, Vec<PageId>) = pages.into_iter().partition(|p| left_pages.contains(p));
+        self.core.reclaim_pages.extend(first);
+        self.core.reclaim_pages.extend(rest);
         let starts: Vec<PageId> = self.core.alloc.extent_starts().collect();
         // a run written or freed before its header is read is no dead extent of this walk
         self.core.alloc.unwatch_idle();
         for &s in &starts {
             self.core.alloc.watch_header(s);
         }
-        self.core.reclaim_ext.extend(starts);
+        let (first, rest): (Vec<PageId>, Vec<PageId>) = starts.into_iter().partition(|p| left_ext.contains(p));
+        self.core.reclaim_ext.extend(first);
+        self.core.reclaim_ext.extend(rest);
         self.core.counters.flush_reclaim_pending_pages = (self.core.reclaim_pages.len() + self.core.reclaim_ext.len()) as u64;
     }
 
@@ -4071,10 +4114,12 @@ impl PartitionStore {
         match (w, m) {
             (MetaWait::Ag(kind), MetaDone::Ag(ag)) => {
                 self.core.alloc.ag_granted(kind, ag, now_ns);
+                self.give_back_spare(cx);
                 self.wake_parked(true);
             }
             (MetaWait::Ag(kind), _) => {
                 self.core.alloc.ag_granted(kind, None, now_ns);
+                self.give_back_spare(cx);
                 self.wake_parked(true);
             }
             (MetaWait::Seq(floor), MetaDone::Ok) => {
@@ -4612,25 +4657,40 @@ impl PartitionStore {
         {
             self.ask_seq(cx.meta);
         }
-        // FLUSHALL: release the old AGs when nothing is staged, in flight or waiting for a
-        // flush in them any more (forgetting a page whose image awaits its flush would lose
-        // the image's tickets: its durability event finds no page state)
-        if self.core.flushall_wait
-            && self.core.writes_in_flight == 0
-            && self.core.dirty.is_empty()
-            && self.core.retry.is_empty()
-            && self.core.deferred.is_empty()
-            && self.core.durable_wait.is_empty()
-            && self.core.durable_q.is_empty()
-            && self.core.ext.writes.is_empty()
-            && self.core.ext.zeros.is_empty()
-            && self.core.loads.is_empty()
-        {
-            self.core.flushall_wait = false;
-            let ags = core::mem::take(&mut self.core.retiring_ags);
-            for ag in ags {
+        // FLUSHALL: release each old AG once nothing is staged, in flight or waiting for a
+        // flush in it any more (forgetting a page whose image awaits its flush would lose the
+        // image's tickets: its durability event finds no page state). Each AG on its own:
+        // waiting until the whole partition had nothing in flight kept every old AG while
+        // writes went on, and under a steady load writes got -OOM after each FLUSHALL (or
+        // FLUSHDB of the only db with keys) until a lull
+        if self.core.flushall_wait && !self.core.io.keys().any(|&id| id < self.core.retiring_io_mark) {
+            let mut i = 0;
+            let mut checked = 0;
+            let mut released = false;
+            while i < self.core.retiring_ags.len() && checked < 8 {
+                checked += 1;
+                let ag = self.core.retiring_ags[i];
+                if self.retiring_busy(cx.cache, ag) {
+                    i += 1;
+                    continue;
+                }
+                self.core.retiring_ags.swap_remove(i);
                 self.forget_ag(cx.cache, ag);
                 self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
+                released = true;
+            }
+            if released {
+                // writes parked on the release ask for an AG again (the meta thread answers
+                // after the releases sent before)
+                self.core.alloc.clear_refusal();
+                self.wake_parked(true);
+            }
+            if self.core.retiring_ags.is_empty() {
+                self.core.flushall_wait = false;
+            } else if i > 0 {
+                // the busy ones checked go to the back: the others get their turn
+                let n = self.core.retiring_ags.len();
+                self.core.retiring_ags.rotate_left(i.min(n));
             }
         }
         // pre-boot uncommitted txn records are zeroed: `resolved_w` may pass them (E10)
@@ -4638,6 +4698,53 @@ impl PartitionStore {
             self.core.prior_txn_zero = None;
             let partition = self.core.cfg.id;
             self.core.meta_req(cx.meta, MetaReq::PriorTxnsZeroed { partition }, MetaWait::Plain);
+        }
+    }
+
+    /// True while some work of the partition still targets a page of `ag` (an AG given up by
+    /// FLUSHALL): a staged, queued, deferred or loading page, an I/O in flight, a write
+    /// waiting for its flush, an extent write or zeroing, a cached page that is not clean.
+    fn retiring_busy(&self, cache: &PageCache, ag: AgId) -> bool {
+        let alloc = &self.core.alloc;
+        let here = |p: PageId| alloc.ag_of(p).is_some_and(|(a, _)| a == ag);
+        let c = &self.core;
+        if c.dirty.iter().any(|&p| here(p))
+            || c.retry.iter().any(|&p| here(p))
+            || c.deferred.iter().any(|&p| here(p))
+            || c.loads.keys().any(|&p| here(p))
+            || c.ext.writes.keys().any(|&p| here(p))
+            || c.ext.zeros.keys().any(|&p| here(p))
+        {
+            return true;
+        }
+        let durable_here = |d: &Durable| match *d {
+            Durable::Page(p) | Durable::Ext(p) | Durable::Zero(p) => here(p),
+        };
+        if c.durable_wait.values().any(durable_here) || c.durable_q.iter().any(durable_here) {
+            return true;
+        }
+        let io_here = |k: &IoKind| match *k {
+            IoKind::PageRead { page, .. } | IoKind::PageWrite { page } => here(page),
+            IoKind::ExtWrite { start } | IoKind::ExtZero { start } | IoKind::HeaderRead { start, .. } => here(start),
+            // a value read of a request older than the FLUSH may read an old AG (its location
+            // is not kept in the tag); a newer request reads live keys elsewhere
+            IoKind::ExtRead { req, generation, .. } => {
+                self.reqs.get(req).is_some_and(|r| r.generation == generation && r.order < self.core.retiring_req_mark)
+            }
+            IoKind::Recovery { .. } => false,
+        };
+        if c.io.values().any(io_here) {
+            return true;
+        }
+        (0..crate::layout::AG_PAGES).any(|i| alloc.page_of(ag, i).is_some_and(|p| cache.page_state(p).is_some_and(|st| !st.is_clean())))
+    }
+
+    /// Releases the idle spare the allocator gave back after a refusal of the other kind
+    /// (the next request for that kind is sent after this release).
+    fn give_back_spare(&mut self, cx: &mut StorageCtx<'_>) {
+        if let Some(ag) = self.core.alloc.take_give_back() {
+            self.forget_ag(cx.cache, ag);
+            self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
         }
     }
 
@@ -4686,12 +4793,8 @@ impl PartitionStore {
         }
         // FLUSHDB reclaim walk (§16.5)
         while (!self.core.reclaim_pages.is_empty() || !self.core.reclaim_ext.is_empty()) && self.core.buckets.reclaim.try_take(now_ns, 1) {
-            if let Some(p) = self.core.reclaim_pages.pop_front() {
-                if cx.cache.page_state(p).is_none() && !self.core.loads.contains_key(&p) {
-                    self.load_page(cx, p, None, false);
-                }
-                self.reclaim_progress();
-            } else if let Some(s) = self.core.reclaim_ext.pop_front() {
+            // extent headers first: one read frees a whole run
+            if let Some(s) = self.core.reclaim_ext.pop_front() {
                 if !self.core.alloc.begin_header_read(s) {
                     // written or freed since the walk started: not a dead extent to reclaim
                     self.reclaim_progress();
@@ -4699,6 +4802,11 @@ impl PartitionStore {
                 }
                 let tag = self.core.tag(IoKind::HeaderRead { start: s, why: HeaderWhy::Reclaim });
                 cx.io.push(IoReq::read(tag, s.dev(), s.byte_offset(), AlignedBuf::zeroed(PAGE)));
+            } else if let Some(p) = self.core.reclaim_pages.pop_front() {
+                if cx.cache.page_state(p).is_none() && !self.core.loads.contains_key(&p) {
+                    self.load_page(cx, p, None, false);
+                }
+                self.reclaim_progress();
             }
         }
         // hole warming (§11.3): keep a few cached pages with room

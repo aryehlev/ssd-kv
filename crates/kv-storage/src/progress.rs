@@ -15,6 +15,7 @@
 //! | request (`blocked`) | a barrier submitted before it | `reqs.blocked` | `finish` of the barrier |
 //! | barrier request | every older request | `reqs.barriers` | `finish` of the oldest request |
 //! | request (`parked`, space) | an AG grant | `space_wait` (only while an AG request is wanted or in flight) | every AG reply (granted or refused) |
+//! | request (`parked`, space, refused) | the release of the AGs a FLUSHALL gave up | `space_wait` (only while `retiring_ags` is not empty) | `tick` releasing one of them (each is released once nothing targets it any more) |
 //! | request (`parked`, seq) | a seq reservation / txn id range | `seq_wait` (only while a reservation is asked, or the reserve allows a retry) | `ReserveSeq` reply; `txn_progress` each tick |
 //! | executed local txn (held) | its durable commit | `reqs.held[txn]` | `txn_committed`, or ReadOnly |
 //! | staged page effect | the page writer | `dirty` / `retry` (built next tick), image in flight (re-queued when durable), `deferred` (older copies) | `tick`, `image_durable`, `stale_gone`, FLUSH (copies dead by the cutoff) |
@@ -72,6 +73,8 @@ pub enum WaitFor {
     Older { oldest: ReqId },
     /// An AG grant (`AcquireAg` wanted or in flight).
     AgGrant,
+    /// The release of the AGs a FLUSHALL gave up (the partition's own `retiring_ags`).
+    AgRelease,
     /// A seq reservation (E12) or the txn id range extension.
     SeqReservation,
     /// The durable commit of txn `txn`.
@@ -194,6 +197,9 @@ impl PartitionStore {
         if r.parked {
             if self.core.space_wait.contains(&id) && self.core.alloc.ag_outstanding() {
                 w.push(WaitFor::AgGrant);
+            }
+            if self.core.space_wait.contains(&id) && !self.core.retiring_ags.is_empty() {
+                w.push(WaitFor::AgRelease);
             }
             if self.core.seq_wait.contains(&id) && (self.core.seq_asked || self.core.next_seq < self.core.seq_limit) {
                 w.push(WaitFor::SeqReservation);
@@ -346,7 +352,7 @@ impl PartitionStore {
             if !r.queued && kq != r.waits {
                 return fail(format!("request {i} counts {} key queues ahead, {kq} found", r.waits));
             }
-            if r.parked && !waits.iter().any(|w| matches!(w, WaitFor::AgGrant | WaitFor::SeqReservation | WaitFor::PartBuild)) {
+            if r.parked && !waits.iter().any(|w| matches!(w, WaitFor::AgGrant | WaitFor::AgRelease | WaitFor::SeqReservation | WaitFor::PartBuild)) {
                 return fail(format!("request {i} is parked with no AG request or seq reservation outstanding"));
             }
         }

@@ -358,6 +358,9 @@ struct SpareSlot {
     asked_class_was_reserved: bool,
     /// The last request served from the reserve was refused too (the reserve is used up).
     reserve_refused_at_ns: Option<u64>,
+    /// The partition released AGs while the request in flight was being answered: a refusal
+    /// of it predates the release and is not latched (the request is sent again).
+    stale_refusal: bool,
 }
 
 /// Why an AG is requested, least urgent first.
@@ -399,6 +402,8 @@ pub(crate) struct Alloc {
     /// read concurrent with a write of the run, or with its release and reuse, may return the
     /// previous header; what such a read decides is void (`Alloc::end_header_read`).
     hdr_watch: HashMap<PageId, (u32, bool), foldhash::fast::FixedState>,
+    /// An idle spare given back to the pool (taken by the partition, which releases it).
+    give_back: Option<AgId>,
 }
 
 fn kind_slot(k: AgKind) -> usize {
@@ -427,6 +432,7 @@ impl Alloc {
             extent: Vec::new(),
             extent_of: HashMap::with_hasher(Default::default()),
             hdr_watch: HashMap::with_hasher(Default::default()),
+            give_back: None,
             cached: CachedSpace::default(),
             slots: [SpareSlot::default(); 2],
         }
@@ -1048,6 +1054,7 @@ impl Alloc {
     pub(crate) fn ag_granted(&mut self, kind: AgKind, ag: Option<AgId>, now_ns: u64) {
         let ki = kind_slot(kind);
         self.slots[ki].asked = false;
+        let stale = core::mem::take(&mut self.slots[ki].stale_refusal);
         let spare = core::mem::take(&mut self.slots[ki].asked_class) == AgClass::Spare;
         match ag {
             Some(ag) => {
@@ -1065,6 +1072,23 @@ impl Alloc {
                 self.slots[ki].refused_at_ns = None;
             }
             None if spare => {}
+            None if stale => {
+                // answered before AGs this partition released were back in the pool: ask
+                // again (behind the releases) instead of failing writes for the retry period
+                self.slots[ki].want = true;
+                self.slots[ki].class = self.slots[ki].class.max(AgClass::Need);
+            }
+            None if self.slots[1 - ki].spare.is_some() && !self.slots[ki].asked_class_was_reserved => {
+                // refused while this partition holds an idle spare of the other kind: that
+                // spare goes back to the pool and the request is sent again (behind the
+                // release). Latched as a refusal, the write failed with -OOM for the retry
+                // period while the partition sat on a whole free AG (after a FLUSHALL every
+                // partition takes a SMALL spare first, so its first EXTENT AG was refused)
+                self.give_back = self.slots[1 - ki].spare.take();
+                self.slots[1 - ki].want = false;
+                self.slots[ki].want = true;
+                self.slots[ki].class = self.slots[ki].class.max(AgClass::Need);
+            }
             None => {
                 self.slots[ki].refused_at_ns = Some(now_ns.max(1));
                 if self.slots[ki].asked_class_was_reserved {
@@ -1078,6 +1102,11 @@ impl Alloc {
         }
     }
 
+    /// A spare AG this partition gives back to the pool (see [`Alloc::ag_granted`]).
+    pub(crate) fn take_give_back(&mut self) -> Option<AgId> {
+        self.give_back.take()
+    }
+
     /// True when the reserve above the fill limit refused an AG of `kind` within the retry
     /// period: a write that may use the reserve fails with `-OOM` instead of waiting.
     pub(crate) fn reserve_refused(&self, kind: AgKind, now_ns: u64) -> bool {
@@ -1089,6 +1118,7 @@ impl Alloc {
         for s in &mut self.slots {
             s.refused_at_ns = None;
             s.reserve_refused_at_ns = None;
+            s.stale_refusal = s.asked;
         }
     }
 
@@ -1225,6 +1255,8 @@ impl Alloc {
             s.spare = None;
             s.want = false;
             s.refused_at_ns = None;
+            // a refusal of a request in flight was answered before these AGs come back
+            s.stale_refusal = s.asked;
         }
         out
     }

@@ -467,3 +467,111 @@ fn deletes_give_ags_back() {
     assert!(stored >= 300, "only {stored} MiB values after the deletes ({after}/{total} AGs used before them, {end} at the end)");
     db.quiesce();
 }
+
+/// FLUSHDB more often than the paced reclaim walk takes frees the flushed space (§16.5): every
+/// FLUSHDB restarted the walk over all of the partition's pages, with the extents queued
+/// behind them, so a partition with many small-record pages never freed a flushed extent and
+/// writes got `-OOM` on a nearly empty device. A FLUSHDB of the only db with keys in the
+/// partition now frees space like FLUSHALL; with keys in another db the walk keeps its
+/// progress across FLUSHDBs and reads extent headers first.
+#[test]
+fn frequent_flushdb_frees_extents() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    for other_db in [false, true] {
+        let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+        let mut d = RamDev::new(pages, 4096, 9);
+        format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 9).unwrap();
+        let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+        eng.recover().unwrap();
+        let mut db = Db::new(eng, T0);
+        if other_db {
+            let t = db.set(1, b"{t}other", b"v", None).unwrap();
+            db.wait(b"{t}other", t, TicketState::Written);
+        }
+        // small records on far more pages than the cache holds: the walk reads them all
+        for i in 0..300_000u64 {
+            let k = format!("{{t}}s{i}");
+            let t = db.set(0, k.as_bytes(), &value(i, 100), None).unwrap();
+            db.wait(k.as_bytes(), t, TicketState::Written);
+        }
+        let mut refused = 0;
+        let mut written = 0u64;
+        for cycle in 0..80u64 {
+            for i in 0..8u64 {
+                let k = format!("{{t}}x{cycle}_{i}");
+                match db.set(0, k.as_bytes(), &value(i, 1 << 20), None) {
+                    Ok(t) => {
+                        db.wait(k.as_bytes(), t, TicketState::Written);
+                        written += 1;
+                    }
+                    Err(StoreError::OutOfSpace) => refused += 1,
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+            for (p, t) in db.flushdb(Some(0)) {
+                db.wait_in(p, t, TicketState::Durable);
+            }
+            for _ in 0..10 {
+                db.advance(100);
+                db.eng.pump();
+            }
+        }
+        let (used, total) = db.eng.meta().ag_usage();
+        assert!(refused == 0, "other db {other_db}: {refused} of {} 1 MiB writes refused ({written} MiB written, {used}/{total} AGs used)", refused + written);
+        if other_db {
+            let (_, v) = db.get(1, b"{t}other").unwrap().expect("the other db keeps its key");
+            assert_eq!(v, b"v");
+        }
+        db.quiesce();
+    }
+}
+
+/// A FLUSHALL (or FLUSHDB of the only db with keys) issued while writes of every kind are
+/// staged or in flight gives every old AG back once that work is done, also while new writes
+/// keep coming (each AG on its own, not when the whole partition is idle).
+#[test]
+fn flush_under_load_gives_old_ags_back() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    for wide in [None, Some(0u8)] {
+        let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+        let mut d = RamDev::new(pages, 4096, 9);
+        format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 9).unwrap();
+        let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+        eng.recover().unwrap();
+        let mut db = Db::new(eng, T0);
+        let mut refused = 0;
+        let mut n = 0u64;
+        for round in 0..40u64 {
+            // writes of every size, not waited for, then a flush right behind them
+            for i in 0..60u64 {
+                n += 1;
+                let len = [40usize, 900, 3000, 70_000, 1 << 20][(i % 5) as usize];
+                let k = format!("{{t}}k{}", n % 500);
+                match db.set(0, k.as_bytes(), &value(n, len), None) {
+                    Ok(_) => {}
+                    Err(StoreError::OutOfSpace) => refused += 1,
+                    Err(e) => panic!("{e:?}"),
+                }
+                if i % 7 == 0 {
+                    db.eng.pump();
+                }
+            }
+            if round % 4 == 3 {
+                let _ = db.flushdb(wide);
+            }
+            for _ in 0..3 {
+                db.advance(50);
+                db.eng.pump();
+            }
+        }
+        for _ in 0..200 {
+            db.advance(50);
+            db.eng.pump();
+        }
+        let (used, total) = db.eng.meta().ag_usage();
+        assert!(refused == 0 && used <= 24, "flush {wide:?}: {refused} writes refused, {used}/{total} AGs used at the end");
+        db.quiesce();
+    }
+}

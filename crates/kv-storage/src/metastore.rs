@@ -782,7 +782,33 @@ impl MetaCore {
     /// kind and lasts until the old AGs are back.
     fn acquire(&mut self, partition: u16, kind: AgKind, want_dev: Option<u8>) -> Option<AgId> {
         let first = kind != AgKind::Free && self.owned.get(usize::from(partition)).is_some_and(|o| o[kind_index(kind)] == 0);
+        if !(first && kind == AgKind::Small) && !self.small_reserve_kept(partition, kind) {
+            return None;
+        }
         self.acquire_with(partition, kind, want_dev, !first)
+    }
+
+    /// True when granting `partition` an AG of `kind` (other than its first SMALL AG) still
+    /// leaves a free AG for every partition that holds extents but owns no SMALL AG. A delete
+    /// inside a multi-key write stages a txn marker, a small record (§14.6 step 2): a
+    /// partition whose keys all live in extents owns no SMALL page, and once extent AGs had
+    /// taken every free AG, its multi-key DEL got `-OOM` and a full device could only be
+    /// emptied one key per command. A partition owning no AG at all holds no key and needs no
+    /// marker, so it reserves nothing until its first extent AG. Only applied when the devices
+    /// hold [`crate::engine::MIN_AGS_PER_PARTITION`] AGs per partition (the minimum
+    /// [`crate::engine::check_capacity`] asks for); a smaller device set keeps the old
+    /// first-come order.
+    fn small_reserve_kept(&self, partition: u16, kind: AgKind) -> bool {
+        if self.total_ags < u64::from(self.partitions) * crate::engine::MIN_AGS_PER_PARTITION {
+            return true;
+        }
+        let (s, x) = (kind_index(AgKind::Small), kind_index(AgKind::Extent));
+        let mut lacking = self.owned.iter().filter(|o| o[x] > 0 && o[s] == 0).count() as u64;
+        if kind == AgKind::Extent && self.owned.get(usize::from(partition)).is_some_and(|o| o[x] == 0 && o[s] == 0) {
+            // this grant makes the partition one of them
+            lacking += 1;
+        }
+        self.total_ags.saturating_sub(self.allocated) > lacking
     }
 
     /// [`MetaCore::acquire`]; `limit` applies the fill limit (an accepted write's reserved

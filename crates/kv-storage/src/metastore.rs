@@ -765,11 +765,24 @@ impl MetaCore {
                 }
             }
         }
-        self.headroom() > reserve
+        // and, unless it is the partition's first AG of the kind, an eighth of the device
+        // stays free for writes that need an AG: on a small device with many partitions spares
+        // took every free AG and each partition's next AG of a kind was refused (-OOM) until
+        // idle spares went back
+        let first = self.owned.get(usize::from(partition)).is_some_and(|o| o[ki] == 0);
+        let margin = if first { 0 } else { self.total_ags / 8 };
+        self.headroom() > reserve + margin
     }
 
+    /// A partition's first AG of a kind is served while any AG is free, above the fill limit
+    /// too: without it the partition cannot write that kind at all. After a FLUSHALL every
+    /// partition gives up its AGs and asks for new ones while the others' are still being
+    /// released; a first AG refused there latched a refusal, and writes got -OOM for the retry
+    /// period on a nearly empty device. The overshoot is bounded by one AG per partition and
+    /// kind and lasts until the old AGs are back.
     fn acquire(&mut self, partition: u16, kind: AgKind, want_dev: Option<u8>) -> Option<AgId> {
-        self.acquire_with(partition, kind, want_dev, true)
+        let first = kind != AgKind::Free && self.owned.get(usize::from(partition)).is_some_and(|o| o[kind_index(kind)] == 0);
+        self.acquire_with(partition, kind, want_dev, !first)
     }
 
     /// [`MetaCore::acquire`]; `limit` applies the fill limit (an accepted write's reserved
@@ -1234,17 +1247,24 @@ mod tests {
         while ask(&mut core, &mut io, MetaReq::AcquireSpare { partition: 0, kind: AgKind::Small }).is_some() {
             spares += 1;
         }
-        // the headroom left after the two taken, less 30 kept for the other 15 partitions' kinds
+        // the headroom left after the two taken, less 30 kept for the other 15 partitions'
+        // kinds and an eighth of the device
         let (_, total) = core.ag_usage();
         let limit = (f64::from(0.95f32) * total as f64).floor() as u64;
-        assert_eq!(spares, limit - 2 - 30);
+        assert_eq!(spares, limit - 2 - 30 - total / 8);
         // every other partition still gets both first AGs, even as "spares"
         for p in 1..16u16 {
             assert!(ask(&mut core, &mut io, MetaReq::AcquireSpare { partition: p, kind: AgKind::Small }).is_some(), "p{p} small");
             assert!(ask(&mut core, &mut io, MetaReq::AcquireAg { partition: p, kind: AgKind::Extent }).is_some(), "p{p} extent");
         }
-        assert_eq!(core.ag_usage().0, limit);
-        assert!(ask(&mut core, &mut io, MetaReq::AcquireAg { partition: 3, kind: AgKind::Small }).is_none(), "fill limit");
+        // the eighth kept from spares serves writes that need an AG, up to the fill limit
+        assert_eq!(core.ag_usage().0, limit - total / 8);
+        let mut needed = 0;
+        while ask(&mut core, &mut io, MetaReq::AcquireAg { partition: 3, kind: AgKind::Small }).is_some() {
+            needed += 1;
+        }
+        assert_eq!(needed, total / 8);
+        assert_eq!(core.ag_usage().0, limit, "fill limit");
         // an accepted write that must move is served above the limit, while AGs are free
         let mut reserved = 0;
         while ask(&mut core, &mut io, MetaReq::AcquireReserved { partition: 3, kind: AgKind::Small }).is_some() {

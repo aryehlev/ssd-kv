@@ -1284,6 +1284,35 @@ mod tests {
         let _ = a;
     }
 
+    /// H7: a cycle with an AG grant, partition meta, a commit and a superblock update writes
+    /// each block into its older copy and flushes the device once (every reply of a cycle waits
+    /// for all of its flushes); what it wrote is all there after a reload.
+    #[test]
+    fn a_cycle_flushes_each_device_once() {
+        let mut io = TimedIo { inner: devs(8), writes: 0, flushes: 0, write_ns: 0, flush_ns: 0 };
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        let t = core.shared.txn_ids.next();
+        let mut m = PartitionMeta::initial(4);
+        m.seq_floor = Seq(500);
+        let msgs = vec![
+            MetaMsg::new(3, 1, MetaReq::AcquireAg { partition: 3, kind: AgKind::Small }),
+            MetaMsg::new(4, 2, MetaReq::PartitionMeta { m }),
+            MetaMsg::new(5, 3, MetaReq::CommitTxn { txn: t }),
+        ];
+        io.reset();
+        let mut out = Vec::new();
+        core.process(&mut io, msgs, 2_000_000_000_000, &mut out);
+        assert!(matches!(out[0].2, MetaDone::Ag(Some(_))), "{:?}", out[0].2);
+        assert_eq!(out[2].2, MetaDone::Committed { txn: t });
+        assert!(io.writes >= 4, "AG table, partition meta, intent slot, superblock: {}", io.writes);
+        assert_eq!(io.flushes, 1, "one flush for the whole cycle");
+        let again = MetaCore::load(&mut io.inner, 0).unwrap();
+        assert_eq!(again.ag_usage().0, 1);
+        assert_eq!(again.partition_meta(4).unwrap().seq_floor, Seq(500));
+        assert!(again.prior.is_committed(t) || t <= again.resolved_w());
+        assert_eq!(again.superblock().clock_floor_unix_ms, 2_000_000_000_000);
+    }
+
     #[test]
     fn clock_floor_moves_forward_only() {
         let mut io = devs(4);

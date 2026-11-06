@@ -31,6 +31,8 @@ import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
 import io.lettuce.core.cluster.api.sync.RedisAdvancedClusterCommands;
 import io.lettuce.core.cluster.models.partitions.RedisClusterNode;
 import io.lettuce.core.protocol.ProtocolVersion;
+import io.lettuce.core.resource.DefaultClientResources;
+import io.lettuce.core.resource.Delay;
 import redis.clients.jedis.ClusterPipeline;
 import redis.clients.jedis.Connection;
 import redis.clients.jedis.ConnectionPoolConfig;
@@ -193,10 +195,14 @@ public class MatrixClient {
         LettuceKv(List<RedisURI> uris, boolean resp3, boolean replicas) {
             this.uris = uris;
             this.resp3 = resp3;
-            client = RedisClusterClient.create(uris);
-            // DESIGN §23.5 settings, plus a short adaptive-refresh rate limit and a refresh on the
-            // first failed reconnect: with Lettuce's defaults (30 s, 5 reconnects) a refresh
-            // taken before the promotion commits blocks the next one for 30 s
+            // DESIGN §23.5 settings: a constant 100 ms reconnect delay (Lettuce's default
+            // exponential backoff has grown to 0.5-1 s by the time the promotion commits, ~2 s
+            // after a kill, so the reconnect failure that triggers the next refresh came up to a
+            // second late), a short adaptive-refresh rate limit and a refresh on the first failed
+            // reconnect: with Lettuce's defaults (30 s, 5 reconnects) a refresh taken before the
+            // promotion commits blocks the next one for 30 s
+            client = RedisClusterClient.create(
+                DefaultClientResources.builder().reconnectDelay(Delay.constant(Duration.ofMillis(100))).build(), uris);
             ClusterTopologyRefreshOptions topo = ClusterTopologyRefreshOptions.builder().dynamicRefreshSources(false)
                 .enableAllAdaptiveRefreshTriggers().enablePeriodicRefresh(Duration.ofSeconds(30))
                 .adaptiveRefreshTriggersTimeout(Duration.ofMillis(500)).refreshTriggersReconnectAttempts(1).build();

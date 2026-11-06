@@ -483,6 +483,8 @@ impl<B: Backend> Worker<B> {
             Some(Hold::Queue) => queues_free,
             Some(Hold::LargeValue) => self.shared.budget.may_start(),
             Some(Hold::TxnCredit) => self.shared.txn_credits.load(Ordering::Acquire) > 0,
+            // parsed again: the pre-consume check holds it again while the state lasts
+            Some(Hold::Gate) => true,
             Some(Hold::Dirty) => !self.dirty_full,
             // lifted by the transaction when its locks are sent
             Some(Hold::Order) => false,
@@ -504,7 +506,7 @@ impl<B: Backend> Worker<B> {
         for &slot in &held {
             self.reconsider(slot);
         }
-        held.retain(|&s| self.conns.get(s as usize).and_then(Option::as_ref).is_some_and(|c| matches!(c.hold, Some(Hold::LargeValue | Hold::TxnCredit))));
+        held.retain(|&s| self.conns.get(s as usize).and_then(Option::as_ref).is_some_and(|c| matches!(c.hold, Some(Hold::LargeValue | Hold::TxnCredit | Hold::Gate))));
         self.shared_held = held;
     }
 
@@ -568,7 +570,7 @@ impl<B: Backend> Worker<B> {
                 Ok(kv_resp::Parsed::Command { consumed }) => {
                     let base = start;
                     // pre-consume checks (§6.7): the command stays unconsumed if one fails
-                    match self.x.pre_consume(&self.shared, &mut conn, &args, base) {
+                    match self.x.pre_consume(&self.shared, &mut conn, &args, base, self.now.boot_ns) {
                         Ok(lv) => {
                             conn.consumed += consumed;
                             conn.lv_admitted = false;
@@ -590,7 +592,7 @@ impl<B: Backend> Worker<B> {
         }
         if conn.hold.is_some() {
             conn.flags |= flags::BACKPRESSURED;
-            if matches!(conn.hold, Some(Hold::LargeValue | Hold::TxnCredit)) && !self.shared_held.contains(&slot) {
+            if matches!(conn.hold, Some(Hold::LargeValue | Hold::TxnCredit | Hold::Gate)) && !self.shared_held.contains(&slot) {
                 self.shared_held.push(slot);
             }
         } else {

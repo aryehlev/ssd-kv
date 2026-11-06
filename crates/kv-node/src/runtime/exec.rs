@@ -261,7 +261,7 @@ impl ExecState {
     /// `conn.read_buf[base..]`): the large-value soft limit and the txn credit. On success the
     /// command's large-value reservation is taken (unconditionally, §6.9) and the credit, if
     /// one was needed, is held by the returned value.
-    pub fn pre_consume(&mut self, shared: &Arc<NodeShared>, conn: &mut Conn, args: &[(u32, u32)], base: usize) -> Result<PreConsume, Hold> {
+    pub fn pre_consume(&mut self, shared: &Arc<NodeShared>, conn: &mut Conn, args: &[(u32, u32)], base: usize, now_boot_ns: u64) -> Result<PreConsume, Hold> {
         let large: u64 = args.iter().filter(|&&(_, l)| is_large(l as usize)).map(|&(_, l)| rounded(l as usize)).sum();
         if large > 0 && !conn.lv_admitted && !shared.budget.may_start() {
             return Err(Hold::LargeValue);
@@ -271,6 +271,11 @@ impl ExecState {
             let (o, l) = args[i];
             &src[o as usize..(o + l) as usize]
         };
+        if gate_holds(shared, conn, args, src, now_boot_ns) {
+            conn.gate_hold_since.get_or_insert(now_boot_ns);
+            return Err(Hold::Gate);
+        }
+        conn.gate_hold_since = None;
         let needs_credit = !args.is_empty() && {
             let name = arg(0);
             let multi = conn.multi.is_some();
@@ -291,6 +296,47 @@ impl ExecState {
         };
         Ok(PreConsume { lv: Reservation::take(shared, large), credit })
     }
+}
+
+/// How long a cluster write waits on a passing TRYAGAIN state of the routing gate before it is
+/// answered TRYAGAIN after all (a term raise takes tens of milliseconds; a handoff drains the
+/// writes in flight first).
+pub(crate) const GATE_HOLD_NS: u64 = 500_000_000;
+
+/// Whether the complete command at `args` (in `src`) is a write the cluster routing gate would
+/// answer TRYAGAIN right now (a write in MULTI is checked when queued, an EXEC for its queued
+/// writes), and the connection has not waited for that longer than `GATE_HOLD_NS`.
+fn gate_holds(shared: &NodeShared, conn: &Conn, args: &[(u32, u32)], src: &[u8], now_boot_ns: u64) -> bool {
+    use crate::cluster::ownership::Gate;
+    if args.is_empty() || shared.cluster().is_none() {
+        return false;
+    }
+    if conn.gate_hold_since.is_some_and(|t| now_boot_ns.saturating_sub(t) >= GATE_HOLD_NS) {
+        return false;
+    }
+    let own = shared.ownership.read().clone();
+    if !own.may_try_again() {
+        return false;
+    }
+    let argv: SmallVec<[&[u8]; 8]> = args.iter().map(|&(o, l)| &src[o as usize..(o + l) as usize]).collect();
+    let Some(spec) = kv_cmd::lookup(argv[0]) else { return false };
+    let lease_ok = shared.lease.valid(now_boot_ns);
+    let try_again = |spec: &'static CommandSpec, argv: &[&[u8]]| {
+        if !spec.flags.contains(CmdFlags::WRITE) || !spec.has_keys() {
+            return false;
+        }
+        let pos = kv_cmd::key_positions(spec, argv);
+        match kv_cmd::common_slot(argv, &pos) {
+            Ok(slot) => own.gate(slot, spec.flags, conn.readonly, lease_ok, conn.id) == Gate::TryAgain,
+            Err(_) => false,
+        }
+    };
+    if spec.id == CmdId::Exec {
+        return conn.multi.as_ref().is_some_and(|m| {
+            m.queued.iter().any(|c| try_again(c.id.spec(), &c.argv()))
+        });
+    }
+    try_again(spec, &argv)
 }
 
 /// Keys written by a list of queued commands (the EXEC txn-credit rule, §6.7).

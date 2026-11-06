@@ -1247,9 +1247,48 @@ fn sigterm_on_a_primary_hands_off_first() {
     c.wait_member(1, "in-sync isr", 60);
     let w = Writer::start(coords.clone(), "h1", Duration::from_millis(1));
     w.at_least(100, 60);
+    // transactions straight to the primary: during its handoff they wait instead of failing
+    // with TRYAGAIN (clients do not retry a TRYAGAIN inside a transaction pipeline); once it
+    // is demoted they are redirected
+    let tx_addr = c.node_addr(0);
+    let tx_stop = Arc::new(AtomicBool::new(false));
+    let tx: Vec<_> = (0..4).map(|t| {
+        let stop = tx_stop.clone();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let Ok(mut conn) = Conn::open(tx_addr) else { return seen };
+            let mut i = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                i += 1;
+                let k = format!("htx:{t}:{}", i % 50);
+                let v = i.to_string();
+                let r = conn
+                    .call_str(&["MULTI"])
+                    .and_then(|_| conn.call_str(&["SET", &k, &v]))
+                    .and_then(|q| conn.call_str(&["EXEC"]).map(|e| (q, e)));
+                match r {
+                    Ok((q, e)) => {
+                        let (q, e) = (text(&q), text(&e));
+                        if q.contains("TRYAGAIN") || e.contains("TRYAGAIN") {
+                            seen.push(format!("{q} / {e}"));
+                        }
+                        if q.contains("MOVED") || e.contains("EXECABORT") && !e.contains("TRYAGAIN") {
+                            // demoted: the node redirects now
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            seen
+        })
+    }).collect();
     // SIGTERM: the primary asks for a handoff, is demoted, then stops cleanly
     let t0 = Instant::now();
     c.stop_node(0, 15);
+    tx_stop.store(true, Ordering::Release);
+    let seen: Vec<String> = tx.into_iter().flat_map(|t| t.join().unwrap()).collect();
+    assert!(seen.is_empty(), "transactions answered TRYAGAIN during the handoff: {seen:?}");
     assert!(
         c.log_contains(0, "handing the shard off before shutting down"),
         "SIGTERM on a primary starts a handoff"

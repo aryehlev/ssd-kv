@@ -73,6 +73,11 @@ pub enum Hold {
     /// the transaction gate, and later commands must not reach its partitions before its locks
     /// (§6.6, §6.8). Lifted when the locks are sent.
     Order,
+    /// A cluster write the routing gate would answer TRYAGAIN (a handoff or term raise of
+    /// this primary, a migration seal not committed yet): it waits for the state to pass, up
+    /// to `GATE_HOLD_NS` from `Conn::gate_hold_since`, instead of failing at once (clients do
+    /// not retry a TRYAGAIN inside a transaction pipeline).
+    Gate,
 }
 
 /// A fan-out reply being gathered (§6.8).
@@ -140,6 +145,9 @@ pub struct Conn {
     pub(crate) lv_admitted: bool,
     /// Why reading stopped, if it did.
     pub(crate) hold: Option<Hold>,
+    /// When the command at the parse position was first held on the routing gate
+    /// (`Hold::Gate`, boot-clock ns).
+    pub(crate) gate_hold_since: Option<u64>,
     /// The connection is on the worker's "has bytes to parse" list.
     pub(crate) queued_for_parse: bool,
     /// The connection is on the worker's "has output to send" list.
@@ -183,6 +191,7 @@ impl Conn {
             send_inflight: false,
             lv_admitted: false,
             hold: None,
+            gate_hold_since: None,
             queued_for_parse: false,
             queued_for_send: false,
         }

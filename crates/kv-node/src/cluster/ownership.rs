@@ -210,6 +210,11 @@ impl Ownership {
             .is_some_and(|f| f.load(Ordering::Acquire))
     }
 
+    /// Whether some write may be answered TRYAGAIN now (a cheap test before computing slots).
+    pub fn may_try_again(&self) -> bool {
+        self.mode == Mode::Cluster && (self.in_handoff() || !self.pending_seal.is_empty())
+    }
+
     fn in_handoff(&self) -> bool {
         self.handoff
             .as_ref()

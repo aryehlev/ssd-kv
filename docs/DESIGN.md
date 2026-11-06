@@ -1957,6 +1957,11 @@ RANDOMKEY), `slot_filter()`, which return decisions, not slot sets (lint, LC-24)
   its current state, stamped `at` = its last executed seq, then continues with current-term groups from `at + 1`.
   Images carry current-term seqs, so they beat every divergent older-term record; together (a)-(d) cover every key
   whose state on the member can differ from the primary's state at `at`.
+* **Relative ops while a sync runs.** While a member's Repair or full sync runs (it has a direct feed), and while
+  the partition is a migration source, the primary sends an APPEND, SETRANGE or EXPIRE/PERSIST as the full state of
+  its key read in the same execution (a `Put`, or a `Del` when the key is gone afterwards); the backlog and the other
+  members keep the op itself. Applied as a relative op to a copy the sync has not replaced yet, it would build a value
+  the primary never held, stored at a seq that the key's image or snapshot record (older) can never replace.
 * **Full sync (per partition): an in-place merge, never a wipe-and-reload (LC-39).** Started only by `replica add`
   (learner) or `replica resync`. `at` = the primary's last executed seq. The member keeps its AGs, allocator state and
   index; it sets the partition-meta flag `SYNCING` (durable) before applying the first record. The primary walks the

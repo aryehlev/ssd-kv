@@ -488,6 +488,20 @@ pub(crate) fn write_sync(d: &mut dyn BlockDevice, offset: u64, buf: AlignedBuf) 
     }
 }
 
+/// Flushes every device of a set before anything of it is read at open. A crashed process
+/// left completed writes in the devices' volatile caches; recovery takes what it reads as the
+/// state on media and zeroes the older copies of every key whose newer copy it finds. Read
+/// unflushed, a newer copy on one device (say the chunks of a large value) could still be lost
+/// to a power cut after recovery had durably zeroed its older copy on another (device 0's
+/// startup superblock flush covers device 0 only): the key was lost although a durable version
+/// of it existed.
+pub(crate) fn flush_all(devs: &mut [&mut dyn BlockDevice]) -> std::io::Result<()> {
+    for d in devs.iter_mut() {
+        flush_sync(&mut **d)?;
+    }
+    Ok(())
+}
+
 /// Makes every completed write durable (no-op request on write-through devices completes too).
 pub(crate) fn flush_sync(d: &mut dyn BlockDevice) -> std::io::Result<()> {
     let tag = sync_tag();
@@ -562,6 +576,7 @@ impl StorageEngine for PageStore {
         let dsync = cfg.flush_method == FlushMethod::Dsync;
         let mut boot = {
             let mut refs: Vec<&mut dyn BlockDevice> = devs.iter_mut().map(|d| d as &mut dyn BlockDevice).collect();
+            flush_all(&mut refs)?;
             Boot::load(&mut refs, dsync)?
         };
         if boot.cluster != cfg.cluster {
@@ -720,6 +735,7 @@ impl<D: BlockDevice> LocalEngine<D> {
         let mut devs: Vec<EngineDev<D>> = devs.into_iter().map(|dev| EngineDev { dev, stash: Vec::new() }).collect();
         let mut boot = {
             let mut refs: Vec<&mut dyn BlockDevice> = devs.iter_mut().map(|d| &mut d.dev as &mut dyn BlockDevice).collect();
+            flush_all(&mut refs)?;
             Boot::load(&mut refs, dsync)?
         };
         boot.write_startup(&mut devs[0].dev)?;

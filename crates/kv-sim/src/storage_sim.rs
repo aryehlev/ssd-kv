@@ -7771,6 +7771,69 @@ step ticks 2
 step crash power sectors 12
 "#,
     ),
+    (
+        "power_cut_after_kill_loses_unflushed_newer_copy_on_other_device",
+        r#"kv-sim storage case 1
+seed 752467
+# minimized from 244 to 105 steps in 277 s (two-image wb lba512 Flushed p128); original: I1 step=195 [power cut-Power] :: db 0 key 15 after power cut (Power): observed absent is absent: an acknowledged write was lost; allowed: [0: op 0 Durable (1062 bytes, fp abf44819664b8461, deadline None)] 
+# matrix cell: two-image wb lba512 Flushed p128
+fail I1 104 power_cut-Power
+# db 0 key 4 after power cut (Power): observed absent is absent: an acknowledged write was lost; allowed: [0: op 0 Durable (269 bytes, fp 339c375d1e11f1ed, deadline None)] 
+cfg partitions 128
+cfg devices 2
+cfg ags 140
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wb
+cfg dsync 1
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 26
+cfg groups 6
+cfg dbs 2
+cfg profile large
+cfg steps 240
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 14
+cfg skip_pct 0
+cfg per_poll 0
+cfg shuffle 0
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 1 3279 - - 0 0
+step cmd setrange 0 24 981 154
+step cmd set 0 19 56609 - - 0 0
+step cmd del 0 1,19
+step cmd set 0 24 398568 - - 0 0
+step cmd set 1 15 1964 - - 0 0
+step cmd set 0 23 53518 - - 0 0
+step cmd set 0 17 1959 - - 0 0
+step cmd set 0 10 577195 - - 0 0
+step cmd set 1 8 2161 - - 0 0
+step cmd set 0 0 3633337 - - 0 0
+step cmd set 0 0 3118 past xx 0 0
+step ticks 5
+step cmd set 0 0 523 - - 0 0
+step cmd set 0 25 1054 - - 0 0
+step cmd set 1 15 10389336 - - 0 0
+step ticks 2
+step cmd copy 0 0 6 1
+step cmd set 0 15 1062 - - 0 0
+step cmd set 0 4 269 - - 0 0
+step crash kill sectors 8
+step crash power bytes 0
+"#,
+    ),
 ];
 
 /// Replays a case text.

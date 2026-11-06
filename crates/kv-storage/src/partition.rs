@@ -782,6 +782,40 @@ impl Core {
         }
     }
 
+    /// True when record `(db, seq)` is below its db's durable flush cutoff: dead for good
+    /// (cutoffs only grow), wherever its bytes are found later, recovery included.
+    pub(crate) fn flushed_dead(&self, db: u8, seq: Seq) -> bool {
+        self.cutoff_durable.get(usize::from(db)).is_some_and(|&c| seq.0 < c)
+    }
+
+    /// A cached page whose every record is dead by a durable flush cutoff, with no work
+    /// staged or in flight and nothing tracked in it, holds nothing: it becomes fresh (its
+    /// next write is a full-page image; §11.7: dead records may remain on media). True when it
+    /// did.
+    pub(crate) fn make_fresh_if_flushed(&mut self, cache: &mut PageCache, page: PageId) -> bool {
+        let Some(f) = cache.peek(page) else { return false };
+        let Some(st) = cache.page_state(page) else { return false };
+        if st.fresh || st.corrupt || st.recs.is_empty() || !st.is_clean() || !st.pending.is_empty() || st.inflight.is_some() {
+            return false;
+        }
+        if !st.recs.iter().all(|r| self.flushed_dead(r.db, r.seq)) {
+            return false;
+        }
+        if self.stale.at_page(page) > 0
+            || self.prior_txn_pages.contains(&page)
+            || self.deferred.contains(&page)
+            || self.retire.iter().any(|r| r.page == page)
+            || self.older_pages.iter().any(|o| o.0 == page)
+        {
+            return false;
+        }
+        let Some(st) = cache.state_mut(f) else { return false };
+        st.recs.clear();
+        st.fresh = true;
+        self.alloc.note_fresh(page);
+        true
+    }
+
     pub(crate) fn note_page_space(&mut self, cache: &PageCache, page: PageId) {
         let Some(st) = cache.page_state(page) else { return };
         if st.corrupt {
@@ -2897,9 +2931,11 @@ impl PartitionStore {
             self.core.reclaim_pages.clear();
             self.core.reclaim_ext.clear();
             self.core.alloc.want_spare(AgKind::Small);
-        } else {
-            self.start_reclaim(cx.cache);
         }
+        // FLUSHDB of one db: the reclaim walk starts once the cutoff is durable (on_meta_done):
+        // only then are the db's records dead for the page writer and the extent check, so a
+        // walk run before it reclaimed nothing (its extent headers were read as live and never
+        // again) and every write it allowed into a page could lose a pre-flush record
         let group = self.core.cfg.produce_groups.then(|| Group { seq: cutoff, ops: vec![Op::FlushDb { db }] });
         Ok(ExecOut { ticket: Some(t), group, seq: Some(cutoff) })
     }
@@ -2918,6 +2954,31 @@ impl PartitionStore {
         }
         self.core.reclaim_ext.extend(starts);
         self.core.counters.flush_reclaim_pending_pages = (self.core.reclaim_pages.len() + self.core.reclaim_ext.len()) as u64;
+    }
+
+    /// FLUSHDB (cutoff durable): the cached pages' records of the flushed dbs are dead. Their
+    /// space is free now: a page holding nothing else is fresh again (and its AG releasable),
+    /// any other page's free space is recomputed. The reclaim walk reads uncached pages only;
+    /// without this the cached pages kept counting the flushed records as used bytes for good
+    /// (nothing rebuilds a clean page), and with no page of an AG fresh again no AG went back
+    /// to the pool, so writes of other kinds (extents) got -OOM until a FLUSHALL.
+    fn reclaim_cached(&mut self, cx: &mut StorageCtx<'_>, dbs: u16) {
+        let pages: Vec<PageId> = self.core.alloc.owned_small_pages().filter(|p| cx.cache.contains(*p)).collect();
+        for page in pages {
+            let Some(f) = cx.cache.peek(page) else { continue };
+            let core = &self.core;
+            let Some(st) = cx.cache.state_mut(f) else { continue };
+            let mut changed = false;
+            for r in st.recs.iter_mut() {
+                if dbs & (1 << r.db) != 0 && r.status != RecStatus::Droppable && core.flushed_dead(r.db, r.seq) {
+                    r.status = RecStatus::Droppable;
+                    changed = true;
+                }
+            }
+            if changed && !self.core.make_fresh_if_flushed(cx.cache, page) {
+                self.core.note_page_space(cx.cache, page);
+            }
+        }
     }
 
     /// A barrier: its ticket is durable once everything staged before it is durable, every txn
@@ -3419,7 +3480,7 @@ impl PartitionStore {
         }
         // reclaim walk / warming: recompute the page's free space and drop dead space
         let dead = cx.cache.page_state(page).is_some_and(|st| st.recs.iter().any(|r| r.status == RecStatus::Droppable));
-        if dead {
+        if dead && !self.core.make_fresh_if_flushed(cx.cache, page) {
             self.core.note_page_space(cx.cache, page);
         }
         Core::maybe_unpin(cx.cache, page);
@@ -3545,6 +3606,12 @@ impl PartitionStore {
                     if !open_txn {
                         retire.push(RetireItem { db, key: key.into(), page, seq: rn.seq });
                     }
+                } else if self.core.cutoff.get(usize::from(db)).is_some_and(|&c| rn.seq.0 < c) {
+                    // a record of a FLUSHDB whose cutoff is not durable yet: the index let it
+                    // go, but it is the key's state if the flush is lost to a crash, so the
+                    // page keeps it until the cutoff is durable (then `reclaim_cached` or the
+                    // reclaim walk frees it)
+                    recs[newest].status = RecStatus::Protected;
                 } else {
                     if !rn.is_marker() && rn.expire_at().is_none_or(|t| t > cx.now.unix_ms) {
                         self.core.counters.unexpected_orphans += 1;
@@ -3810,7 +3877,7 @@ impl PartitionStore {
         cx.cache.put_state(inf.n_frame, st);
         if empty {
             self.core.alloc.note_fresh(page);
-        } else {
+        } else if !self.core.make_fresh_if_flushed(cx.cache, page) {
             self.core.note_page_space(cx.cache, page);
         }
         for (db, key) in inf.cleared.into_iter().chain(orphaned) {
@@ -4030,6 +4097,9 @@ impl PartitionStore {
                 self.core.tickets.meta_done(ticket);
                 if all {
                     self.core.flushall_wait = true;
+                } else {
+                    self.reclaim_cached(cx, dbs);
+                    self.start_reclaim(cx.cache);
                 }
                 // effects deferred behind in-page copies of the flushed dbs go ahead: the page
                 // writer counts those copies until the cutoff is durable (a pre-flush copy is

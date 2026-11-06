@@ -345,3 +345,67 @@ fn ttl_changes_and_deletes_work_on_a_full_partition() {
     db.wait_in(p, out.ticket, TicketState::Written);
     db.quiesce();
 }
+
+/// FLUSHDB frees the space of the flushed records for every kind of write (§16.5, §11.7):
+/// the cached pages' records of the db were never marked dead (the reclaim walk reads
+/// uncached pages only, and nothing rebuilds a clean page), and no page holding only dead
+/// records became fresh again, so no SMALL AG went back to the pool: after a FLUSHDB of a
+/// device filled with small records every extent write got `-OOM` until a FLUSHALL.
+#[test]
+fn flushdb_frees_space_for_every_kind_of_write() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    for cache_mb in [8usize, 256] {
+        // 16 partitions, 40 AGs: one partition (one hash tag) fills what the others leave
+        let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+        let mut d = RamDev::new(pages, 4096, 9);
+        format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 9).unwrap();
+        let mut c = cfg();
+        c.cache_bytes = cache_mb << 20;
+        let mut eng = LocalEngine::open(vec![d], &c).unwrap();
+        eng.recover().unwrap();
+        let mut db = Db::new(eng, T0);
+        let mut refused = 0;
+        let mut n = 0u64;
+        while refused < 200 {
+            let k = format!("{{t}}s{n}");
+            n += 1;
+            match db.set(0, k.as_bytes(), &value(n, 100), None) {
+                Ok(t) => {
+                    db.wait(k.as_bytes(), t, TicketState::Written);
+                }
+                Err(StoreError::OutOfSpace) => refused += 1,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        let (full, total) = db.eng.meta().ag_usage();
+        for (p, t) in db.flushdb(Some(0)) {
+            db.wait_in(p, t, TicketState::Durable);
+        }
+        // the reclaim walk is paced: give it time
+        for _ in 0..600 {
+            db.advance(100);
+            db.eng.pump();
+        }
+        let (after, _) = db.eng.meta().ag_usage();
+        let mut stored = 0;
+        for i in 0..400u64 {
+            let k = format!("{{t}}x{i}");
+            match db.set(0, k.as_bytes(), &value(i, 2049 + (i as usize % 7) * 3000), None) {
+                Ok(t) => {
+                    db.wait(k.as_bytes(), t, TicketState::Written);
+                    stored += 1;
+                }
+                Err(StoreError::OutOfSpace) => {
+                    for _ in 0..20 {
+                        db.advance(100);
+                        db.eng.pump();
+                    }
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert!(stored >= 380, "cache {cache_mb} MiB: only {stored}/400 extent writes after FLUSHDB of a full device ({full}/{total} AGs used before, {after} after)");
+        db.quiesce();
+    }
+}

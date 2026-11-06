@@ -877,15 +877,45 @@ impl Alloc {
     }
 
     /// Carves `n` pages at a keyed draw over every `n`-aligned position of the open-space
-    /// runs (no small hole fits the request).
+    /// runs (no small hole fits the request) that keeps a run of the largest extent class
+    /// (2048 pages, half an AG) wherever one was: a run that can hold one offers only the
+    /// positions leaving a 2048-page piece before or after the carve, and any position is drawn
+    /// only when no run offers one. A value just over 8 MiB is a 2048-page chunk plus one-page
+    /// pieces; the pieces, drawn anywhere in an AG, left no 2048-page run in it, so most such
+    /// values took an AG of their own and a device refused them with much of its space free.
     fn carve_open(&mut self, n: u16, dev: Option<u8>) -> Option<PageId> {
         let min = n.saturating_mul(Self::OPEN_SPACE);
-        let mut total = 0usize;
-        for a in &self.extent {
-            if dev.is_some_and(|d| a.ag.dev != d) {
-                continue;
+        let big = crate::layout::EXT_MAX_PAGES as u16;
+        // the n-aligned slots of a run (relative index ranges) under the policy above
+        let slots = |l: u16, spare_big: bool| -> (usize, usize, usize) {
+            let all = usize::from(l / n);
+            if !spare_big || n >= big || l < big {
+                return (all, 0, 0);
             }
-            total += a.runs.iter().filter(|r| r.0 >= min).map(|r| usize::from(r.0 / n)).sum::<usize>();
+            // a carve at slot k leaves k*n pages before it and l - (k+1)*n after it
+            let before_end = if l >= big + n { usize::from((l - big) / n) } else { 0 };
+            let after_start = usize::from(big.div_ceil(n));
+            let after = all.saturating_sub(after_start);
+            (before_end.min(after_start), after_start, after)
+        };
+        let count = |l: u16, spare_big: bool| -> usize {
+            let (a, _, c) = slots(l, spare_big);
+            a + c
+        };
+        let mut spare_big = true;
+        let mut total = 0usize;
+        for pass in 0..2 {
+            spare_big = pass == 0;
+            total = 0;
+            for a in &self.extent {
+                if dev.is_some_and(|d| a.ag.dev != d) {
+                    continue;
+                }
+                total += a.runs.iter().filter(|r| r.0 >= min).map(|r| count(r.0, spare_big)).sum::<usize>();
+            }
+            if total > 0 {
+                break;
+            }
         }
         let mut k = self.pick_index(domain::CARVE, total)?;
         for ai in 0..self.extent.len() {
@@ -897,13 +927,14 @@ impl Alloc {
                 if l < min {
                     continue;
                 }
-                let slots = usize::from(l / n);
-                if k < slots {
-                    let off = s + k as u16 * n;
+                let (a, c0, c) = slots(l, spare_big);
+                if k < a + c {
+                    let slot = if k < a { k } else { c0 + (k - a) };
+                    let off = s + slot as u16 * n;
                     self.extent[ai].take(off, n);
                     return Some(PageId::new(self.extent[ai].ag.dev, self.extent[ai].first + u32::from(off)));
                 }
-                k -= slots;
+                k -= a + c;
             }
         }
         None

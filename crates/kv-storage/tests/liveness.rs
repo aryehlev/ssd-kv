@@ -575,3 +575,98 @@ fn flush_under_load_gives_old_ags_back() {
         db.quiesce();
     }
 }
+
+/// A multi-key delete works in every partition of a device filled with extents only. Its
+/// deletes stage txn markers, small records (§14.6 step 2); a partition whose keys all live in
+/// extents owns no SMALL AG, and once extent AGs had taken every free AG only the first two
+/// partitions got one: every other partition's multi-key DEL answered `-OOM`, so a full device
+/// could only be emptied one key per command. The pool now keeps a free AG for each partition
+/// owning no SMALL AG.
+#[test]
+fn multi_key_deletes_work_in_every_partition_of_a_device_full_of_extents() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 11);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 11).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    let parts = db.eng.partitions();
+    let mut by_part: Vec<Vec<String>> = vec![Vec::new(); usize::from(parts)];
+    let mut refused = 0;
+    let mut i = 0u64;
+    while refused < 400 {
+        let k = format!("k{i}");
+        i += 1;
+        match db.set(0, k.as_bytes(), &value(i, 2100 + (i as usize * 7919) % 30_000), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                by_part[usize::from(db.eng.partition_of(k.as_bytes()))].push(k);
+            }
+            Err(StoreError::OutOfSpace) => refused += 1,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let (used, total) = db.eng.meta().ag_usage();
+    for (p, keys) in by_part.iter().enumerate() {
+        assert!(keys.len() >= 2, "partition {p} stored {} keys", keys.len());
+        let ks: Vec<&[u8]> = keys[..2].iter().map(|k| k.as_bytes()).collect();
+        let (n, out) = db
+            .eng
+            .run(p as u16, keyed(0, &ks, kv_common::Access::Write), &mut |s| {
+                s.select(0);
+                let mut n = 0;
+                for k in &ks {
+                    n += u32::from(s.delete(k)?);
+                }
+                Ok(n)
+            })
+            .unwrap_or_else(|e| panic!("multi-key delete in partition {p} of a device full of extents ({used}/{total} AGs used): {e:?}"));
+        assert_eq!(n, 2);
+        db.wait_in(p as u16, out.ticket, TicketState::Written);
+    }
+    db.quiesce();
+}
+
+/// Values just over the extent maximum (8 MiB: a chunkmap, a 2048-page chunk, half an AG,
+/// and a one-page chunk, §14.5) fill the device two to an AG. The one-page pieces were
+/// carved at keyed positions anywhere in an AG, leaving no 2048-page run in it, so most
+/// such values took an AG of their own and `-OOM` came with much of the device free.
+#[test]
+fn values_just_over_the_extent_maximum_fill_most_of_the_device() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 13);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 13).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    let (_, total) = db.eng.meta().ag_usage();
+    let v = value(1, 8 << 20);
+    let mut stored = 0u64;
+    let mut refused = 0;
+    for i in 0..400u64 {
+        // four partitions write in turn
+        let k = format!("{{b{}}}{i}", i % 4);
+        match db.set(0, k.as_bytes(), &v, None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                stored += 1;
+            }
+            Err(StoreError::OutOfSpace) => {
+                refused += 1;
+                if refused > 20 {
+                    break;
+                }
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let (used, _) = db.eng.meta().ag_usage();
+    // at most two per AG; each partition's first AG holds one and the small pieces, and
+    // spares and the fill limit hold some back: more than one per AG of the device
+    assert!(stored > total, "{stored} values of 8 MiB on {total} AGs ({used} used)");
+    db.quiesce();
+}

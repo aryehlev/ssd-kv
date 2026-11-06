@@ -175,8 +175,9 @@ pub fn decide(h: &Hello, v: &PrimaryView<'_>) -> SyncDecision {
     // the groups of earlier terms this primary received after the position it reported when it
     // was fenced (in flight then, applied after): its state holds them, so a member that lacks
     // them (the old primary, restarted below them) gets their keys' images too
-    if let Some(end) = v.received.end().filter(|e| e.term() < v.term && *e > prev_end) {
-        let from = h.applied.max(prev_end);
+    let received_more = v.received.last().is_some_and(|l| l > prev_end);
+    if let Some(end) = v.received.end().filter(|e| received_more && e.term() < v.term && *e > prev_end) {
+        let from = from.max(prev_end);
         if from < end {
             match v.received.keys_between_into(from, end, &mut keys) {
                 Some(false) => {}
@@ -405,6 +406,40 @@ mod tests {
         let v2 = PrimaryView { received: &late, ..v };
         let d = decide(&hello(4, Seq::new(4, 10)), &v2);
         assert!(matches!(d, SyncDecision::Reject(RejectReason::NeedOperatorResync)));
+    }
+
+    #[test]
+    fn a_ring_with_nothing_after_the_takeover_point_needs_no_coverage_before_it() {
+        // term 2 produced nothing on this partition (closed where term 1 did, (1,52)); this
+        // primary of term 3 took the term-2 stream over with an empty ring started at (2,0):
+        // a member holding term 1's closing point lacks only the current term's groups
+        let mut received = Backlog::new(1 << 16);
+        received.start_after(Seq::new(2, 0));
+        let mut backlog = Backlog::new(1 << 16);
+        backlog.start_after(Seq::new(3, 0));
+        let s = Seq::new(3, 1);
+        backlog.push(s, &put(s, b"t3-1"));
+        let end = |seq: Seq| {
+            let mut v = vec![0u64; 16];
+            v[3] = seq.0;
+            v
+        };
+        let history = vec![(1, end(Seq::new(1, 52))), (2, end(Seq::new(1, 52)))];
+        let v = PrimaryView {
+            term: 3,
+            history: &history,
+            backlog: &backlog,
+            received: &received,
+            is_member: true,
+            operator_full_sync: false,
+            last_executed: Seq::new(3, 1),
+        };
+        assert_eq!(keys(&decide(&hello(1, Seq::new(1, 52)), &v)), ["t3-1"]);
+        // behind term 1's closing point: not covered here
+        assert!(matches!(
+            decide(&hello(1, Seq::new(1, 40)), &v),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
     }
 
     #[test]

@@ -1818,6 +1818,23 @@ impl Node {
                         5
                     };
                     fx.report.resync_why[why] += 1;
+                    if trace_on() {
+                        eprintln!(
+                            "[{}] p{p} {} rejects {:?} (why {why}): hello last_term {} applied {} fence {} recovered {:?}; prev_end {:?} at {} ring floor {} end {:?} history {:?}",
+                            fx.now_l / MS,
+                            short(&node_id(self.idx)),
+                            member_node.map(|n| short(&node_id(n))),
+                            h.last_term,
+                            sq(h.applied),
+                            h.fence_term,
+                            h.recovered,
+                            prev_end.map(sq),
+                            sq(at),
+                            sq(pp.prev_received.floor()),
+                            pp.prev_received.end().map(sq),
+                            history.iter().map(|(t, v)| (*t, sq(Seq(v[usize::from(p)])))).collect::<Vec<_>>(),
+                        );
+                    }
                     // kv-node: the primary reports the member (NeedsFullSync), unless the
                     // committed assignment already shows it, at most once a second
                     let recorded = assignment_members.iter().any(|(id, st, _)| {

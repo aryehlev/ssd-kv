@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use smallvec::SmallVec;
 
 use kv_ctrl::{
     CoordToNode, Health, MemberState, MigPhase, MigrationTask, NodeAssignment, NodeError, NodeId,
@@ -85,6 +86,9 @@ const TERM_RAISE_LIMIT: Duration = Duration::from_secs(2);
 /// How long a partition's lag report of a member counts for the node-wide shrink choice (each
 /// lagging partition reports every 100 ms).
 const LAG_REPORT_WINDOW: Duration = Duration::from_millis(150);
+/// How long a requested ISR shrink counts as done while the committed ISR does not show it (a
+/// commit takes milliseconds; a request the coordinator dropped stops counting after this).
+const SHRINK_PENDING: Duration = Duration::from_millis(1000);
 /// Longest wait of a shutting-down primary for its handoff (the coordinator's handoff bound is
 /// 5 s): after it the node shuts down anyway and its shard fails over by lease expiry.
 const SHUTDOWN_HANDOFF_LIMIT: Duration = Duration::from_secs(8);
@@ -735,20 +739,25 @@ impl Agent {
                 if age_ns >= e.0 {
                     *e = (age_ns, now);
                 }
-                let ages: Vec<(u16, u64)> = role
+                // a shrink requested lately that the committed ISR does not show yet counts as
+                // done: it takes the spare budget first, so that a stall of every member never
+                // gets two of them dropped (one per report, before the first commit arrives)
+                // when only one may go
+                let lagging: Vec<Lagging> = role
                     .members
                     .iter()
                     .enumerate()
                     .filter(|(_, (_, _, in_isr))| *in_isr)
-                    .filter_map(|(i, (n, _, _))| self.lagging.get(n).map(|(age, _)| (i as u16, *age)))
+                    .map(|(i, (n, _, _))| Lagging {
+                        member: i as u16,
+                        age_ns: self.lagging.get(n).map(|(age, _)| *age),
+                        pending: self
+                            .shrink_sent
+                            .get(n)
+                            .is_some_and(|t| now.duration_since(*t) < SHRINK_PENDING),
+                    })
                     .collect();
-                let isr_len = 1 + role.members.iter().filter(|(_, _, in_isr)| *in_isr).count();
-                let chosen = kv_repl::primary::shrink_choice(
-                    &ages,
-                    isr_len,
-                    usize::from(role.min_isr.max(1)),
-                    keep_age_ns,
-                );
+                let chosen = shrink_with_pending(&lagging, usize::from(role.min_isr.max(1)), keep_age_ns);
                 for i in chosen {
                     let Some((member, _, _)) = role.members.get(usize::from(i)) else {
                         continue;
@@ -1208,12 +1217,73 @@ async fn write_msg(s: &mut TcpStream, m: &NodeToCoord) -> std::io::Result<()> {
     s.write_all(&f).await
 }
 
+
+/// An ISR member of a primary's shard as the shrink choice sees it: its lag age if it lags
+/// (`None`: it acknowledges), and whether a shrink of it was requested lately and is not
+/// committed yet.
+#[derive(Clone, Copy, Debug)]
+struct Lagging {
+    member: u16,
+    age_ns: Option<u64>,
+    pending: bool,
+}
+
+/// The members to ask the coordinator to drop (see `kv_repl::primary::shrink_choice`), with the
+/// shrinks requested and not committed yet counted as done: they take the spare budget (the
+/// committed ISR with the primary above `min_isr`) first, a pending one that still lags is
+/// asked again, and the others are chosen oldest first within what is left or past the keep
+/// bound.
+fn shrink_with_pending(isr: &[Lagging], min_isr: usize, keep_age_ns: u64) -> SmallVec<[u16; 2]> {
+    let spare = (1 + isr.len()).saturating_sub(min_isr.max(1));
+    let mut out = SmallVec::new();
+    let mut left = spare.saturating_sub(isr.iter().filter(|l| l.pending && l.age_ns.is_none()).count());
+    for l in isr.iter().filter(|l| l.pending && l.age_ns.is_some()) {
+        let age = l.age_ns.unwrap_or(0);
+        if left > 0 || age > keep_age_ns {
+            out.push(l.member);
+        }
+        left = left.saturating_sub(1);
+    }
+    let ages: Vec<(u16, u64)> = isr
+        .iter()
+        .filter(|l| !l.pending)
+        .filter_map(|l| l.age_ns.map(|a| (l.member, a)))
+        .collect();
+    // `shrink_choice` with an ISR of `left` spare members over `min_isr`
+    out.extend(kv_repl::primary::shrink_choice(&ages, left + min_isr.max(1), min_isr.max(1), keep_age_ns));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use kv_common::slot::SlotSet;
     use kv_ctrl::{MemberState, NodeId, ShardId, ShardRole};
 
-    use super::device_failed_reports;
+    use super::{Lagging, device_failed_reports, shrink_with_pending};
+
+    const MS: u64 = 1_000_000;
+
+    fn l(member: u16, age_ms: Option<u64>, pending: bool) -> Lagging {
+        Lagging { member, age_ns: age_ms.map(|a| a * MS), pending }
+    }
+
+    #[test]
+    fn a_requested_shrink_takes_the_spare_budget_until_it_commits() {
+        let keep = 875 * MS;
+        // RF3, min ISR 2, both members stalled: the older one goes
+        assert_eq!(shrink_with_pending(&[l(0, Some(600), false), l(1, Some(560), false)], 2, keep).as_slice(), &[0]);
+        // its shrink is requested and not committed: the other one stays (it used to be picked
+        // as soon as its age passed the first one's, and both were dropped: NOREPLICAS)
+        assert_eq!(shrink_with_pending(&[l(0, Some(600), true), l(1, Some(640), false)], 2, keep).as_slice(), &[0]);
+        assert_eq!(shrink_with_pending(&[l(0, None, true), l(1, Some(700), false)], 2, keep).as_slice(), &[] as &[u16]);
+        // past the keep bound it goes as well (a dead member still leaves within a second)
+        assert_eq!(shrink_with_pending(&[l(0, Some(900), true), l(1, Some(880), false)], 2, keep).as_slice(), &[0, 1]);
+        // RF2, min ISR 2: a member lately shrunk and back is still kept until the keep bound
+        assert_eq!(shrink_with_pending(&[l(0, Some(600), true)], 2, keep).as_slice(), &[] as &[u16]);
+        assert_eq!(shrink_with_pending(&[l(0, Some(900), true)], 2, keep).as_slice(), &[0]);
+        // min ISR 1: every lagging member may go
+        assert_eq!(shrink_with_pending(&[l(0, Some(600), true), l(1, Some(560), false)], 1, keep).as_slice(), &[0, 1]);
+    }
 
     fn role(primary: bool, isr_members: usize) -> ShardRole {
         ShardRole {

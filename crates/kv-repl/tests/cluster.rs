@@ -1475,10 +1475,12 @@ fn both_members_stalling_together_cost_latency_not_errors() {
         })
         .collect();
     std::thread::sleep(Duration::from_millis(1500));
-    for _ in 0..2 {
+    // stalls of every length below the keep bound: a shrink requested for one member and not
+    // committed yet used to leave the other one counted as spare, so both were dropped
+    for ms in [560, 600, 640, 680, 800, 620] {
         c.pause_node(1, true);
         c.pause_node(2, true);
-        std::thread::sleep(Duration::from_millis(800));
+        std::thread::sleep(Duration::from_millis(ms));
         c.pause_node(1, false);
         c.pause_node(2, false);
         std::thread::sleep(Duration::from_millis(1500));

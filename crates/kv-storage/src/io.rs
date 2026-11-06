@@ -289,6 +289,11 @@ pub trait BlockDevice {
     fn info(&self) -> DevInfo;
     fn submit(&mut self, r: IoReq);
     fn poll(&mut self, out: &mut Vec<IoDone>, wait: bool);
+    /// The open file behind a synchronous device, for callers that issue several plain
+    /// positioned writes at once from threads of their own (the meta thread's batches).
+    fn sync_file(&self) -> Option<&File> {
+        None
+    }
 }
 
 /// How [`SyncFileDevice::open_with`] opens a device.
@@ -457,6 +462,10 @@ impl BlockDevice for SyncFileDevice {
 
     fn poll(&mut self, out: &mut Vec<IoDone>, _wait: bool) {
         out.append(&mut self.done);
+    }
+
+    fn sync_file(&self) -> Option<&File> {
+        Some(&self.file)
     }
 }
 

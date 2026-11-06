@@ -168,7 +168,20 @@ pub trait MetaIo {
     fn flush(&mut self, dev: u8) -> std::io::Result<()>;
     fn devices(&self) -> usize;
     fn lba(&self, dev: u8) -> u32;
+    /// Writes every `(dev, offset, buf)`; the writes may be issued concurrently (no order
+    /// between them: the cycle's flush makes them durable together).
+    fn write_all(&mut self, writes: Vec<(u8, u64, AlignedBuf)>) -> std::io::Result<()> {
+        for (d, off, buf) in writes {
+            self.write(d, off, buf)?;
+        }
+        Ok(())
+    }
 }
+
+/// Most threads one batch of metadata writes uses (a cycle after FLUSHDB writes one partition
+/// meta block per partition: issued one after the other on a busy disk they took about a
+/// second, and every reply of the cycle, AG grants and txn commits included, waited for them).
+const META_WRITE_THREADS: usize = 16;
 
 /// Devices owned by the meta thread.
 pub struct OwnedDevs(pub Vec<Box<dyn BlockDevice + Send>>);
@@ -192,6 +205,39 @@ impl MetaIo for OwnedDevs {
     }
     fn lba(&self, dev: u8) -> u32 {
         self.0[usize::from(dev)].info().lba.max(512)
+    }
+    fn write_all(&mut self, writes: Vec<(u8, u64, AlignedBuf)>) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let files: Option<Vec<&std::fs::File>> = self.0.iter().map(|d| d.sync_file()).collect();
+        let Some(files) = files.filter(|_| writes.len() >= 3) else {
+            for (d, off, buf) in writes {
+                self.write(d, off, buf)?;
+            }
+            return Ok(());
+        };
+        for (d, off, buf) in &writes {
+            let info = self.0[usize::from(*d)].info();
+            if !off.is_multiple_of(u64::from(info.lba.max(512))) || off + buf.len() as u64 > info.bytes() {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+        }
+        let threads = writes.len().min(META_WRITE_THREADS);
+        let per = writes.len().div_ceil(threads);
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = writes
+                .chunks(per)
+                .map(|part| {
+                    let files = &files;
+                    sc.spawn(move || -> std::io::Result<()> {
+                        for (d, off, buf) in part {
+                            files[usize::from(*d)].write_all_at(buf.as_slice(), *off)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            hs.into_iter().try_for_each(|h| h.join().unwrap_or_else(|_| Err(std::io::Error::other("meta write thread panicked"))))
+        })
     }
 }
 
@@ -833,6 +879,7 @@ impl MetaCore {
     fn write_dirty(&mut self, io: &mut dyn MetaIo) -> std::io::Result<[bool; crate::layout::MAX_DEVICES]> {
         let mut touched = [false; crate::layout::MAX_DEVICES];
         let mut page = AlignedBuf::zeroed(PAGE);
+        let mut batch: Vec<(u8, u64, AlignedBuf)> = Vec::new();
         for (d, blocks) in self.agt.iter_mut().enumerate() {
             for (i, b) in blocks.iter_mut().enumerate() {
                 if !b.dirty {
@@ -840,7 +887,7 @@ impl MetaCore {
                 }
                 let copy = b.copy.other();
                 b.v.encode(b.seq + 1, page.page_mut(0));
-                io.write(d as u8, DeviceLayout::ag_table_copy_page(i as u32, copy) * PAGE as u64, page.clone())?;
+                batch.push((d as u8, DeviceLayout::ag_table_copy_page(i as u32, copy) * PAGE as u64, page.clone()));
                 b.seq += 1;
                 b.copy = copy;
                 b.dirty = false;
@@ -855,7 +902,7 @@ impl MetaCore {
             }
             let copy = b.copy.other();
             b.v.encode(parts, b.seq + 1, page.page_mut(0));
-            io.write(0, l0.pmeta_copy_page(p as u16, copy) * PAGE as u64, page.clone())?;
+            batch.push((0, l0.pmeta_copy_page(p as u16, copy) * PAGE as u64, page.clone()));
             b.seq += 1;
             b.copy = copy;
             b.dirty = false;
@@ -864,7 +911,7 @@ impl MetaCore {
         if self.nmeta.dirty {
             let copy = self.nmeta.copy.other();
             self.nmeta.v.encode(self.nmeta.seq + 1, page.page_mut(0));
-            io.write(0, l0.nmeta_copy_page(copy) * PAGE as u64, page.clone())?;
+            batch.push((0, l0.nmeta_copy_page(copy) * PAGE as u64, page.clone()));
             self.nmeta.seq += 1;
             self.nmeta.copy = copy;
             self.nmeta.dirty = false;
@@ -873,12 +920,13 @@ impl MetaCore {
         if self.header.dirty {
             let copy = self.header.copy.other();
             self.header.v.encode(self.header.seq + 1, page.page_mut(0));
-            io.write(0, l0.intent_header_copy_page(copy) * PAGE as u64, page.clone())?;
+            batch.push((0, l0.intent_header_copy_page(copy) * PAGE as u64, page.clone()));
             self.header.seq += 1;
             self.header.copy = copy;
             self.header.dirty = false;
             touched[0] = true;
         }
+        io.write_all(batch)?;
         Ok(touched)
     }
 
@@ -982,6 +1030,13 @@ impl MetaIo for TimedIo {
     }
     fn lba(&self, dev: u8) -> u32 {
         self.inner.lba(dev)
+    }
+    fn write_all(&mut self, writes: Vec<(u8, u64, AlignedBuf)>) -> std::io::Result<()> {
+        let t = std::time::Instant::now();
+        self.writes += writes.len() as u32;
+        let r = self.inner.write_all(writes);
+        self.write_ns += t.elapsed().as_nanos() as u64;
+        r
     }
 }
 
@@ -1311,6 +1366,29 @@ mod tests {
         assert_eq!(again.partition_meta(4).unwrap().seq_floor, Seq(500));
         assert!(again.prior.is_committed(t) || t <= again.resolved_w());
         assert_eq!(again.superblock().clock_floor_unix_ms, 2_000_000_000_000);
+    }
+
+    /// A batch of block writes on a file device is issued from several threads and every
+    /// block lands where it was asked to.
+    #[test]
+    fn batched_writes_on_a_file_land_in_place() {
+        use crate::io::{DevInfo, SyncFileDevice, SyncOpen};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.dev");
+        std::fs::write(&path, vec![0u8; 64 * PAGE]).unwrap();
+        let dev = SyncFileDevice::open_with(&path, DevInfo::new(64, 512), SyncOpen { direct: false, exclusive: false, read_only: false }).unwrap();
+        let mut io = OwnedDevs(vec![Box::new(dev)]);
+        let writes: Vec<(u8, u64, AlignedBuf)> = (0..40u64).map(|i| (0u8, (i + 3) * PAGE as u64, AlignedBuf::from_slice(&[i as u8 + 1; PAGE]))).collect();
+        io.write_all(writes).unwrap();
+        io.flush(0).unwrap();
+        for i in 0..40u64 {
+            let b = io.read(0, (i + 3) * PAGE as u64, PAGE).unwrap();
+            assert!(b.as_slice().iter().all(|&x| x == i as u8 + 1), "block {i}");
+        }
+        assert!(io.read(0, 0, PAGE).unwrap().as_slice().iter().all(|&x| x == 0));
+        // out of range: refused before anything is written
+        let bad = vec![(0u8, 1u64 << 40, AlignedBuf::zeroed(PAGE)), (0, 0, AlignedBuf::zeroed(PAGE)), (0, PAGE as u64, AlignedBuf::zeroed(PAGE))];
+        assert!(io.write_all(bad).is_err());
     }
 
     #[test]

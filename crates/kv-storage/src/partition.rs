@@ -228,6 +228,8 @@ pub struct PartitionCounters {
     pub stale_copies: u64,
     pub foreground_scrub_writes: u64,
     pub txn_markers: u64,
+    /// Cross-partition txn parts aborted by their coordinator (§14.6 step 6).
+    pub txn_aborts: u64,
     pub flush_reclaim_pending_pages: u64,
     pub corrupt_pages: u64,
     pub unexpected_orphans: u64,
@@ -498,6 +500,8 @@ pub(crate) struct OpenTxn {
     /// `(db, key, page, seq)` of the txn delete markers.
     pub(crate) markers: SmallVec<[MarkerAt; 1]>,
     pub(crate) pages: SmallVec<[PageId; 2]>,
+    /// XTxn parts: what to undo per key if the coordinator aborts the txn (`crate::abort`).
+    pub(crate) undo: Vec<crate::abort::TxnUndo>,
 }
 
 /// A txn delete marker: `(db, key, page, seq)`.
@@ -623,6 +627,14 @@ pub(crate) struct Core {
     /// Tickets inherited by an effect of a txn whose `OpenTxn` the executing commit has not
     /// registered yet: `(txn, ticket)`, moved to its commit waiters at the end of the commit.
     pub(crate) txn_inherit: Vec<(u64, TicketId)>,
+    /// XTxn part requests waiting until the staged effects of their keys are in an image (a
+    /// part never cancels another write's staged effect, `crate::abort`); woken after the
+    /// builds of every tick.
+    pub(crate) part_wait: Vec<ReqId>,
+    /// Cross-partition txns aborted before their part was applied here: the `Apply` is refused.
+    pub(crate) aborted: HashSet<u64, foldhash::fast::FixedState>,
+    /// Aborted txn parts whose records are not durably gone yet (§14.6 step 6).
+    pub(crate) aborting: Vec<crate::abort::Aborting>,
     /// Scratch vectors (no per-tick allocation).
     pub(crate) scratch_pos: Vec<Pos>,
     pub(crate) scratch_txn: Vec<u64>,
@@ -1037,6 +1049,9 @@ impl PartitionStore {
             last_local_txn: None,
             older_pages: Vec::new(),
             txn_inherit: Vec::new(),
+            part_wait: Vec::new(),
+            aborted: HashSet::with_hasher(Default::default()),
+            aborting: Vec::new(),
             scratch_pos: Vec::new(),
             scratch_txn: Vec::new(),
             watch: WatchSet { keys: HashMap::with_hasher(Default::default()), touched: Vec::new() },
@@ -1083,6 +1098,8 @@ impl PartitionStore {
             && self.core.loads.is_empty()
             && self.core.meta_wait.is_empty()
             && self.core.gone_wait.is_empty()
+            && self.core.aborting.is_empty()
+            && self.core.part_wait.is_empty()
             && self.reqs.live == 0
     }
 
@@ -1688,6 +1705,12 @@ impl PartitionStore {
                         self.requeue(id, r);
                         ExecStatus::Requeued
                     }
+                    Commit::PartWait => {
+                        r.parked = true;
+                        self.core.part_wait.push(id);
+                        self.requeue(id, r);
+                        ExecStatus::Requeued
+                    }
                     Commit::Err(e) => {
                         self.finish(cx.cache, id, r);
                         ExecStatus::Failed(e)
@@ -1727,12 +1750,14 @@ enum Commit {
     Park,
     /// Waiting for a seq reservation (E12) or a txn id.
     Seq,
+    /// An XTxn part waiting for the staged effects of its keys to be built (`crate::abort`).
+    PartWait,
     Err(StoreError),
 }
 
 /// Where a staged change goes (planned before anything is applied).
 #[derive(Clone)]
-enum Plan {
+pub(crate) enum Plan {
     None,
     Small { page: PageId, fresh: bool },
     Ext { start: PageId, n_pages: u32, inplace: bool },
@@ -1753,6 +1778,22 @@ impl PartitionStore {
     fn commit(&mut self, cx: &mut StorageCtx<'_>, staged: SmallVec<[Staged; 2]>, txn: Option<u64>, seqo: Option<Seq>) -> Commit {
         if staged.is_empty() {
             return Commit::Done(ExecOut::none());
+        }
+        if let Some(t) = txn {
+            // an XTxn part of a txn its coordinator already gave up stages nothing (§14.6)
+            if self.core.aborted.remove(&t) {
+                return Commit::Err(StoreError::Io(-libc::ECANCELED));
+            }
+            // it never cancels another write's staged effect (`crate::abort`)
+            match self.part_must_wait(cx.cache, &staged) {
+                Some(Need::ExtWrite(start)) => {
+                    let mut n = SmallVec::new();
+                    n.push(Need::ExtWrite(start));
+                    return Commit::Need(n);
+                }
+                Some(_) => return Commit::PartWait,
+                None => {}
+            }
         }
         let writes = staged.iter().filter(|s| matches!(s.change, Change::Put { .. } | Change::Delete)).count();
         let seq = if writes == 0 {
@@ -1831,6 +1872,7 @@ impl PartitionStore {
             barriers: SmallVec::new(),
             markers: SmallVec::new(),
             pages: SmallVec::new(),
+            undo: Vec::new(),
         });
         if otx.is_some() {
             self.core.counters.page_writes_txn += 1;
@@ -2062,9 +2104,17 @@ impl PartitionStore {
         txn: u64,
         ticket: Option<TicketId>,
         fx: Option<TicketId>,
-        otx: Option<&mut OpenTxn>,
+        mut otx: Option<&mut OpenTxn>,
     ) {
         let seq = s.seq.unwrap_or(seq);
+        // an XTxn part records how to undo the change (`crate::abort`)
+        let undo = match &otx {
+            Some(o) if !o.local && matches!(s.change, Change::Put { .. } | Change::Delete) => Some(self.part_undo(&s, &plan, seq)),
+            _ => None,
+        };
+        if let (Some(u), Some(o)) = (undo, otx.as_deref_mut()) {
+            o.undo.push(u);
+        }
         let mut tickets: SmallVec<[TicketId; 1]> = SmallVec::new();
         if matches!(s.change, Change::Put { .. } | Change::Delete) {
             tickets.extend(ticket);
@@ -2091,7 +2141,7 @@ impl PartitionStore {
                 match plan {
                     Plan::Small { page, fresh } => {
                         let rec = self.encode(&s, rec_kind, seq, expire_at, value, txn, tickets);
-                        self.place_small_version(cx, &s, page, fresh, rec, vtype, expire_at, otx);
+                        self.place_small_version(cx, &s, page, fresh, rec, vtype, expire_at, otx.as_deref_mut());
                     }
                     Plan::Ext { start, n_pages, inplace } => {
                         let class = class_for(n_pages).expect("extent class");
@@ -2108,7 +2158,7 @@ impl PartitionStore {
                         self.add_ext_write(start, hdr, s.db, s.key.clone(), buf, tickets, inherited, None, inplace);
                         let e = Entry { fp32: s.kh.fp32(), x8: class, page36: start.to36(), kind: Kind::Extent, vtype, sync_mark: false };
                         self.core.index_set(&s, cur36(&s.cur), e, expire_at);
-                        if let Some(o) = otx {
+                        if let Some(o) = otx.as_deref_mut() {
                             o.keys.push((s.db, s.key.clone()));
                         }
                     }
@@ -2145,7 +2195,7 @@ impl PartitionStore {
                         }
                         let e = Entry { fp32: s.kh.fp32(), x8: class, page36: map.to36(), kind: Kind::ChunkMap, vtype, sync_mark: false };
                         self.core.index_set(&s, cur36(&s.cur), e, expire_at);
-                        if let Some(o) = otx {
+                        if let Some(o) = otx.as_deref_mut() {
                             o.keys.push((s.db, s.key.clone()));
                         }
                     }
@@ -2157,7 +2207,7 @@ impl PartitionStore {
                     // a txn delete stages a TXN_DELETE_MARKER instead of a Remove (§14.6)
                     if let Plan::Small { page, fresh } = plan {
                         let rec = self.encode(&s, REC_KIND_TXN_DELETE_MARKER, seq, None, &[], txn, tickets);
-                        self.place_small_version(cx, &s, page, fresh, rec, VType::String, None, otx);
+                        self.place_small_version(cx, &s, page, fresh, rec, VType::String, None, otx.as_deref_mut());
                         self.core.counters.txn_markers += 1;
                     } else {
                         // nothing on media to delete
@@ -2450,7 +2500,7 @@ impl PartitionStore {
     }
 
     /// Cancels the staged chunk writes of a chunkmap that was never written.
-    fn cancel_chunks(&mut self, map: PageId) {
+    pub(crate) fn cancel_chunks(&mut self, map: PageId) {
         let Some(chunks) = self.core.ext.chunkmaps.remove(&map) else { return };
         for (c, n) in chunks {
             let rc = self.core.ext.chunk_rc.entry(c).or_insert(1);
@@ -2489,7 +2539,7 @@ impl PartitionStore {
         }
     }
 
-    fn wake(&mut self, waiters: SmallVec<[(ReqId, u32); 1]>) {
+    pub(crate) fn wake(&mut self, waiters: SmallVec<[(ReqId, u32); 1]>) {
         for (id, generation) in waiters {
             if self.reqs.live_gen(id, generation) {
                 let r = self.reqs.get_mut(id).expect("live");
@@ -3715,7 +3765,8 @@ impl PartitionStore {
         cx.cache.promote(page, inf.n_frame);
         st.m_frame = inf.n_frame;
         st.recs = inf.recs;
-        image::settle(&mut st.recs, cx.cache.frame(inf.n_frame));
+        let core = &self.core;
+        image::settle_with(&mut st.recs, cx.cache.frame(inf.n_frame), &|r| core.dead(r.db, r.seq, r.txn));
         st.fresh = false;
         st.r#gen = st.r#gen.wrapping_add(1);
         let mut supersede: SmallVec<[image::KeyAt; 2]> = SmallVec::new();
@@ -3918,7 +3969,7 @@ impl PartitionStore {
     }
 
     /// Makes sure `page` is rebuilt to zero its tracked copies (loads it when needed).
-    fn ensure_scrub(&mut self, cx: &mut StorageCtx<'_>, page: PageId) {
+    pub(crate) fn ensure_scrub(&mut self, cx: &mut StorageCtx<'_>, page: PageId) {
         if let Some(st) = cx.cache.page_state_mut(page) {
             st.scrub = true;
             self.core.mark_dirty(cx.cache, page);
@@ -4100,6 +4151,7 @@ impl PartitionStore {
         self.txn_progress(cx);
         self.retire_ready(cx);
         self.foreground_scrubs(cx);
+        self.abort_progress(cx);
         if self.core.state == PartState::Ready {
             // builds may stage relocations onto other pages: run until no page is left
             self.core.relocations = 0;
@@ -4109,6 +4161,13 @@ impl PartitionStore {
             self.submit_extents(cx);
         } else {
             self.core.dirty.clear();
+        }
+        // XTxn parts waiting for the staged effects of their keys try again (`crate::abort`)
+        for id in core::mem::take(&mut self.core.part_wait) {
+            if let Some(r) = self.reqs.get_mut(id) {
+                r.parked = false;
+            }
+            self.reqs.check_ready(id);
         }
         self.meta_requests(cx);
         self.background(cx);

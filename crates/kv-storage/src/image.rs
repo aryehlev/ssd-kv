@@ -835,14 +835,21 @@ fn write_rec(n: &mut [u8; PAGE], rec: &EncodedRecord, off: u16, page: PageId, cr
 
 /// After N became durable: versions superseded by a newer copy of their key in the same image
 /// become Superseded (zeroed by the page's next build, R3).
+#[cfg(test)]
 pub(crate) fn settle(recs: &mut [RecDesc], img: &[u8; PAGE]) {
+    settle_with(recs, img, &|_| false);
+}
+
+/// [`settle`] where a dead record (`dead`: of an aborted txn, or below a flush cutoff) never
+/// supersedes an older copy: that copy is the key's current version.
+pub(crate) fn settle_with(recs: &mut [RecDesc], img: &[u8; PAGE], dead: &dyn Fn(&RecDesc) -> bool) {
     for i in 0..recs.len() {
         if !matches!(recs[i].status, RecStatus::Live | RecStatus::Protected) {
             continue;
         }
         let (a, ka) = (recs[i], recs[i].key(img));
         let newer = recs.iter().enumerate().any(|(j, b)| {
-            j != i && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && b.key(img) == ka
+            j != i && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && b.key(img) == ka && !(b.txn != 0 && dead(b))
         });
         if newer {
             recs[i].status = RecStatus::Superseded;

@@ -28,6 +28,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
 
+pub(crate) mod abort;
 pub mod agtable;
 pub mod alloc;
 pub mod cache;

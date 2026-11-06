@@ -27,6 +27,8 @@
 //! | ticket | each effect holding it, and its metadata | the effects' ticket lists (one dependency per holder, handed over with its count on supersession, D2); handed to an effect of a txn from a staged write outside it, also one metadata dependency in `OpenTxn::barriers` | the effects' written / durable events, meta replies, `txn_committed` |
 //! | barrier ticket (SAVE, SHUTDOWN drain) | the effects, open txns and tracked copies present when it executed | one dependency on each (ticket lists, `OpenTxn::barriers`, watched `stale` entries) | their events; later work never extends it |
 //! | txn (fx ticket durable) | its `COMMITTED` listing | `meta_wait` (FIFO) | `on_meta_done` |
+//! | XTxn part request (`parked`) | the build of a staged effect of its key (a part never cancels one) | `part_wait` | the end of every tick |
+//! | abort ticket of an XTxn part | every page / extent still holding a record of the txn | `aborting` items (one dependency each) | `abort_progress` each tick: scrub builds, zeroing of the part's extents once written |
 //!
 //! Two rules make the table hold under every interleaving: (1) a waiter is registered before the
 //! event can be delivered (the partition is single threaded and events are delivered only
@@ -86,6 +88,9 @@ pub enum WaitFor {
     OlderCopy { at: PageId },
     /// A meta-thread reply (FLUSH cutoff durable, txn commit, barrier drain).
     Meta,
+    /// An XTxn part request: the staged effects of its keys are built at the next tick
+    /// (`Core::part_wait`).
+    PartBuild,
 }
 
 /// A non-terminal item of the partition.
@@ -193,6 +198,9 @@ impl PartitionStore {
             if self.core.seq_wait.contains(&id) && (self.core.seq_asked || self.core.next_seq < self.core.seq_limit) {
                 w.push(WaitFor::SeqReservation);
             }
+            if self.core.part_wait.contains(&id) {
+                w.push(WaitFor::PartBuild);
+            }
         }
         if r.blocked
             && let Some(&(o, b)) = self.reqs.barriers.front()
@@ -259,6 +267,16 @@ impl PartitionStore {
         }
         for (t, at) in c.stale.watched() {
             out.push((t, WaitFor::OlderCopy { at }));
+        }
+        // aborted txn parts: one dependency per page or extent still holding the txn
+        for a in &c.aborting {
+            for it in &a.items {
+                let w = match *it {
+                    crate::abort::AbortItem::Page(page) => WaitFor::PageBuild { page },
+                    crate::abort::AbortItem::Ext { start, .. } => WaitFor::ExtIssue { start },
+                };
+                out.push((a.ticket, w));
+            }
         }
         for (db, key, _, ts) in &c.gone_wait {
             let at = c.stale.get(*db, key).first().map_or(PageId(0), |e| e.at.page());
@@ -328,7 +346,7 @@ impl PartitionStore {
             if !r.queued && kq != r.waits {
                 return fail(format!("request {i} counts {} key queues ahead, {kq} found", r.waits));
             }
-            if r.parked && !waits.iter().any(|w| matches!(w, WaitFor::AgGrant | WaitFor::SeqReservation)) {
+            if r.parked && !waits.iter().any(|w| matches!(w, WaitFor::AgGrant | WaitFor::SeqReservation | WaitFor::PartBuild)) {
                 return fail(format!("request {i} is parked with no AG request or seq reservation outstanding"));
             }
         }

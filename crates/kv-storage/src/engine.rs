@@ -957,6 +957,16 @@ impl<D: BlockDevice> LocalEngine<D> {
         }
     }
 
+    /// [`PartitionStore::abort_txn`] on partition `p` (a cross-partition txn its coordinator
+    /// gave up).
+    pub fn abort_txn(&mut self, p: u16, txn: u64) -> Option<crate::ticket::TicketId> {
+        let now = self.now();
+        let (part, mut cx) = split(&mut self.parts, &mut self.plumb, &mut self.cache, &self.client, usize::from(p), now);
+        let t = part.abort_txn(&mut cx, txn);
+        self.submit_io();
+        t
+    }
+
     /// The last reported state of ticket `t` of partition `p` (`None` = not reported yet).
     pub fn ticket_state(&self, p: u16, t: crate::ticket::TicketId) -> Option<crate::ticket::TicketState> {
         self.tickets.get(&(p, t.0)).copied()

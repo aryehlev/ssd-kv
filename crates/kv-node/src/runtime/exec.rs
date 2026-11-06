@@ -192,6 +192,9 @@ pub struct ExecState {
     /// Partitions that executed a request this loop turn.
     executed: SmallVec<[u16; 8]>,
     held: Vec<Held>,
+    /// The worker is stopping: no command waits on the routing gate any more (it is answered
+    /// TRYAGAIN or redirected before the connections close).
+    pub gate_hold_off: bool,
 }
 
 impl ExecState {
@@ -219,6 +222,7 @@ impl ExecState {
             rng: 0x9e37_79b9_7f4a_7c15 ^ u64::from(workers),
             executed: SmallVec::new(),
             held: Vec::new(),
+            gate_hold_off: false,
         }
     }
 
@@ -271,7 +275,7 @@ impl ExecState {
             let (o, l) = args[i];
             &src[o as usize..(o + l) as usize]
         };
-        if gate_holds(shared, conn, args, src, now_boot_ns) {
+        if !self.gate_hold_off && gate_holds(shared, conn, args, src, now_boot_ns) {
             conn.gate_hold_since.get_or_insert(now_boot_ns);
             return Err(Hold::Gate);
         }
@@ -303,9 +307,10 @@ impl ExecState {
 /// writes in flight first).
 pub(crate) const GATE_HOLD_NS: u64 = 500_000_000;
 
-/// Whether the complete command at `args` (in `src`) is a write the cluster routing gate would
-/// answer TRYAGAIN right now (a write in MULTI is checked when queued, an EXEC for its queued
-/// writes), and the connection has not waited for that longer than `GATE_HOLD_NS`.
+/// Whether the complete keyed command at `args` (in `src`) is one the cluster routing gate would
+/// answer TRYAGAIN right now (writes during a handoff or term raise, any command on a slot whose
+/// migration seal is not committed yet; a command in MULTI is checked when queued, an EXEC for
+/// its queued commands), and the connection has not waited for that longer than `GATE_HOLD_NS`.
 fn gate_holds(shared: &NodeShared, conn: &Conn, args: &[(u32, u32)], src: &[u8], now_boot_ns: u64) -> bool {
     use crate::cluster::ownership::Gate;
     if args.is_empty() || shared.cluster().is_none() {
@@ -322,7 +327,7 @@ fn gate_holds(shared: &NodeShared, conn: &Conn, args: &[(u32, u32)], src: &[u8],
     let Some(spec) = kv_cmd::lookup(argv[0]) else { return false };
     let lease_ok = shared.lease.valid(now_boot_ns);
     let try_again = |spec: &'static CommandSpec, argv: &[&[u8]]| {
-        if !spec.flags.contains(CmdFlags::WRITE) || !spec.has_keys() {
+        if !spec.has_keys() {
             return false;
         }
         let pos = kv_cmd::key_positions(spec, argv);

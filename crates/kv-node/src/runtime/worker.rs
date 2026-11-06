@@ -681,6 +681,18 @@ impl<B: Backend> Worker<B> {
         if self.cluster.is_some() {
             self.cluster_stop();
         }
+        // commands waiting on the routing gate (a handoff before this stop) are answered now:
+        // redirected, or TRYAGAIN, rather than dropped with their connections
+        self.x.gate_hold_off = true;
+        for slot in 0..self.conns.len() as u32 {
+            let held = self.conns[slot as usize].as_ref().is_some_and(|c| c.hold == Some(Hold::Gate));
+            if held {
+                if let Some(c) = self.conns[slot as usize].as_mut() {
+                    c.hold = None;
+                }
+                self.parse_conn(slot);
+            }
+        }
         // drain: every partition writes what it executed (§8.2 SHUTDOWN)
         self.start_local_barrier_for_shutdown();
         tracing::info!(worker = self.id, "worker stopping");

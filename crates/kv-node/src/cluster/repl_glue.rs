@@ -1409,7 +1409,25 @@ impl<B: Backend> Worker<B> {
             return reject(io, RejectReason::StaleTerm, term);
         }
         let d = sync::decide(&h, &view);
-        tracing::info!(partition = p, member = %pp.peers[mi].node.hex40(), decision = d.kind(), "replication handshake");
+        if matches!(d, SyncDecision::Reject(_)) {
+            // positions only (what the coverage tests of `sync::decide` saw)
+            let fmt = |s: Seq| format!("{}:{}", s.term(), s.counter());
+            tracing::info!(
+                partition = p,
+                member = %pp.peers[mi].node.hex40(),
+                decision = d.kind(),
+                hello_last_term = h.last_term,
+                hello_applied = %fmt(h.applied),
+                recovered = ?h.recovered,
+                prev_end = ?sync::prev_takeover(&pp.history, term, p).map(|(_, s)| fmt(s)),
+                ring_floor = %fmt(pp.received.floor()),
+                ring_end = ?pp.received.end().map(fmt),
+                backlog_floor = %fmt(pp.sender.backlog().floor()),
+                "replication handshake"
+            );
+        } else {
+            tracing::info!(partition = p, member = %pp.peers[mi].node.hex40(), decision = d.kind(), "replication handshake");
+        }
         let mode = match d {
             SyncDecision::Reject(r) => {
                 if r == RejectReason::NeedOperatorResync {

@@ -1682,3 +1682,167 @@ fn a_removed_coordinator_is_never_a_moved_target() {
     assert!(!targets().contains(&removed));
     c.ok = true;
 }
+
+/// Writers of relative ops (APPEND, PEXPIRE, SETRANGE) on a fixed key set; each records the
+/// tokens its acknowledged APPENDs added, per key, in order.
+struct RelWriters {
+    stop: Arc<AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<Vec<(String, String)>>>,
+}
+
+/// Keys of the relative-op test, all in one slot (one partition holds the whole repair set,
+/// so its image feed runs long enough for writes to overtake it).
+const REL_KEYS: usize = 4000;
+
+impl RelWriters {
+    fn start(coords: &[SocketAddr], round: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handles = (0..4u64)
+            .map(|w| {
+                let (s, cl) = (stop.clone(), coords.to_vec());
+                std::thread::spawn(move || {
+                    let mut r = Routed::new(cl);
+                    let mut acked = Vec::new();
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (w + 1) ^ (u64::from(round) << 32);
+                    let mut i = 0u64;
+                    while !s.load(Ordering::Acquire) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        i += 1;
+                        let k = format!("rel:{{r}}:{}", x % REL_KEYS as u64);
+                        match (x >> 20) % 8 {
+                            0..=4 => {
+                                let t = format!("{round}.{w}.{i};");
+                                if let Outcome::Ok(Value::Int(_)) =
+                                    r.exec(k.as_bytes(), &[b"APPEND", k.as_bytes(), t.as_bytes()])
+                                {
+                                    acked.push((k, t));
+                                }
+                            }
+                            5 | 6 => {
+                                let ms = (3_600_000 + (x >> 40) % 1000).to_string();
+                                let _ = r.exec(k.as_bytes(), &[b"PEXPIRE", k.as_bytes(), ms.as_bytes()]);
+                            }
+                            _ => {
+                                // overwrites the first byte (the value's tokens stay)
+                                let _ = r.exec(k.as_bytes(), &[b"SETRANGE", k.as_bytes(), b"0", b"S"]);
+                            }
+                        }
+                    }
+                    acked
+                })
+            })
+            .collect();
+        RelWriters { stop, handles }
+    }
+
+    fn finish(self, acked: &mut hashbrown::HashMap<String, Vec<String>>) -> usize {
+        self.stop.store(true, Ordering::Release);
+        let mut n = 0;
+        for h in self.handles {
+            for (k, t) in h.join().unwrap() {
+                acked.entry(k).or_default().push(t);
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+/// Every key of the relative-op test on node `i` (READONLY reads, one connection).
+fn rel_values(c: &Cluster, i: usize) -> Vec<Option<String>> {
+    let mut conn = Conn::open(c.node_addr(i)).unwrap();
+    conn.call_str(&["READONLY"]).unwrap();
+    (0..REL_KEYS)
+        .map(|k| match conn.call_str(&["GET", &format!("rel:{{r}}:{k}")]).unwrap() {
+            Value::Bulk(Some(b)) => Some(String::from_utf8_lossy(&b).into_owned()),
+            Value::Bulk(None) | Value::Null => None,
+            other => Some(format!("<{}>", text(&other))),
+        })
+        .collect()
+}
+
+/// The keys whose value on node `a` differs from node `b`'s.
+fn rel_diff(c: &Cluster, a: usize, b: usize) -> Vec<String> {
+    let (va, vb) = (rel_values(c, a), rel_values(c, b));
+    (0..REL_KEYS)
+        .filter(|&k| va[k] != vb[k])
+        .map(|k| format!("rel:{{r}}:{k}"))
+        .collect()
+}
+
+/// Every acknowledged APPEND token is in its key's value on node `i`.
+fn rel_lost(c: &Cluster, i: usize, acked: &hashbrown::HashMap<String, Vec<String>>) -> Vec<String> {
+    let v = rel_values(c, i);
+    let mut lost = Vec::new();
+    for (k, toks) in acked {
+        let idx: usize = k["rel:{r}:".len()..].parse().unwrap();
+        let val = v[idx].as_deref().unwrap_or("");
+        if let Some(t) = toks.iter().find(|t| !val.contains(t.as_str())) {
+            lost.push(format!("{k}: acknowledged token {t} missing"));
+        }
+    }
+    lost
+}
+
+#[test]
+fn relative_writes_during_a_sync_reach_the_member_as_full_state() {
+    // DESIGN §23.7: an APPEND, SETRANGE or PEXPIRE executed while a member's full sync or
+    // repair is in progress reaches that member as the key's full state: applied as a relative
+    // op to the copy the sync had not replaced yet, it built a value the primary never held,
+    // stored at a seq the key's image could not replace, so the member entered the ISR with
+    // old values and a failover to it lost acknowledged writes
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = Cluster::start("relative", 2, Duration::from_secs(480));
+    let coords = c.coord_clients();
+    let ids: Vec<String> = c.nodes.iter().map(|n| n.id.clone()).collect();
+    c.admin(&["SHARD", "CREATE", "1", "--primary", &ids[0], "--min-isr", "1"]);
+    c.admin(&["SLOTS", "ASSIGN", "0-16383", "1"]);
+    c.wait_primary(0, 30);
+    let mut r = Routed::new(coords.clone());
+    let pad = "x".repeat(1000);
+    for k in 0..REL_KEYS {
+        set_settled(&mut r, &format!("rel:{{r}}:{k}"), &format!("base{k}-{pad}|"));
+    }
+    let mut acked: hashbrown::HashMap<String, Vec<String>> = hashbrown::HashMap::new();
+
+    // a learner's merge full sync under relative writes
+    let w = RelWriters::start(&coords, 1);
+    std::thread::sleep(Duration::from_millis(500));
+    c.admin(&["REPLICA", "ADD", "1", &ids[1]]);
+    c.wait_member(1, "in-sync isr", 120);
+    std::thread::sleep(Duration::from_millis(500));
+    let n = w.finish(&mut acked);
+    eprintln!("full sync under relative writes: {n} appends acknowledged");
+    assert!(n > 500, "the writers made progress ({n} appends acknowledged)");
+    std::thread::sleep(Duration::from_millis(500));
+    let d = rel_diff(&c, 0, 1);
+    assert!(d.is_empty(), "the learner differs from the primary on {} keys, e.g. {:?}", d.len(), &d[..d.len().min(4)]);
+
+    // a returning member's repair under relative writes
+    let w = RelWriters::start(&coords, 2);
+    std::thread::sleep(Duration::from_millis(500));
+    c.kill_node(0);
+    c.wait_primary(1, 60);
+    std::thread::sleep(Duration::from_millis(2000));
+    c.spawn_node(0);
+    c.wait_serving(0);
+    c.wait_member(0, "in-sync isr", 120);
+    std::thread::sleep(Duration::from_millis(500));
+    let n = w.finish(&mut acked);
+    eprintln!("repair under relative writes: {n} appends acknowledged");
+    assert!(n > 500, "the writers made progress ({n} appends acknowledged)");
+    std::thread::sleep(Duration::from_millis(500));
+    let d = rel_diff(&c, 1, 0);
+    assert!(d.is_empty(), "the repaired member differs from the primary on {} keys, e.g. {:?}", d.len(), &d[..d.len().min(4)]);
+    let lost = rel_lost(&c, 1, &acked);
+    assert!(lost.is_empty(), "{} keys lost acknowledged appends on the primary, e.g. {:?}", lost.len(), &lost[..lost.len().min(4)]);
+
+    // and a failover to the repaired member keeps every acknowledged append
+    c.kill_node(1);
+    c.wait_primary(0, 60);
+    let lost = rel_lost(&c, 0, &acked);
+    assert!(lost.is_empty(), "{} keys lost acknowledged appends after the failover, e.g. {:?}", lost.len(), &lost[..lost.len().min(4)]);
+    c.ok = true;
+}

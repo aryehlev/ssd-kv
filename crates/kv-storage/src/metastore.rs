@@ -236,16 +236,23 @@ impl SbLink {
 
     /// Writes `sb` (with the next block seq, into the older copy) through `io` and flushes.
     pub(crate) fn write(cell: &mut SbCell, io: &mut dyn MetaIo, sb: Superblock) -> std::io::Result<()> {
-        let seq = cell.seq + 1;
-        let copy = cell.copy.other();
-        let mut buf = AlignedBuf::zeroed(PAGE);
-        sb.encode(seq, buf.page_mut(0));
-        io.write(0, SB_PAGE[copy.index()] * PAGE as u64, buf)?;
+        let (seq, copy) = Self::write_unflushed(cell, io, &sb)?;
         io.flush(0)?;
         cell.sb = sb;
         cell.seq = seq;
         cell.copy = copy;
         Ok(())
+    }
+
+    /// Writes `sb` into the older copy without a flush; returns its `(seq, copy)`. The cell
+    /// takes them once a flush of device 0 succeeded.
+    pub(crate) fn write_unflushed(cell: &SbCell, io: &mut dyn MetaIo, sb: &Superblock) -> std::io::Result<(u64, AbCopy)> {
+        let seq = cell.seq + 1;
+        let copy = cell.copy.other();
+        let mut buf = AlignedBuf::zeroed(PAGE);
+        sb.encode(seq, buf.page_mut(0));
+        io.write(0, SB_PAGE[copy.index()] * PAGE as u64, buf)?;
+        Ok((seq, copy))
     }
 }
 
@@ -422,7 +429,12 @@ impl MetaCore {
         // a reserved id range before any multi-key write (§10.7)
         core.header.v.txn_floor = core.shared.txn_ids.next_floor();
         core.header.dirty = true;
-        core.write_dirty(io)?;
+        let touched = core.write_dirty(io)?;
+        for (d, t) in touched.iter().enumerate().take(io.devices()) {
+            if *t {
+                io.flush(d as u8)?;
+            }
+        }
         core.shared.txn_ids.extend_floor(core.header.v.txn_floor);
         Ok(core)
     }
@@ -540,17 +552,23 @@ impl MetaCore {
             };
             pending.push((m.partition, m.token, done));
         }
-        // commit batch: the lowest-index slots with room (§10.7)
+        // commit batch: the lowest-index slots with room (§10.7); written now, made durable by
+        // the cycle's single flush below
+        let mut slot_writes: SmallVec<[(usize, AbCopy, crate::intent::IntentSlot); 2]> = SmallVec::new();
         if !commits.is_empty() {
             let batch: SmallVec<[u64; 8]> = commits.iter().map(|&(_, t)| t).collect();
-            if let Err(e) = self.write_commits(io, &batch) {
-                for &(i, _) in &commits {
-                    pending[i].2 = MetaDone::Failed(neg(&e));
+            match self.write_commits(io, &batch) {
+                Err(e) => {
+                    for &(i, _) in &commits {
+                        pending[i].2 = MetaDone::Failed(neg(&e));
+                    }
                 }
-            } else {
-                for &t in &batch {
-                    if t > self.w {
-                        self.resolved.insert(t);
+                Ok(w) => {
+                    slot_writes = w;
+                    for &t in &batch {
+                        if t > self.w {
+                            self.resolved.insert(t);
+                        }
                     }
                 }
             }
@@ -568,9 +586,48 @@ impl MetaCore {
             self.header.v.resolved_w = w_target;
             self.header.dirty = true;
         }
-        let res = self.write_dirty(io).and_then(|()| self.write_superblock(io, &sb_updates));
+        // every changed block (and the superblock) is written into its older copy, then each
+        // touched device is flushed once: one flush per cycle, not one per kind of block (each
+        // reply of the cycle waits for all of its flushes, and on a busy disk every flush took
+        // hundreds of milliseconds)
+        let link = self.link.clone();
+        let res = {
+            let mut cell = (!sb_updates.is_empty()).then(|| link.cell.lock());
+            let res = self.write_dirty(io).and_then(|mut touched| {
+                if !slot_writes.is_empty() {
+                    touched[0] = true;
+                }
+                let sb = match cell.as_mut() {
+                    Some(c) => Self::write_superblock(c, io, &sb_updates)?,
+                    None => None,
+                };
+                if sb.is_some() {
+                    touched[0] = true;
+                }
+                for (d, t) in touched.iter().enumerate().take(io.devices()) {
+                    if *t {
+                        io.flush(d as u8)?;
+                    }
+                }
+                Ok(sb)
+            });
+            match res {
+                Ok(sb) => {
+                    if let (Some(c), Some((sb, seq, copy))) = (cell.as_mut(), sb) {
+                        c.sb = sb;
+                        c.seq = seq;
+                        c.copy = copy;
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        };
         match res {
             Ok(()) => {
+                for (slot, copy, st) in slot_writes {
+                    self.slots[slot].store(copy, st);
+                }
                 self.shared.txn_ids.extend_floor(self.header.v.txn_floor);
                 if w_target > self.w {
                     self.advance_w(w_target, &mut pending);
@@ -743,7 +800,9 @@ impl MetaCore {
     }
 
     /// Writes the commit batch into the lowest-index slots with room and flushes (E6).
-    fn write_commits(&mut self, io: &mut dyn MetaIo, batch: &[u64]) -> std::io::Result<()> {
+    /// Writes the commit batch into the older copies of the chosen slots (no flush: the cycle
+    /// flushes once). The returned slot contents are stored once that flush succeeded.
+    fn write_commits(&mut self, io: &mut dyn MetaIo, batch: &[u64]) -> std::io::Result<SmallVec<[(usize, AbCopy, crate::intent::IntentSlot); 2]>> {
         let mut open = [0usize; INTENT_SLOTS];
         for (s, p) in self.slots.iter().enumerate() {
             open[s] = p.open_count(self.w);
@@ -766,15 +825,12 @@ impl MetaCore {
             io.write(0, l0.intent_slot_copy_offset(lba, u32::from(slot), copy), buf)?;
             writes.push((usize::from(slot), copy, s));
         }
-        io.flush(0)?;
-        for (slot, copy, s) in writes {
-            self.slots[slot].store(copy, s);
-        }
-        Ok(())
+        Ok(writes)
     }
 
-    /// Writes every changed block once into its older copy, then flushes each touched device.
-    fn write_dirty(&mut self, io: &mut dyn MetaIo) -> std::io::Result<()> {
+    /// Writes every changed block once into its older copy; returns the devices it wrote to
+    /// (the cycle flushes each of them once).
+    fn write_dirty(&mut self, io: &mut dyn MetaIo) -> std::io::Result<[bool; crate::layout::MAX_DEVICES]> {
         let mut touched = [false; crate::layout::MAX_DEVICES];
         let mut page = AlignedBuf::zeroed(PAGE);
         for (d, blocks) in self.agt.iter_mut().enumerate() {
@@ -823,31 +879,24 @@ impl MetaCore {
             self.header.dirty = false;
             touched[0] = true;
         }
-        for (d, t) in touched.iter().enumerate().take(io.devices()) {
-            if *t {
-                io.flush(d as u8)?;
-            }
-        }
-        Ok(())
+        Ok(touched)
     }
 
-    fn write_superblock(&mut self, io: &mut dyn MetaIo, updates: &[SbUpdate]) -> std::io::Result<()> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-        let link = self.link.clone();
-        let mut cell = link.cell.lock();
-        if cell.closed {
-            return Ok(());
+    /// Writes the superblock with `updates` applied into its older copy (no flush); returns
+    /// the state the cell takes once the cycle's flush succeeded. The caller holds the cell
+    /// from this write until then (the engine's shutdown writes the superblock too).
+    fn write_superblock(cell: &mut SbCell, io: &mut dyn MetaIo, updates: &[SbUpdate]) -> std::io::Result<Option<(Superblock, u64, AbCopy)>> {
+        if updates.is_empty() || cell.closed {
+            return Ok(None);
         }
         let mut sb = cell.sb.clone();
         for u in updates {
             sb.apply(u);
         }
         if sb == cell.sb {
-            return Ok(());
+            return Ok(None);
         }
-        SbLink::write(&mut cell, io, sb)
+        SbLink::write_unflushed(cell, io, &sb).map(|(seq, copy)| Some((sb, seq, copy)))
     }
 
     /// The device-0 superblock as last written.
@@ -892,6 +941,71 @@ fn neg(e: &std::io::Error) -> i32 {
 // ---------------------------------------------------------------------------------------------
 // The thread
 
+/// The meta thread's devices with the time its writes and flushes took (stall trace).
+struct TimedIo {
+    inner: OwnedDevs,
+    writes: u32,
+    flushes: u32,
+    write_ns: u64,
+    flush_ns: u64,
+}
+
+impl TimedIo {
+    fn reset(&mut self) {
+        self.writes = 0;
+        self.flushes = 0;
+        self.write_ns = 0;
+        self.flush_ns = 0;
+    }
+}
+
+impl MetaIo for TimedIo {
+    fn read(&mut self, dev: u8, offset: u64, len: usize) -> std::io::Result<AlignedBuf> {
+        self.inner.read(dev, offset, len)
+    }
+    fn write(&mut self, dev: u8, offset: u64, buf: AlignedBuf) -> std::io::Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.inner.write(dev, offset, buf);
+        self.writes += 1;
+        self.write_ns += t.elapsed().as_nanos() as u64;
+        r
+    }
+    fn flush(&mut self, dev: u8) -> std::io::Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.inner.flush(dev);
+        self.flushes += 1;
+        self.flush_ns += t.elapsed().as_nanos() as u64;
+        r
+    }
+    fn devices(&self) -> usize {
+        self.inner.devices()
+    }
+    fn lba(&self, dev: u8) -> u32 {
+        self.inner.lba(dev)
+    }
+}
+
+/// Request counts of a processing cycle by kind (stall trace).
+fn msg_kinds(msgs: &[MetaMsg]) -> String {
+    let mut n = [0u32; 9];
+    for m in msgs {
+        let i = match m.req {
+            MetaReq::AcquireAg { .. } | MetaReq::AcquireAgOn { .. } | MetaReq::AcquireSpare { .. } | MetaReq::AcquireReserved { .. } => 0,
+            MetaReq::ReleaseAg { .. } => 1,
+            MetaReq::PartitionMeta { .. } => 2,
+            MetaReq::NodeMeta { .. } => 3,
+            MetaReq::ReserveSeq { .. } => 4,
+            MetaReq::CommitTxn { .. } => 5,
+            MetaReq::TxnAborted { .. } => 6,
+            MetaReq::Superblock(_) => 7,
+            MetaReq::Barrier | MetaReq::PriorTxnsZeroed { .. } => 8,
+        };
+        n[i] += 1;
+    }
+    let names = ["acquire", "release", "pmeta", "nmeta", "seq", "commit", "aborted", "sb", "other"];
+    names.iter().zip(n.iter()).filter(|(_, c)| **c > 0).map(|(k, c)| format!("{k}={c}")).collect::<Vec<_>>().join(" ")
+}
+
 /// Delivers a meta reply `(partition, token, done)` to one worker.
 pub type ReplyHook = Box<dyn Fn(u16, u64, MetaDone) + Send>;
 
@@ -932,6 +1046,8 @@ impl MetaStore {
                     }
                 };
                 let mut out = Vec::new();
+                let trace = crate::progress::stall_trace_ms();
+                let mut io = TimedIo { inner: io, writes: 0, flushes: 0, write_ns: 0, flush_ns: 0 };
                 loop {
                     let first = match rx.recv_timeout(Duration::from_millis(CLOCK_FLOOR_INTERVAL_MS)) {
                         Ok(m) => Some(m),
@@ -943,11 +1059,27 @@ impl MetaStore {
                         msgs.push(m);
                     }
                     let now = kv_common::Now::read().unix_ms;
+                    // `KVSSD_STALL_TRACE_MS`: a processing cycle slower than the limit is
+                    // printed with what it did (every reply of the cycle waited for all of it)
+                    let started = trace.map(|_| (std::time::Instant::now(), msg_kinds(&msgs)));
+                    io.reset();
                     match core.as_mut() {
                         Ok(c) => c.process(&mut io, msgs, now, &mut out),
                         Err(e) => {
                             let errno = neg(e);
                             out.extend(msgs.into_iter().map(|m| (m.partition, m.token, MetaDone::Failed(errno))));
+                        }
+                    }
+                    if let (Some(limit), Some((t0, kinds))) = (trace, started) {
+                        let ms = t0.elapsed().as_millis() as u64;
+                        if ms >= limit {
+                            eprintln!(
+                                "kvssd stall trace meta: cycle {ms}ms requests [{kinds}] writes={} ({}ms) flushes={} ({}ms)",
+                                io.writes,
+                                io.write_ns / 1_000_000,
+                                io.flushes,
+                                io.flush_ns / 1_000_000
+                            );
                         }
                     }
                     deliver(&mut out);

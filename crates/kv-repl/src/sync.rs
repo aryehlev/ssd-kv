@@ -140,6 +140,18 @@ pub fn decide(h: &Hello, v: &PrimaryView<'_>) -> SyncDecision {
             _ => return SyncDecision::Reject(RejectReason::NeedOperatorResync),
         }
     }
+    // the groups of earlier terms this primary received after the position it reported when it
+    // was fenced (in flight then, applied after): its state holds them, so a member that lacks
+    // them (the old primary, restarted below them) gets their keys' images too
+    if let Some(end) = v.received.end().filter(|e| e.term() < v.term && *e > prev_end) {
+        let from = h.applied.max(prev_end);
+        if from < end {
+            match v.received.keys_between_into(from, end, &mut keys) {
+                Some(false) => {}
+                _ => return SyncDecision::Reject(RejectReason::NeedOperatorResync),
+            }
+        }
+    }
     // (d): the current term's groups up to `at`, from this primary's own backlog
     if at > start {
         match v.backlog.keys_between_into(start, at, &mut keys) {
@@ -287,6 +299,31 @@ mod tests {
         );
         // ahead of the takeover point (an old primary): only the current term's keys here
         let d = decide(&hello(2, Seq::new(2, 30)), &view(&r));
+        assert_eq!(keys(&d), ["new1", "new2", "new3", "new4"]);
+    }
+
+    #[test]
+    fn groups_received_after_the_takeover_point_are_repaired_too() {
+        // the new primary received (2,9) and (2,10) after the position it reported at its
+        // fence: its state holds them, so a member below them (the old primary restarted at
+        // (2,8), or behind it) gets their keys as images
+        let mut r = rings();
+        for i in 9..=10 {
+            let s = Seq::new(2, i);
+            r.received.push(s, &put(s, format!("old{i}").as_bytes()));
+        }
+        let v = view(&r);
+        let d = decide(&hello(2, Seq::new(2, 8)), &v);
+        assert_eq!(keys(&d), ["old9", "old10", "new1", "new2", "new3", "new4"]);
+        let d = decide(&hello(2, Seq::new(2, 9)), &v);
+        assert_eq!(keys(&d), ["old10", "new1", "new2", "new3", "new4"]);
+        let d = decide(&hello(2, Seq::new(2, 6)), &v);
+        assert_eq!(
+            keys(&d),
+            ["old7", "old8", "old9", "old10", "new1", "new2", "new3", "new4"]
+        );
+        // a member that holds them already gets the current term's keys only
+        let d = decide(&hello(2, Seq::new(2, 10)), &v);
         assert_eq!(keys(&d), ["new1", "new2", "new3", "new4"]);
     }
 

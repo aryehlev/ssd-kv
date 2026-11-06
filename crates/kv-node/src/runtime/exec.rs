@@ -1353,6 +1353,10 @@ impl<B: Backend> Worker<B> {
         reply.clear();
         let databases = self.cfg.databases;
         let txns_before = self.backend.txns_opened(p);
+        if self.router.cluster {
+            let imaging = self.cluster_imaging(p);
+            self.backend.set_imaging(imaging);
+        }
         let status = {
             let work = match &job.kind {
                 JobKind::Cmd(c) => Work::Cmd(c),

@@ -167,6 +167,142 @@ pub fn run_repl(ks: &mut kv_storage::keyspace::Keyspace<'_>, w: &ReplWork) -> Re
     }
 }
 
+/// The full state `(vtype, expire_at, value)` of a key after a request (`None`: absent).
+pub type KeyImage = Option<(u8, u64, Vec<u8>)>;
+
+/// The key a relative op (APPEND, SETRANGE, EXPIRE/PERSIST) changes: `(db, key)`.
+pub fn relative_op_key(op: &Op) -> Option<(u8, &[u8])> {
+    match op {
+        Op::Append { db, key, .. } | Op::SetRange { db, key, .. } | Op::Expire { db, key, .. } => Some((*db, key)),
+        _ => None,
+    }
+}
+
+/// A [`Store`] that remembers the keys its relative changes (APPEND, SETRANGE, EXPIRE/PERSIST)
+/// touched, so that their full state after the request can be read in the same execution
+/// ([`read_images`]). A cluster primary sends that state, not the relative op, to a member
+/// whose sync is in progress or to a migration destination: an APPEND applied to a copy that
+/// the sync has not replaced yet would build a value the primary never held (DESIGN §23.7).
+pub struct Imaging<'s, S: Store> {
+    pub s: &'s mut S,
+    pub on: bool,
+    pub touched: SmallVec<[(u8, Box<[u8]>); 2]>,
+}
+
+impl<'s, S: Store> Imaging<'s, S> {
+    pub fn new(s: &'s mut S, on: bool) -> Self {
+        Imaging { s, on, touched: SmallVec::new() }
+    }
+
+    fn note(&mut self, key: &[u8]) {
+        if self.on {
+            let db = self.s.db();
+            if !self.touched.iter().any(|(d, k)| *d == db && **k == *key) {
+                self.touched.push((db, key.into()));
+            }
+        }
+    }
+}
+
+impl<S: Store> Store for Imaging<'_, S> {
+    #[inline]
+    fn db(&self) -> u8 {
+        self.s.db()
+    }
+    #[inline]
+    fn select(&mut self, db: u8) {
+        self.s.select(db)
+    }
+    #[inline]
+    fn now_ms(&self) -> u64 {
+        self.s.now_ms()
+    }
+    #[inline]
+    fn meta(&mut self, key: &[u8]) -> Result<Option<kv_storage::keyspace::KeyMeta>, StoreError> {
+        self.s.meta(key)
+    }
+    #[inline]
+    fn get(&mut self, key: &[u8]) -> Result<Option<(kv_storage::keyspace::KeyMeta, kv_storage::keyspace::Value<'_>)>, StoreError> {
+        self.s.get(key)
+    }
+    #[inline]
+    fn put(&mut self, key: &[u8], value: &[u8], vtype: VType, expire_at_ms: Option<u64>) -> Result<(), StoreError> {
+        self.s.put(key, value, vtype, expire_at_ms)
+    }
+    #[inline]
+    fn append(&mut self, key: &[u8], data: &[u8]) -> Result<u64, StoreError> {
+        let n = self.s.append(key, data)?;
+        self.note(key);
+        Ok(n)
+    }
+    #[inline]
+    fn set_range(&mut self, key: &[u8], off: u64, data: &[u8]) -> Result<u64, StoreError> {
+        let n = self.s.set_range(key, off, data)?;
+        self.note(key);
+        Ok(n)
+    }
+    #[inline]
+    fn set_expire(&mut self, key: &[u8], expire_at_ms: Option<u64>) -> Result<bool, StoreError> {
+        let r = self.s.set_expire(key, expire_at_ms)?;
+        self.note(key);
+        Ok(r)
+    }
+    #[inline]
+    fn delete(&mut self, key: &[u8]) -> Result<bool, StoreError> {
+        self.s.delete(key)
+    }
+}
+
+/// Reads the state of each `(db, key)` after the request's changes (staged ones included) into
+/// `out`; the selected database is restored.
+pub fn read_images<S: Store>(s: &mut S, keys: &[(u8, Box<[u8]>)], out: &mut Vec<(u8, Box<[u8]>, KeyImage)>) -> Result<(), StoreError> {
+    let db0 = s.db();
+    for (db, k) in keys {
+        if out.iter().any(|(d, kk, _)| d == db && kk == k) {
+            continue;
+        }
+        s.select(*db);
+        let img = match s.get(k)? {
+            Some((m, v)) => {
+                let vtype = match m.vtype {
+                    VType::String => kv_storage::extent::EXT_VTYPE_STRING,
+                    VType::Hash => kv_storage::extent::EXT_VTYPE_HASH,
+                };
+                Some((vtype, m.expire_at_ms.unwrap_or(0), v.to_vec()))
+            }
+            None => None,
+        };
+        out.push((*db, k.clone(), img));
+    }
+    s.select(db0);
+    Ok(())
+}
+
+/// `g` with every relative op replaced by the full state of its key from `images` (a `Put`, or
+/// a `Del` of a key absent afterwards); `None` when a relative op's key has no image.
+pub fn with_full_images(g: &kv_storage::effect::Group, images: &[(u8, Box<[u8]>, KeyImage)]) -> Option<kv_storage::effect::Group> {
+    let mut ops = Vec::with_capacity(g.ops.len());
+    for op in &g.ops {
+        match relative_op_key(op) {
+            None => ops.push(op.clone()),
+            Some((db, key)) => {
+                let (_, _, img) = images.iter().find(|(d, k, _)| *d == db && **k == *key)?;
+                ops.push(match img {
+                    Some((vtype, expire_at, value)) => Op::Put {
+                        db,
+                        vtype: *vtype,
+                        expire_at: *expire_at,
+                        key: key.into(),
+                        value: value.clone(),
+                    },
+                    None => Op::Del { db, key: key.into() },
+                });
+            }
+        }
+    }
+    Some(kv_storage::effect::Group { seq: g.seq, ops })
+}
+
 /// Runs `work` against a store, writing its reply to `reply` (the caller truncates it before a
 /// re-run). Keyed handlers come from `cmd::keyed`, so the production `Keyspace` and test
 /// stores execute the same code.
@@ -284,6 +420,11 @@ pub trait Backend {
     /// The watched keys of partition `p` changed since the last call (see
     /// `PartitionStore::take_touched`).
     fn take_touched(&mut self, _p: u16, _out: &mut Vec<(u8, Box<[u8]>)>) {}
+    /// Whether the following `exec`s read the full state of every key a relative op changes
+    /// (see [`Imaging`]); the images of the last completed `exec` are taken by `take_images`.
+    fn set_imaging(&mut self, _on: bool) {}
+    /// The key images the last `exec` read (empty unless imaging was on).
+    fn take_images(&mut self, _out: &mut Vec<(u8, Box<[u8]>, KeyImage)>) {}
 }
 
 /// Storage resources of one worker for the page store.
@@ -308,6 +449,10 @@ pub struct PageBackend {
     /// I/O or meta completion, durable writes). Idle partitions with no background work are
     /// not ticked: their tick would find nothing to build.
     touched: Vec<bool>,
+    /// `exec` reads the full state of keys relative ops change (`Backend::set_imaging`).
+    imaging: bool,
+    /// The key images of the last `exec`.
+    images: Vec<(u8, Box<[u8]>, KeyImage)>,
 }
 
 impl PageBackend {
@@ -343,6 +488,8 @@ impl PageBackend {
             sections_done,
             durable: Vec::new(),
             touched: vec![true; usize::from(partitions)],
+            imaging: false,
+            images: Vec::new(),
         }
     }
 
@@ -395,18 +542,48 @@ impl Backend for PageBackend {
 
     fn exec(&mut self, p: u16, now: Now, id: ReqId, work: Work<'_>, env: &ExecEnv, reply: &mut Vec<u8>) -> ExecStatus<WorkOut> {
         let base = reply.len();
+        let imaging = self.imaging;
+        let mut images = std::mem::take(&mut self.images);
+        images.clear();
         let (part, mut cx) = self.split(p, now);
         let status = part.exec(&mut cx, id, &mut |ks| {
             reply.truncate(base);
+            images.clear();
             match work {
-                Work::Repl(w) => run_repl(ks, w).map(WorkOut::Repl),
-                _ => run_work(ks, work, env, reply),
+                Work::Repl(w) => {
+                    let out = run_repl(ks, w)?;
+                    if imaging && let ReplWork::Own { ops } = w {
+                        let keys: SmallVec<[(u8, Box<[u8]>); 2]> =
+                            ops.iter().filter_map(relative_op_key).map(|(d, k)| (d, k.into())).collect();
+                        read_images(ks, &keys, &mut images)?;
+                    }
+                    Ok(WorkOut::Repl(out))
+                }
+                _ => {
+                    let mut im = Imaging::new(ks, imaging);
+                    let out = run_work(&mut im, work, env, reply)?;
+                    let touched = std::mem::take(&mut im.touched);
+                    if !touched.is_empty() {
+                        read_images(ks, &touched, &mut images)?;
+                    }
+                    Ok(out)
+                }
             }
         });
         if !matches!(status, ExecStatus::Done(..)) {
             reply.truncate(base);
+            images.clear();
         }
+        self.images = images;
         status
+    }
+
+    fn set_imaging(&mut self, on: bool) {
+        self.imaging = on;
+    }
+
+    fn take_images(&mut self, out: &mut Vec<(u8, Box<[u8]>, KeyImage)>) {
+        out.append(&mut self.images);
     }
 
     fn scan(&mut self, p: u16, now: Now, id: ReqId, matcher: &dyn Fn(&[u8]) -> bool, out: &mut Vec<Box<[u8]>>) -> ExecStatus<u64> {
@@ -873,5 +1050,68 @@ pub mod mem {
         fn slot_len(&self, _p: u16, _db: u8, _slot: u16) -> usize {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod imaging_tests {
+    use super::*;
+    use kv_storage::effect::Group;
+
+    #[test]
+    fn relative_ops_become_full_state() {
+        let g = Group {
+            seq: Seq::new(3, 9),
+            ops: vec![
+                Op::Append { db: 0, key: b"a".as_slice().into(), data: b"x".to_vec() },
+                Op::Put { db: 0, vtype: 1, expire_at: 0, key: b"p".as_slice().into(), value: b"v".to_vec() },
+                Op::Expire { db: 1, key: b"e".as_slice().into(), expire_at: 77 },
+                Op::SetRange { db: 0, key: b"gone".as_slice().into(), offset: 2, data: b"y".to_vec() },
+            ],
+        };
+        let images: Vec<(u8, Box<[u8]>, KeyImage)> = vec![
+            (0, b"a".as_slice().into(), Some((1, 5, b"abcx".to_vec()))),
+            (1, b"e".as_slice().into(), Some((2, 77, b"h".to_vec()))),
+            (0, b"gone".as_slice().into(), None),
+        ];
+        let f = with_full_images(&g, &images).expect("every relative op has an image");
+        assert_eq!(f.seq, g.seq);
+        assert_eq!(
+            f.ops,
+            vec![
+                Op::Put { db: 0, vtype: 1, expire_at: 5, key: b"a".as_slice().into(), value: b"abcx".to_vec() },
+                g.ops[1].clone(),
+                Op::Put { db: 1, vtype: 2, expire_at: 77, key: b"e".as_slice().into(), value: b"h".to_vec() },
+                Op::Del { db: 0, key: b"gone".as_slice().into() },
+            ]
+        );
+        // a relative op without an image (of its db) cannot be converted
+        assert!(with_full_images(&g, &images[1..]).is_none());
+        let wrong_db: Vec<(u8, Box<[u8]>, KeyImage)> =
+            images.iter().map(|(d, k, i)| (d ^ 1, k.clone(), i.clone())).collect();
+        assert!(with_full_images(&g, &wrong_db).is_none());
+    }
+
+    #[test]
+    fn the_imaging_store_reads_the_state_after_the_request() {
+        let mut m = crate::cmd::testkit::Model::default();
+        let mut im = Imaging::new(&mut m, true);
+        im.put(b"k", b"ab", VType::String, None).unwrap();
+        im.append(b"k", b"cd").unwrap();
+        im.select(2);
+        im.put(b"t", b"v", VType::String, None).unwrap();
+        im.set_expire(b"t", Some(u64::MAX / 2)).unwrap();
+        im.set_expire(b"t", Some(u64::MAX / 2)).unwrap();
+        let touched = std::mem::take(&mut im.touched);
+        assert_eq!(touched.len(), 2, "each key once");
+        let mut out = Vec::new();
+        read_images(&mut m, &touched, &mut out).unwrap();
+        assert_eq!(out[0], (0, b"k".as_slice().into(), Some((kv_storage::extent::EXT_VTYPE_STRING, 0, b"abcd".to_vec()))));
+        assert_eq!(out[1].0, 2);
+        assert_eq!(out[1].2.as_ref().map(|i| i.1), Some(u64::MAX / 2));
+        // off: nothing is remembered
+        let mut im = Imaging::new(&mut m, false);
+        im.append(b"k", b"e").unwrap();
+        assert!(im.touched.is_empty());
     }
 }

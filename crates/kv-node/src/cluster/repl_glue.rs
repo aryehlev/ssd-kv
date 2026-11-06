@@ -51,7 +51,7 @@ use super::migrate_glue::{MigIn, MigOut};
 use super::net::{ReplEvent, StreamIo};
 use super::track::Prefix;
 use super::{AgentMsg, ClusterShared, REPL_TOKEN_BIT, before, same_token};
-use crate::runtime::backend::{Backend, ReplOut, ReplWork};
+use crate::runtime::backend::{Backend, ReplOut, ReplWork, relative_op_key, with_full_images};
 use crate::runtime::exec::{CommitWaiter, Job, JobKind};
 use crate::runtime::worker::Worker;
 use crate::runtime::xmsg::ExecEnv;
@@ -687,6 +687,20 @@ impl<B: Backend> Worker<B> {
     // -----------------------------------------------------------------------------------------
     // produced groups (primary)
 
+    /// Whether partition `p`'s executions read the full state of the keys relative ops change
+    /// (`Backend::set_imaging`): it is a primary with a member in a repair or full sync, or the
+    /// source of a migration (see `cluster_group`).
+    pub(crate) fn cluster_imaging(&mut self, p: u16) -> bool {
+        self.with_cluster(|_, cw| {
+            let Some(pr) = cw.part(p) else { return false };
+            let Role::Primary(pp) = &pr.role else {
+                return false;
+            };
+            !pr.mig_out.is_empty() || pp.peers.iter().any(|x| x.direct.is_some())
+        })
+        .unwrap_or(false)
+    }
+
     /// A primary partition executed a request that produced `g`: backlog, direct feeds,
     /// migration forwards and local durability tracking. Returns the seq the reply waits for
     /// (`None`: no shard commit applies here).
@@ -699,6 +713,16 @@ impl<B: Backend> Worker<B> {
         let seed = self.backend.hash_seed(p);
         let done_now = ticket.is_none() || self.local_need().is_none();
         let boot_now = self.now.boot_ns;
+        // a relative op (APPEND, SETRANGE, EXPIRE) reaches a member in sync and a migration
+        // destination as the full state of its key, read in the same execution: their copy of
+        // the key may still be the one the sync or the copy replaces (an image or snapshot record
+        // of it follows), and the op applied to that copy would build a value this primary never
+        // held, stored at a seq the image can never replace
+        let relative = g.ops.iter().any(|o| relative_op_key(o).is_some());
+        let mut images = Vec::new();
+        if relative {
+            self.backend.take_images(&mut images);
+        }
         self.with_cluster(|_, cw| {
             let run_now = cw.run.peek(boot_now);
             let pr = cw.part(p)?;
@@ -711,6 +735,18 @@ impl<B: Backend> Worker<B> {
             let term = pp.term;
             let fps = group_fps(g, seed);
             let wide = is_wide(g);
+            // `Some(None)`: a relative op's key has no image (a member that needs the full state
+            // restarts its sync; a migration destination gets the op, which its copy applies in
+            // the source's order)
+            let full: Option<Option<(Group, Vec<u8>)>> = (relative
+                && (!pr.mig_out.is_empty() || pp.peers.iter().any(|x| x.direct.is_some())))
+            .then(|| {
+                with_full_images(g, &images).map(|fg| {
+                    let mut e = Vec::with_capacity(codec::encoded_len(&fg));
+                    codec::encode_group(&fg, &mut e);
+                    (fg, e)
+                })
+            });
             for peer in pp.peers.iter() {
                 let (Some(io), Some(d)) = (&peer.stream, &peer.direct) else {
                     continue;
@@ -721,13 +757,27 @@ impl<B: Backend> Worker<B> {
                         wide || fps.iter().any(|&(s, fp)| walk.passed(s, fp))
                     }
                 };
-                if forward {
-                    io.send(frame_bytes(&Frame::Groups(enc.clone()), p, term));
+                if !forward {
+                    continue;
+                }
+                match &full {
+                    None => io.send(frame_bytes(&Frame::Groups(enc.clone()), p, term)),
+                    Some(Some((_, e))) => io.send(frame_bytes(&Frame::Groups(e.clone()), p, term)),
+                    Some(None) => {
+                        tracing::warn!(
+                            partition = p,
+                            "a relative op's key state was not read: the member's sync restarts"
+                        );
+                        io.abort();
+                    }
                 }
             }
             let slot = group_slot(g);
             for mo in pr.mig_out.iter_mut() {
-                mo.on_group(g, &enc, slot, &fps, p, term);
+                match &full {
+                    Some(Some((fg, fe))) => mo.on_group(fg, fe, slot, &fps, p, term),
+                    _ => mo.on_group(g, &enc, slot, &fps, p, term),
+                }
             }
             pr.durable.push(g.seq, done_now);
             if !done_now && let Some(t) = ticket {

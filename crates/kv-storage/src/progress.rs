@@ -618,7 +618,7 @@ impl PartitionStore {
     }
 }
 
-fn stall_trace_ms() -> Option<u64> {
+pub(crate) fn stall_trace_ms() -> Option<u64> {
     static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MS.get_or_init(|| std::env::var("KVSSD_STALL_TRACE_MS").ok().and_then(|v| v.parse().ok()))
 }

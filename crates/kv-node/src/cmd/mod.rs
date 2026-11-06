@@ -46,7 +46,7 @@ mod pagestore_tests;
 #[cfg(test)]
 mod props;
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

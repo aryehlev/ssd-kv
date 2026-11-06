@@ -132,6 +132,9 @@ pub(crate) struct Scan {
     found: Vec<Found>,
     /// Extents of uncommitted txns to zero after recovery.
     txn_extents: Vec<(PageId, u32)>,
+    /// Pages holding older copies of a key next to its current one: rewritten after
+    /// recovery without them.
+    dup_pages: Vec<PageId>,
     /// Snapshot path: the section being assembled.
     section: Vec<u8>,
     section_left: u32,
@@ -161,6 +164,7 @@ impl Scan {
             group: 0,
             found: Vec::new(),
             txn_extents: Vec::new(),
+            dup_pages: Vec::new(),
             section: Vec::new(),
             section_left: 0,
             snap_chunkmaps: Vec::new(),
@@ -490,6 +494,15 @@ fn scan_small_page(p: &mut PartitionStore, scan: &mut Scan, page: PageId, buf: &
         let e = Entry { fp32: kh.fp32(), x8: kh.x8(), page36: page.to36(), kind: Kind::Small, vtype, sync_mark: false };
         let absent = marker || expired;
         insert_survivor(p, scan, db, slot, kh, e, v.hdr.expire_at(), absent);
+        if !absent && copies > 1 && scan.dup_pages.last() != Some(&page) {
+            // older copies of a current key next to it (a two-image update whose follow-up
+            // image was not written before the crash): nothing else zeroes them, as nothing
+            // tracks them and the page may never be written again, so the page is rewritten
+            // without them once recovery is done (what recovery read is durable: the devices
+            // were flushed at open). Left alone, every crash between an update and its
+            // follow-up image added a copy for good
+            scan.dup_pages.push(page);
+        }
         if absent && copies > 1 {
             // an absent newest copy (expired, or a committed marker) with an older valid copy
             // of the key next to it: the key's newest copy on media until the older one is
@@ -785,6 +798,13 @@ fn post_recovery(p: &mut PartitionStore, cx: &mut StorageCtx<'_>, scan: &mut Sca
                     p.core.ext.zeros.entry(page).or_insert(crate::partition::ExtZero::pending(n_pages, ZeroWhy::Stale { db, key }));
                 }
             }
+        }
+    }
+    // older in-page copies of current keys: a scrub build drops them (loaded, the page's
+    // lower-seq copies of a key are superseded)
+    for page in core::mem::take(&mut scan.dup_pages) {
+        if !p.core.prior_txn_pages.contains(&page) {
+            p.load_page(cx, page, None, true);
         }
     }
     // records of txns that never committed: zeroed unpaced, then reported (E10)

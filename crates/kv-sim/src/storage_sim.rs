@@ -7834,6 +7834,175 @@ step crash kill sectors 8
 step crash power bytes 0
 "#,
     ),
+    (
+        "older_in_page_copies_of_a_live_key_after_two_crashes",
+        r#"kv-sim storage case 1
+seed 865275
+# minimized from 399 to 127 steps in 61 s (two-image wb lba512 Flushed p16); original: I11 step=399 [expired-leftover] :: 1 key(s) violate the copy bounds after the final quiesce: |   db 0 key 11 (live) has 3 valid copies on media: ["page 0x2e78a@seq0x3000003 txn 0 deadline None", "page 0x2e78a@seq0x2000001 txn 0 deadline None", "page 0x2e78a@seq0x3000004 txn 0 deadline None"]
+# matrix cell: two-image wb lba512 Flushed p16
+fail I11 127 expired-leftover
+# 1 key(s) violate the copy bounds after the final quiesce:
+#   db 0 key 11 (live) has 3 valid copies on media: ["page 0x2d3a0@seq0x2 txn 0 deadline None", "page 0x2d3a0@seq0x1000001 txn 0 deadline None", "page 0x2d3a0@seq0x1000003 txn 0 deadline None"]
+cfg partitions 16
+cfg devices 1
+cfg ags 49
+cfg lba 512
+cfg page_mode two-image
+cfg atomic_unit 512
+cfg cache wb
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 16777216
+cfg fill_pct 95
+cfg snapshot 1
+cfg keys 156
+cfg groups 26
+cfg dbs 1
+cfg profile mixed
+cfg steps 398
+cfg rounds 5
+cfg tick_permille 120
+cfg delay_max 32
+cfg late_pct 20
+cfg skip_pct 0
+cfg per_poll 1
+cfg shuffle 1
+cfg tick_ms 1
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd msetnx 0 113:75,35:1481
+step cmd get 0 91
+step ticks 1
+step cmd getdel 0 13
+step cmd get 0 9
+step cmd getdel 0 12
+step cmd expire 0 6 - 1
+step cmd del 0 98,124
+step ticks 1
+step cmd get 0 89
+step cmd flush 0
+step cmd set 0 13 47010 - nx 0 0
+step cmd set 0 4 829 - - 0 0
+step cmd rename 0 153 153 0
+step cmd rename 0 56 108 1
+step ticks 1
+step ticks 5
+step cmd del 0 80,54,28
+step ticks 5
+step cmd set 0 15 25 - - 0 0
+step cmd set 0 11 25 - - 1 0
+step cmd set 0 2 1944 r70002420 nx 0 1
+step cmd setrange 0 154 385 158
+step cmd setrange 0 31 795 244
+step cmd setrange 0 9 333 281
+step cmd del 0 83,57
+step cmd set 0 9 16 r3607 - 0 0
+step cmd set 0 27 1340 - - 0 0
+step cmd set 0 139 2062 - - 0 0
+step cmd set 0 10 564 r2243 - 0 0
+step cmd get 0 68
+step ticks 6
+step cmd set 0 103 786 - nx 0 0
+step cmd meta 0 16
+step cmd rename 0 6 110 1
+step cmd set 0 6 926 r160 nx 0 0
+step cmd del 0 46
+step cmd append 0 1 84660
+step cmd set 0 5 3576 r3015 xx 0 0
+step cmd msetnx 0 4:926234,56:306,56:748,4:753
+step ticks 1
+step ticks 4
+step cmd set 0 81 3548 - - 1 0
+step cmd get 0 67
+step cmd get 0 8
+step cmd getdel 0 113
+step cmd del 0 42,94
+step cmd append 0 16 226
+step cmd setrange 0 90 951 586
+step cmd set 0 87 23 r3412 - 0 0
+step cmd expire 0 8 - 0
+step ticks 1
+step cmd set 0 60 1914 - - 0 0
+step cmd set 0 45 307 - - 0 0
+step cmd set 0 135 1929 - - 0 0
+step cmd setrange 0 77 369 209
+step ticks 29
+step cmd set 0 18 2790 r3831 - 0 1
+step cmd expire 0 4 - 0
+step cmd del 0 55
+step cmd meta 0 96
+step cmd expire 0 123 - 0
+step cmd expire 0 119 - 0
+step cmd set 0 10 270 r13 - 0 0
+step cmd set 0 56 99 - nx 0 0
+step cmd set 0 15 743 - nx 0 0
+step cmd append 0 125 121
+step cmd set 0 126 3916 r32 - 0 0
+step cmd set 0 24 636 - xx 0 0
+step cmd scan 0 1 28
+step cmd get 0 53
+step cmd append 0 1 130
+step ticks 3
+step ticks 8
+step cmd get 0 128
+step cmd append 0 87 91
+step crash power prefix 0
+step cmd getdel 0 3
+step cmd set 0 92 1069 r839 - 0 1
+step cmd set 0 8 119 - - 0 0
+step cmd set 0 6 2023 - - 1 0
+step cmd set 0 5 3191 r18 - 1 0
+step ticks 3
+step cmd set 0 85 464 r2107 xx 0 0
+step cmd del 0 129,129
+step cmd set 0 127 2021 r1198 - 0 0
+step cmd setrange 0 10 795 240
+step cmd set 0 9 245 - - 0 0
+step cmd set 0 10 15 - - 0 0
+step cmd get 0 10
+step cmd persist 0 5
+step cmd del 0 17
+step cmd set 0 153 17 r141 - 0 0
+step cmd set 0 2 13 r83931183 - 0 0
+step ticks 1
+step cmd scan 0 15 25
+step cmd set 0 16 19 - - 0 1
+step cmd get 0 121
+step cmd setrange 0 10 924 280
+step cmd set 0 11 2230 r2914 nx 0 0
+step cmd rename 0 17 95 0
+step cmd del 0 0
+step cmd set 0 6 3 - - 0 0
+step cmd append 0 11 99
+step ticks 3
+step ticks 1
+step cmd append 0 36 165
+step ticks 25
+step cmd append 0 120 145
+step cmd set 0 2 4054 - xx 0 0
+step cmd get 0 3
+step cmd set 0 1 712 r41170506 - 0 0
+step cmd set 0 141 256 r100 - 0 0
+step cmd set 0 11 216 - xx 0 0
+step cmd set 0 21 8265187 - - 0 0
+step cmd mset 0 10:4580772,114:845844,114:969,114:49404
+step cmd get 0 123
+step clock 234
+step cmd expire 0 16 r470 0
+step cmd set 0 11 2625 - - 0 0
+step ticks 7
+step cmd set 0 7 8680171 r40 - 0 0
+step cmd get 0 10
+step cmd get 0 31
+step crash power sectors 0
+step cmd set 0 77 7 - - 0 0
+step cmd expire 0 126 - 1
+"#,
+    ),
 ];
 
 /// Replays a case text.

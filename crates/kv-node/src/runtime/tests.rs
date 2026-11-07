@@ -692,3 +692,57 @@ fn multi_key_writes_without_a_credit_are_refused_in_bounded_time() {
     let v: String = redis::cmd("GET").arg(&a).query(&mut c).unwrap();
     assert_eq!(v, "z");
 }
+
+/// Cross-partition transactions on overlapping and disjoint keys from many connections, with
+/// single-key writes and reads of the same partitions in between: every request completes,
+/// and each MSET of a pair of keys leaves both keys with the same value (a transaction holds
+/// only its keys; conflicting ones run in the order they took the gate).
+#[test]
+fn concurrent_transactions_on_shared_partitions_complete_atomically() {
+    let n = TestNode::start(4, |_| {});
+    let port = n.port;
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..12).map(|i| (format!("{{x{i}}}a").into_bytes(), format!("{{y{i}}}b").into_bytes())).collect();
+    let pairs = Arc::new(pairs);
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let pairs = pairs.clone();
+            std::thread::spawn(move || {
+                let mut c = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap().get_connection().unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut r = t as u64 * 7919 + 1;
+                for i in 0..300 {
+                    r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let (a, b) = &pairs[(r >> 33) as usize % pairs.len()];
+                    let v = format!("{t}-{i}");
+                    match (r >> 20) % 4 {
+                        0 | 1 => {
+                            let _: () = redis::cmd("MSET").arg(a).arg(&v).arg(b).arg(&v).query(&mut c).unwrap();
+                        }
+                        2 => {
+                            // a pipeline: a single-key write of another key of the partition
+                            // between two transactions
+                            let (a2, b2) = &pairs[(r >> 40) as usize % pairs.len()];
+                            let _: ((), (), ()) = redis::pipe()
+                                .cmd("MSET").arg(a).arg(&v).arg(b).arg(&v)
+                                .cmd("SET").arg(format!("solo{t}")).arg(&v)
+                                .cmd("MSET").arg(a2).arg(&v).arg(b2).arg(&v)
+                                .query(&mut c)
+                                .unwrap();
+                        }
+                        _ => {
+                            let _: Vec<Option<String>> = redis::cmd("MGET").arg(a).arg(b).query(&mut c).unwrap();
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let mut c = n.client();
+    for (a, b) in pairs.iter() {
+        let got: Vec<Option<String>> = redis::cmd("MGET").arg(a).arg(b).query(&mut c).unwrap();
+        assert_eq!(got[0], got[1], "every MSET applied both keys together");
+    }
+}

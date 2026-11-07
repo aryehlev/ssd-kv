@@ -121,6 +121,10 @@ struct Coord {
     credit: Option<CreditGuard>,
     /// The `Lock` messages went out (the gate served the transaction).
     started: bool,
+    /// The transaction holds the gate: from its turn until every part registered its `Lock`.
+    gate: bool,
+    /// Parts that answered `Registered`.
+    registered: usize,
     /// The connection stopped parsing until then (`Hold::Order`).
     holds_conn: bool,
 }
@@ -137,9 +141,88 @@ enum Held {
 struct PartHold {
     xtxn: u64,
     coord: u16,
-    queue: VecDeque<HoldItem>,
+    /// The keys the transaction locked in the partition (key bytes, any database).
+    keys: SmallVec<[Box<[u8]>; 4]>,
     /// The part's `Apply` failed at exec (it staged nothing; an abort has nothing to undo).
     apply_failed: bool,
+}
+
+/// The cross-partition transactions holding keys of one partition, and what waits for them
+/// (§6.8 step 2). A transaction holds only its keys: a request whose keys are disjoint from
+/// every holder's and from everything queued goes in at once. Holding the whole partition made
+/// every request of a partition wait for each transaction touching it, and with the gate
+/// released only at the end of a transaction, every cross-partition write of the node waited
+/// for all earlier ones (about 1.8 ms each), so a few hundred concurrent MSETs waited seconds.
+#[derive(Default)]
+struct PartHolds {
+    holders: SmallVec<[PartHold; 2]>,
+    /// FIFO: an item waits while it conflicts with a holder or with an item ahead of it.
+    queue: VecDeque<HoldItem>,
+}
+
+/// What an item of a hold queue touches.
+enum Footprint<'a> {
+    /// Keyless requests (FLUSHDB, barriers, SCAN steps, ...): every key.
+    All,
+    Keys(SmallVec<[&'a [u8]; 4]>),
+}
+
+impl Footprint<'_> {
+    fn meets(&self, keys: &[&[u8]]) -> bool {
+        match self {
+            Footprint::All => true,
+            Footprint::Keys(k) => k.iter().any(|a| keys.contains(a)),
+        }
+    }
+}
+
+impl HoldItem {
+    fn footprint(&self) -> Footprint<'_> {
+        match self {
+            HoldItem::Job(req, _) => request_footprint(req),
+            HoldItem::Lock(XTxnMsg::Lock { keys, .. }) => Footprint::Keys(keys.iter().map(|k| &*k.key).collect()),
+            HoldItem::Lock(_) => Footprint::All,
+        }
+    }
+
+    fn conn(&self) -> Option<ConnRef> {
+        match self {
+            HoldItem::Job(_, job) => job.to.map(|t| t.conn),
+            HoldItem::Lock(_) => None,
+        }
+    }
+}
+
+fn request_footprint(req: &Request) -> Footprint<'_> {
+    match req.kind {
+        ReqKind::Keyed | ReqKind::Txn { .. } if !req.keys.is_empty() => Footprint::Keys(req.keys.iter().map(|(k, _)| &**k).collect()),
+        _ => Footprint::All,
+    }
+}
+
+impl PartHolds {
+    fn holder(&self, xtxn: u64) -> Option<&PartHold> {
+        self.holders.iter().find(|h| h.xtxn == xtxn)
+    }
+
+    /// Whether an item touching `fp` (sent by connection `conn`) must wait: it conflicts with
+    /// a holder, with a queued item (per-key FIFO; keyless items keep strict FIFO), or an
+    /// earlier command of its connection waits (a connection's commands reach a partition in
+    /// order, §6.6).
+    fn must_wait(&self, queued: &VecDeque<HoldItem>, fp: &Footprint<'_>, conn: Option<ConnRef>) -> bool {
+        let keys: SmallVec<[&[u8]; 4]> = match fp {
+            Footprint::All => return !self.holders.is_empty() || !queued.is_empty(),
+            Footprint::Keys(k) => k.clone(),
+        };
+        if self.holders.iter().any(|h| h.keys.iter().any(|k| keys.contains(&&**k))) {
+            return true;
+        }
+        queued.iter().any(|q| (conn.is_some() && q.conn() == conn) || q.footprint().meets(&keys))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.holders.is_empty() && self.queue.is_empty()
+    }
 }
 
 /// A cross-partition transaction given up after its parts were sent `Apply` (coordinator
@@ -187,7 +270,7 @@ pub struct ExecState {
     pub outbox: Vec<VecDeque<XMsg>>,
     /// Messages to this worker itself (handled in the next drain, never re-entrantly).
     pub local: VecDeque<XMsg>,
-    holds: hashbrown::HashMap<u16, PartHold, foldhash::fast::RandomState>,
+    holds: hashbrown::HashMap<u16, PartHolds, foldhash::fast::RandomState>,
     coords: hashbrown::HashMap<u64, Coord, foldhash::fast::RandomState>,
     aborting: hashbrown::HashMap<u64, Aborting, foldhash::fast::RandomState>,
     gate_q: VecDeque<u64>,
@@ -1353,10 +1436,10 @@ impl<B: Backend> Worker<B> {
         }
         if let Some(h) = self.x.holds.get_mut(&p) {
             let own = match &job.kind {
-                JobKind::Lock { xtxn, .. } | JobKind::Apply { xtxn, .. } => *xtxn == h.xtxn,
+                JobKind::Lock { xtxn, .. } | JobKind::Apply { xtxn, .. } => h.holder(*xtxn).is_some(),
                 _ => false,
             };
-            if !own {
+            if !own && h.must_wait(&h.queue, &request_footprint(&req), job.to.map(|t| t.conn)) {
                 h.queue.push_back(HoldItem::Job(req, job));
                 return;
             }
@@ -1700,9 +1783,7 @@ impl<B: Backend> Worker<B> {
                 self.send(coord, XMsg::XTxn(XTxnMsg::Locked { xtxn, partition: p, reads: Err(e) }));
             }
             JobKind::Apply { xtxn, coord, .. } => {
-                if let Some(h) = self.x.holds.get_mut(&p)
-                    && h.xtxn == xtxn
-                {
+                if let Some(h) = self.x.holds.get_mut(&p).and_then(|h| h.holders.iter_mut().find(|h| h.xtxn == xtxn)) {
                     h.apply_failed = true;
                 }
                 self.send(coord, XMsg::XTxn(XTxnMsg::Applied { xtxn, partition: p, res: Err(e) }));
@@ -1827,7 +1908,7 @@ impl<B: Backend> Worker<B> {
         // the gate ticket is taken only for a transaction that will run (it must be released
         // in turn)
         coord.ticket = self.shared.xtxn.ticket();
-        self.x.coords.insert(xtxn, Coord { coord, to, start_ns: self.now.mono_ns, credit, started: false, holds_conn: false });
+        self.x.coords.insert(xtxn, Coord { coord, to, start_ns: self.now.mono_ns, credit, started: false, gate: false, registered: 0, holds_conn: false });
         self.x.gate_q.push_back(xtxn);
         self.poll_gate();
         match self.x.coords.get_mut(&xtxn) {
@@ -1854,6 +1935,9 @@ impl<B: Backend> Worker<B> {
             if c.coord.partitions().next().is_none() {
                 self.xtxn_step(xtxn, |c| c.abort(b"ERR internal: empty transaction"));
                 continue;
+            }
+            if let Some(c) = self.x.coords.get_mut(&xtxn) {
+                c.gate = true;
             }
             self.xtxn_step(xtxn, |c| c.start(me));
             // the locks are on their way: the connection's later commands queue behind them
@@ -1886,6 +1970,19 @@ impl<B: Backend> Worker<B> {
             self.on_xtxn(m);
         } else {
             self.send(dst, XMsg::XTxn(m));
+        }
+    }
+
+    /// A part of transaction `xtxn` registered its `Lock`: after the last one the gate goes to
+    /// the next transaction. The gate orders only the entry into the partitions' lock queues
+    /// (see `crate::dispatch::xtxn`).
+    fn xtxn_registered(&mut self, xtxn: u64) {
+        let Some(c) = self.x.coords.get_mut(&xtxn) else { return };
+        c.registered += 1;
+        if c.gate && c.registered >= c.coord.lock_count() {
+            c.gate = false;
+            self.shared.xtxn.release(c.coord.ticket);
+            self.shared.wake_all();
         }
     }
 
@@ -1930,8 +2027,10 @@ impl<B: Backend> Worker<B> {
                         self.xtxn_send(p, m);
                     }
                     let Some(c) = self.x.coords.remove(&xtxn) else { return };
-                    self.shared.xtxn.release(c.coord.ticket);
-                    self.shared.wake_all();
+                    if c.gate {
+                        self.shared.xtxn.release(c.coord.ticket);
+                        self.shared.wake_all();
+                    }
                     self.record(c.coord.cmd.id, c.start_ns, reply.first() == Some(&b'-'));
                     self.deliver(c.to, ReplyBody::Bytes(reply));
                     return;
@@ -1943,26 +2042,18 @@ impl<B: Backend> Worker<B> {
     fn on_xtxn(&mut self, m: XTxnMsg) {
         match m {
             XTxnMsg::Lock { xtxn, from, partition, db, keys } => {
-                if let Some(h) = self.x.holds.get_mut(&partition)
-                    && h.xtxn != xtxn
-                {
-                    // the previous transaction still holds the partition
+                let h = self.x.holds.entry(partition).or_default();
+                let wait = h.must_wait(&h.queue, &Footprint::Keys(keys.iter().map(|k| &*k.key).collect()), None);
+                if wait {
+                    // a transaction holding some of these keys, or a request waiting for one
                     h.queue.push_back(HoldItem::Lock(XTxnMsg::Lock { xtxn, from, partition, db, keys }));
-                    return;
+                } else {
+                    self.lock_part(xtxn, from, partition, db, keys);
                 }
-                self.x.holds.insert(partition, PartHold { xtxn, coord: from, queue: VecDeque::new(), apply_failed: false });
-                let req = Request {
-                    db,
-                    keys: keys.iter().map(|k| (k.key.clone(), k.access)).collect(),
-                    kind: ReqKind::Keyed,
-                    origin: Origin::Client,
-                };
-                let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 };
-                let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Lock { xtxn, coord: from, keys }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
-                self.submit_job(partition, req, job);
+                self.send(from, XMsg::XTxn(XTxnMsg::Registered { xtxn }));
             }
             XTxnMsg::Apply { xtxn, txn_id, partition, ops } => {
-                let coord = self.x.holds.get(&partition).map_or(xtxn_worker(xtxn), |h| h.coord);
+                let coord = self.x.holds.get(&partition).and_then(|h| h.holder(xtxn)).map_or(xtxn_worker(xtxn), |h| h.coord);
                 let db = ops.iter().find_map(op_db).unwrap_or(0);
                 let keys = ops.iter().filter_map(op_key).map(|k| (Box::<[u8]>::from(k), kv_cmd::Access::Write)).collect();
                 let req = Request { db, keys, kind: ReqKind::Txn { txn_id }, origin: Origin::Client };
@@ -1978,7 +2069,7 @@ impl<B: Backend> Worker<B> {
             XTxnMsg::Abort { xtxn, txn_id, partition } => {
                 // undone before the hold goes: the requests queued behind it see the keys'
                 // previous versions (a failed RENAME keeps its source)
-                let (coord, failed) = self.x.holds.get(&partition).filter(|h| h.xtxn == xtxn).map_or((xtxn_worker(xtxn), false), |h| (h.coord, h.apply_failed));
+                let (coord, failed) = self.x.holds.get(&partition).and_then(|h| h.holder(xtxn)).map_or((xtxn_worker(xtxn), false), |h| (h.coord, h.apply_failed));
                 let ticket = if failed { None } else { self.backend.abort_txn(partition, self.now, txn_id) };
                 match ticket {
                     Some(t) => self.wait(partition, t.0, Waiter { what: WaitFor::Abort { xtxn, coord, partition }, need: Need::Durable }),
@@ -1993,6 +2084,7 @@ impl<B: Backend> Worker<B> {
                 self.release_hold(partition, xtxn);
             }
             XTxnMsg::Aborted { xtxn, ok, .. } => self.part_aborted(xtxn, ok),
+            XTxnMsg::Registered { xtxn } => self.xtxn_registered(xtxn),
             XTxnMsg::Locked { xtxn, partition, reads } => self.xtxn_step(xtxn, |c| c.on_locked(partition, reads)),
             XTxnMsg::Applied { xtxn, partition, res } => self.xtxn_step(xtxn, |c| c.on_applied(partition, res)),
         }
@@ -2017,16 +2109,67 @@ impl<B: Backend> Worker<B> {
         self.backend.meta_request(p, WORKER_TOKEN_BIT | xtxn, MetaReq::TxnAborted { txn: a.txn_id });
     }
 
-    /// Ends transaction `xtxn`'s hold of `p`: what arrived meanwhile goes in, in order (a
-    /// later transaction's `Lock` takes the partition at its place in that order).
+    /// Transaction `xtxn` takes its keys of `partition` (nothing conflicting holds or waits)
+    /// and reads them.
+    fn lock_part(&mut self, xtxn: u64, from: u16, partition: u16, db: u8, keys: SmallVec<[LockKey; 4]>) {
+        let h = self.x.holds.entry(partition).or_default();
+        h.holders.push(PartHold { xtxn, coord: from, keys: keys.iter().map(|k| k.key.clone()).collect(), apply_failed: false });
+        let req = Request { db, keys: keys.iter().map(|k| (k.key.clone(), k.access)).collect(), kind: ReqKind::Keyed, origin: Origin::Client };
+        let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 };
+        let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Lock { xtxn, coord: from, keys }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
+        let id = self.backend.submit(partition, self.now, req);
+        self.x.jobs.insert((partition, id.0), job);
+    }
+
+    /// Ends transaction `xtxn`'s hold of `p`: what waited for it goes in, in order (an item
+    /// that still conflicts with a holder or with an item ahead of it keeps waiting; a later
+    /// transaction's `Lock` takes its keys at its place in that order).
     fn release_hold(&mut self, p: u16, xtxn: u64) {
-        if self.x.holds.get(&p).is_none_or(|h| h.xtxn != xtxn) {
+        let Some(mut h) = self.x.holds.remove(&p) else { return };
+        if let Some(i) = h.holders.iter().position(|x| x.xtxn == xtxn) {
+            h.holders.remove(i);
+        } else if let Some(i) = h.queue.iter().position(|q| matches!(q, HoldItem::Lock(XTxnMsg::Lock { xtxn: x, .. }) if *x == xtxn)) {
+            // the transaction ended (another part failed) while this `Lock` still waited: it
+            // must never take the keys later, nothing would release them
+            h.queue.remove(i);
+        } else {
+            self.x.holds.insert(p, h);
             return;
         }
-        let Some(h) = self.x.holds.remove(&p) else { return };
-        for item in h.queue {
+        let queue = std::mem::take(&mut h.queue);
+        let mut kept: VecDeque<HoldItem> = VecDeque::new();
+        let mut go: Vec<HoldItem> = Vec::new();
+        for item in queue {
+            // items ahead that go in now are submitted before this one (in order)
+            let wait = h.must_wait(&kept, &item.footprint(), item.conn());
+            if wait {
+                kept.push_back(item);
+                continue;
+            }
+            if let HoldItem::Lock(XTxnMsg::Lock { xtxn, from, keys, .. }) = &item {
+                // later items see its keys held
+                h.holders.push(PartHold { xtxn: *xtxn, coord: *from, keys: keys.iter().map(|k| k.key.clone()).collect(), apply_failed: false });
+            }
+            go.push(item);
+        }
+        h.queue = kept;
+        if !h.is_empty() {
+            self.x.holds.insert(p, h);
+        }
+        for item in go {
             match item {
-                HoldItem::Job(req, job) => self.submit_job(p, req, job),
+                HoldItem::Job(req, job) => {
+                    let id = self.backend.submit(p, self.now, req);
+                    self.x.jobs.insert((p, id.0), job);
+                }
+                HoldItem::Lock(XTxnMsg::Lock { xtxn, from, partition, db, keys }) => {
+                    // its holder entry is in place: submit its read
+                    let req = Request { db, keys: keys.iter().map(|k| (k.key.clone(), k.access)).collect(), kind: ReqKind::Keyed, origin: Origin::Client };
+                    let env = ExecEnv { proto: kv_resp::Proto::Resp2, db, now_ms: self.now.unix_ms, readonly_conn: false, conn_id: 0, watch: 0 };
+                    let job = Job { to: None, id: CmdId::Mset, kind: JobKind::Lock { xtxn, coord: from, keys }, env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
+                    let id = self.backend.submit(partition, self.now, req);
+                    self.x.jobs.insert((partition, id.0), job);
+                }
                 HoldItem::Lock(m) => self.on_xtxn(m),
             }
         }

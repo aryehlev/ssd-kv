@@ -1,11 +1,19 @@
 //! Standalone cross-partition transactions (DESIGN §6.8, §14.6, LC-37).
 //!
 //! 1. The coordinating worker (the one that received the command) takes the node-global
-//!    `XTxnGate` (one XTxn at a time; a conflict lock, not load control). The txn credit was
-//!    reserved before the command was consumed (§6.7).
-//! 2. `Lock { keys }` (key bytes only) to each involved partition: it stops admitting new
-//!    requests (queued FIFO), lets already-ready requests finish, prefetches the keys, replies
-//!    `Locked`.
+//!    `XTxnGate` (a conflict lock, not load control): one XTxn enters the partitions' lock
+//!    order at a time, and it gives the gate up once every part answered `Registered` (its
+//!    `Lock` holds its keys or waits in FIFO order behind what conflicts with it). Every
+//!    partition then orders any two conflicting transactions the same way (the order in which
+//!    they held the gate), so none waits for another that waits for it, and transactions on
+//!    disjoint keys read, write and commit concurrently (the meta thread batches their
+//!    commits). Holding the gate to the end serialized every cross-partition write of the
+//!    node (about 1.8 ms each): a few hundred concurrent MSETs waited for seconds. The txn
+//!    credit was reserved before the command was consumed (§6.7).
+//! 2. `Lock { keys }` (key bytes only) to each involved partition: the transaction holds those
+//!    keys (requests touching one of them, keyless requests, and what queues behind them wait
+//!    in FIFO order; requests on other keys go on), the partition prefetches the keys and
+//!    replies `Locked`.
 //! 3. `Read`: values and metas the command needs (MSETNX existence, RENAME source value).
 //! 4. A txn id is taken and `Apply { txn_id, ops }` is sent; partitions stage TXN-flagged
 //!    records and report when their writes are durable.
@@ -100,6 +108,10 @@ pub struct LockKey {
 pub enum XTxnMsg {
     /// Lock the partition for transaction `xtxn` of worker `from` and read what `keys` ask.
     Lock { xtxn: u64, from: u16, partition: u16, db: u8, keys: SmallVec<[LockKey; 4]> },
+    /// The partition took the `Lock` in its order of transactions (its keys are held, or it
+    /// waits behind what holds or waits for them): from now on no later transaction gets
+    /// ahead of this one on those keys.
+    Registered { xtxn: u64 },
     /// The partition is locked; one read per key of the `Lock`, in order.
     Locked { xtxn: u64, partition: u16, reads: Result<Vec<KeyRead>, StoreError> },
     /// Stage `ops` as TXN-flagged records of `txn_id`.
@@ -510,6 +522,16 @@ impl XTxnCoord {
         let mut out = Vec::new();
         kv_resp::ReplyWriter::new(&mut out, self.env.proto).error(msg);
         self.finish_unlocked(out)
+    }
+
+    /// Every part is locked (or the transaction ended).
+    pub fn locked(&self) -> bool {
+        self.phase != Phase::Locking
+    }
+
+    /// Number of `Lock` messages the transaction sends (one per part).
+    pub fn lock_count(&self) -> usize {
+        self.parts.len()
     }
 
     /// Whether the transaction finished.

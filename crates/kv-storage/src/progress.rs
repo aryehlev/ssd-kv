@@ -29,6 +29,7 @@
 //! | barrier ticket (SAVE, SHUTDOWN drain) | the effects, open txns and tracked copies present when it executed | one dependency on each (ticket lists, `OpenTxn::barriers`, watched `stale` entries) | their events; later work never extends it |
 //! | txn (fx ticket durable) | its `COMMITTED` listing | `meta_wait` (FIFO) | `on_meta_done` |
 //! | XTxn part request (`parked`) | the build of a staged effect of its key (a part never cancels one) | `part_wait` | the end of every tick |
+//! | request (`parked`, refused space during a FLUSHDB reclaim) | space the reclaim frees | `reclaim_wait` (only while `reclaim_pending`; `-OOM` after `SPACE_WAIT_NS`) | `tick`: every `RECLAIM_RECHECK_NS`, after a dead run's zeroing is durable, and when the reclaim ends |
 //! | abort ticket of an XTxn part | every page / extent still holding a record of the txn | `aborting` items (one dependency each) | `abort_progress` each tick: scrub builds, zeroing of the part's extents once written |
 //!
 //! Two rules make the table hold under every interleaving: (1) a waiter is registered before the
@@ -94,6 +95,9 @@ pub enum WaitFor {
     /// An XTxn part request: the staged effects of its keys are built at the next tick
     /// (`Core::part_wait`).
     PartBuild,
+    /// A write refused space while a FLUSHDB reclaim gives space back (`Core::reclaim_wait`):
+    /// it tries again within `RECLAIM_RECHECK_NS` and is answered `-OOM` after `SPACE_WAIT_NS`.
+    Reclaim,
 }
 
 /// A non-terminal item of the partition.
@@ -206,6 +210,9 @@ impl PartitionStore {
             }
             if self.core.part_wait.contains(&id) {
                 w.push(WaitFor::PartBuild);
+            }
+            if self.core.reclaim_wait.contains(&id) {
+                w.push(WaitFor::Reclaim);
             }
         }
         if r.blocked
@@ -352,7 +359,7 @@ impl PartitionStore {
             if !r.queued && kq != r.waits {
                 return fail(format!("request {i} counts {} key queues ahead, {kq} found", r.waits));
             }
-            if r.parked && !waits.iter().any(|w| matches!(w, WaitFor::AgGrant | WaitFor::AgRelease | WaitFor::SeqReservation | WaitFor::PartBuild)) {
+            if r.parked && !waits.iter().any(|w| matches!(w, WaitFor::AgGrant | WaitFor::AgRelease | WaitFor::SeqReservation | WaitFor::PartBuild | WaitFor::Reclaim)) {
                 return fail(format!("request {i} is parked with no AG request or seq reservation outstanding"));
             }
         }
@@ -490,6 +497,7 @@ impl PartitionStore {
             ("deletes waiting for older copies", c.gone_wait.len()),
             ("requests parked on space", c.space_wait.len()),
             ("requests parked on seqs", c.seq_wait.len()),
+            ("requests waiting for a FLUSHDB reclaim", c.reclaim_wait.len()),
             ("held txn requests", self.reqs.held.len()),
             ("tracked copies", c.stale.len()),
             ("absent copies to retire", c.retire.len()),

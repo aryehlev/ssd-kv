@@ -661,6 +661,15 @@ pub(crate) struct Core {
     /// part never cancels another write's staged effect, `crate::abort`); woken after the
     /// builds of every tick.
     pub(crate) part_wait: Vec<ReqId>,
+    /// Writes refused space while a FLUSHDB reclaim is under way here (`Core::reclaim_pending`):
+    /// the flushed records' space is coming back, so they wait for it (bounded by
+    /// `SPACE_WAIT_NS`); woken when reclaimed space is freed, when the reclaim ends, and every
+    /// `RECLAIM_RECHECK_NS` (a page the walk loaded may have room now).
+    pub(crate) reclaim_wait: Vec<ReqId>,
+    /// When the requests in `reclaim_wait` try again at the latest.
+    pub(crate) reclaim_recheck_ns: u64,
+    /// FLUSHDB reclaim header reads in flight.
+    pub(crate) reclaim_reads: u32,
     /// Cross-partition txns aborted before their part was applied here: the `Apply` is refused.
     pub(crate) aborted: HashSet<u64, foldhash::fast::FixedState>,
     /// Aborted txn parts whose records are not durably gone yet (§14.6 step 6).
@@ -728,6 +737,19 @@ impl WatchSet {
 impl Core {
     pub(crate) fn crc(&self) -> RecordCrc {
         self.cfg.crc
+    }
+
+    /// True while a FLUSHDB of one db is giving space back here: its cutoff is not durable yet,
+    /// or its reclaim walk has pages or extent headers left to read, or dead runs it found are
+    /// being zeroed (each frees its run once durable). Every part is finite: the meta thread
+    /// answers, the walk advances every tick it is wanted (urgent while writes wait), I/O
+    /// completes.
+    pub(crate) fn reclaim_pending(&self) -> bool {
+        !self.reclaim_ext.is_empty()
+            || !self.reclaim_pages.is_empty()
+            || self.reclaim_reads > 0
+            || self.meta_wait.iter().any(|w| matches!(w, MetaWait::Cutoff { all: false, .. }))
+            || self.ext.zeros.values().any(|z| matches!(z.why, ZeroWhy::Dead))
     }
 
     pub(crate) fn take_buf(&mut self, len: usize) -> AlignedBuf {
@@ -1116,6 +1138,9 @@ impl PartitionStore {
             older_pages: Vec::new(),
             txn_inherit: Vec::new(),
             part_wait: Vec::new(),
+            reclaim_wait: Vec::new(),
+            reclaim_recheck_ns: 0,
+            reclaim_reads: 0,
             aborted: HashSet::with_hasher(Default::default()),
             aborting: Vec::new(),
             scratch_pos: Vec::new(),
@@ -1166,6 +1191,7 @@ impl PartitionStore {
             && self.core.gone_wait.is_empty()
             && self.core.aborting.is_empty()
             && self.core.part_wait.is_empty()
+            && self.core.reclaim_wait.is_empty()
             && self.reqs.live == 0
     }
 
@@ -1780,6 +1806,24 @@ impl PartitionStore {
                         self.requeue(id, r);
                         ExecStatus::Requeued
                     }
+                    Commit::Reclaim => {
+                        let now_ns = cx.now.mono_ns;
+                        let (since, _) = *r.space_since.get_or_insert((now_ns, self.core.alloc.refusals()));
+                        if now_ns.saturating_sub(since) >= SPACE_WAIT_NS {
+                            // the reclaim did not give back enough in time: `-OOM` in bounded time
+                            self.core.counters.space_wait_timeouts += 1;
+                            self.finish(cx.cache, id, r);
+                            return ExecStatus::Failed(StoreError::OutOfSpace);
+                        }
+                        r.parked = true;
+                        r.parks += 1;
+                        if self.core.reclaim_wait.is_empty() {
+                            self.core.reclaim_recheck_ns = now_ns + RECLAIM_RECHECK_NS;
+                        }
+                        self.core.reclaim_wait.push(id);
+                        self.requeue(id, r);
+                        ExecStatus::Requeued
+                    }
                     Commit::Seq => {
                         r.parked = true;
                         self.core.seq_wait.push(id);
@@ -1825,6 +1869,9 @@ fn page_ref_need(pr: &PageRef) -> Need {
 /// How long a write waits for space after a refusal before it is answered `-OOM`.
 pub(crate) const SPACE_WAIT_NS: u64 = 500_000_000;
 
+/// How often writes waiting for a FLUSHDB reclaim try again at the latest.
+pub(crate) const RECLAIM_RECHECK_NS: u64 = 5_000_000;
+
 /// Outcome of a commit attempt.
 enum Commit {
     Done(ExecOut),
@@ -1832,6 +1879,8 @@ enum Commit {
     Need(SmallVec<[Need; 2]>),
     /// Waiting for an AG from the meta thread.
     Park,
+    /// Refused space while a FLUSHDB reclaim of this partition is under way (`reclaim_wait`).
+    Reclaim,
     /// Waiting for a seq reservation (E12) or a txn id.
     Seq,
     /// An XTxn part waiting for the staged effects of its keys to be built (`crate::abort`).
@@ -2059,6 +2108,13 @@ impl PartitionStore {
             if !self.core.alloc.reserve_refused(kind, cx.now.mono_ns) && self.core.alloc.want_reserved(kind) {
                 return Err(Commit::Park);
             }
+        }
+        if matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && self.core.reclaim_pending() {
+            // a FLUSHDB of this partition is giving the flushed records' space back (its
+            // reclaim walk starts once the cutoff is durable, which is also when the FLUSHDB is
+            // answered): writes sent right after the reply got `-OOM` on a device the flush had
+            // just emptied, so they wait for the reclaim instead (bounded by SPACE_WAIT_NS)
+            return Err(Commit::Reclaim);
         }
         r
     }
@@ -3860,6 +3916,9 @@ impl PartitionStore {
     }
 
     fn header_read_done(&mut self, cx: &mut StorageCtx<'_>, start: PageId, why: HeaderWhy, d: IoDone) {
+        if why == HeaderWhy::Reclaim {
+            self.core.reclaim_reads = self.core.reclaim_reads.saturating_sub(1);
+        }
         // a write, zeroing or release of the run while the header was read voids the read: it
         // may have returned the previous occupant's header (an in-place rewrite keeps the
         // location; a freed run is given out again), and the index checks below cannot tell
@@ -4078,6 +4137,8 @@ impl PartitionStore {
             ZeroWhy::Dead => {}
         }
         self.core.alloc.clear_refusal();
+        // writes waiting for reclaimed space try again at the next tick
+        self.core.reclaim_recheck_ns = 0;
     }
 
     /// A copy of the key with seq `newer` is durable and committed: the tracked sources it
@@ -4346,6 +4407,16 @@ impl PartitionStore {
             self.submit_extents(cx);
         } else {
             self.core.dirty.clear();
+        }
+        // writes waiting for a FLUSHDB reclaim try again: space was freed, the reclaim ended
+        // (they get `-OOM` at once if it gave back too little) or the recheck time came
+        if !self.core.reclaim_wait.is_empty() && (cx.now.mono_ns >= self.core.reclaim_recheck_ns || !self.core.reclaim_pending()) {
+            for id in core::mem::take(&mut self.core.reclaim_wait) {
+                if let Some(r) = self.reqs.get_mut(id) {
+                    r.parked = false;
+                }
+                self.reqs.check_ready(id);
+            }
         }
         // XTxn parts waiting for the staged effects of their keys try again (`crate::abort`)
         for id in core::mem::take(&mut self.core.part_wait) {
@@ -4868,7 +4939,7 @@ impl PartitionStore {
         // its writes got `-OOM` on a device holding a few hundred MB. Then it also takes up to
         // RECLAIM_URGENT_PER_TICK steps a tick while fewer than RECLAIM_URGENT_LOADS of its
         // page loads are in flight, so the device's speed bounds it.
-        let mut urgent = if self.core.alloc.refused_recently(now_ns) { RECLAIM_URGENT_PER_TICK } else { 0 };
+        let mut urgent = if self.core.alloc.refused_recently(now_ns) || !self.core.reclaim_wait.is_empty() { RECLAIM_URGENT_PER_TICK } else { 0 };
         while (!self.core.reclaim_pages.is_empty() || !self.core.reclaim_ext.is_empty())
             && (self.core.buckets.reclaim.try_take(now_ns, 1) || (urgent > 0 && self.core.loads.len() < RECLAIM_URGENT_LOADS && {
                 urgent -= 1;
@@ -4882,6 +4953,7 @@ impl PartitionStore {
                     self.reclaim_progress();
                     continue;
                 }
+                self.core.reclaim_reads += 1;
                 let tag = self.core.tag(IoKind::HeaderRead { start: s, why: HeaderWhy::Reclaim });
                 cx.io.push(IoReq::read(tag, s.dev(), s.byte_offset(), AlignedBuf::zeroed(PAGE)));
             } else if let Some(p) = self.core.reclaim_pages.pop_front() {

@@ -677,6 +677,56 @@ fn values_just_over_the_extent_maximum_fill_most_of_the_device() {
     db.quiesce();
 }
 
+/// A write sent right after a FLUSHDB of one of two databases is answered waits for the space
+/// the reclaim walk gives back instead of getting `-OOM`: the walk starts when the cutoff is
+/// durable, which is also when the FLUSHDB is answered, so on a device the flush had just
+/// emptied the first writes after the reply found every AG still held and were refused.
+#[test]
+fn writes_right_after_flushdb_wait_for_the_reclaim() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    let pages = 20 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 23);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 23).unwrap();
+    let mut c = cfg();
+    c.cache_bytes = 8 << 20;
+    let mut eng = LocalEngine::open(vec![d], &c).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    // db 1 keeps a key, so the FLUSHDB of db 0 needs the walk (§16.5)
+    let t = db.set(1, b"{t}keep", b"v", None).unwrap();
+    db.wait(b"{t}keep", t, TicketState::Written);
+    // the device full of 1 MiB values of db 0
+    let mut stored = 0u64;
+    let mut refused = 0;
+    while refused < 5 {
+        let k = format!("{{t}}f{stored}");
+        match db.set(0, k.as_bytes(), &value(stored, 1 << 20), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                stored += 1;
+            }
+            Err(StoreError::OutOfSpace) => refused += 1,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(stored > 100, "only {stored} MiB values fit");
+    for (q, t) in db.flushdb(Some(0)) {
+        db.wait_in(q, t, TicketState::Durable);
+    }
+    // at once, with no engine time passing: every write succeeds
+    for i in 0..stored / 2 {
+        let k = format!("{{t}}x{i}");
+        match db.set(0, k.as_bytes(), &value(i, 1 << 20), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+            }
+            Err(e) => panic!("write {i} of {} after FLUSHDB of {stored} MiB values: {e:?}", stored / 2),
+        }
+    }
+    db.quiesce();
+}
+
 /// After a FLUSHDB of one of two databases, the reclaim walk runs as fast as the device reads
 /// while the partition's writes are refused space. It was paced (4000 reads/s shared by every
 /// partition) whatever happened, so under frequent FLUSHDBs it fell behind and about a fifth

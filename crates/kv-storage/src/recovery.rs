@@ -411,10 +411,12 @@ fn issue_scan_reads(p: &mut PartitionStore, cx: &mut StorageCtx<'_>, scan: &mut 
 /// True when the record is dead for recovery: below its db's flush cutoff, or of a txn that
 /// never committed (§18.3 step 2; expiry is not part of this filter).
 fn dead(p: &PartitionStore, db: u8, seq: Seq, txn: u64) -> bool {
-    if p.core.cutoff.get(usize::from(db)).is_some_and(|&c| seq.0 < c) {
-        return true;
-    }
-    txn != 0 && !p.core.prior.is_committed(txn)
+    below_cutoff(p, db, seq) || (txn != 0 && !p.core.prior.is_committed(txn))
+}
+
+/// True when the record is below its db's flush cutoff: dead permanently (cutoffs only rise).
+fn below_cutoff(p: &PartitionStore, db: u8, seq: Seq) -> bool {
+    p.core.cutoff.get(usize::from(db)).is_some_and(|&c| seq.0 < c)
 }
 
 /// Inserts a survivor into its table, noting fingerprint conflicts.
@@ -583,16 +585,23 @@ fn accept_extent(p: &mut PartitionStore, scan: &mut Scan, start: PageId, h: &ext
     }
     let kl = h.key_len as usize;
     let Some(key) = buf.get(EXT_HDR..EXT_HDR + kl) else { return };
-    if dead(p, h.db, h.seq, h.txn) {
-        if h.txn != 0 {
-            // the run stays allocated until its first sector is zeroed (E10)
-            p.core.alloc.mark_extent(start, n);
-            scan.txn_extents.push((start, n));
-        }
-        return;
-    }
     let slot = key_slot(key);
     if slot % p.core.cfg.partitions != p.core.cfg.id || h.db >= p.core.cfg.databases {
+        // another partition's: left behind in an AG it gave back, so its run is not allocated
+        // (this partition's cutoffs and txns say nothing about it)
+        return;
+    }
+    if below_cutoff(p, h.db, h.seq) {
+        // dead for good, whatever its txn: a FLUSHALL gave its AG back without zeroing it, and
+        // the run may hold newer extents now. Marked and zeroed as a dead txn's run, it freed
+        // the live extents inside the old run (an acknowledged write lost at the next crash)
+        return;
+    }
+    if dead(p, h.db, h.seq, h.txn) {
+        // an uncommitted txn's extent: nothing frees its run before its first sector is zeroed
+        // (E10), so the run is still this one's; it stays allocated until zeroed
+        p.core.alloc.mark_extent(start, n);
+        scan.txn_extents.push((start, n));
         return;
     }
     let seed = p.core.cfg.hash_seed;

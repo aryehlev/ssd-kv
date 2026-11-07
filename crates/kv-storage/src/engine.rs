@@ -883,9 +883,11 @@ impl<D: BlockDevice> LocalEngine<D> {
 
     /// One driver iteration: device completions, meta requests, page writer and background
     /// work of every partition, flush submission (§6.4).
-    pub fn pump(&mut self) {
-        // a fixed clock moves 1 ms per iteration while an AG request waits for the pool
-        // (`metastore::ACQUIRE_WAIT_MS`), so that its refusal comes in bounded iterations
+    /// [`LocalEngine::pump`] for the waiting loops of this driver (`run`, `run_scan`,
+    /// `wait_ticket`): a fixed clock moves 1 ms per iteration while an AG request waits for
+    /// the pool (`metastore::ACQUIRE_WAIT_MS`), so that its answer comes in bounded
+    /// iterations. A driver with a clock of its own (the simulator) calls `pump`.
+    fn pump_waiting(&mut self) {
         if self.meta.has_held_acquires()
             && let Some(c) = self.clock.as_mut()
         {
@@ -893,6 +895,10 @@ impl<D: BlockDevice> LocalEngine<D> {
             c.boot_ns += 1_000_000;
             c.unix_ms += 1;
         }
+        self.pump();
+    }
+
+    pub fn pump(&mut self) {
         self.pump_io();
         let now = self.now();
         for p in 0..self.parts.len() {
@@ -1018,7 +1024,7 @@ impl<D: BlockDevice> LocalEngine<D> {
             if i % 256 == 255 && self.check_progress().is_err() {
                 break;
             }
-            self.pump();
+            self.pump_waiting();
         }
         self.ticket_state(p, t).unwrap_or(S::Executed)
     }
@@ -1046,7 +1052,7 @@ impl<D: BlockDevice> LocalEngine<D> {
                     }
                 }
             }
-            self.pump();
+            self.pump_waiting();
         }
         Err(crate::keyspace::StoreError::Io(-libc::ETIMEDOUT))
     }
@@ -1071,7 +1077,7 @@ impl<D: BlockDevice> LocalEngine<D> {
                     }
                 }
             }
-            self.pump();
+            self.pump_waiting();
         }
         Err(crate::keyspace::StoreError::Io(-libc::ETIMEDOUT))
     }

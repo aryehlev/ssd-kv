@@ -8004,6 +8004,89 @@ step cmd set 0 77 7 - - 0 0
 step cmd expire 0 126 - 1
 "#,
     ),
+    (
+        "the engine's own wait loops never move the driver's clock",
+        r#"kv-sim storage case 1
+seed 6105720
+# minimized from 793 to 42 steps in 54 s (two-image wt lba4096 Flushed p16); original: RESULT step=539 [GET-result] :: cmd get 0 35 (step 500) observed [1, 1018701, 15709388534119654848, 1800000007689], the model expects Ok([1, 1018701, 15709388534119654848, 1800000007607])
+# matrix cell: two-image wt lba4096 Flushed p16
+fail RESULT 42 GET-result
+# cmd get 0 35 (step 40) observed [1, 1018701, 8270736378273257544, 1800000004574], the model expects Ok([1, 1018701, 8270736378273257544, 1800000004546])
+cfg partitions 16
+cfg devices 1
+cfg ags 39
+cfg lba 4096
+cfg page_mode two-image
+cfg atomic_unit 4096
+cfg cache wt
+cfg dsync 0
+cfg durability flushed
+cfg cache_bytes 4194304
+cfg fill_pct 45
+cfg snapshot 0
+cfg keys 106
+cfg groups 35
+cfg dbs 2
+cfg profile full
+cfg steps 792
+cfg rounds 2
+cfg tick_permille 40
+cfg delay_max 0
+cfg late_pct 31
+cfg skip_pct 10
+cfg per_poll 1
+cfg shuffle 0
+cfg tick_ms 2
+cfg hang_ticks 20000
+cfg settle_ticks 30000
+cfg error_ppm 0
+cfg no_flush 0
+cfg max_len 0
+cfg unit_cap 0
+step cmd set 0 75 456 - - 0 0
+step cmd del 1 80,80,45
+step cmd append 1 72 199
+step cmd msetnx 0 69:461716,69:361976
+step cmd expire 0 82 r87 1
+step cmd set 1 7 6306442 r88 - 0 0
+step cmd del 1 94,59,24
+step cmd del 0 93,58
+step cmd set 0 51 7680262 - - 0 0
+step cmd set 0 6 971856 - - 0 0
+step cmd set 0 67 43426 - - 0 0
+step cmd get 0 2
+step cmd del 0 76,6,41
+step cmd set 0 65 220868 - - 0 0
+step cmd mset 0 11:562,81:963
+step cmd append 0 41 289
+step cmd setrange 1 8 357 136
+step cmd setrange 0 77 1175 333
+step clock 33
+step cmd setrange 0 69 111 546
+step cmd set 0 88 570064 - - 0 0
+step cmd set 1 104 2829970 - - 0 0
+step cmd set 0 86 69120 - nx 1 1
+step cmd get 1 4
+step cmd del 0 8,43
+step cmd set 0 43 8102182 - nx 0 0
+step cmd get 0 89
+step cmd setrange 0 10 709 3
+step cmd mset 0 10:43586,80:911473,80:661371
+step cmd mset 0 1:926441,1:38031,36:94986,71:518824
+step cmd set 1 105 945049 r45193068 nx 0 1
+step cmd set 0 96 722 - - 1 0
+step cmd set 1 12 1088 - - 0 0
+step cmd set 0 18 977 r307 nx 0 0
+step quiesce
+step cmd expire 1 5 r42188808 0
+step cmd set 0 35 1018701 r4101 - 0 0
+step cmd get 0 98
+step cmd set 0 10 4590615 - nx 0 0
+step cmd del 0 8
+step cmd get 0 35
+step cmd get 0 58
+"#,
+    ),
 ];
 
 /// Replays a case text.

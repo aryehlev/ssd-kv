@@ -194,3 +194,32 @@ fn an_aborted_part_never_takes_an_earlier_staged_write_with_it() {
         db.quiesce();
     }
 }
+
+/// The coordinator's commit of the txn failed (a meta write error): the part can be neither
+/// committed nor undone. Before, nothing told the partition, so a later write of the part's
+/// key and a barrier waited for the commit forever; now the partition turns read-only and
+/// both are answered with the error.
+#[test]
+fn a_failed_commit_fails_what_waits_for_the_part() {
+    for (i, size) in [100usize, 20_000].into_iter().enumerate() {
+        let seed = 950 + i as u64;
+        let mut db = fresh(seed);
+        let (a, _) = two_keys(&db);
+        let t = db.set(0, &a, b"a-old", None).unwrap();
+        db.wait(&a, t, TicketState::Durable);
+        let txn = db.eng.meta().txn_ids().next();
+        apply_part(&mut db, &a, txn, Part::Put(size), &value(seed, size)).unwrap();
+        for _ in 0..3 {
+            db.eng.pump();
+        }
+        let later = db.set(0, &a, b"later", None).unwrap();
+        for _ in 0..3 {
+            db.eng.pump();
+        }
+        let pa = db.eng.partition_of(&a);
+        db.eng.txn_commit_failed(pa, txn, -libc::EIO);
+        let st = db.wait(&a, later, TicketState::Durable);
+        assert!(matches!(st, TicketState::Failed(_)), "size {size}: the later write ends with the error, got {st:?}");
+        assert!(db.set(0, &a, b"refused", None).is_err(), "size {size}: the partition is read-only");
+    }
+}

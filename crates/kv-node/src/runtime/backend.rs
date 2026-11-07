@@ -402,6 +402,9 @@ pub trait Backend {
     fn abort_txn(&mut self, _p: u16, _now: Now, _txn: u64) -> Option<TicketId> {
         None
     }
+    /// The commit of cross-partition txn `txn` failed with `errno`
+    /// (`PartitionStore::txn_commit_failed`): `p` turns read-only and fails what waits on it.
+    fn txn_commit_failed(&mut self, _p: u16, _txn: u64, _errno: i32) {}
     /// How many multi-key txns partition `p` has opened (monotonic): a request whose exec
     /// moved it spent its txn credit (§14.6 step 0).
     fn txns_opened(&self, p: u16) -> u64;
@@ -701,6 +704,13 @@ impl Backend for PageBackend {
         self.parts[usize::from(p)].as_ref()?;
         let (part, mut cx) = self.split(p, now);
         part.abort_txn(&mut cx, txn)
+    }
+
+    fn txn_commit_failed(&mut self, p: u16, txn: u64, errno: i32) {
+        self.touched[usize::from(p)] = true;
+        if let Some(part) = self.parts[usize::from(p)].as_mut() {
+            part.txn_commit_failed(txn, errno);
+        }
     }
 
     fn txns_opened(&self, p: u16) -> u64 {

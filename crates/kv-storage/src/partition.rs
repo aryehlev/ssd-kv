@@ -3427,7 +3427,7 @@ impl PartitionStore {
         }
     }
 
-    fn write_failed(&mut self, errno: i32) {
+    pub(crate) fn write_failed(&mut self, errno: i32) {
         if self.core.failed.is_none() {
             self.core.failed = Some(errno);
         }

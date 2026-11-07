@@ -146,6 +146,18 @@ impl PartitionStore {
         Some(ticket)
     }
 
+    /// The coordinator's commit of cross-partition txn `txn` failed (the meta store's write
+    /// failed with `errno`): whether the commit reached media is unknown, so the part can be
+    /// neither committed nor undone. The partition becomes read-only and every ticket fails
+    /// (`write_failed`), so nothing waits for the txn's commit for good: barriers, writes the
+    /// part superseded and later writes of its keys are answered with the error. Recovery
+    /// settles the txn from what the commit slots hold.
+    pub fn txn_commit_failed(&mut self, txn: u64, errno: i32) {
+        if self.core.txns.get(&txn).is_some_and(|o| !o.local) {
+            self.write_failed(errno);
+        }
+    }
+
     /// Puts the key's index entry back to what it was before the part.
     fn undo_index(&mut self, u: &TxnUndo) {
         let new36 = match u.new {

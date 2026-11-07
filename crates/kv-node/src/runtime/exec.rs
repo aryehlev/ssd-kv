@@ -1988,6 +1988,10 @@ impl<B: Backend> Worker<B> {
                 }
                 self.release_hold(partition, xtxn);
             }
+            XTxnMsg::CommitFailed { xtxn, txn_id, partition, errno } => {
+                self.backend.txn_commit_failed(partition, txn_id, errno);
+                self.release_hold(partition, xtxn);
+            }
             XTxnMsg::Aborted { xtxn, ok, .. } => self.part_aborted(xtxn, ok),
             XTxnMsg::Locked { xtxn, partition, reads } => self.xtxn_step(xtxn, |c| c.on_locked(partition, reads)),
             XTxnMsg::Applied { xtxn, partition, res } => self.xtxn_step(xtxn, |c| c.on_applied(partition, res)),

@@ -113,6 +113,10 @@ pub enum XTxnMsg {
     /// The transaction was given up after `Apply` was sent (another part failed, §14.6 step
     /// 6): undo what the part staged (or refuse its `Apply` if it has not run), then unlock.
     Abort { xtxn: u64, txn_id: u64, partition: u16 },
+    /// The commit of `txn_id` failed (`errno`): it may or may not have reached media, so the
+    /// part is neither committed nor undone; the partition turns read-only and fails what
+    /// waits on it, then unlocks.
+    CommitFailed { xtxn: u64, txn_id: u64, partition: u16, errno: i32 },
     /// Nothing of the aborted part is left on media or in flight in `partition` (`ok`), or
     /// its undo failed (an I/O error: some of it may be left).
     Aborted { xtxn: u64, partition: u16, ok: bool },
@@ -479,18 +483,20 @@ impl XTxnCoord {
             return Step::Wait;
         }
         self.phase = Phase::Done;
-        let reply = match res {
-            Ok(()) => std::mem::take(&mut self.reply),
-            Err(e) => Self::error_reply(e, self.env.proto),
+        let (reply, errno) = match res {
+            Ok(()) => (std::mem::take(&mut self.reply), None),
+            Err(e) => (Self::error_reply(e, self.env.proto), Some(if let StoreError::Io(n) = e { n } else { -libc::EIO })),
         };
         let msgs = self
             .parts
             .iter()
             .map(|p| {
-                let m = if p.has_ops && reply.first() != Some(&b'-') {
-                    XTxnMsg::Commit { xtxn: self.xtxn, txn_id: self.txn_id, partition: p.partition }
-                } else {
-                    XTxnMsg::Unlock { xtxn: self.xtxn, partition: p.partition }
+                let m = match (p.has_ops, errno) {
+                    (true, None) => XTxnMsg::Commit { xtxn: self.xtxn, txn_id: self.txn_id, partition: p.partition },
+                    // an Unlock alone left the part open: later writes of its keys, and
+                    // barriers, waited for its commit for good
+                    (true, Some(errno)) => XTxnMsg::CommitFailed { xtxn: self.xtxn, txn_id: self.txn_id, partition: p.partition, errno },
+                    (false, _) => XTxnMsg::Unlock { xtxn: self.xtxn, partition: p.partition },
                 };
                 (p.partition, m)
             })
@@ -644,6 +650,22 @@ mod tests {
         assert!(matches!(t.on_applied(1, Ok(())), Step::Wait));
         let Step::FinishAborted { msgs, parts: 2, .. } = t.on_applied(2, Err(StoreError::OutOfSpace)) else { panic!() };
         assert!(msgs.iter().any(|(p, m)| *p == 1 && matches!(m, XTxnMsg::Abort { txn_id: 6, .. })), "the applied source delete is undone");
+    }
+
+    #[test]
+    fn a_failed_commit_fails_the_parts_with_ops() {
+        let cmd = OwnedCmd::new(CmdId::Rename, &[b"RENAME", b"a-src", b"b-dst"]);
+        let mut t = XTxnCoord::new(1, 0, cmd, env(), part).unwrap();
+        let _ = t.start(0);
+        let _ = t.on_locked(1, Ok(vec![KeyRead { exists: true, value: Some((1, None, b"v".to_vec())) }]));
+        let _ = t.on_locked(2, Ok(reads(1, false)));
+        let _ = t.apply(8);
+        let _ = t.on_applied(1, Ok(()));
+        let Step::Commit { txn_id: 8 } = t.on_applied(2, Ok(())) else { panic!() };
+        let Step::Finish { msgs, reply } = t.on_committed(Err(StoreError::Io(-5))) else { panic!() };
+        assert!(reply.starts_with(b"-"));
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|(_, m)| matches!(m, XTxnMsg::CommitFailed { txn_id: 8, errno: -5, .. })), "an unlock alone leaves the parts open");
     }
 
     #[test]

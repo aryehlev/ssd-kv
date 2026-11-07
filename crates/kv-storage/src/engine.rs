@@ -983,6 +983,11 @@ impl<D: BlockDevice> LocalEngine<D> {
         t
     }
 
+    /// [`PartitionStore::txn_commit_failed`] on partition `p`.
+    pub fn txn_commit_failed(&mut self, p: u16, txn: u64, errno: i32) {
+        self.parts[usize::from(p)].txn_commit_failed(txn, errno);
+    }
+
     /// The last reported state of ticket `t` of partition `p` (`None` = not reported yet).
     pub fn ticket_state(&self, p: u16, t: crate::ticket::TicketId) -> Option<crate::ticket::TicketState> {
         self.tickets.get(&(p, t.0)).copied()

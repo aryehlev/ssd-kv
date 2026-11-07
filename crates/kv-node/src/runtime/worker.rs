@@ -478,7 +478,7 @@ impl<B: Backend> Worker<B> {
         let Some(c) = self.conns[slot as usize].as_mut() else { return };
         let lift = match c.hold {
             None => false,
-            Some(Hold::Pending) => c.pending() < max_pending,
+            Some(Hold::Pending) => c.pending() < c.reply_window(max_out, max_pending),
             Some(Hold::Output) => c.output_bytes() < max_out,
             Some(Hold::Queue) => queues_free,
             Some(Hold::LargeValue) => self.shared.budget.may_start(),
@@ -545,7 +545,7 @@ impl<B: Backend> Worker<B> {
             if conn.closing() || conn.hold.is_some() {
                 break;
             }
-            if conn.pending() >= max_pending {
+            if conn.pending() >= conn.reply_window(max_out, max_pending) {
                 conn.hold = Some(Hold::Pending);
                 break;
             }

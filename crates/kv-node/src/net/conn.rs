@@ -28,6 +28,10 @@ use crate::runtime::xmsg::{OwnedCmd, ReplyBody};
 
 /// Initial (and idle) size of `read_buf`.
 pub const READ_BUF_INITIAL: usize = 16 * 1024;
+/// Unreplied commands a connection may have before its first reply ([`Conn::reply_window`]).
+pub const INITIAL_WINDOW: u64 = 16;
+/// Replies at least this long are queued as their own output segment (no copy into `out`).
+const SEG_MIN: usize = 64 * 1024;
 /// An idle `read_buf` larger than this shrinks back to [`READ_BUF_INITIAL`].
 pub const READ_BUF_SHRINK: usize = 1024 * 1024;
 
@@ -155,6 +159,9 @@ pub struct Conn {
     pub(crate) queued_for_parse: bool,
     /// The connection is on the worker's "has output to send" list.
     pub(crate) queued_for_send: bool,
+    /// Running estimate of this connection's reply size in bytes (1/8 weight to each new
+    /// reply), for [`Conn::reply_window`]; `0` until the first reply.
+    pub(crate) reply_est: u64,
 }
 
 impl Conn {
@@ -198,6 +205,7 @@ impl Conn {
             credit_hold_since: None,
             queued_for_parse: false,
             queued_for_send: false,
+            reply_est: 0,
         }
     }
 
@@ -211,6 +219,23 @@ impl Conn {
     #[inline]
     pub fn output_bytes(&self) -> u64 {
         self.out_queued
+    }
+
+    /// How many unreplied commands the connection may have before reading stops: the replies
+    /// of commands already consumed are produced whatever their size (a consumed command never
+    /// waits, LC-15), so the output limit has to apply before consumption. With a window of
+    /// `max_pending` alone, one client pipelining 4096 GETs of a 4 MiB value without reading
+    /// the replies made the server hold 16 GiB of replies and abort on a failed allocation.
+    /// The window is `output_limit` over the connection's estimated reply size, between 1 and
+    /// `max_pending`; before the first reply it is [`INITIAL_WINDOW`].
+    pub fn reply_window(&self, output_limit: u64, max_pending: usize) -> usize {
+        let est = if self.reply_est == 0 { output_limit / INITIAL_WINDOW } else { self.reply_est };
+        let w = output_limit / est.max(1);
+        (w.min(max_pending as u64) as usize).max(1)
+    }
+
+    fn note_reply(&mut self, n: u64) {
+        self.reply_est = if self.reply_est == 0 { n.max(1) } else { (self.reply_est - self.reply_est / 8 + n / 8).max(1) };
     }
 
     /// Unparsed input bytes (CLIENT LIST `qbuf=`).
@@ -278,6 +303,7 @@ impl Conn {
         self.next_req_seq += 1;
         self.base_seq = self.next_req_seq;
         self.out_queued += n as u64;
+        self.note_reply(n as u64);
     }
 
     /// Delivers the reply of `req_seq`; returns whether output became ready.
@@ -334,10 +360,19 @@ impl Conn {
     /// Appends reply bytes to the output.
     pub fn push_output(&mut self, body: ReplyBody) {
         self.out_queued += body.len() as u64;
+        self.note_reply(body.len() as u64);
         match body {
             ReplyBody::Bytes(b) => {
                 if self.out.is_empty() && self.out.capacity() < b.capacity() {
                     self.out = b;
+                } else if b.len() >= SEG_MIN {
+                    // a large reply goes out as its own segment: copied into `out`, it doubled
+                    // `out`'s allocation (a 1 GiB allocation for a few hundred MiB of replies)
+                    if !self.out.is_empty() {
+                        let o = std::mem::take(&mut self.out);
+                        self.out_segs.push_back(OutSeg::Bytes(o, 0));
+                    }
+                    self.out_segs.push_back(OutSeg::Bytes(b, 0));
                 } else {
                     self.out.extend_from_slice(&b);
                 }
@@ -412,6 +447,25 @@ mod tests {
 
     fn bytes(s: &[u8]) -> ReplyBody {
         ReplyBody::Bytes(s.to_vec())
+    }
+
+    /// The output limit applies before commands are consumed: a client pipelining GETs of a
+    /// 4 MiB value gets about `limit / 4 MiB` of them in flight, not `max-pending-per-conn`.
+    #[test]
+    fn reply_window_follows_the_reply_size() {
+        let limit = 64 << 20;
+        let mut c = conn();
+        assert_eq!(c.reply_window(limit, 4096), INITIAL_WINDOW as usize);
+        c.push_output(ReplyBody::Bytes(vec![0; 4 << 20]));
+        assert_eq!(c.reply_window(limit, 4096), 16);
+        c.push_output(ReplyBody::Bytes(vec![0; 8 << 20]));
+        assert_eq!(c.reply_window(limit, 4096), 14);
+        c.push_output(ReplyBody::Bytes(vec![0; 512 << 20]));
+        assert_eq!(c.reply_window(limit, 4096), 1, "never below one");
+        for _ in 0..400 {
+            c.push_output(bytes(b"+OK\r\n"));
+        }
+        assert_eq!(c.reply_window(limit, 4096), 4096, "small replies: max-pending-per-conn");
     }
 
     fn drain(c: &mut Conn) -> Vec<u8> {

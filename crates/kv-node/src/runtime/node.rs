@@ -146,10 +146,11 @@ fn prepare_devices(cfg: &Config) -> Result<Vec<PathBuf>, StartError> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| fail(&format!("cannot create {}", dir.display()), e))?;
             }
-            tracing::info!(path = %path.display(), bytes = size.unwrap_or(0), "formatting a new data file");
+            let partitions = format_partitions_for(cfg, size.unwrap_or(0))?;
+            tracing::info!(path = %path.display(), bytes = size.unwrap_or(0), partitions, "formatting a new data file");
             let opts = kv_storage::format::FormatOpts {
                 devices: devs.clone(),
-                partitions: cfg.format_partitions,
+                partitions,
                 cluster: cfg.cluster_enabled,
                 snapshot_region: cfg.snapshot_region,
             };
@@ -157,6 +158,42 @@ fn prepare_devices(cfg: &Config) -> Result<Vec<PathBuf>, StartError> {
         }
     }
     Ok(devs.into_iter().map(|(p, _)| p).collect())
+}
+
+/// The partition count of a new data file of `bytes`: `format-partitions`, or the largest
+/// smaller count whose partitions all get their first two allocation groups under
+/// `max-storage-fill` (`kv_storage::engine::check_capacity`). With too many partitions for the
+/// file, writes got `-OOM` with the file almost empty (64 partitions on 1 GB: about 20 MB
+/// stored). A file too small even for 16 partitions is refused.
+fn format_partitions_for(cfg: &Config, bytes: u64) -> Result<u16, StartError> {
+    let pages = bytes / kv_storage::layout::PAGE as u64;
+    let Ok(layout) = kv_storage::layout::DeviceLayout::compute(pages, true, 0) else {
+        // the format reports a size it cannot lay out
+        return Ok(cfg.format_partitions);
+    };
+    let fits = |p: u16| kv_storage::engine::check_capacity(std::slice::from_ref(&layout), p, cfg.max_storage_fill);
+    if fits(cfg.format_partitions).is_ok() {
+        return Ok(cfg.format_partitions);
+    }
+    match [64u16, 32, 16].into_iter().filter(|&p| p < cfg.format_partitions).find(|&p| fits(p).is_ok()) {
+        Some(p) => {
+            tracing::warn!(requested = cfg.format_partitions, partitions = p, ags = layout.n_ags, "the data file is too small for format-partitions: formatting with fewer partitions");
+            Ok(p)
+        }
+        None => Err(fail("format", fits(16.min(cfg.format_partitions)).expect_err("does not fit"))),
+    }
+}
+
+/// Refuses data devices whose allocation groups cannot give each of the `partitions` its
+/// first SMALL and EXTENT AG under `max-storage-fill` (formatted elsewhere, or with a lower
+/// fill limit): the node would answer `-OOM` with the devices almost empty.
+fn check_capacity(paths: &[PathBuf], partitions: u16, max_fill: f32) -> Result<(), StartError> {
+    let mut layouts = Vec::with_capacity(paths.len());
+    for p in paths {
+        let sb = read_superblock(p).map_err(|e| fail(&format!("cannot read {}", p.display()), e))?.ok_or_else(|| StartError(format!("{} holds no kvssd format", p.display())))?;
+        layouts.push(sb.layout());
+    }
+    kv_storage::engine::check_capacity(&layouts, partitions, max_fill).map_err(|e| fail("storage", e))
 }
 
 /// `cache-size auto`: 60% of `MemAvailable` minus an index estimate (12.5 B per 300 B record
@@ -360,6 +397,7 @@ pub fn start(cfg: Config) -> Result<NodeHandle, StartError> {
         )));
     }
     let partitions = fmt.partitions;
+    check_capacity(&paths, partitions, cfg.max_storage_fill)?;
     let workers = cfg.worker_count(partitions);
     // cluster mode: the node's own metadata as persisted, read before the engine opens
     let boot_meta = if cfg.cluster_enabled {
@@ -520,7 +558,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             data_dir: dir.path().join("sub"),
-            data_size: 64 << 20,
+            // the smallest file giving 16 partitions their first two allocation groups
+            data_size: 600 << 20,
             format_partitions: 16,
             snapshot_region: kv_storage::format::SnapshotRegionSize::Percent(0.0),
             ..Config::default()
@@ -533,5 +572,21 @@ mod tests {
         let again = prepare_devices(&cfg).unwrap();
         assert_eq!(again, devs);
         assert!(read_format(&dir.path().join("missing")).is_err());
+        check_capacity(&devs, 16, 0.95).expect("16 partitions fit");
+        assert!(check_capacity(&devs, 64, 0.95).is_err(), "64 partitions get no AG each");
+    }
+
+    /// A new data file too small for `format-partitions` is formatted with fewer partitions
+    /// (64 partitions on 1 GB got `-OOM` after about 20 MB); one too small even for 16 is
+    /// refused before anything is written.
+    #[test]
+    fn format_partitions_fit_the_data_file() {
+        let cfg = |p: u16| Config { format_partitions: p, max_storage_fill: 0.95, ..Config::default() };
+        assert_eq!(format_partitions_for(&cfg(64), 4 << 30).unwrap(), 64, "the default file holds the default count");
+        assert_eq!(format_partitions_for(&cfg(128), 4 << 30).unwrap(), 64);
+        assert_eq!(format_partitions_for(&cfg(64), 1 << 30).unwrap(), 16);
+        assert_eq!(format_partitions_for(&cfg(64), 2 << 30).unwrap(), 32);
+        let e = format_partitions_for(&cfg(16), 64 << 20).unwrap_err();
+        assert!(e.0.contains("too small for 16 partitions"), "{}", e.0);
     }
 }

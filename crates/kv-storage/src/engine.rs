@@ -883,21 +883,6 @@ impl<D: BlockDevice> LocalEngine<D> {
 
     /// One driver iteration: device completions, meta requests, page writer and background
     /// work of every partition, flush submission (§6.4).
-    /// [`LocalEngine::pump`] for the waiting loops of this driver (`run`, `run_scan`,
-    /// `wait_ticket`): a fixed clock moves 1 ms per iteration while an AG request waits for
-    /// the pool (`metastore::ACQUIRE_WAIT_MS`), so that its answer comes in bounded
-    /// iterations. A driver with a clock of its own (the simulator) calls `pump`.
-    fn pump_waiting(&mut self) {
-        if self.meta.has_held_acquires()
-            && let Some(c) = self.clock.as_mut()
-        {
-            c.mono_ns += 1_000_000;
-            c.boot_ns += 1_000_000;
-            c.unix_ms += 1;
-        }
-        self.pump();
-    }
-
     pub fn pump(&mut self) {
         self.pump_io();
         let now = self.now();
@@ -963,6 +948,7 @@ impl<D: BlockDevice> LocalEngine<D> {
         }
         let mut msgs = Vec::new();
         self.inbox.drain(&mut msgs);
+        // commits that found the intent table full are tried again in later cycles
         if !msgs.is_empty() || self.meta.has_deferred_commits() {
             self.meta.process(&mut LocalIo(&mut self.plumb.devs), msgs, now.unix_ms, &mut self.replies);
         }
@@ -1024,7 +1010,7 @@ impl<D: BlockDevice> LocalEngine<D> {
             if i % 256 == 255 && self.check_progress().is_err() {
                 break;
             }
-            self.pump_waiting();
+            self.pump();
         }
         self.ticket_state(p, t).unwrap_or(S::Executed)
     }
@@ -1052,7 +1038,7 @@ impl<D: BlockDevice> LocalEngine<D> {
                     }
                 }
             }
-            self.pump_waiting();
+            self.pump();
         }
         Err(crate::keyspace::StoreError::Io(-libc::ETIMEDOUT))
     }
@@ -1077,7 +1063,7 @@ impl<D: BlockDevice> LocalEngine<D> {
                     }
                 }
             }
-            self.pump_waiting();
+            self.pump();
         }
         Err(crate::keyspace::StoreError::Io(-libc::ETIMEDOUT))
     }

@@ -386,7 +386,18 @@ enum Held {
     Reply(MetaDone),
     /// A commit of this txn still waiting for room.
     Commit(u64),
+    /// An AG request for space a write needs that found the pool at its limit, tried again
+    /// every cycle until `since_ms + ACQUIRE_WAIT_MS` (see [`ACQUIRE_WAIT_MS`]).
+    Acquire { partition: u16, kind: AgKind, dev: Option<u8>, reserved: bool, since_ms: u64 },
 }
+
+/// How long an AG request for space a write needs waits for the pool when it finds it at its
+/// limit. A refusal at once failed the write with `-OOM` (and latched the refusal for the
+/// partition's next writes) while the limit was taken by idle spare AGs of other partitions,
+/// which they give back as soon as they see the refusal pressure: pipelined writes of 2 KiB
+/// values to a 768 MB device got their first `-OOM` with 47% of its capacity stored, and a
+/// quarter of all writes failed before the device was full.
+pub const ACQUIRE_WAIT_MS: u64 = 200;
 
 /// Index of an allocated AG kind in [`MetaCore`]'s per-partition counts.
 fn kind_index(kind: AgKind) -> usize {
@@ -551,7 +562,7 @@ impl MetaCore {
             // neither readable (the engine then refused to open)
             out.extend(self.held.drain(..).map(|(p, token, h)| match h {
                 Held::Reply(d) => (p, token, d),
-                Held::Commit(_) => (p, token, MetaDone::Failed(errno)),
+                Held::Commit(_) | Held::Acquire { .. } => (p, token, MetaDone::Failed(errno)),
             }));
             out.extend(msgs.into_iter().map(|m| (m.partition, m.token, MetaDone::Failed(errno))));
             return;
@@ -566,22 +577,44 @@ impl MetaCore {
             .enumerate()
             .filter_map(|(i, h)| match h.2 {
                 Held::Commit(t) => Some((i, t)),
-                Held::Reply(_) => None,
+                _ => None,
             })
             .collect();
+        // AG requests held by an earlier cycle are tried again first (in the order asked)
+        for i in 0..self.held.len() {
+            if let Held::Acquire { partition, kind, dev, reserved, since_ms } = self.held[i].2 {
+                let ag = if reserved { self.acquire_with(partition, kind, None, false) } else { self.acquire(partition, kind, dev) };
+                if ag.is_some() || now_ms.saturating_sub(since_ms) >= ACQUIRE_WAIT_MS {
+                    self.held[i].2 = Held::Reply(MetaDone::Ag(self.needed(ag)));
+                } else {
+                    self.shared.ag_pressure.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        // new AG requests that found the pool at its limit: `(pending index, held request)`
+        let mut acq_wait: SmallVec<[(usize, Held); 2]> = SmallVec::new();
         for m in msgs {
             let done = match m.req {
                 MetaReq::AcquireAg { partition, kind } => {
                     let ag = self.acquire(partition, kind, None);
+                    if ag.is_none() {
+                        acq_wait.push((pending.len(), Held::Acquire { partition, kind, dev: None, reserved: false, since_ms: now_ms }));
+                    }
                     MetaDone::Ag(self.needed(ag))
                 }
                 MetaReq::AcquireAgOn { partition, kind, dev } => {
                     let ag = self.acquire(partition, kind, Some(dev));
+                    if ag.is_none() {
+                        acq_wait.push((pending.len(), Held::Acquire { partition, kind, dev: Some(dev), reserved: false, since_ms: now_ms }));
+                    }
                     MetaDone::Ag(self.needed(ag))
                 }
                 MetaReq::AcquireSpare { partition, kind } => MetaDone::Ag(if self.spare_allowed(partition, kind) { self.acquire(partition, kind, None) } else { None }),
                 MetaReq::AcquireReserved { partition, kind } => {
                     let ag = self.acquire_with(partition, kind, None, false);
+                    if ag.is_none() {
+                        acq_wait.push((pending.len(), Held::Acquire { partition, kind, dev: None, reserved: true, since_ms: now_ms }));
+                    }
                     MetaDone::Ag(self.needed(ag))
                 }
                 MetaReq::ReleaseAg { ag } => {
@@ -766,15 +799,20 @@ impl MetaCore {
                     self.held[i].2 = Held::Reply(MetaDone::Failed(errno));
                 }
                 for h in self.held.iter_mut() {
-                    if let Held::Commit(_) = h.2 {
+                    if let Held::Commit(_) | Held::Acquire { .. } = h.2 {
                         h.2 = Held::Reply(MetaDone::Failed(errno));
                     }
                 }
+                acq_wait.clear();
             }
         }
         // replies of a partition with a held reply queue up behind it; then every partition's
         // held replies go out up to its first commit still waiting for room
         for (i, (p, token, d)) in pending.drain(..).enumerate() {
+            if let Some(&(_, h)) = acq_wait.iter().find(|(j, _)| *j == i) {
+                self.held.push((p, token, h));
+                continue;
+            }
             match d {
                 MetaDone::Committed { txn } if deferred.contains(&i) => self.held.push((p, token, Held::Commit(txn))),
                 _ if self.held.iter().any(|h| h.0 == p) => self.held.push((p, token, Held::Reply(d))),
@@ -787,7 +825,7 @@ impl MetaCore {
             for h in self.held.drain(..) {
                 match h.2 {
                     Held::Reply(d) if !blocked.contains(&h.0) => out.push((h.0, h.1, d)),
-                    Held::Commit(_) => {
+                    Held::Commit(_) | Held::Acquire { .. } => {
                         if !blocked.contains(&h.0) {
                             blocked.push(h.0);
                         }
@@ -800,10 +838,16 @@ impl MetaCore {
         }
     }
 
-    /// Commits waiting for room in the intent table (the meta thread then runs its next
-    /// cycle soon rather than at the clock-floor cadence).
+    /// Commits waiting for room in the intent table, or AG requests waiting for the pool
+    /// ([`ACQUIRE_WAIT_MS`]): the next cycle runs soon, with or without new requests (the meta
+    /// thread's cadence; an inline driver calls [`MetaCore::process`] again).
+    /// AG requests waiting for the pool ([`ACQUIRE_WAIT_MS`]).
+    pub fn has_held_acquires(&self) -> bool {
+        self.held.iter().any(|h| matches!(h.2, Held::Acquire { .. }))
+    }
+
     pub fn has_deferred_commits(&self) -> bool {
-        self.held.iter().any(|h| matches!(h.2, Held::Commit(_)))
+        self.held.iter().any(|h| matches!(h.2, Held::Commit(_) | Held::Acquire { .. }))
     }
 
     /// The highest `t` such that every txn id `<= t` is resolved (E10).
@@ -1289,10 +1333,54 @@ mod tests {
         OwnedDevs(vec![Box::new(d)])
     }
 
+    /// One cycle at t = 1 s; a cycle that answers nothing because an AG request waits for
+    /// the pool runs once more after [`ACQUIRE_WAIT_MS`] (the refusal comes then).
     fn run(core: &mut MetaCore, io: &mut OwnedDevs, msgs: Vec<MetaMsg>) -> MetaReplies {
         let mut out = Vec::new();
         core.process(io, msgs, 1_000, &mut out);
+        if out.is_empty() && core.held.iter().any(|h| matches!(h.2, Held::Acquire { .. })) {
+            core.process(io, Vec::new(), 1_000 + ACQUIRE_WAIT_MS, &mut out);
+        }
         out
+    }
+
+    /// An AG request that finds the pool at its limit waits up to `ACQUIRE_WAIT_MS` and is
+    /// granted when an AG comes back meanwhile (spares given back under the pressure); the
+    /// partition's later replies stay behind it.
+    #[test]
+    fn a_needed_ag_waits_for_the_pool_before_it_is_refused() {
+        let mut io = devs(20);
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        core.set_max_fill(0.5);
+        let got: Vec<AgId> = (0..10).filter_map(|_| acquire(&mut core, &mut io, 0)).collect();
+        assert_eq!(got.len(), 10);
+        let mut out = Vec::new();
+        core.process(
+            &mut io,
+            vec![
+                MetaMsg::new(0, 5, MetaReq::AcquireAg { partition: 0, kind: AgKind::Small }),
+                MetaMsg::new(0, 6, MetaReq::ReserveSeq { partition: 0, floor: Seq(1 << 30) }),
+            ],
+            10_000,
+            &mut out,
+        );
+        assert!(out.is_empty(), "the request waits, and the reply after it");
+        assert!(core.shared.ag_pressure.load(Ordering::Relaxed), "spares are asked back");
+        core.process(&mut io, vec![MetaMsg::new(5, 7, MetaReq::ReleaseAg { ag: got[3] })], 10_050, &mut out);
+        let r: Vec<(u16, u64)> = out.iter().map(|x| (x.0, x.1)).collect();
+        assert_eq!(r, vec![(5, 7)], "granted in the cycle after the release");
+        out.clear();
+        core.process(&mut io, Vec::new(), 10_052, &mut out);
+        assert!(matches!(out[0], (0, 5, MetaDone::Ag(Some(_)))), "{out:?}");
+        assert!(matches!(out[1], (0, 6, MetaDone::Ok)), "{out:?}");
+        // nothing comes back: refused after the wait
+        out.clear();
+        core.process(&mut io, vec![MetaMsg::new(0, 8, MetaReq::AcquireAg { partition: 0, kind: AgKind::Small })], 20_000, &mut out);
+        assert!(out.is_empty());
+        core.process(&mut io, Vec::new(), 20_000 + ACQUIRE_WAIT_MS - 1, &mut out);
+        assert!(out.is_empty());
+        core.process(&mut io, Vec::new(), 20_000 + ACQUIRE_WAIT_MS, &mut out);
+        assert!(matches!(out[0], (0, 8, MetaDone::Ag(None))), "{out:?}");
     }
 
     fn acquire(core: &mut MetaCore, io: &mut OwnedDevs, p: u16) -> Option<AgId> {
@@ -1338,6 +1426,7 @@ mod tests {
         }
     }
 
+    /// The fill limit refuses (after `ACQUIRE_WAIT_MS`, see `run`).
     #[test]
     fn fill_limit_refuses_at_once() {
         let mut io = devs(20);

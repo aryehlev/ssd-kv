@@ -884,6 +884,15 @@ impl<D: BlockDevice> LocalEngine<D> {
     /// One driver iteration: device completions, meta requests, page writer and background
     /// work of every partition, flush submission (§6.4).
     pub fn pump(&mut self) {
+        // a fixed clock moves 1 ms per iteration while an AG request waits for the pool
+        // (`metastore::ACQUIRE_WAIT_MS`), so that its refusal comes in bounded iterations
+        if self.meta.has_held_acquires()
+            && let Some(c) = self.clock.as_mut()
+        {
+            c.mono_ns += 1_000_000;
+            c.boot_ns += 1_000_000;
+            c.unix_ms += 1;
+        }
         self.pump_io();
         let now = self.now();
         for p in 0..self.parts.len() {
@@ -948,7 +957,7 @@ impl<D: BlockDevice> LocalEngine<D> {
         }
         let mut msgs = Vec::new();
         self.inbox.drain(&mut msgs);
-        if !msgs.is_empty() {
+        if !msgs.is_empty() || self.meta.has_deferred_commits() {
             self.meta.process(&mut LocalIo(&mut self.plumb.devs), msgs, now.unix_ms, &mut self.replies);
         }
         let replies = core::mem::take(&mut self.replies);

@@ -110,6 +110,12 @@ pub enum XTxnMsg {
     Commit { xtxn: u64, txn_id: u64, partition: u16 },
     /// Unlock without applying (the command failed or wrote nothing).
     Unlock { xtxn: u64, partition: u16 },
+    /// The transaction was given up after `Apply` was sent (another part failed, §14.6 step
+    /// 6): undo what the part staged (or refuse its `Apply` if it has not run), then unlock.
+    Abort { xtxn: u64, txn_id: u64, partition: u16 },
+    /// Nothing of the aborted part is left on media or in flight in `partition` (`ok`), or
+    /// its undo failed (an I/O error: some of it may be left).
+    Aborted { xtxn: u64, partition: u16, ok: bool },
 }
 
 /// The transaction kinds (multi-key writes whose keys span partitions).
@@ -150,6 +156,12 @@ pub enum Step {
     Commit { txn_id: u64 },
     /// Send the messages, then deliver `reply` and release the gate: the transaction is over.
     Finish { msgs: Vec<(u16, XTxnMsg)>, reply: Vec<u8> },
+    /// Like `Finish`, for a transaction given up after its parts were sent `Apply`: `msgs`
+    /// carries an `Abort` to each of the `parts` such parts. Once every one answered `Aborted`
+    /// the worker reports `TxnAborted { txn_id }` to the meta thread, whose resolution returns
+    /// the txn credit (a txn id left unresolved stops `resolved_w`, and with it the return of
+    /// every later credit).
+    FinishAborted { msgs: Vec<(u16, XTxnMsg)>, reply: Vec<u8>, txn_id: u64, parts: usize },
     /// Nothing to do until the next message.
     Wait,
 }
@@ -424,14 +436,41 @@ impl XTxnCoord {
             return Step::Wait;
         }
         if let Err(e) = res {
-            // Not committed: the staged TXN records are dead (§14.6 abort); unlock everything.
+            // Not committed: every part that was sent ops undoes them (§14.6 step 6). An
+            // `Unlock` alone left the other parts' staged records open for good: their keys
+            // showed the uncommitted versions (a failed RENAME had deleted its source), later
+            // writes of those keys never completed, and the txn id never resolved.
             let reply = Self::error_reply(e, self.env.proto);
-            return self.finish_unlocked(reply);
+            return self.finish_aborted(reply);
         }
         if let Some(p) = self.parts.iter_mut().find(|p| p.partition == partition && !p.applied) {
             p.applied = true;
         }
         if self.parts.iter().all(|p| p.applied) { self.on_all_applied() } else { Step::Wait }
+    }
+
+    /// Ends a transaction whose parts were sent `Apply`: `Abort` to those, `Unlock` to the
+    /// others.
+    fn finish_aborted(&mut self, reply: Vec<u8>) -> Step {
+        self.phase = Phase::Done;
+        let mut parts = 0;
+        let msgs = self
+            .parts
+            .iter()
+            .map(|p| {
+                let m = if p.has_ops {
+                    parts += 1;
+                    XTxnMsg::Abort { xtxn: self.xtxn, txn_id: self.txn_id, partition: p.partition }
+                } else {
+                    XTxnMsg::Unlock { xtxn: self.xtxn, partition: p.partition }
+                };
+                (p.partition, m)
+            })
+            .collect();
+        if parts == 0 {
+            return Step::Finish { msgs, reply };
+        }
+        Step::FinishAborted { msgs, reply, txn_id: self.txn_id, parts }
     }
 
     /// The commit of the txn id is durable (or failed).
@@ -589,9 +628,22 @@ mod tests {
         let _ = t.on_locked(1, Ok(reads(1, false)));
         let _ = t.on_locked(2, Ok(reads(1, false)));
         let _ = t.apply(5);
-        let Step::Finish { reply, msgs } = t.on_applied(2, Err(StoreError::OutOfSpace)) else { panic!() };
+        let Step::FinishAborted { reply, msgs, txn_id, parts } = t.on_applied(2, Err(StoreError::OutOfSpace)) else { panic!() };
         assert!(reply.starts_with(b"-OOM"));
-        assert!(msgs.iter().all(|(_, m)| matches!(m, XTxnMsg::Unlock { .. })), "not committed: unlock only");
+        assert_eq!((txn_id, parts), (5, 2));
+        assert!(msgs.iter().all(|(_, m)| matches!(m, XTxnMsg::Abort { txn_id: 5, .. })), "not committed: every part with ops undoes them");
+        assert!(matches!(t.on_applied(1, Ok(())), Step::Wait), "a late Applied of an aborted txn is ignored");
+
+        // RENAME to a key of another partition: the source's part is aborted with the rest
+        let cmd = OwnedCmd::new(CmdId::Rename, &[b"RENAME", b"a-src", b"b-dst"]);
+        let mut t = XTxnCoord::new(4, 0, cmd, env(), part).unwrap();
+        let _ = t.start(0);
+        let _ = t.on_locked(1, Ok(vec![KeyRead { exists: true, value: Some((1, None, b"v".to_vec())) }]));
+        let _ = t.on_locked(2, Ok(reads(1, false)));
+        let _ = t.apply(6);
+        assert!(matches!(t.on_applied(1, Ok(())), Step::Wait));
+        let Step::FinishAborted { msgs, parts: 2, .. } = t.on_applied(2, Err(StoreError::OutOfSpace)) else { panic!() };
+        assert!(msgs.iter().any(|(p, m)| *p == 1 && matches!(m, XTxnMsg::Abort { txn_id: 6, .. })), "the applied source delete is undone");
     }
 
     #[test]

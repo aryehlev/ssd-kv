@@ -148,6 +148,9 @@ pub struct Conn {
     /// When the command at the parse position was first held on the routing gate
     /// (`Hold::Gate`, boot-clock ns).
     pub(crate) gate_hold_since: Option<u64>,
+    /// When the command at the parse position was first held for a txn credit
+    /// (`Hold::TxnCredit`, boot-clock ns).
+    pub(crate) credit_hold_since: Option<u64>,
     /// The connection is on the worker's "has bytes to parse" list.
     pub(crate) queued_for_parse: bool,
     /// The connection is on the worker's "has output to send" list.
@@ -192,6 +195,7 @@ impl Conn {
             lv_admitted: false,
             hold: None,
             gate_hold_since: None,
+            credit_hold_since: None,
             queued_for_parse: false,
             queued_for_send: false,
         }

@@ -394,6 +394,14 @@ pub trait Backend {
     /// A fresh txn id for a cross-partition transaction, `None` when the engine cannot provide
     /// one.
     fn next_txn_id(&mut self) -> Option<u64>;
+    /// Undoes partition `p`'s part of cross-partition txn `txn`, which its coordinator gave up
+    /// (`PartitionStore::abort_txn`, §14.6 step 6): the part's keys show their previous
+    /// versions at once, and a part not applied yet is refused when it runs. Returns the
+    /// ticket that is `Durable` once nothing of the txn is left on media or in flight in `p`
+    /// (`None`: nothing was staged).
+    fn abort_txn(&mut self, _p: u16, _now: Now, _txn: u64) -> Option<TicketId> {
+        None
+    }
     /// How many multi-key txns partition `p` has opened (monotonic): a request whose exec
     /// moved it spent its txn credit (§14.6 step 0).
     fn txns_opened(&self, p: u16) -> u64;
@@ -687,6 +695,12 @@ impl Backend for PageBackend {
 
     fn next_txn_id(&mut self) -> Option<u64> {
         self.txn_ids.as_ref().and_then(|t| t.try_next())
+    }
+
+    fn abort_txn(&mut self, p: u16, now: Now, txn: u64) -> Option<TicketId> {
+        self.parts[usize::from(p)].as_ref()?;
+        let (part, mut cx) = self.split(p, now);
+        part.abort_txn(&mut cx, txn)
     }
 
     fn txns_opened(&self, p: u16) -> u64 {

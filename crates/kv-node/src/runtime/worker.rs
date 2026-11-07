@@ -482,7 +482,11 @@ impl<B: Backend> Worker<B> {
             Some(Hold::Output) => c.output_bytes() < max_out,
             Some(Hold::Queue) => queues_free,
             Some(Hold::LargeValue) => self.shared.budget.may_start(),
-            Some(Hold::TxnCredit) => self.shared.txn_credits.load(Ordering::Acquire) > 0,
+            // parsed again after `CREDIT_HOLD_NS` too: the pre-consume check refuses it then
+            Some(Hold::TxnCredit) => {
+                self.shared.txn_credits.load(Ordering::Acquire) > 0
+                    || c.credit_hold_since.is_some_and(|t| self.now.boot_ns.saturating_sub(t) >= crate::runtime::exec::CREDIT_HOLD_NS)
+            }
             // parsed again: the pre-consume check holds it again while the state lasts
             Some(Hold::Gate) => true,
             Some(Hold::Dirty) => !self.dirty_full,

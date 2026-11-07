@@ -574,3 +574,121 @@ fn watch_aborts_exec_when_a_watched_key_changed() {
     n.shared.request_shutdown();
     assert_eq!(n.wait(), 0);
 }
+
+/// Cross-partition RENAMEs and MSETs on a full page store: a part refused for space (`-OOM`,
+/// storage full) aborts the transaction's other parts (§14.6 step 6). Before, they were only
+/// unlocked: a failed RENAME had deleted its source (the source's staged delete stayed
+/// visible), the parts' txns stayed open so later writes of their keys and SHUTDOWN never
+/// completed, and the txn ids never resolved, so the txn credits leaked until every
+/// multi-key write waited for one.
+#[test]
+fn failed_cross_partition_writes_on_a_full_device_undo_every_part() {
+    use crate::runtime::node;
+
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut cfg = Config { port, threads: Some(2), ..Config::default() };
+    cfg.data_dir = dir.path().to_path_buf();
+    cfg.data_size = 1 << 30;
+    cfg.format_partitions = 16;
+    cfg.cache_size = Some(64 << 20);
+    let n = node::start(cfg).expect("kvd starts");
+    for _ in 0..2000 {
+        if !n.shared.loading() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut c = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap().get_connection().unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let big = vec![b'x'; 100_000];
+    let (mut i, mut refused) = (0u32, 0u32);
+    while refused < 20 && i < 30_000 {
+        if redis::cmd("SET").arg(format!("fill{i}")).arg(&big).query::<()>(&mut c).is_err() {
+            refused += 1;
+        }
+        i += 1;
+    }
+    assert_eq!(refused, 20, "the device fills up");
+    let (mut renamed, mut failed) = (0, 0);
+    for j in 0..300 {
+        let src = format!("fill{j}");
+        let exists: i64 = redis::cmd("EXISTS").arg(&src).query(&mut c).unwrap();
+        if exists == 0 {
+            continue;
+        }
+        match redis::cmd("RENAME").arg(&src).arg(format!("dst{j}")).query::<()>(&mut c) {
+            Ok(()) => renamed += 1,
+            Err(e) => {
+                assert!(!e.is_timeout(), "RENAME {src} hangs");
+                failed += 1;
+                let back: i64 = redis::cmd("EXISTS").arg(&src).query(&mut c).unwrap();
+                assert_eq!(back, 1, "a failed RENAME keeps its source ({e})");
+            }
+        }
+    }
+    assert!(failed > 0, "some RENAMEs were refused for space ({renamed} renamed)");
+    for j in 0..100 {
+        let mut m = redis::cmd("MSET");
+        for k in 0..4 {
+            m.arg(format!("m{}", (j * 7 + k * 13) % 97)).arg(vec![b'y'; 5000 * (k + 1)]);
+        }
+        if let Err(e) = m.query::<()>(&mut c) {
+            assert!(!e.is_timeout(), "MSET #{j} hangs");
+        }
+    }
+    // every aborted txn id resolves and gives its credit back
+    let mut in_use = String::new();
+    for _ in 0..200 {
+        let info: String = redis::cmd("INFO").arg("all").query(&mut c).unwrap();
+        in_use = info.lines().find_map(|l| l.strip_prefix("txn_credits_in_use:")).unwrap_or("?").trim().to_string();
+        if in_use == "0" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(in_use, "0", "txn credits leaked");
+    let _: redis::RedisResult<()> = redis::cmd("SHUTDOWN").query(&mut c);
+    assert_eq!(n.wait(), 0, "SHUTDOWN completes");
+}
+
+/// Txn ids that never resolve (a failed device) leave no credit for further multi-key
+/// writes: such a write is refused after `CREDIT_HOLD_NS` instead of holding its connection
+/// forever (an EXEC is answered EXECABORT).
+#[test]
+fn multi_key_writes_without_a_credit_are_refused_in_bounded_time() {
+    use crate::runtime::exec::CREDIT_HOLD_NS;
+    let port = free_port();
+    let threads = 2;
+    let cfg = Config { port, threads: Some(threads), ..Config::default() };
+    let node = start_with(cfg, PARTITIONS, move |w, shared: &Arc<NodeShared>| {
+        let s = shared.clone();
+        MemBackend::new(w, threads, PARTITIONS).with_meta(Box::new(move |p, token, r| {
+            if let MetaReq::CommitTxn { txn } = r {
+                // committed, but the ids never resolve: no credit comes back
+                s.workers[usize::from(w)].send_side(XMsg::Meta { partition: p, token, done: MetaDone::Committed { txn } });
+            }
+        }))
+    })
+    .expect("node starts");
+    let n = TestNode { node: Some(node), port };
+    let mut c = n.client();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let (a, b) = keys_on_two_workers();
+    for i in 0..crate::shared::TXN_CREDITS {
+        let _: () = redis::cmd("MSET").arg(&a).arg(i).arg(&b).arg(i).query(&mut c).unwrap();
+    }
+    let t = std::time::Instant::now();
+    let e = redis::cmd("MSET").arg(&a).arg("x").arg(&b).arg("y").query::<()>(&mut c).unwrap_err();
+    assert!(!e.is_timeout() && e.to_string().contains("no transaction credit"), "{e}");
+    assert!(t.elapsed() >= Duration::from_nanos(CREDIT_HOLD_NS) && t.elapsed() < Duration::from_secs(5));
+    let _: () = redis::cmd("MULTI").query(&mut c).unwrap();
+    let _: () = redis::cmd("SET").arg(&a).arg("1").query(&mut c).unwrap();
+    let _: () = redis::cmd("SET").arg(&b).arg("2").query(&mut c).unwrap();
+    let e = redis::cmd("EXEC").query::<redis::Value>(&mut c).unwrap_err();
+    assert!(e.to_string().to_ascii_uppercase().contains("EXECABORT"), "{e}");
+    // single-key writes go on
+    let _: () = redis::cmd("SET").arg(&a).arg("z").query(&mut c).unwrap();
+    let v: String = redis::cmd("GET").arg(&a).query(&mut c).unwrap();
+    assert_eq!(v, "z");
+}

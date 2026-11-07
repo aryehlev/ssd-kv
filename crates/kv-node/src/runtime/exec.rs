@@ -91,6 +91,8 @@ enum WaitFor {
     Reply { to: ReplyTo, body: ReplyBody, commit: Option<(u16, kv_storage::layout::Seq)> },
     Node { gather: GatherRef, commit: Option<(u16, kv_storage::layout::Seq)> },
     Apply { xtxn: u64, coord: u16, partition: u16 },
+    /// The abort of an XTxn part left nothing of it on media (`Failed`: it may have).
+    Abort { xtxn: u64, coord: u16, partition: u16 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -136,6 +138,19 @@ struct PartHold {
     xtxn: u64,
     coord: u16,
     queue: VecDeque<HoldItem>,
+    /// The part's `Apply` failed at exec (it staged nothing; an abort has nothing to undo).
+    apply_failed: bool,
+}
+
+/// A cross-partition transaction given up after its parts were sent `Apply` (coordinator
+/// side): its txn id is reported resolved (`TxnAborted`) once every part's abort left nothing
+/// on media.
+struct Aborting {
+    txn_id: u64,
+    parts: usize,
+    /// A part's abort failed (I/O): some record of the txn may be left, so the id must never
+    /// resolve (that would make such a record valid, E10).
+    failed: bool,
 }
 
 /// What waits behind a partition hold, in arrival order.
@@ -174,6 +189,7 @@ pub struct ExecState {
     pub local: VecDeque<XMsg>,
     holds: hashbrown::HashMap<u16, PartHold, foldhash::fast::RandomState>,
     coords: hashbrown::HashMap<u64, Coord, foldhash::fast::RandomState>,
+    aborting: hashbrown::HashMap<u64, Aborting, foldhash::fast::RandomState>,
     gate_q: VecDeque<u64>,
     next_xtxn: u64,
     node_parts: hashbrown::HashMap<GatherRef, NodePart, foldhash::fast::RandomState>,
@@ -208,6 +224,7 @@ impl ExecState {
             local: VecDeque::new(),
             holds: Default::default(),
             coords: Default::default(),
+            aborting: Default::default(),
             gate_q: VecDeque::new(),
             next_xtxn: 0,
             node_parts: Default::default(),
@@ -290,15 +307,26 @@ impl ExecState {
                 _ => false,
             }
         };
+        let mut no_credit = false;
         let credit = if needs_credit {
             if !shared.take_txn_credit() {
-                return Err(Hold::TxnCredit);
+                // credits come back as txn ids resolve; a node whose ids stopped resolving (a
+                // failed device leaves aborted or uncommitted ids unresolved for good) refuses
+                // the command instead of holding the connection forever
+                let since = *conn.credit_hold_since.get_or_insert(now_boot_ns);
+                if now_boot_ns.saturating_sub(since) < CREDIT_HOLD_NS {
+                    return Err(Hold::TxnCredit);
+                }
+                no_credit = true;
+                None
+            } else {
+                Some(CreditGuard(Some(shared.clone())))
             }
-            Some(CreditGuard(Some(shared.clone())))
         } else {
             None
         };
-        Ok(PreConsume { lv: Reservation::take(shared, large), credit })
+        conn.credit_hold_since = None;
+        Ok(PreConsume { lv: Reservation::take(shared, large), credit, no_credit })
     }
 }
 
@@ -391,7 +419,15 @@ impl Drop for CreditGuard {
 pub struct PreConsume {
     pub lv: Reservation,
     pub credit: Option<CreditGuard>,
+    /// The command needs a txn credit and none became free within `CREDIT_HOLD_NS`: it is
+    /// refused (EXEC: EXECABORT).
+    pub no_credit: bool,
 }
+
+/// How long a multi-key write waits for a txn credit before it is refused.
+pub(crate) const CREDIT_HOLD_NS: u64 = 2_000_000_000;
+
+const NO_CREDIT: &[u8] = b"ERR multi-key write refused: no transaction credit became free (transaction ids are not resolving)";
 
 /// The partition request of a keyed command: its keys with their access modes (key bytes only;
 /// the partition computes the key hashes, LC-37).
@@ -676,7 +712,7 @@ impl<B: Backend> Worker<B> {
 
     /// Dispatches the command whose arguments `args` lie in `conn.read_buf[base..]`.
     pub(super) fn dispatch(&mut self, slot: u32, conn: &mut Conn, args: &[(u32, u32)], base: usize, pc: PreConsume) {
-        let PreConsume { lv, mut credit } = pc;
+        let PreConsume { lv, mut credit, no_credit } = pc;
         let mut out = std::mem::take(&mut self.x.reply);
         out.clear();
         let resolved = {
@@ -703,6 +739,18 @@ impl<B: Backend> Worker<B> {
             }
         };
         conn.last_cmd_id = Some(spec.id);
+        if no_credit {
+            if spec.id == CmdId::Exec && conn.multi.is_some() {
+                // EXEC answers EXECABORT and ends the transaction and its WATCH session
+                crate::cmd::txn::flag_queue_error(conn);
+            } else {
+                ReplyWriter::new(&mut out, conn.proto).error(NO_CREDIT);
+                self.shared.command_stats[usize::from(self.id)].reject(spec.id);
+                self.reply_now(conn, &mut out);
+                self.x.reply = out;
+                return;
+            }
+        }
         let mut w = ReplyWriter::new(&mut out, conn.proto);
         let requirepass = !self.cfg.requirepass.is_empty();
         if requirepass && !conn.authed && !router::allowed_before_auth(spec) {
@@ -1652,6 +1700,11 @@ impl<B: Backend> Worker<B> {
                 self.send(coord, XMsg::XTxn(XTxnMsg::Locked { xtxn, partition: p, reads: Err(e) }));
             }
             JobKind::Apply { xtxn, coord, .. } => {
+                if let Some(h) = self.x.holds.get_mut(&p)
+                    && h.xtxn == xtxn
+                {
+                    h.apply_failed = true;
+                }
                 self.send(coord, XMsg::XTxn(XTxnMsg::Applied { xtxn, partition: p, res: Err(e) }));
             }
             JobKind::Node { gather } => self.node_part_done(gather, Some(e)),
@@ -1745,6 +1798,9 @@ impl<B: Backend> Worker<B> {
             WaitFor::Apply { xtxn, coord, partition } => {
                 let res = failed.map_or(Ok(()), Err);
                 self.send(coord, XMsg::XTxn(XTxnMsg::Applied { xtxn, partition, res }));
+            }
+            WaitFor::Abort { xtxn, coord, partition } => {
+                self.send(coord, XMsg::XTxn(XTxnMsg::Aborted { xtxn, partition, ok: failed.is_none() }));
             }
         }
     }
@@ -1865,6 +1921,10 @@ impl<B: Backend> Worker<B> {
                     self.backend.meta_request(p, WORKER_TOKEN_BIT | xtxn, MetaReq::CommitTxn { txn: txn_id });
                     return;
                 }
+                Step::FinishAborted { msgs, reply, txn_id, parts } => {
+                    self.x.aborting.insert(xtxn, Aborting { txn_id, parts, failed: false });
+                    step = Step::Finish { msgs, reply };
+                }
                 Step::Finish { msgs, reply } => {
                     for (p, m) in msgs {
                         self.xtxn_send(p, m);
@@ -1890,7 +1950,7 @@ impl<B: Backend> Worker<B> {
                     h.queue.push_back(HoldItem::Lock(XTxnMsg::Lock { xtxn, from, partition, db, keys }));
                     return;
                 }
-                self.x.holds.insert(partition, PartHold { xtxn, coord: from, queue: VecDeque::new() });
+                self.x.holds.insert(partition, PartHold { xtxn, coord: from, queue: VecDeque::new(), apply_failed: false });
                 let req = Request {
                     db,
                     keys: keys.iter().map(|k| (k.key.clone(), k.access)).collect(),
@@ -1915,9 +1975,42 @@ impl<B: Backend> Worker<B> {
                 self.release_hold(partition, xtxn);
             }
             XTxnMsg::Unlock { xtxn, partition } => self.release_hold(partition, xtxn),
+            XTxnMsg::Abort { xtxn, txn_id, partition } => {
+                // undone before the hold goes: the requests queued behind it see the keys'
+                // previous versions (a failed RENAME keeps its source)
+                let (coord, failed) = self.x.holds.get(&partition).filter(|h| h.xtxn == xtxn).map_or((xtxn_worker(xtxn), false), |h| (h.coord, h.apply_failed));
+                let ticket = if failed { None } else { self.backend.abort_txn(partition, self.now, txn_id) };
+                match ticket {
+                    Some(t) => self.wait(partition, t.0, Waiter { what: WaitFor::Abort { xtxn, coord, partition }, need: Need::Durable }),
+                    None => {
+                        self.send(coord, XMsg::XTxn(XTxnMsg::Aborted { xtxn, partition, ok: true }));
+                    }
+                }
+                self.release_hold(partition, xtxn);
+            }
+            XTxnMsg::Aborted { xtxn, ok, .. } => self.part_aborted(xtxn, ok),
             XTxnMsg::Locked { xtxn, partition, reads } => self.xtxn_step(xtxn, |c| c.on_locked(partition, reads)),
             XTxnMsg::Applied { xtxn, partition, res } => self.xtxn_step(xtxn, |c| c.on_applied(partition, res)),
         }
+    }
+
+    /// A part of aborted transaction `xtxn` is undone (`ok`) or its undo failed. After the
+    /// last one the txn id is reported resolved; its resolution returns
+    /// the transaction's credit (`MetaDone::Resolved`).
+    fn part_aborted(&mut self, xtxn: u64, ok: bool) {
+        let Some(a) = self.x.aborting.get_mut(&xtxn) else { return };
+        a.parts -= 1;
+        a.failed |= !ok;
+        if a.parts > 0 {
+            return;
+        }
+        let a = self.x.aborting.remove(&xtxn).expect("present");
+        if a.failed {
+            tracing::warn!(worker = self.id, txn = a.txn_id, "the abort of a cross-partition transaction failed: its id stays unresolved");
+            return;
+        }
+        let p = self.backend.owned().first().copied().unwrap_or(0);
+        self.backend.meta_request(p, WORKER_TOKEN_BIT | xtxn, MetaReq::TxnAborted { txn: a.txn_id });
     }
 
     /// Ends transaction `xtxn`'s hold of `p`: what arrived meanwhile goes in, in order (a

@@ -232,6 +232,10 @@ pub struct PartitionCounters {
     pub txn_deletes_split: u64,
     /// Writes answered `-OOM` after waiting `SPACE_WAIT_NS` for space that was refused.
     pub space_wait_timeouts: u64,
+    /// Staged records that had to move to another page at build time and found no room there
+    /// (each tick a move is tried again; expected 0, since a record stays in the page it was
+    /// admitted to, §14.3).
+    pub moves_without_room: u64,
     pub extent_writes: u64,
     pub host_bytes_written: u64,
     pub user_bytes_written: u64,
@@ -978,6 +982,18 @@ impl Core {
 }
 
 /// Seq of the version at `c` (`Seq::ZERO` when absent or unknown).
+/// True when the next build of a cached SMALL page `q` places a new record of `need` bytes by
+/// R2 beside what is staged there and the gaps `planned` takes on it (`PageState::places`). A
+/// page's largest gap less its staged bytes is no promise: staged puts may split the gap, and
+/// first-fit-decreasing placement is not monotone. An uncached page is checked once loaded.
+fn page_takes(cache: &PageCache, boot: &Boot, dflt: PageUpdateMode, q: PageId, need: u16, planned: &[(PageId, u16)]) -> bool {
+    let Some(st) = cache.page_state(q) else { return true };
+    let mode = boot.devs.get(usize::from(q.dev())).map_or(dflt, |d| d.page_update);
+    let mut extra: SmallVec<[u16; 4]> = planned.iter().filter(|(p, l)| *p == q && *l > 0).map(|&(_, l)| l).collect();
+    extra.push(need);
+    st.places(cache.frame(st.image().1), mode, None, &extra)
+}
+
 fn cur_seq(c: &Cur) -> Seq {
     match c {
         Cur::Absent => Seq::ZERO,
@@ -1962,13 +1978,15 @@ impl PartitionStore {
         // 1. plan every placement; nothing changes unless all succeed
         let mut undo = Undo::default();
         let mut plans: SmallVec<[Plan; 2]> = SmallVec::new();
+        // gap bytes each small placement planned so far takes on its page
+        let mut planned: SmallVec<[(PageId, u16); 2]> = SmallVec::new();
         let mut i = 0;
         while i < staged.len() {
             let s = &staged[i];
             let p = match &s.change {
                 // a cross-partition part, a TTL change or a delete (marker) may use the reserve
-                Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some() || s.no_growth, &mut undo),
-                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, true, &mut undo),
+                Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some() || s.no_growth, &mut undo, &mut planned),
+                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, true, &mut undo, &mut planned),
                 _ => Ok(Plan::None),
             };
             match p {
@@ -1982,6 +2000,7 @@ impl PartitionStore {
                     // an AG free for each such partition cost a third of a small device
                     self.undo(core::mem::take(&mut undo));
                     plans.clear();
+                    planned.clear();
                     is_txn = false;
                     non_atomic = true;
                     self.core.counters.txn_deletes_split += 1;
@@ -2093,8 +2112,8 @@ impl PartitionStore {
     /// coordinator to resolve), and to writes that do not grow the key (`Staged::no_growth`:
     /// TTL changes, txn delete markers), whose old copy is freed once they are durable.
     #[allow(clippy::too_many_arguments)]
-    fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, reserve: bool, undo: &mut Undo) -> Result<Plan, Commit> {
-        let r = self.plan_put_at(cx, s, key_len, val_len, txn, undo);
+    fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, reserve: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
+        let r = self.plan_put_at(cx, s, key_len, val_len, txn, undo, planned);
         if matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && !self.core.retiring_ags.is_empty() {
             // a FLUSHALL gave up this partition's AGs and they go back to the pool once their
             // last writes are done (each tick): the space is coming back, so the write waits
@@ -2119,22 +2138,33 @@ impl PartitionStore {
         r
     }
 
-    fn plan_put_at(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, undo: &mut Undo) -> Result<Plan, Commit> {
+    #[allow(clippy::too_many_arguments)]
+    fn plan_put_at(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
         let now_ns = cx.now.mono_ns;
         let small = small_len(key_len, val_len as usize, txn);
         if key_len <= u16::MAX as usize && val_len <= u16::MAX as u64 && small <= SMALL_REC_MAX {
             let need = small as u16;
             if let Cur::Small { page, .. } = s.cur
-                && self.fits(cx.cache, page, need, s)
+                && let Some(gap) = self.fits(cx.cache, page, need, s, txn, planned)
             {
+                planned.push((page, gap));
                 return Ok(Plan::Small { page, fresh: false });
             }
-            // never stage a key onto a page holding its tracked copy, or onto a corrupt page
+            // never stage a key onto a page holding its tracked copy, or onto a corrupt page,
+            // or onto one whose next build would not place it (`page_takes`)
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
             let absent = stale.absent_of(s.db, &s.key).map(|a| a.page);
-            let exclude = |q: PageId| stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt);
-            return match self.core.alloc.place_small(need, cache, now_ns, &exclude) {
+            let (boot, dflt) = (&self.core.boot, self.core.cfg.page_update);
+            let pl: &[(PageId, u16)] = planned;
+            let exclude = |q: PageId| {
+                stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, q, need, pl)
+            };
+            let place = self.core.alloc.place_small(need, cache, now_ns, &exclude);
+            if let SmallPlace::Cached(q) | SmallPlace::Fresh(q) = place {
+                planned.push((q, need));
+            }
+            return match place {
                 SmallPlace::Cached(q) => Ok(Plan::Small { page: q, fresh: false }),
                 SmallPlace::Fresh(q) => {
                     undo.fresh.push(q);
@@ -2228,35 +2258,34 @@ impl PartitionStore {
             && !self.core.ext.zeros.contains_key(&start)
     }
 
-    /// True when a new version of `need` bytes of the key can stay in its page.
-    fn fits(&self, cache: &PageCache, page: PageId, need: u16, s: &Staged) -> bool {
-        let Some(st) = cache.page_state(page) else { return false };
+    /// The gap bytes a new version of `need` bytes of the key takes when it stays in its page
+    /// (0: rewritten in place, R1a), `None` when it cannot stay. It stays only if the next build
+    /// places it by R2 beside everything else staged there (`PageState::places`) and the puts
+    /// `planned` by the same command: admitted on the page's free byte count, a version that
+    /// found no gap at build time had to move away, which on a full device waited for space
+    /// forever.
+    fn fits(&self, cache: &PageCache, page: PageId, need: u16, s: &Staged, txn: bool, planned: &[(PageId, u16)]) -> Option<u16> {
+        let st = cache.page_state(page)?;
         if st.corrupt {
-            return false;
+            return None;
         }
         let h32 = s.kh.h32();
-        let staged_same: u16 = st
-            .pending
-            .iter()
-            .filter_map(|p| match p {
-                Pending::Put(r) if p.is_key(s.db, h32, &s.key) => Some(r.desc.len),
-                _ => None,
-            })
-            .sum();
-        let free = PAGE_ROOM.saturating_sub(st.used_bytes()) + staged_same;
-        if self.core.dev_mode(page.dev()) == PageUpdateMode::Atomic {
-            let (recs, fr) = st.image();
-            let img = cache.frame(fr);
+        let mode = self.core.dev_mode(page.dev());
+        let (recs, fr) = st.image();
+        let img = cache.frame(fr);
+        if mode == PageUpdateMode::Atomic && !txn {
             let old = recs
                 .iter()
                 .filter(|r| r.status == RecStatus::Live && r.db == s.db && r.h32 == h32 && r.key(img) == &*s.key)
                 .map(|r| r.len)
                 .fold(0, u16::max);
             if need <= old {
-                return true;
+                return Some(0);
             }
         }
-        need <= free
+        let mut extra: SmallVec<[u16; 4]> = planned.iter().filter(|(p, _)| *p == page).map(|&(_, l)| l).collect();
+        extra.push(need);
+        st.places(img, mode, Some((s.db, h32, &s.key)), &extra).then_some(need)
     }
 
     /// Applies one planned change.
@@ -2574,6 +2603,10 @@ impl PartitionStore {
                     && let Some(i) = st.pending.iter().position(|p| p.is_change() && p.is_key(s.db, h32, &s.key))
                 {
                     let mut eff = st.pending.remove(i);
+                    if let Pending::Put(r) = &eff {
+                        // the page's other staged puts were admitted with it counted
+                        st.phantom.push(r.desc.len);
+                    }
                     out.extend(eff.tickets_mut().drain(..));
                 }
                 if let Some(seq) = self.protect_in_page(cx.cache, page, s.db, h32, &s.key) {
@@ -2950,6 +2983,10 @@ impl PartitionStore {
         if let Some(st) = cache.page_state_mut(page) {
             if let Some(i) = st.pending.iter().position(|p| p.is_change() && p.is_key(db, h32, &key)) {
                 let mut old = st.pending.remove(i);
+                if let Pending::Put(r) = &old {
+                    // the page's other staged puts were admitted with it counted
+                    st.phantom.push(r.desc.len);
+                }
                 tickets.extend(old.tickets_mut().drain(..));
             }
             st.pending.push(Pending::Remove { db, h32, key, seq, tickets });
@@ -4645,7 +4682,10 @@ impl PartitionStore {
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
             let absent = stale.absent_of(db, &key).map(|a| a.page);
-            let exclude = |q: PageId| q == from || stale.state_at(db, &key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt);
+            let (boot, dflt) = (&self.core.boot, self.core.cfg.page_update);
+            let exclude = |q: PageId| {
+                q == from || stale.state_at(db, &key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, q, need, &[])
+            };
             self.core.alloc.place_small(need, cache, now_ns, &exclude)
         };
         let target = match place {
@@ -4664,6 +4704,7 @@ impl PartitionStore {
                 None
             }
             SmallPlace::NeedAg | SmallPlace::Full => {
+                self.core.counters.moves_without_room += 1;
                 // the write was accepted: its space comes from above the fill limit
                 let _ = self.core.alloc.want_reserved(AgKind::Small);
                 None

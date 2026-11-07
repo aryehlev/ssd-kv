@@ -781,3 +781,45 @@ fn reclaim_walk_speeds_up_while_writes_are_refused_space() {
     assert!(before > 5000 && before - after >= 4000, "{n} records flushed: the walk went from {before} to {after} pending pages in 2 s");
     db.quiesce();
 }
+
+/// An update stays in its page only if the page's next build places it (R2) beside its
+/// protected old copy (R1, two-image mode). A page holding two 1040-byte records, six 144-byte
+/// ones, a 144-byte hole (a record that moved within the page) and 976 free bytes at its end has
+/// 1120 free bytes but no 1040-byte gap: admitted on the free byte count, an update of the
+/// second large record found no gap at build time and had to move to another page. On a full
+/// device no page had room, and the move waited for an AG forever (its reply never came; SAVE
+/// and SHUTDOWN hung behind it). Admitted by the placement itself, it goes to a page that
+/// takes it, and nothing has to move after acceptance.
+#[test]
+fn an_update_admitted_to_its_page_is_placed_there() {
+    let mut db = fresh(64 * 4096, 31);
+    let big = |n: u8| vec![n; 1000];
+    let small = |n: u8| vec![n; 100];
+    let mut keys: Vec<(Vec<u8>, Vec<u8>)> = vec![(b"{t}a".to_vec(), big(1)), (b"{t}b".to_vec(), big(2))];
+    for i in 0..6u8 {
+        keys.push((format!("{{t}}c{i}").into_bytes(), small(10 + i)));
+    }
+    for (k, v) in &keys {
+        let t = db.set(0, k, v, None).unwrap();
+        db.wait(k, t, TicketState::Durable);
+    }
+    let page = db.eng.locate(0, b"{t}a").expect("stored").page;
+    for (k, _) in &keys {
+        assert_eq!(db.eng.locate(0, k).expect("stored").page, page, "every record on one page");
+    }
+    // the last small record moves within the page: its old bytes become a 144-byte hole
+    let t = db.set(0, b"{t}c5", &small(30), None).unwrap();
+    db.wait(b"{t}c5", t, TicketState::Durable);
+    // a build zeroes the superseded copy (R3)
+    let t = db.set(0, b"{t}c4", &small(31), None).unwrap();
+    db.wait(b"{t}c4", t, TicketState::Durable);
+    let p = db.eng.partition_of(b"{t}b");
+    let moves = |db: &Db<RamDev>| db.eng.partition(p).counters().page_writes_move;
+    let before = moves(&db);
+    let t = db.set(0, b"{t}b", &big(3), None).unwrap();
+    db.wait(b"{t}b", t, TicketState::Durable);
+    assert_eq!(moves(&db), before, "an accepted update moved at build time");
+    assert_eq!(db.get(0, b"{t}b").unwrap().expect("present").1, big(3));
+    assert_eq!(db.eng.partition(p).counters().moves_without_room, 0);
+    db.quiesce();
+}

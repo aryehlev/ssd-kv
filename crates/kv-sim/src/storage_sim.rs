@@ -1251,6 +1251,9 @@ pub struct RunStats {
     pub other_errors: u64,
     pub quiesces: u64,
     pub keys_checked: u64,
+    /// Most records seen moving at build time without room on another page (an engine instance's
+    /// `moves_without_room`, summed over partitions; expected 0).
+    pub moves_without_room: u64,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2327,6 +2330,8 @@ impl<'c> Sim<'c> {
         }
         {
             let e = self.eng.as_ref().expect("engine open");
+            let mnr: u64 = (0..e.partitions()).map(|p| e.partition(p).counters().moves_without_room).sum();
+            self.stats.moves_without_room = self.stats.moves_without_room.max(mnr);
             for p in 0..e.partitions() {
                 let c = e.partition(p).counters();
                 if c.unexpected_orphans > 0 {
@@ -2953,7 +2958,7 @@ pub mod cli {
             let mut w = stdout.lock();
             match r {
                 Ok(s) => {
-                    let _ = writeln!(w, "ok {seed} {ms} ticks={} cmds={} maxlat={} crashes={} cleans={} snap={} oom={} requeues={}", s.ticks, s.commands, s.max_latency, s.crashes, s.cleans, s.snapshot_restarts, s.out_of_space, s.requeues);
+                    let _ = writeln!(w, "ok {seed} {ms} ticks={} cmds={} maxlat={} crashes={} cleans={} snap={} oom={} requeues={} mnr={}", s.ticks, s.commands, s.max_latency, s.crashes, s.cleans, s.snapshot_restarts, s.out_of_space, s.requeues, s.moves_without_room);
                 }
                 Err(f) => {
                     let _ = writeln!(w, "fail {seed} {ms} {}", f.line());
@@ -3082,6 +3087,8 @@ pub mod cli {
         let mut cells: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         let mut durs: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         let mut slowest = (0u128, 0u64);
+        // passed seeds in which a record had to move at build time and found no room at once
+        let mut mnr_seeds: Vec<u64> = Vec::new();
         let mut done = 0u64;
         let total = all.len() as u64;
         let mut last_print = Instant::now();
@@ -3118,6 +3125,9 @@ pub mod cli {
                             w.current = None;
                             passed += 1;
                             done += 1;
+                            if it.next().and_then(|r| r.split_whitespace().find_map(|t| t.strip_prefix("mnr="))).and_then(|v| v.parse::<u64>().ok()).is_some_and(|n| n > 0) {
+                                mnr_seeds.push(seed);
+                            }
                             if ms > slowest.0 {
                                 slowest = (ms, seed);
                             }
@@ -3204,6 +3214,10 @@ pub mod cli {
         println!();
         println!("== storage simulation: seeds {}..{} ({} runs) in {:.0} s; slowest seed {} ({} ms)", o.start, o.start + o.seeds, done, t0.elapsed().as_secs_f64(), slowest.1, slowest.0);
         println!("   passed {passed}, failed {}", seen.len());
+        if !mnr_seeds.is_empty() {
+            mnr_seeds.sort_unstable();
+            println!("   passed seeds with records that moved at build time and found no room at once: {} (first: {:?})", mnr_seeds.len(), &mnr_seeds[..mnr_seeds.len().min(10)]);
+        }
         println!("   per matrix cell (passed / failed):");
         for (c, (ok, bad)) in &cells {
             println!("     {c:<24} {ok:>6} / {bad}");

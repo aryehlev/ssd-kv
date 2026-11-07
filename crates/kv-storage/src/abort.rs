@@ -217,13 +217,19 @@ impl PartitionStore {
     fn drop_staged(&mut self, cache: &mut PageCache, page: PageId, db: u8, h32: u32, key: &[u8], txn: u64) -> bool {
         let mut tickets: SmallVec<[TicketId; 2]> = SmallVec::new();
         if let Some(st) = cache.page_state_mut(page) {
+            let mut gone: SmallVec<[u16; 1]> = SmallVec::new();
             st.pending.retain(|p| {
                 let ours = matches!(p, crate::image::Pending::Put(r) if r.desc.txn == txn) && p.is_key(db, h32, key);
                 if ours {
                     tickets.extend(p.tickets().iter().copied());
+                    if let crate::image::Pending::Put(r) = p {
+                        gone.push(r.desc.len);
+                    }
                 }
                 !ours
             });
+            // the page's other staged puts were admitted with it counted
+            st.phantom.extend(gone);
         }
         for t in tickets {
             self.core.tickets.effect_resolved(t);

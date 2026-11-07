@@ -57,6 +57,11 @@ pub struct PageState {
     pub(crate) corrupt: bool,
     /// The partition holds one frame pin for this page's pending/inflight work.
     pub(crate) work_pin: bool,
+    /// Lengths of staged puts taken out of `pending` since the last build by something other
+    /// than a build (the key moved away, a remove replaced the put, a txn abort): every put still
+    /// staged was admitted with them counted (`PageState::places`), and the next build places by
+    /// that view if its own placement fails (`build`). Cleared by each build.
+    pub(crate) phantom: SmallVec<[u16; 2]>,
 }
 
 /// A record of an image.
@@ -248,6 +253,7 @@ impl PageState {
             scrub: false,
             corrupt: false,
             work_pin: false,
+            phantom: SmallVec::new(),
         }
     }
 
@@ -304,6 +310,53 @@ impl PageState {
         best = best.max(PAGE as u16 - at);
         let staged: u16 = self.pending.iter().map(|p| if let Pending::Put(r) = p { r.desc.len } else { 0 }).sum();
         best.saturating_sub(staged)
+    }
+
+    /// True when the page's next build places every staged put that needs free bytes, plus
+    /// records of `extra` lengths about to be staged, by R2 without moving any of them away
+    /// (§14.3). `img` is the current image's frame. The current image's live and protected
+    /// records keep their bytes (an updated key's copy stays protected beside its new version
+    /// in two-image mode, R1); `skip` names a key whose staged put the new one replaces
+    /// (staging coalesces); in atomic mode a non-txn staged put no longer than its key's newest
+    /// copy is rewritten at that copy's offset (R1a) and needs no gap. A page's free byte count
+    /// or its largest gap is no promise: free bytes split into gaps smaller than the record do
+    /// not take it, and other staged puts take gaps first. An accepted record that found no gap
+    /// at build time had to move, which on a full device found no page and waited for space
+    /// forever. Ties of equal lengths do not change which lengths fit, so keys are not needed.
+    pub(crate) fn places(&self, img: &[u8; PAGE], mode: PageUpdateMode, skip: Option<(u8, u32, &[u8])>, extra: &[u16]) -> bool {
+        let (recs, _) = self.image();
+        let kept: SmallVec<[&RecDesc; 24]> = recs.iter().filter(|r| matches!(r.status, RecStatus::Live | RecStatus::Protected)).collect();
+        let mut occupied: SmallVec<[(u16, u16); 24]> = kept.iter().map(|r| (r.off, r.end())).collect();
+        let mut lens: SmallVec<[u16; 8]> = extra.iter().copied().chain(self.phantom.iter().copied()).collect();
+        for p in &self.pending {
+            let Pending::Put(r) = p else { continue };
+            if let Some((db, h32, key)) = skip
+                && p.is_key(db, h32, key)
+            {
+                continue;
+            }
+            if mode == PageUpdateMode::Atomic && r.desc.txn == 0 {
+                let newest = (0..kept.len())
+                    .filter(|&j| kept[j].db == r.desc.db && kept[j].h32 == r.desc.h32 && kept[j].key(img) == r.key())
+                    .max_by_key(|&j| kept[j].seq);
+                if let Some(j) = newest
+                    && r.desc.len <= kept[j].len
+                {
+                    // rewritten at the old copy's offset; its tail is free
+                    occupied[j].1 = occupied[j].0 + r.desc.len;
+                    continue;
+                }
+            }
+            lens.push(r.desc.len);
+        }
+        lens.sort_unstable_by(|a, b| b.cmp(a));
+        for len in lens {
+            match find_gap(&mut occupied, len) {
+                Some(off) => occupied.push((off, off + len)),
+                None => return false,
+            }
+        }
+        true
     }
 
     /// Largest record of the page (slack rule, §11.3).
@@ -474,6 +527,27 @@ fn io_shape(ch: &Changes, env: &dyn BuildEnv) -> (SmallVec<[(u16, u16); 2]>, boo
 
 /// Lowest 16-aligned offset >= 0x20 where `len` bytes overlap nothing in `occupied`
 /// (`(off, end)` pairs, any order).
+/// R2 offsets for records of `lens` (sorted longest first) among `taken` bytes, with
+/// `reserved` lengths placed alongside them in the same order but not reported; `None` for a
+/// record no gap takes.
+fn ffd(taken: &[(u16, u16)], lens: &[u16], reserved: &[u16]) -> SmallVec<[Option<u16>; 8]> {
+    let mut occupied: SmallVec<[(u16, u16); 24]> = taken.iter().copied().collect();
+    let mut all: SmallVec<[(u16, Option<usize>); 12]> = lens.iter().enumerate().map(|(i, &l)| (l, Some(i))).collect();
+    all.extend(reserved.iter().map(|&l| (l, None)));
+    // stable: equal lengths keep the records' R2 order, reservations after them
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out: SmallVec<[Option<u16>; 8]> = SmallVec::from_elem(None, lens.len());
+    for (len, i) in all {
+        if let Some(off) = find_gap(&mut occupied, len) {
+            occupied.push((off, off + len));
+            if let Some(i) = i {
+                out[i] = Some(off);
+            }
+        }
+    }
+    out
+}
+
 fn find_gap(occupied: &mut SmallVec<[(u16, u16); 24]>, len: u16) -> Option<u16> {
     occupied.sort_unstable();
     let mut at = SMALL_HDR as u16;
@@ -583,6 +657,8 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
             i += 1;
         }
     }
+
+    let phantom = core::mem::take(&mut st.phantom);
 
     // 2. staged effects (one per key: staging coalesces)
     let pending = core::mem::take(&mut st.pending);
@@ -727,10 +803,47 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
 
     // 4. R2: first-fit-decreasing placement over the bytes no kept record occupies
     puts.sort_by(|(a, _), (b, _)| b.desc.len.cmp(&a.desc.len).then(a.desc.h32.cmp(&b.desc.h32)).then_with(|| a.key().cmp(b.key())));
-    let mut occupied: SmallVec<[(u16, u16); 24]> = keep.iter().map(|r| (r.off, r.end())).collect();
+    let kept: SmallVec<[(u16, u16); 24]> = keep.iter().map(|r| (r.off, r.end())).collect();
+    let lens: SmallVec<[u16; 8]> = puts.iter().map(|(r, _)| r.desc.len).collect();
+    // Puts deferred to a later image (E14) and puts taken out since the last build were counted
+    // when the others were admitted (`PageState::places`): their bytes stay free in N, so the
+    // deferred ones still fit when they go in.
+    let reserved: SmallVec<[u16; 4]> =
+        st.pending.iter().filter_map(|p| if let Pending::Put(r) = p { Some(r.desc.len) } else { None }).chain(phantom.iter().copied()).collect();
+    let mut offs = ffd(&kept, &lens, &reserved);
+    if offs.iter().any(Option::is_none) && !st.fresh {
+        // First-fit-decreasing is not monotone: with fewer bytes taken (records this build
+        // drops) it can fail where the placement the puts were admitted by succeeded. The
+        // build then places by that admission view: M's records as they were when the puts
+        // were admitted (live and protected ones, and also superseded ones when the admission
+        // saw them protected in an image then in flight). Bytes it leaves unused are free for
+        // the next image.
+        for with_superseded in [false, true] {
+            let mut view = kept.clone();
+            for r in st.recs.iter() {
+                let taken = matches!(r.status, RecStatus::Live | RecStatus::Protected) || (with_superseded && r.status == RecStatus::Superseded);
+                if taken && !keep.iter().any(|k| k.off == r.off) {
+                    view.push((r.off, r.end()));
+                }
+            }
+            let alt = ffd(&view, &lens, &reserved);
+            if alt.iter().all(Option::is_some) {
+                offs = alt;
+                break;
+            }
+        }
+    }
+    if offs.iter().any(Option::is_none) && !reserved.is_empty() {
+        // no view places everything: place what fits, the rest moves (§14.3)
+        let alt = ffd(&kept, &lens, &[]);
+        if alt.iter().filter(|o| o.is_none()).count() < offs.iter().filter(|o| o.is_none()).count() {
+            offs = alt;
+        }
+    }
+    let mut occupied = kept;
     let mut replaced: SmallVec<[u16; 2]> = SmallVec::new();
-    for (rec, old) in puts {
-        match find_gap(&mut occupied, rec.desc.len) {
+    for ((rec, old), at) in puts.into_iter().zip(offs) {
+        match at {
             Some(off) => {
                 write_rec(n, &rec, off, page, crc);
                 let mut d = rec.desc;
@@ -1340,6 +1453,179 @@ pub(crate) mod tests {
                     for k in 0..6u8 {
                         prop_assert!(v.iter().filter(|r| r.key == key(k).as_slice()).count() <= 2);
                     }
+                }
+            }
+        }
+    }
+
+    /// The layout a full two-image device produced: two 1040-byte records, a 144-byte hole
+    /// where a deleted record was, six 144-byte records and 976 free bytes at the end. The page
+    /// has 1120 free bytes, but an update of the second 1040-byte record needs a 1040-byte gap
+    /// beside its protected old copy (R1): admitted on the free byte count, it had to move away
+    /// at build time, and with no page free anywhere the move waited forever.
+    #[test]
+    fn free_bytes_split_into_small_gaps_do_not_take_an_update() {
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let mut st = state(&[0; PAGE], true);
+        let a = vec![1u8; 1000];
+        st.pending.push(Pending::Put(encoded(b"a", &a, 1)));
+        st.pending.push(Pending::Put(encoded(b"b", &a, 2)));
+        for i in 0..7u8 {
+            st.pending.push(Pending::Put(encoded(&[b'c', i], &[2; 100], 3 + u64::from(i))));
+        }
+        let (m1, b) = run(&mut st, &[0; PAGE], &env);
+        assert!(b.relocate.is_empty());
+        let mut st = state(&m1, false);
+        let kc = [b'c', 0];
+        st.pending.push(Pending::Remove { db: 0, h32: h32(&kc), key: kc.as_slice().into(), seq: Seq(20), tickets: SmallVec::new() });
+        let (m2, _) = run(&mut st, &m1, &env);
+        let st = state(&m2, false);
+        let room = PAGE as u16 - SMALL_HDR as u16;
+        let b_new = encoded(b"b", &[3; 1000], 30);
+        let need = b_new.desc.len;
+        assert!(room - st.used_bytes() >= need, "the page has the free bytes ({} of {need})", room - st.used_bytes());
+        assert!(!st.places(&m2, PageUpdateMode::TwoImage, Some((0, h32(b"b"), b"b")), &[need]), "no gap takes the update");
+        // what the build does with it
+        let mut st2 = state(&m2, false);
+        st2.pending.push(Pending::Put(b_new));
+        let (_, b) = run(&mut st2, &m2, &env);
+        assert_eq!(b.relocate.len(), 1);
+        // a record the end gap takes is placed
+        let small = encoded(b"d", &[4; 900], 31);
+        assert!(st.places(&m2, PageUpdateMode::TwoImage, None, &[small.desc.len]));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// `PageState::places` predicts the next build: when it says so every staged put is
+        /// placed (no record has to move away), and without staged removes it is exact.
+        #[test]
+        fn prop_places_predicts_the_build(steps in proptest::collection::vec(proptest::collection::vec(
+            prop_oneof![3 => (0u8..12, 0u16..1500).prop_map(|(k, l)| Step::Put(k, l)), 1 => (0u8..12).prop_map(Step::Del)], 1..6), 1..10),
+                                           atomic in any::<bool>()) {
+            let mode = if atomic { PageUpdateMode::Atomic } else { PageUpdateMode::TwoImage };
+            let env = Env { mode, lba: 512, others: HashMap::new() };
+            let mut m = [0u8; PAGE];
+            let mut st = state(&m, true);
+            let mut seq = 0u64;
+            for batch in steps {
+                for s in batch {
+                    seq += 1;
+                    let eff = match s {
+                        Step::Put(k, l) => Pending::Put(encoded(&key(k), &vec![seq as u8; usize::from(l)], seq)),
+                        Step::Del(k) => Pending::Remove { db: 0, h32: h32(&key(k)), key: key(k).into(), seq: Seq(u64::MAX), tickets: SmallVec::new() },
+                    };
+                    if let Some(i) = st.pending.iter().position(|p| p.key() == eff.key()) {
+                        st.pending.remove(i);
+                    }
+                    st.pending.push(eff);
+                }
+                let predicted = st.places(&m, mode, None, &[]);
+                // a staged remove frees bytes the same build may place a record in: the
+                // prediction counts them as taken (it may only err on the safe side)
+                let removes = st.pending.iter().any(|p| matches!(p, Pending::Remove { .. }));
+                let (n, b) = run(&mut st, &m, &env);
+                if predicted || !removes {
+                    prop_assert_eq!(predicted, b.relocate.is_empty(), "prediction {} but {} records moved", predicted, b.relocate.len());
+                }
+                if b.writes() {
+                    m = n;
+                    let mut recs = b.recs;
+                    settle(&mut recs, &m);
+                    let mut next = PageState::loaded(page(), FrameIdx(0), recs);
+                    next.pending = core::mem::take(&mut st.pending);
+                    st = next;
+                }
+            }
+        }
+    }
+
+    /// First-fit-decreasing is not monotone: a remove applied by the same build frees a
+    /// 128-byte gap, the 640-byte put then takes the low gap it opens, and the two 384-byte
+    /// puts no longer fit, although all three were admitted against the page as it was. The
+    /// build places them by the admission view instead of moving one away.
+    #[test]
+    fn admitted_puts_are_placed_when_a_removal_changes_the_gaps() {
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let u = 128u16;
+        let mut m = [0u8; PAGE];
+        write_small_header(&mut m, page(), PART);
+        let crc = RecordCrc::new(SALT);
+        // (unit offset, record length) of M's records; the last one fills the page's end
+        let layout: [(u16, u16); 5] = [(3, 128), (7, 128), (9, 512), (15, 512), (24, 992)];
+        for (i, &(at, len)) in layout.iter().enumerate() {
+            let r = encoded(&[b'm', i as u8], &vec![9; usize::from(len) - 34], 1 + i as u64);
+            assert_eq!(r.desc.len, len);
+            write_rec(&mut m, &r, SMALL_HDR as u16 + at * u, page(), crc);
+        }
+        let mut st = state(&m, false);
+        assert_eq!(st.recs.len(), 5);
+        let k0 = [b'm', 0];
+        st.pending.push(Pending::Remove { db: 0, h32: h32(&k0), key: k0.as_slice().into(), seq: Seq(50), tickets: SmallVec::new() });
+        for (i, len) in [384u16, 384, 640].into_iter().enumerate() {
+            let r = encoded(&[b'p', i as u8], &vec![7; usize::from(len) - 34], 60 + i as u64);
+            assert!(st.places(&m, PageUpdateMode::TwoImage, None, &[r.desc.len]), "put {i} admitted");
+            st.pending.push(Pending::Put(r));
+        }
+        // the plain placement over the bytes the build keeps fails
+        let kept: SmallVec<[(u16, u16); 24]> = layout[1..].iter().map(|&(at, len)| (SMALL_HDR as u16 + at * u, SMALL_HDR as u16 + at * u + len)).collect();
+        assert!(ffd(&kept, &[640, 384, 384], &[]).iter().any(Option::is_none));
+        let (n, b) = run(&mut st, &m, &env);
+        assert!(b.relocate.is_empty(), "{} admitted records moved", b.relocate.len());
+        assert_eq!(b.placed, 3);
+        let got = resolve(&n);
+        assert!(!got.contains_key(&k0.to_vec()));
+        for i in 0..3u8 {
+            assert!(got.contains_key(&vec![b'p', i]));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// A put admitted to a page by `PageState::places` (as `Core::fits` and `page_takes`
+        /// do) is placed by the page's next build, whatever was staged, removed or built since:
+        /// it never has to move away.
+        #[test]
+        fn prop_admitted_puts_never_move(steps in proptest::collection::vec(proptest::collection::vec(
+            prop_oneof![4 => (0u8..12, 0u16..1500).prop_map(|(k, l)| Step::Put(k, l)), 1 => (0u8..12).prop_map(Step::Del)], 1..8), 1..12),
+                                         atomic in any::<bool>()) {
+            let mode = if atomic { PageUpdateMode::Atomic } else { PageUpdateMode::TwoImage };
+            let env = Env { mode, lba: 512, others: HashMap::new() };
+            let mut m = [0u8; PAGE];
+            let mut st = state(&m, true);
+            let mut seq = 0u64;
+            for batch in steps {
+                for s in batch {
+                    seq += 1;
+                    let eff = match s {
+                        Step::Put(k, l) => {
+                            let r = encoded(&key(k), &vec![seq as u8; usize::from(l)], seq);
+                            if !st.places(&m, mode, Some((0, h32(&key(k)), &key(k))), &[r.desc.len]) {
+                                continue;
+                            }
+                            Pending::Put(r)
+                        }
+                        Step::Del(k) => Pending::Remove { db: 0, h32: h32(&key(k)), key: key(k).into(), seq: Seq(u64::MAX), tickets: SmallVec::new() },
+                    };
+                    if let Some(i) = st.pending.iter().position(|p| p.key() == eff.key()) {
+                        // a remove replacing a staged put leaves its length behind (`stage_remove`)
+                        if let (Pending::Put(r), Pending::Remove { .. }) = (st.pending.remove(i), &eff) {
+                            st.phantom.push(r.desc.len);
+                        }
+                    }
+                    st.pending.push(eff);
+                }
+                let (n, b) = run(&mut st, &m, &env);
+                prop_assert!(b.relocate.is_empty(), "{} admitted records moved", b.relocate.len());
+                if b.writes() {
+                    m = n;
+                    let mut recs = b.recs;
+                    settle(&mut recs, &m);
+                    let mut next = PageState::loaded(page(), FrameIdx(0), recs);
+                    next.pending = core::mem::take(&mut st.pending);
+                    st = next;
                 }
             }
         }

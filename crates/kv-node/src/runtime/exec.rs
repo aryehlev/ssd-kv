@@ -386,28 +386,15 @@ impl ExecState {
             return Err(Hold::LargeValue);
         }
         let src = &conn.read_buf[base..];
-        let arg = |i: usize| -> &[u8] {
-            let (o, l) = args[i];
-            &src[o as usize..(o + l) as usize]
-        };
         if !self.gate_hold_off && gate_holds(shared, conn, args, src, now_boot_ns) {
             conn.gate_hold_since.get_or_insert(now_boot_ns);
             return Err(Hold::Gate);
         }
         conn.gate_hold_since = None;
-        let needs_credit = !args.is_empty() && {
-            let name = arg(0);
-            let multi = conn.multi.is_some();
-            match kv_cmd::lookup(name).map(|s| s.id) {
-                Some(CmdId::Mset | CmdId::Msetnx) => !multi && args.len() >= 5,
-                Some(CmdId::Rename | CmdId::Renamenx | CmdId::Copy) => !multi && args.len() >= 3,
-                Some(CmdId::Exec) => conn.multi.as_ref().is_some_and(|m| written_keys(&m.queued) >= 2),
-                _ => false,
-            }
-        };
+        let needed = if args.is_empty() { 0 } else { credits_needed(shared, conn, args, src) };
         let mut no_credit = false;
-        let credit = if needs_credit {
-            if !shared.take_txn_credit() {
+        let credit = if needed > 0 {
+            if !shared.take_txn_credits(needed) {
                 // credits come back as txn ids resolve; a node whose ids stopped resolving (a
                 // failed device leaves aborted or uncommitted ids unresolved for good) refuses
                 // the command instead of holding the connection forever
@@ -418,7 +405,7 @@ impl ExecState {
                 no_credit = true;
                 None
             } else {
-                Some(CreditGuard(Some(shared.clone())))
+                Some(CreditGuard { shared: Some(shared.clone()), n: needed })
             }
         } else {
             None
@@ -470,6 +457,41 @@ fn gate_holds(shared: &NodeShared, conn: &Conn, args: &[(u32, u32)], src: &[u8],
     try_again(spec, &argv)
 }
 
+/// Txn credits a complete command needs before it is consumed (§6.7, §14.6 step 0): one for
+/// every txn it may open. A partition opens a txn for every request that writes two or more
+/// keys, so a multi-key write needs one credit, and a standalone DEL/UNLINK fanned out over
+/// several partitions one for every partition that gets two or more of its keys (the
+/// uncredited multi-key DELs of a busy node took more txn ids than the intent table has
+/// commit positions: its commits failed and every partition turned read-only).
+fn credits_needed(shared: &NodeShared, conn: &Conn, args: &[(u32, u32)], src: &[u8]) -> u32 {
+    let arg = |i: usize| -> &[u8] {
+        let (o, l) = args[i];
+        &src[o as usize..(o + l) as usize]
+    };
+    let multi = conn.multi.is_some();
+    match kv_cmd::lookup(arg(0)).map(|s| s.id) {
+        Some(CmdId::Mset | CmdId::Msetnx) => u32::from(!multi && args.len() >= 5),
+        Some(CmdId::Rename | CmdId::Renamenx | CmdId::Copy) => u32::from(!multi && args.len() >= 3),
+        Some(CmdId::Del | CmdId::Unlink) if !multi && args.len() >= 3 => {
+            if shared.cluster().is_some() || shared.partitions <= 1 {
+                // never fanned out: every key goes to one partition
+                return 1;
+            }
+            let mut per: SmallVec<[(u16, u8); 16]> = SmallVec::new();
+            for i in 1..args.len() {
+                let p = router::partition_of(kv_common::key_slot(arg(i)), shared.partitions);
+                match per.iter_mut().find(|(q, _)| *q == p) {
+                    Some((_, n)) => *n = n.saturating_add(1),
+                    None => per.push((p, 1)),
+                }
+            }
+            per.iter().filter(|&&(_, n)| n >= 2).count() as u32
+        }
+        Some(CmdId::Exec) => u32::from(conn.multi.as_ref().is_some_and(|m| written_keys(&m.queued) >= 2)),
+        _ => 0,
+    }
+}
+
 /// Keys written by a list of queued commands (the EXEC txn-credit rule, §6.7).
 fn written_keys(cmds: &[OwnedCmd]) -> usize {
     cmds.iter()
@@ -478,37 +500,54 @@ fn written_keys(cmds: &[OwnedCmd]) -> usize {
         .sum()
 }
 
-/// A txn credit taken before consuming a multi-key write; returned unless spent.
-pub struct CreditGuard(Option<Arc<NodeShared>>);
+/// Txn credits taken before consuming a multi-key write (one per txn the command may open);
+/// returned unless spent.
+pub struct CreditGuard {
+    shared: Option<Arc<NodeShared>>,
+    n: u32,
+}
 
 impl CreditGuard {
     /// Takes a credit from the node pool for a replication request (`None`: none free now).
     pub(crate) fn try_take(shared: &Arc<NodeShared>) -> Option<Self> {
-        shared.take_txn_credit().then(|| CreditGuard(Some(shared.clone())))
+        shared.take_txn_credits(1).then(|| CreditGuard { shared: Some(shared.clone()), n: 1 })
     }
 
     /// Takes over a credit that travelled with a command to its owner worker.
     fn adopt(shared: &Arc<NodeShared>) -> Self {
-        CreditGuard(Some(shared.clone()))
+        CreditGuard { shared: Some(shared.clone()), n: 1 }
+    }
+
+    /// One of the credits, for a sub-request of a fanned-out command (`None` once all are
+    /// handed out).
+    fn split_one(&mut self) -> Option<CreditGuard> {
+        if self.n == 0 {
+            return None;
+        }
+        self.n -= 1;
+        Some(CreditGuard { shared: self.shared.clone(), n: 1 })
     }
 
     /// A txn was opened with this credit: it returns when the meta thread reports the txn
     /// resolved (`MetaDone::Resolved`).
     fn spend(mut self) {
-        self.0 = None;
+        self.shared = None;
     }
 
     /// The credit moves with its command to another worker, which adopts it.
     fn transfer(mut self) -> bool {
-        self.0 = None;
+        debug_assert_eq!(self.n, 1, "only a single credit travels with a command");
+        self.shared = None;
         true
     }
 }
 
 impl Drop for CreditGuard {
     fn drop(&mut self) {
-        if let Some(s) = self.0.take() {
-            s.give_back_txn_credits(1);
+        if let Some(s) = self.shared.take()
+            && self.n > 0
+        {
+            s.give_back_txn_credits(self.n);
         }
     }
 }
@@ -992,7 +1031,7 @@ impl<B: Backend> Worker<B> {
                     (0..split.parts.len()).map(|i| (split.parts[i].0, OwnedCmd::new(spec.id, &multikey::sub_argv(&split, i, &argv)))).collect();
                 let argc = argv.len();
                 drop(argv);
-                self.fan_out(slot, conn, spec.id, split, argc, subs, env);
+                self.fan_out(slot, conn, spec.id, split, argc, subs, env, credit.take());
             }
             Route::XTxn => {
                 drop(argv);
@@ -1018,21 +1057,29 @@ impl<B: Backend> Worker<B> {
 
     /// Sends one sub-request per partition and installs the gather (§6.8).
     #[allow(clippy::too_many_arguments)]
-    fn fan_out(&mut self, slot: u32, conn: &mut Conn, id: CmdId, split: FanOutSplit, argc: usize, subs: Vec<(u16, OwnedCmd)>, env: ExecEnv) {
+    /// Sends one sub-request per partition and installs the gather (§6.8). A sub-request
+    /// that writes two or more keys gets one of `credit`'s txn credits (`credits_needed`
+    /// took one for each); the rest go back.
+    #[allow(clippy::too_many_arguments)]
+    fn fan_out(&mut self, slot: u32, conn: &mut Conn, id: CmdId, split: FanOutSplit, argc: usize, subs: Vec<(u16, OwnedCmd)>, env: ExecEnv, mut credit: Option<CreditGuard>) {
         let seq = conn.reserve_slot();
         let n = subs.len();
+        let writes = id.spec().flags.contains(CmdFlags::WRITE);
+        let multi_key: Vec<bool> = split.parts.iter().map(|(_, ix)| writes && ix.len() >= 2).collect();
         conn.set_gather(seq, GatherSlot { id, split, argc, parts: (0..n).map(|_| None).collect(), remaining: n });
         let cref = self.conn_ref(slot);
         for (i, (partition, sub)) in subs.into_iter().enumerate() {
             let to = ReplyTo { conn: cref, seq, part: Some(i as u16) };
             let worker = self.router.workers;
             let owner = partition % worker;
+            let sub_credit = if multi_key[i] { credit.as_mut().and_then(CreditGuard::split_one) } else { None };
             if owner == self.id {
                 let req = keyed_request(id.spec(), &sub.argv(), env.db);
-                let job = Job { to: Some(to), id, kind: JobKind::Cmd(sub), env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: None };
+                let job = Job { to: Some(to), id, kind: JobKind::Cmd(sub), env, start_ns: self.now.mono_ns, _lv: Reservation::NONE, credit: sub_credit };
                 self.submit_job(partition, req, job);
             } else {
-                let msg = XMsg::Cmd { from: self.id, conn: cref, req_seq: seq, partition, cmd: sub, env, part: Some(i as u16), credit: false, lv: Reservation::NONE };
+                let credit = sub_credit.is_some_and(CreditGuard::transfer);
+                let msg = XMsg::Cmd { from: self.id, conn: cref, req_seq: seq, partition, cmd: sub, env, part: Some(i as u16), credit, lv: Reservation::NONE };
                 self.send_cmd(conn, owner, msg);
             }
         }
@@ -1063,7 +1110,7 @@ impl<B: Backend> Worker<B> {
                     .map(|i| (split.parts[i].0, OwnedCmd::new(spec.id, &multikey::sub_argv(&split, i, &args.argv))))
                     .collect();
                 let env = self.env_of(conn);
-                self.fan_out(slot, conn, spec.id, split, args.argv.len(), subs, env);
+                self.fan_out(slot, conn, spec.id, split, args.argv.len(), subs, env, None);
             }
             ConnOutcome::Async => match crate::cmd::node_op(spec.id, conn, &args.argv) {
                 Some(op) => {

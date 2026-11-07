@@ -264,7 +264,12 @@ impl NodeShared {
 
     /// Takes a txn credit before a multi-key write is consumed (§6.7, §14.6).
     pub fn take_txn_credit(&self) -> bool {
-        self.txn_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
+        self.take_txn_credits(1)
+    }
+
+    /// Takes `n` txn credits at once, or none (a command that may open `n` txns).
+    pub fn take_txn_credits(&self, n: u32) -> bool {
+        self.txn_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| c.checked_sub(n)).is_ok()
     }
 
     /// Returns txn credits (resolved transactions, or a command answered before it reached a

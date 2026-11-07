@@ -652,6 +652,81 @@ fn failed_cross_partition_writes_on_a_full_device_undo_every_part() {
     assert_eq!(n.wait(), 0, "SHUTDOWN completes");
 }
 
+/// Pipelined multi-key DELs from several connections (each DEL opens a local txn in every
+/// partition that gets two or more of its keys): every DEL succeeds and the partitions keep
+/// taking writes. The DELs took txn ids without credits, more ids than the intent table has
+/// commit positions were outstanding, the commits failed and every partition turned
+/// read-only ('ERR storage I/O error' for every later write; SHUTDOWN refused).
+#[test]
+fn pipelined_multi_key_deletes_keep_within_the_commit_positions() {
+    use crate::runtime::node;
+
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut cfg = Config { port, threads: Some(2), ..Config::default() };
+    cfg.data_dir = dir.path().to_path_buf();
+    cfg.data_size = 1 << 30;
+    cfg.format_partitions = 16;
+    cfg.cache_size = Some(64 << 20);
+    let n = node::start(cfg).expect("kvd starts");
+    for _ in 0..2000 {
+        if !n.shared.loading() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    const KEYS: usize = 40_000;
+    let mut c = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap().get_connection().unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    for base in (0..KEYS).step_by(1000) {
+        let mut p = redis::pipe();
+        for k in base..base + 1000 {
+            p.cmd("SET").arg(format!("k{k}")).arg("v").ignore();
+        }
+        let _: () = p.query(&mut c).unwrap();
+    }
+    let threads: Vec<_> = (0..4u64)
+        .map(|t| {
+            std::thread::spawn(move || {
+                let mut c = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap().get_connection().unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                let mut r = t * 7919 + 3;
+                let mut p = redis::pipe();
+                for _ in 0..600 {
+                    let mut d = redis::cmd("DEL");
+                    for _ in 0..48 {
+                        r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        d.arg(format!("k{}", (r >> 33) as usize % KEYS));
+                    }
+                    p.add_command(d);
+                }
+                let res: Vec<redis::Value> = p.query(&mut c).unwrap_or_else(|e| panic!("pipelined DELs failed: {e}"));
+                for v in res {
+                    assert!(matches!(v, redis::Value::Int(_)), "DEL answered {v:?}");
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    for p in 0..64 {
+        let _: () = redis::cmd("SET").arg(format!("{{p{p}}}after")).arg("ok").query(&mut c).unwrap_or_else(|e| panic!("a partition stopped taking writes: {e}"));
+    }
+    let mut in_use = String::new();
+    for _ in 0..200 {
+        let info: String = redis::cmd("INFO").arg("all").query(&mut c).unwrap();
+        in_use = info.lines().find_map(|l| l.strip_prefix("txn_credits_in_use:")).unwrap_or("?").trim().to_string();
+        if in_use == "0" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(in_use, "0", "txn credits leaked");
+    let _: redis::RedisResult<()> = redis::cmd("SHUTDOWN").query(&mut c);
+    assert_eq!(n.wait(), 0, "SHUTDOWN completes");
+}
+
 /// Txn ids that never resolve (a failed device) leave no credit for further multi-key
 /// writes: such a write is refused after `CREDIT_HOLD_NS` instead of holding its connection
 /// forever (an EXEC is answered EXECABORT).

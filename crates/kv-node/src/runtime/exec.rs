@@ -121,7 +121,8 @@ struct Coord {
     credit: Option<CreditGuard>,
     /// The `Lock` messages went out (the gate served the transaction).
     started: bool,
-    /// The transaction holds the gate: from its turn until every part registered its `Lock`.
+    /// The transaction belongs to the batch holding the gate and some of its parts have not
+    /// registered their `Lock` yet.
     gate: bool,
     /// Parts that answered `Registered`.
     registered: usize,
@@ -260,6 +261,14 @@ struct NodePart {
     err: Option<StoreError>,
 }
 
+/// Transactions of one worker that entered the partitions' lock order together (one gate
+/// turn): the gate goes on once each of them registered every `Lock`.
+struct GateBatch {
+    ticket: u64,
+    /// `Registered` answers still due.
+    outstanding: usize,
+}
+
 /// The mutable execution state of a worker.
 pub struct ExecState {
     jobs: hashbrown::HashMap<(u16, u32), Job, foldhash::fast::RandomState>,
@@ -274,6 +283,10 @@ pub struct ExecState {
     coords: hashbrown::HashMap<u64, Coord, foldhash::fast::RandomState>,
     aborting: hashbrown::HashMap<u64, Aborting, foldhash::fast::RandomState>,
     gate_q: VecDeque<u64>,
+    /// The gate ticket this worker took for its next batch.
+    gate_ticket: Option<u64>,
+    /// The batch of transactions holding the gate.
+    gate_batch: Option<GateBatch>,
     next_xtxn: u64,
     node_parts: hashbrown::HashMap<GatherRef, NodePart, foldhash::fast::RandomState>,
     gathers: Vec<Option<HomeGather>>,
@@ -309,6 +322,8 @@ impl ExecState {
             coords: Default::default(),
             aborting: Default::default(),
             gate_q: VecDeque::new(),
+            gate_ticket: None,
+            gate_batch: None,
             next_xtxn: 0,
             node_parts: Default::default(),
             gathers: Vec::new(),
@@ -1898,16 +1913,13 @@ impl<B: Backend> Worker<B> {
         let xtxn = (u64::from(self.id) << 40) | self.x.next_xtxn;
         let router = self.router;
         let id = cmd.id;
-        let Some(mut coord) = XTxnCoord::new(xtxn, 0, cmd, env, |k| router.partition_of_key(k)) else {
+        let Some(coord) = XTxnCoord::new(xtxn, 0, cmd, env, |k| router.partition_of_key(k)) else {
             let mut b = Vec::new();
             ReplyWriter::new(&mut b, env.proto).error(b"ERR internal: not a cross-partition transaction command");
             self.record(id, self.now.mono_ns, true);
             self.deliver(to, ReplyBody::Bytes(b));
             return true;
         };
-        // the gate ticket is taken only for a transaction that will run (it must be released
-        // in turn)
-        coord.ticket = self.shared.xtxn.ticket();
         self.x.coords.insert(xtxn, Coord { coord, to, start_ns: self.now.mono_ns, credit, started: false, gate: false, registered: 0, holds_conn: false });
         self.x.gate_q.push_back(xtxn);
         self.poll_gate();
@@ -1920,24 +1932,43 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    /// Starts the transaction at the head of this worker's gate queue when the gate serves it.
+    /// Starts every transaction of this worker's gate queue when the gate serves the worker
+    /// (one ticket per batch): they send their `Lock`s in queue order, so every partition
+    /// registers them in that order, and the gate goes on once all of them registered (a gate
+    /// turn costs a message round trip to the parts' workers, so one transaction per turn
+    /// bounded the node to about a thousand cross-partition writes a second).
     fn poll_gate(&mut self) {
-        while let Some(&xtxn) = self.x.gate_q.front() {
-            let Some(c) = self.x.coords.get(&xtxn) else {
-                self.x.gate_q.pop_front();
-                continue;
-            };
-            if !self.shared.xtxn.is_turn(c.coord.ticket) {
-                return;
+        if self.x.gate_batch.is_some() || self.x.gate_q.is_empty() {
+            return;
+        }
+        let t = match self.x.gate_ticket {
+            Some(t) => t,
+            None => {
+                let t = self.shared.xtxn.ticket();
+                self.x.gate_ticket = Some(t);
+                t
             }
-            self.x.gate_q.pop_front();
-            let me = self.id;
+        };
+        if !self.shared.xtxn.is_turn(t) {
+            return;
+        }
+        self.x.gate_ticket = None;
+        let batch: SmallVec<[u64; 16]> = self.x.gate_q.drain(..).filter(|x| self.x.coords.contains_key(x)).collect();
+        let mut outstanding = 0;
+        for x in &batch {
+            if let Some(c) = self.x.coords.get_mut(x) {
+                c.gate = true;
+                c.registered = 0;
+                outstanding += c.coord.lock_count();
+            }
+        }
+        self.x.gate_batch = Some(GateBatch { ticket: t, outstanding });
+        let me = self.id;
+        for xtxn in batch {
+            let Some(c) = self.x.coords.get(&xtxn) else { continue };
             if c.coord.partitions().next().is_none() {
                 self.xtxn_step(xtxn, |c| c.abort(b"ERR internal: empty transaction"));
                 continue;
-            }
-            if let Some(c) = self.x.coords.get_mut(&xtxn) {
-                c.gate = true;
             }
             self.xtxn_step(xtxn, |c| c.start(me));
             // the locks are on their way: the connection's later commands queue behind them
@@ -1949,6 +1980,8 @@ impl<B: Backend> Worker<B> {
                 }
             }
         }
+        // a batch whose transactions all ended at once (or lock nothing) passes the gate on
+        self.gate_registered(0);
     }
 
     /// Lifts hold `h` of a connection of this worker (if it still holds it).
@@ -1979,9 +2012,21 @@ impl<B: Backend> Worker<B> {
     fn xtxn_registered(&mut self, xtxn: u64) {
         let Some(c) = self.x.coords.get_mut(&xtxn) else { return };
         c.registered += 1;
-        if c.gate && c.registered >= c.coord.lock_count() {
-            c.gate = false;
-            self.shared.xtxn.release(c.coord.ticket);
+        if c.gate {
+            c.gate = c.registered < c.coord.lock_count();
+            self.gate_registered(1);
+        }
+    }
+
+    /// `n` registrations of the batch holding the gate arrived (or will never come: their
+    /// transaction ended); after the last one the gate serves the next ticket.
+    fn gate_registered(&mut self, n: usize) {
+        let Some(b) = self.x.gate_batch.as_mut() else { return };
+        b.outstanding = b.outstanding.saturating_sub(n);
+        if b.outstanding == 0 {
+            let t = b.ticket;
+            self.x.gate_batch = None;
+            self.shared.xtxn.release(t);
             self.shared.wake_all();
         }
     }
@@ -2028,8 +2073,8 @@ impl<B: Backend> Worker<B> {
                     }
                     let Some(c) = self.x.coords.remove(&xtxn) else { return };
                     if c.gate {
-                        self.shared.xtxn.release(c.coord.ticket);
-                        self.shared.wake_all();
+                        // its parts' late `Registered` answers are ignored
+                        self.gate_registered(c.coord.lock_count().saturating_sub(c.registered));
                     }
                     self.record(c.coord.cmd.id, c.start_ns, reply.first() == Some(&b'-'));
                     self.deliver(c.to, ReplyBody::Bytes(reply));

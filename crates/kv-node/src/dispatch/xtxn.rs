@@ -1,9 +1,11 @@
 //! Standalone cross-partition transactions (DESIGN §6.8, §14.6, LC-37).
 //!
 //! 1. The coordinating worker (the one that received the command) takes the node-global
-//!    `XTxnGate` (a conflict lock, not load control): one XTxn enters the partitions' lock
-//!    order at a time, and it gives the gate up once every part answered `Registered` (its
-//!    `Lock` holds its keys or waits in FIFO order behind what conflicts with it). Every
+//!    `XTxnGate` (a conflict lock, not load control): one worker's batch of XTxns (those
+//!    waiting in its gate queue at its turn, started in queue order) enters the partitions'
+//!    lock order at a time, and the worker gives the gate up once every part of the batch
+//!    answered `Registered` (its `Lock` holds its keys or waits in FIFO order behind what
+//!    conflicts with it). Every
 //!    partition then orders any two conflicting transactions the same way (the order in which
 //!    they held the gate), so none waits for another that waits for it, and transactions on
 //!    disjoint keys read, write and commit concurrently (the meta thread batches their
@@ -185,7 +187,7 @@ pub enum Step {
 /// The coordinator side of one cross-partition transaction.
 pub struct XTxnCoord {
     pub xtxn: u64,
-    /// The gate ticket this transaction holds.
+    /// Unused: the gate is taken per batch of a worker (`ExecState::gate_ticket`).
     pub ticket: u64,
     pub cmd: OwnedCmd,
     pub env: ExecEnv,

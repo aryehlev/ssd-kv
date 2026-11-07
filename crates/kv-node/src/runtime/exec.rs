@@ -163,16 +163,29 @@ struct PartHolds {
 
 /// What an item of a hold queue touches.
 enum Footprint<'a> {
-    /// Keyless requests (FLUSHDB, barriers, SCAN steps, ...): every key.
+    /// Keyless writes and barriers (FLUSHALL, SAVE / SHUTDOWN drains, sync walks): every key.
     All,
-    Keys(SmallVec<[&'a [u8]; 4]>),
+    /// FLUSHDB of one database: every key of that database.
+    Db(u8),
+    /// Keyless reads (SCAN steps, RANDOMKEY): they read every key, but a write of another
+    /// connection queued after one may go ahead of it (the read is concurrent with it).
+    Read,
+    /// The keys of a keyed request or of a transaction's `Lock` (key bytes, in database `db`).
+    Keys(u8, SmallVec<[&'a [u8]; 4]>),
 }
 
 impl Footprint<'_> {
-    fn meets(&self, keys: &[&[u8]]) -> bool {
+    /// Whether a keyed request of database `db` on `keys`, queued behind an item with this
+    /// footprint, must wait for it. A transaction's `Lock` (`lock`) waits behind every keyless
+    /// item: keyless items wait until no transaction holds keys of the partition, and `Lock`s
+    /// going ahead of one would keep it waiting for good under a steady stream of
+    /// transactions.
+    fn blocks(&self, db: u8, keys: &[&[u8]], lock: bool) -> bool {
         match self {
             Footprint::All => true,
-            Footprint::Keys(k) => k.iter().any(|a| keys.contains(a)),
+            Footprint::Db(d) => lock || *d == db,
+            Footprint::Read => lock,
+            Footprint::Keys(_, k) => k.iter().any(|a| keys.contains(a)),
         }
     }
 }
@@ -181,7 +194,7 @@ impl HoldItem {
     fn footprint(&self) -> Footprint<'_> {
         match self {
             HoldItem::Job(req, _) => request_footprint(req),
-            HoldItem::Lock(XTxnMsg::Lock { keys, .. }) => Footprint::Keys(keys.iter().map(|k| &*k.key).collect()),
+            HoldItem::Lock(XTxnMsg::Lock { keys, db, .. }) => Footprint::Keys(*db, keys.iter().map(|k| &*k.key).collect()),
             HoldItem::Lock(_) => Footprint::All,
         }
     }
@@ -192,11 +205,17 @@ impl HoldItem {
             HoldItem::Lock(_) => None,
         }
     }
+
+    fn is_lock(&self) -> bool {
+        matches!(self, HoldItem::Lock(_))
+    }
 }
 
 fn request_footprint(req: &Request) -> Footprint<'_> {
     match req.kind {
-        ReqKind::Keyed | ReqKind::Txn { .. } if !req.keys.is_empty() => Footprint::Keys(req.keys.iter().map(|(k, _)| &**k).collect()),
+        ReqKind::Keyed | ReqKind::Txn { .. } if !req.keys.is_empty() => Footprint::Keys(req.db, req.keys.iter().map(|(k, _)| &**k).collect()),
+        ReqKind::FlushDb { db: Some(d) } => Footprint::Db(d),
+        ReqKind::ScanStep { .. } | ReqKind::RandomKey { .. } => Footprint::Read,
         _ => Footprint::All,
     }
 }
@@ -206,19 +225,23 @@ impl PartHolds {
         self.holders.iter().find(|h| h.xtxn == xtxn)
     }
 
-    /// Whether an item touching `fp` (sent by connection `conn`) must wait: it conflicts with
-    /// a holder, with a queued item (per-key FIFO; keyless items keep strict FIFO), or an
-    /// earlier command of its connection waits (a connection's commands reach a partition in
-    /// order, §6.6).
-    fn must_wait(&self, queued: &VecDeque<HoldItem>, fp: &Footprint<'_>, conn: Option<ConnRef>) -> bool {
-        let keys: SmallVec<[&[u8]; 4]> = match fp {
-            Footprint::All => return !self.holders.is_empty() || !queued.is_empty(),
-            Footprint::Keys(k) => k.clone(),
+    /// Whether an item touching `fp` (sent by connection `conn`; `lock`: a transaction's
+    /// `Lock`) must wait: it conflicts with a holder, with a queued item (per-key FIFO; keyless
+    /// items keep strict FIFO), or an earlier command of its connection waits (a connection's
+    /// commands reach a partition in order, §6.6). A keyed request of another connection does
+    /// not wait for a queued keyless read, nor for a queued FLUSHDB of another database: every
+    /// keyless item waits for every transaction holding keys of the partition, and under a
+    /// steady stream of cross-partition writes a SCAN step or a FLUSHDB of db 1 held each
+    /// single-key request of db 0 behind it for about two seconds.
+    fn must_wait(&self, queued: &VecDeque<HoldItem>, fp: &Footprint<'_>, conn: Option<ConnRef>, lock: bool) -> bool {
+        let (db, keys): (u8, SmallVec<[&[u8]; 4]>) = match fp {
+            Footprint::All | Footprint::Db(_) | Footprint::Read => return !self.holders.is_empty() || !queued.is_empty(),
+            Footprint::Keys(db, k) => (*db, k.clone()),
         };
         if self.holders.iter().any(|h| h.keys.iter().any(|k| keys.contains(&&**k))) {
             return true;
         }
-        queued.iter().any(|q| (conn.is_some() && q.conn() == conn) || q.footprint().meets(&keys))
+        queued.iter().any(|q| (conn.is_some() && q.conn() == conn) || q.footprint().blocks(db, &keys, lock))
     }
 
     fn is_empty(&self) -> bool {
@@ -1501,7 +1524,7 @@ impl<B: Backend> Worker<B> {
                 JobKind::Lock { xtxn, .. } | JobKind::Apply { xtxn, .. } => h.holder(*xtxn).is_some(),
                 _ => false,
             };
-            if !own && h.must_wait(&h.queue, &request_footprint(&req), job.to.map(|t| t.conn)) {
+            if !own && h.must_wait(&h.queue, &request_footprint(&req), job.to.map(|t| t.conn), false) {
                 h.queue.push_back(HoldItem::Job(req, job));
                 return;
             }
@@ -2135,7 +2158,7 @@ impl<B: Backend> Worker<B> {
         match m {
             XTxnMsg::Lock { xtxn, from, partition, db, keys } => {
                 let h = self.x.holds.entry(partition).or_default();
-                let wait = h.must_wait(&h.queue, &Footprint::Keys(keys.iter().map(|k| &*k.key).collect()), None);
+                let wait = h.must_wait(&h.queue, &Footprint::Keys(db, keys.iter().map(|k| &*k.key).collect()), None, true);
                 if wait {
                     // a transaction holding some of these keys, or a request waiting for one
                     h.queue.push_back(HoldItem::Lock(XTxnMsg::Lock { xtxn, from, partition, db, keys }));
@@ -2233,7 +2256,7 @@ impl<B: Backend> Worker<B> {
         let mut go: Vec<HoldItem> = Vec::new();
         for item in queue {
             // items ahead that go in now are submitted before this one (in order)
-            let wait = h.must_wait(&kept, &item.footprint(), item.conn());
+            let wait = h.must_wait(&kept, &item.footprint(), item.conn(), item.is_lock());
             if wait {
                 kept.push_back(item);
                 continue;
@@ -2515,5 +2538,39 @@ mod tests {
         assert!(matches!(r.kind, ReqKind::Keyed));
         assert_eq!(merge_access(kv_cmd::Access::Meta, kv_cmd::Access::Read), kv_cmd::Access::Read);
         assert_eq!(xtxn_worker((3u64 << 40) | 9), 3);
+    }
+
+    #[test]
+    fn keyed_requests_go_ahead_of_queued_keyless_reads_and_flushes_of_other_databases() {
+        let req = |db: u8, kind: ReqKind| Request { db, keys: SmallVec::new(), kind, origin: Origin::Client };
+        let scan = req(1, ReqKind::ScanStep { db: 1, cursor: 0, count: 10, vtype: None });
+        let rnd = req(1, ReqKind::RandomKey { db: 1, r: 7 });
+        let flush1 = req(1, ReqKind::FlushDb { db: Some(1) });
+        let flushall = req(0, ReqKind::FlushDb { db: None });
+        let barrier = req(0, ReqKind::Barrier);
+        let k: [&[u8]; 1] = [b"k"];
+        for r in [&scan, &rnd] {
+            let fp = request_footprint(r);
+            assert!(!fp.blocks(0, &k, false) && !fp.blocks(1, &k, false), "a keyed request waits for a queued keyless read");
+            assert!(fp.blocks(0, &k, true), "a transaction's Lock goes ahead of a queued keyless read");
+        }
+        let fp = request_footprint(&flush1);
+        assert!(!fp.blocks(0, &k, false), "a request of db 0 waits for a queued FLUSHDB of db 1");
+        assert!(fp.blocks(1, &k, false), "a request of db 1 goes ahead of a queued FLUSHDB of db 1");
+        assert!(fp.blocks(0, &k, true), "a Lock goes ahead of a queued FLUSHDB");
+        for r in [&flushall, &barrier] {
+            assert!(request_footprint(r).blocks(0, &k, false));
+        }
+        let keyed = keyed_request(CmdId::Set.spec(), &[b"SET", b"k", b"v"], 0);
+        assert!(request_footprint(&keyed).blocks(5, &k, false), "same key bytes conflict whatever the database");
+        let other: [&[u8]; 1] = [b"j"];
+        assert!(!request_footprint(&keyed).blocks(0, &other, false));
+        // a keyless item itself keeps strict FIFO behind everything queued
+        let mut h = PartHolds::default();
+        assert!(!h.must_wait(&h.queue, &request_footprint(&scan), None, false));
+        h.holders.push(PartHold { xtxn: 1, coord: 0, keys: SmallVec::from_iter([Box::<[u8]>::from(&b"x"[..])]), apply_failed: false });
+        assert!(h.must_wait(&h.queue, &request_footprint(&scan), None, false), "a keyless read waits for the holders");
+        assert!(h.must_wait(&h.queue, &request_footprint(&flush1), None, false));
+        assert!(!h.must_wait(&h.queue, &request_footprint(&keyed), None, false), "a key no holder holds goes in");
     }
 }

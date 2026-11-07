@@ -942,7 +942,7 @@ pub mod mem {
     }
 
     fn done<R>(r: R) -> ExecStatus<R> {
-        ExecStatus::Done(r, ExecOut { ticket: None, group: None::<Group>, seq: None })
+        ExecStatus::Done(r, ExecOut::new(None, None::<Group>, None))
     }
 
     impl Backend for MemBackend {

@@ -580,8 +580,9 @@ fn flush_under_load_gives_old_ags_back() {
 /// deletes stage txn markers, small records (§14.6 step 2); a partition whose keys all live in
 /// extents owns no SMALL AG, and once extent AGs had taken every free AG only the first two
 /// partitions got one: every other partition's multi-key DEL answered `-OOM`, so a full device
-/// could only be emptied one key per command. The pool now keeps a free AG for each partition
-/// owning no SMALL AG.
+/// could only be emptied one key per command. Such a delete now runs as independent deletes,
+/// which need no space (keeping a free AG for each partition owning no SMALL AG instead cost a
+/// third of a small device's capacity).
 #[test]
 fn multi_key_deletes_work_in_every_partition_of_a_device_full_of_extents() {
     use kv_storage::keyspace::StoreError;
@@ -625,7 +626,12 @@ fn multi_key_deletes_work_in_every_partition_of_a_device_full_of_extents() {
             .unwrap_or_else(|e| panic!("multi-key delete in partition {p} of a device full of extents ({used}/{total} AGs used): {e:?}"));
         assert_eq!(n, 2);
         db.wait_in(p as u16, out.ticket, TicketState::Written);
+        for k in &ks {
+            assert!(db.get(0, k).unwrap().is_none(), "partition {p}: a deleted key is back");
+        }
     }
+    let split: u64 = (0..parts).map(|p| db.eng.partition(p).counters().txn_deletes_split).sum();
+    assert!(split > 0, "some partition had no space for txn markers");
     db.quiesce();
 }
 

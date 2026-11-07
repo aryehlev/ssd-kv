@@ -1902,7 +1902,8 @@ impl<'c> Sim<'c> {
                                 format!("{} (step {}) observed {:?}, the model expects {:?}", Step::Cmd(cmd.clone()).to_text(), self.out[&uid].step, got, want),
                             ));
                         }
-                        let txn = writes.len() >= 2;
+                        // a multi-key delete split for want of marker space is not atomic
+                        let txn = writes.len() >= 2 && !out.non_atomic;
                         if self.trace {
                             let w: Vec<String> = writes
                                 .iter()

@@ -410,6 +410,7 @@ fn render(shared: &NodeShared, sel: Selection) -> String {
                 f!("stale_copies", parts.stale_copies);
                 f!("foreground_scrub_writes", parts.foreground_scrub_writes);
                 f!("txn_markers", parts.txn_markers);
+                f!("txn_deletes_split", parts.txn_deletes_split);
                 f!(
                     "txn_credits_in_use",
                     crate::shared::TXN_CREDITS

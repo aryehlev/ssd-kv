@@ -168,11 +168,21 @@ pub struct ExecOut {
     pub ticket: Option<TicketId>,
     pub group: Option<Group>,
     pub seq: Option<Seq>,
+    /// A multi-key delete ran as independent deletes, not as a txn: the device had no space
+    /// left for its txn markers (`PartitionStore::commit`). A crash before its ticket is
+    /// Written may leave some of its keys deleted and others not; an acknowledged one is
+    /// complete as always.
+    pub non_atomic: bool,
 }
 
 impl ExecOut {
     fn none() -> Self {
-        ExecOut { ticket: None, group: None, seq: None }
+        ExecOut { ticket: None, group: None, seq: None, non_atomic: false }
+    }
+
+    /// The outcome of a write with this ticket, group and seq.
+    pub fn new(ticket: Option<TicketId>, group: Option<Group>, seq: Option<Seq>) -> Self {
+        ExecOut { ticket, group, seq, non_atomic: false }
     }
 }
 
@@ -218,6 +228,8 @@ pub struct PartitionCounters {
     pub page_writes_move: u64,
     pub page_writes_scrub: u64,
     pub page_writes_txn: u64,
+    /// Multi-key deletes run as independent deletes for want of space for txn markers.
+    pub txn_deletes_split: u64,
     pub extent_writes: u64,
     pub host_bytes_written: u64,
     pub user_bytes_written: u64,
@@ -1872,11 +1884,14 @@ impl PartitionStore {
             }
         }
         // a cross-partition part carries its txn id; a local multi-key write takes one (§14.6)
-        let is_txn = txn.is_some() || writes >= 2;
+        let mut is_txn = txn.is_some() || writes >= 2;
+        let mut non_atomic = false;
         // 1. plan every placement; nothing changes unless all succeed
         let mut undo = Undo::default();
         let mut plans: SmallVec<[Plan; 2]> = SmallVec::new();
-        for s in staged.iter() {
+        let mut i = 0;
+        while i < staged.len() {
+            let s = &staged[i];
             let p = match &s.change {
                 // a cross-partition part, a TTL change or a delete (marker) may use the reserve
                 Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some() || s.no_growth, &mut undo),
@@ -1885,11 +1900,27 @@ impl PartitionStore {
             };
             match p {
                 Ok(p) => plans.push(p),
+                Err(Commit::Err(StoreError::OutOfSpace))
+                    if txn.is_none() && staged.iter().all(|s| !matches!(s.change, Change::Put { .. })) =>
+                {
+                    // a local multi-key delete on a device with no AG left for its txn markers
+                    // (small records; a partition whose keys all live in extents owns no SMALL
+                    // AG): its deletes run as independent deletes, which need no space. Keeping
+                    // an AG free for each such partition cost a third of a small device
+                    self.undo(core::mem::take(&mut undo));
+                    plans.clear();
+                    is_txn = false;
+                    non_atomic = true;
+                    self.core.counters.txn_deletes_split += 1;
+                    i = 0;
+                    continue;
+                }
                 Err(c) => {
                     self.undo(undo);
                     return c;
                 }
             }
+            i += 1;
         }
         let (txn_id, local_txn) = match txn {
             Some(t) => (t, false),
@@ -1959,7 +1990,7 @@ impl PartitionStore {
             self.core.tickets.seal(t);
         }
         let group = (self.core.cfg.produce_groups && !ops.is_empty()).then_some(Group { seq, ops });
-        Commit::Done(ExecOut { ticket, group, seq: (writes > 0).then_some(seq) })
+        Commit::Done(ExecOut { ticket, group, seq: (writes > 0).then_some(seq), non_atomic })
     }
 
     fn undo(&mut self, u: Undo) {
@@ -2977,7 +3008,7 @@ impl PartitionStore {
         // walk run before it reclaimed nothing (its extent headers were read as live and never
         // again) and every write it allowed into a page could lose a pre-flush record
         let group = self.core.cfg.produce_groups.then(|| Group { seq: cutoff, ops: vec![Op::FlushDb { db }] });
-        Ok(ExecOut { ticket: Some(t), group, seq: Some(cutoff) })
+        Ok(ExecOut::new(Some(t), group, Some(cutoff)))
     }
 
     /// Queues the paced FLUSHDB reclaim walk over every owned page and extent (§16.5).
@@ -3096,7 +3127,7 @@ impl PartitionStore {
             self.core.stale.require(db, &k, false);
             self.core.fg_keys.push((db, k));
         }
-        ExecOut { ticket: Some(t), group: None, seq: None }
+        ExecOut::new(Some(t), None, None)
     }
 
     // ---------------------------------------------------------------------------------------

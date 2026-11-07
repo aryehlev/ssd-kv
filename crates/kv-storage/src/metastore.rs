@@ -95,11 +95,18 @@ pub struct MetaShared {
     /// A write needed an AG and was refused (fill limit or no free AG), and no AG has been
     /// released since: partitions give their idle spare AGs back (§11.1).
     ag_pressure: std::sync::atomic::AtomicBool,
+    /// Txn commits that found the intent table full and waited for a later cycle.
+    commits_deferred: AtomicU64,
 }
 
 impl MetaShared {
     fn new(txn_ids: Arc<TxnIds>, resolved_w: u64) -> Self {
-        MetaShared { txn_ids, resolved_w: AtomicU64::new(resolved_w), ag_pressure: std::sync::atomic::AtomicBool::new(false) }
+        MetaShared {
+            txn_ids,
+            resolved_w: AtomicU64::new(resolved_w),
+            ag_pressure: std::sync::atomic::AtomicBool::new(false),
+            commits_deferred: AtomicU64::new(0),
+        }
     }
 }
 
@@ -150,6 +157,12 @@ impl MetaClient {
     /// The durable `resolved_w` (§10.7).
     pub fn resolved_w(&self) -> u64 {
         self.shared.resolved_w.load(Ordering::Acquire)
+    }
+
+    /// Txn commits that found the intent table full and were answered in a later cycle (txn
+    /// credits keep this at zero outside the first moments after a restart).
+    pub fn commits_deferred(&self) -> u64 {
+        self.shared.commits_deferred.load(Ordering::Relaxed)
     }
 
     /// True while a write that needed an AG was refused and no AG has been released since: an
@@ -357,6 +370,22 @@ pub struct MetaCore {
     owners: HashMap<u64, (u16, u64), foldhash::fast::FixedState>,
     last_clock_ms: u64,
     failed: Option<i32>,
+    /// Replies held back to keep each partition's replies in request order (a partition
+    /// matches them to its requests by position) behind a commit that found no room in the
+    /// intent table; such a commit waits for a later cycle once `resolved_w` passed enough
+    /// listed ids. Txn credits keep the table from filling (a consumed multi-key write holds
+    /// one), but right after a restart the ids listed by the earlier boot still take
+    /// positions until every partition zeroed its old txn records, and a commit that did not
+    /// fit then was answered `Failed` (the partition turned read-only on a healthy device).
+    held: Vec<(u16, u64, Held)>,
+}
+
+/// A reply [`MetaCore`] holds back.
+#[derive(Clone, Copy, Debug)]
+enum Held {
+    Reply(MetaDone),
+    /// A commit of this txn still waiting for room.
+    Commit(u64),
 }
 
 /// Index of an allocated AG kind in [`MetaCore`]'s per-partition counts.
@@ -471,6 +500,7 @@ impl MetaCore {
             owners: HashMap::with_hasher(Default::default()),
             last_clock_ms: now_ms,
             failed: None,
+            held: Vec::new(),
         };
         // a reserved id range before any multi-key write (§10.7)
         core.header.v.txn_floor = core.shared.txn_ids.next_floor();
@@ -519,12 +549,26 @@ impl MetaCore {
             // cycle after a failed one wrote the other copy of a block whose last write was
             // never flushed, so both copies were in flight at once and a power cut could leave
             // neither readable (the engine then refused to open)
+            out.extend(self.held.drain(..).map(|(p, token, h)| match h {
+                Held::Reply(d) => (p, token, d),
+                Held::Commit(_) => (p, token, MetaDone::Failed(errno)),
+            }));
             out.extend(msgs.into_iter().map(|m| (m.partition, m.token, MetaDone::Failed(errno))));
             return;
         }
         let mut pending: Vec<(u16, u64, MetaDone)> = Vec::with_capacity(msgs.len());
         let mut commits: SmallVec<[(usize, u64); 8]> = SmallVec::new();
         let mut sb_updates: SmallVec<[SbUpdate; 1]> = SmallVec::new();
+        // commits held by an earlier cycle are tried again (`retry`: index into `held`)
+        let retry: SmallVec<[(usize, u64); 8]> = self
+            .held
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| match h.2 {
+                Held::Commit(t) => Some((i, t)),
+                Held::Reply(_) => None,
+            })
+            .collect();
         for m in msgs {
             let done = match m.req {
                 MetaReq::AcquireAg { partition, kind } => {
@@ -599,24 +643,52 @@ impl MetaCore {
             pending.push((m.partition, m.token, done));
         }
         // commit batch: the lowest-index slots with room (§10.7); written now, made durable by
-        // the cycle's single flush below
+        // the cycle's single flush below. Ids the cycle's `resolved_w` covers need no slot (a
+        // record of txn `t <= resolved_w` is valid); ids that find no room wait for a later
+        // cycle (their replies with them)
         let mut slot_writes: SmallVec<[(usize, AbCopy, crate::intent::IntentSlot); 2]> = SmallVec::new();
-        if !commits.is_empty() {
-            let batch: SmallVec<[u64; 8]> = commits.iter().map(|&(_, t)| t).collect();
-            match self.write_commits(io, &batch) {
-                Err(e) => {
-                    for &(i, _) in &commits {
-                        pending[i].2 = MetaDone::Failed(neg(&e));
+        let mut deferred: SmallVec<[usize; 4]> = SmallVec::new();
+        if !commits.is_empty() || !retry.is_empty() {
+            let ids = || retry.iter().chain(commits.iter()).map(|&(_, t)| t);
+            let fresh: SmallVec<[u64; 8]> = ids().filter(|&t| t > self.w && self.resolved.insert(t)).collect();
+            let w_new = self.w_target();
+            let mut listed: SmallVec<[u64; 8]> = ids().filter(|&t| t > w_new).collect();
+            listed.sort_unstable();
+            listed.dedup();
+            let room: usize = self.slots.iter().map(|p| crate::intent::IDS_PER_COPY.saturating_sub(p.open_count(self.w))).sum();
+            let mut over: SmallVec<[u64; 8]> = SmallVec::new();
+            if listed.len() > room {
+                // the highest ids wait: the lowest ones are what lets `resolved_w` move on
+                over = listed.drain(room..).collect();
+                for t in &over {
+                    if fresh.contains(t) {
+                        self.resolved.remove(t);
                     }
                 }
-                Ok(w) => {
-                    slot_writes = w;
-                    for &t in &batch {
-                        if t > self.w {
-                            self.resolved.insert(t);
-                        }
+                self.shared.commits_deferred.fetch_add(over.len() as u64, Ordering::Relaxed);
+            }
+            let res = self.write_commits(io, &listed);
+            for &(i, t) in &commits {
+                match &res {
+                    Err(e) => pending[i].2 = MetaDone::Failed(neg(e)),
+                    Ok(_) if over.contains(&t) => deferred.push(i),
+                    Ok(_) => {}
+                }
+            }
+            for &(i, t) in &retry {
+                match &res {
+                    Err(e) => self.held[i].2 = Held::Reply(MetaDone::Failed(neg(e))),
+                    Ok(_) if over.contains(&t) => {}
+                    Ok(_) => self.held[i].2 = Held::Reply(MetaDone::Committed { txn: t }),
+                }
+            }
+            match res {
+                Err(_) => {
+                    for t in &fresh {
+                        self.resolved.remove(t);
                     }
                 }
+                Ok(w) => slot_writes = w,
             }
         }
         if now_ms >= self.last_clock_ms + CLOCK_FLOOR_INTERVAL_MS {
@@ -688,9 +760,50 @@ impl MetaCore {
                         p.2 = MetaDone::Failed(errno);
                     }
                 }
+                deferred.clear();
+                // the commits tried again this cycle are not durable either
+                for &(i, _) in &retry {
+                    self.held[i].2 = Held::Reply(MetaDone::Failed(errno));
+                }
+                for h in self.held.iter_mut() {
+                    if let Held::Commit(_) = h.2 {
+                        h.2 = Held::Reply(MetaDone::Failed(errno));
+                    }
+                }
             }
         }
-        out.append(&mut pending);
+        // replies of a partition with a held reply queue up behind it; then every partition's
+        // held replies go out up to its first commit still waiting for room
+        for (i, (p, token, d)) in pending.drain(..).enumerate() {
+            match d {
+                MetaDone::Committed { txn } if deferred.contains(&i) => self.held.push((p, token, Held::Commit(txn))),
+                _ if self.held.iter().any(|h| h.0 == p) => self.held.push((p, token, Held::Reply(d))),
+                _ => out.push((p, token, d)),
+            }
+        }
+        if !self.held.is_empty() {
+            let mut blocked: SmallVec<[u16; 8]> = SmallVec::new();
+            let mut keep = Vec::new();
+            for h in self.held.drain(..) {
+                match h.2 {
+                    Held::Reply(d) if !blocked.contains(&h.0) => out.push((h.0, h.1, d)),
+                    Held::Commit(_) => {
+                        if !blocked.contains(&h.0) {
+                            blocked.push(h.0);
+                        }
+                        keep.push(h);
+                    }
+                    Held::Reply(_) => keep.push(h),
+                }
+            }
+            self.held = keep;
+        }
+    }
+
+    /// Commits waiting for room in the intent table (the meta thread then runs its next
+    /// cycle soon rather than at the clock-floor cadence).
+    pub fn has_deferred_commits(&self) -> bool {
+        self.held.iter().any(|h| matches!(h.2, Held::Commit(_)))
     }
 
     /// The highest `t` such that every txn id `<= t` is resolved (E10).
@@ -1143,7 +1256,11 @@ impl MetaStore {
                 let trace = crate::progress::stall_trace_ms();
                 let mut io = TimedIo { inner: io, writes: 0, flushes: 0, write_ns: 0, flush_ns: 0 };
                 loop {
-                    let first = match rx.recv_timeout(Duration::from_millis(CLOCK_FLOOR_INTERVAL_MS)) {
+                    let wait_ms = match core.as_ref() {
+                        Ok(c) if c.has_deferred_commits() => 2,
+                        _ => CLOCK_FLOOR_INTERVAL_MS,
+                    };
+                    let first = match rx.recv_timeout(Duration::from_millis(wait_ms)) {
                         Ok(m) => Some(m),
                         Err(RecvTimeoutError::Timeout) => None,
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -1306,6 +1423,67 @@ mod tests {
                 _ => None,
             })
             .sum()
+    }
+
+    /// A commit that finds the intent table full waits for room instead of failing (a
+    /// `Failed` commit turned its partition read-only on a healthy device), and the lowest
+    /// unresolved id commits through `resolved_w` alone, so room always comes back.
+    #[test]
+    fn a_full_intent_table_defers_commits_until_room_returns() {
+        let mut io = devs(4);
+        let mut core = MetaCore::load(&mut io, 0).unwrap();
+        let low = core.shared.txn_ids.next();
+        let n = crate::intent::TXN_CREDITS as usize + 10;
+        let ids: Vec<u64> = (0..n).map(|_| core.shared.txn_ids.next()).collect();
+        let committed = |r: &MetaReplies| -> Vec<u64> {
+            r.iter()
+                .filter_map(|x| match x.2 {
+                    MetaDone::Committed { txn } => Some(txn),
+                    MetaDone::Failed(e) => panic!("commit failed: {e}"),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut answered = Vec::new();
+        for chunk in ids.chunks(500) {
+            let r = run(&mut core, &mut io, chunk.iter().map(|&t| MetaMsg::new(1, t, MetaReq::CommitTxn { txn: t })).collect());
+            answered.extend(committed(&r));
+        }
+        // every position holds an id above the unresolved `low`; the last ten wait
+        assert_eq!(answered.len(), crate::intent::TXN_CREDITS as usize);
+        assert!(core.has_deferred_commits());
+        assert!(core.shared.commits_deferred.load(Ordering::Relaxed) > 0);
+        let r = run(&mut core, &mut io, Vec::new());
+        assert!(committed(&r).is_empty(), "no room yet");
+        // a later request of the same partition is answered after the held commits (each
+        // partition matches its replies to its requests by position); others go on
+        let r = run(
+            &mut core,
+            &mut io,
+            vec![
+                MetaMsg::new(1, 77, MetaReq::ReserveSeq { partition: 1, floor: Seq(1 << 30) }),
+                MetaMsg::new(2, 78, MetaReq::ReserveSeq { partition: 2, floor: Seq(1 << 30) }),
+            ],
+        );
+        assert_eq!(r.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(), vec![(2, 78)]);
+        // `low` commits without a slot: W passes every id, the waiting ones are answered
+        let r = run(&mut core, &mut io, vec![MetaMsg::new(1, low, MetaReq::CommitTxn { txn: low })]);
+        answered.extend(committed(&r));
+        let order: Vec<u64> = r.iter().filter(|x| x.0 == 1 && !matches!(x.2, MetaDone::Resolved { .. })).map(|x| x.1).collect();
+        let mut expect: Vec<u64> = ids[ids.len() - 10..].to_vec();
+        expect.push(77);
+        expect.push(low);
+        assert_eq!(order, expect, "partition 1's replies in its request order");
+        answered.sort_unstable();
+        let mut all = ids.clone();
+        all.push(low);
+        all.sort_unstable();
+        assert_eq!(answered, all);
+        assert!(!core.has_deferred_commits());
+        assert_eq!(core.resolved_w(), *ids.last().unwrap());
+        assert_eq!(credits(&r) as usize, n + 1);
+        let again = MetaCore::load(&mut io, 0).unwrap();
+        assert!(again.prior.is_committed(low) && again.prior.is_committed(ids[n - 1]));
     }
 
     #[test]

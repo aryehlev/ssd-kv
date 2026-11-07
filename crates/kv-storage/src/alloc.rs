@@ -1144,6 +1144,14 @@ impl Alloc {
         self.slots[kind_slot(kind)].reserve_refused_at_ns.is_some_and(|t| now_ns.saturating_sub(t) < RETRY_NS)
     }
 
+    /// True when an AG request of this partition was refused within the retry period: its
+    /// writes get `-OOM` meanwhile, so work that gives space back is no longer background.
+    pub(crate) fn refused_recently(&self, now_ns: u64) -> bool {
+        self.slots.iter().any(|s| {
+            [s.refused_at_ns, s.reserve_refused_at_ns].iter().flatten().any(|&t| now_ns.saturating_sub(t) < RETRY_NS)
+        })
+    }
+
     /// Clears the refusal so that the next need asks again (space was released).
     pub(crate) fn clear_refusal(&mut self) {
         for s in &mut self.slots {

@@ -670,3 +670,58 @@ fn values_just_over_the_extent_maximum_fill_most_of_the_device() {
     assert!(stored > total, "{stored} values of 8 MiB on {total} AGs ({used} used)");
     db.quiesce();
 }
+
+/// After a FLUSHDB of one of two databases, the reclaim walk runs as fast as the device reads
+/// while the partition's writes are refused space. It was paced (4000 reads/s shared by every
+/// partition) whatever happened, so under frequent FLUSHDBs it fell behind and about a fifth
+/// of the writes of a busy 64-partition device holding a few hundred MB got `-OOM`.
+#[test]
+fn reclaim_walk_speeds_up_while_writes_are_refused_space() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    let pages = 20 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 17);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 17).unwrap();
+    let mut c = cfg();
+    c.cache_bytes = 8 << 20;
+    let mut eng = LocalEngine::open(vec![d], &c).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    // db 0 keeps a key, so the FLUSHDB of db 1 needs the walk (§16.5)
+    let t = db.set(0, b"{t}keep", b"v", None).unwrap();
+    db.wait(b"{t}keep", t, TicketState::Written);
+    let p = db.eng.partition_of(b"{t}keep");
+    // the device full of small records of db 1, two to a page
+    let mut refused = 0;
+    let mut n = 0u64;
+    while refused < 50 {
+        let k = format!("{{t}}f{n}");
+        n += 1;
+        match db.set(1, k.as_bytes(), &value(n, 1900), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+            }
+            Err(StoreError::OutOfSpace) => refused += 1,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    for (q, t) in db.flushdb(Some(1)) {
+        db.wait_in(q, t, TicketState::Durable);
+    }
+    let before = db.eng.partition(p).counters().flush_reclaim_pending_pages;
+    // two seconds of engine time with an extent write refused (no AG is free) now and then
+    for i in 0..1000u64 {
+        if i % 50 == 0 {
+            let k = format!("{{t}}x{i}");
+            if let Ok(t) = db.set(0, k.as_bytes(), &value(i, 1 << 20), None) {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+            }
+        }
+        db.advance(2);
+        db.eng.pump();
+    }
+    let after = db.eng.partition(p).counters().flush_reclaim_pending_pages;
+    // paced, the walk takes 250 steps a second here: 500 in two seconds
+    assert!(before > 5000 && before - after >= 4000, "{n} records flushed: the walk went from {before} to {after} pending pages in 2 s");
+    db.quiesce();
+}

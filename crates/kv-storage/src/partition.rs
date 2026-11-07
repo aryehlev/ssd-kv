@@ -249,6 +249,11 @@ pub struct PartitionCounters {
     pub dirty_bytes: u64,
 }
 
+/// Reclaim walk steps a partition refused space takes per tick beyond its paced rate.
+const RECLAIM_URGENT_PER_TICK: u32 = 8;
+/// ... while fewer than this many of its page loads are in flight.
+const RECLAIM_URGENT_LOADS: usize = 32;
+
 /// Seqs reserved per `seq_floor` write (§10.5).
 pub(crate) const SEQ_RESERVE: u64 = 1 << 24;
 /// Positions of the RAM expiry sweep per tick at most (§16.4); the sweep is paced by time
@@ -4791,8 +4796,20 @@ impl PartitionStore {
                 self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
             }
         }
-        // FLUSHDB reclaim walk (§16.5)
-        while (!self.core.reclaim_pages.is_empty() || !self.core.reclaim_ext.is_empty()) && self.core.buckets.reclaim.try_take(now_ns, 1) {
+        // FLUSHDB reclaim walk (§16.5). Paced, except while this partition is refused space:
+        // the walk is what gives the flushed records' space back, and at its paced rate
+        // (4000 reads/s shared by every partition) a partition of a busy 64-partition device
+        // flushed several times a second fell further behind each time, and about a fifth of
+        // its writes got `-OOM` on a device holding a few hundred MB. Then it also takes up to
+        // RECLAIM_URGENT_PER_TICK steps a tick while fewer than RECLAIM_URGENT_LOADS of its
+        // page loads are in flight, so the device's speed bounds it.
+        let mut urgent = if self.core.alloc.refused_recently(now_ns) { RECLAIM_URGENT_PER_TICK } else { 0 };
+        while (!self.core.reclaim_pages.is_empty() || !self.core.reclaim_ext.is_empty())
+            && (self.core.buckets.reclaim.try_take(now_ns, 1) || (urgent > 0 && self.core.loads.len() < RECLAIM_URGENT_LOADS && {
+                urgent -= 1;
+                true
+            }))
+        {
             // extent headers first: one read frees a whole run
             if let Some(s) = self.core.reclaim_ext.pop_front() {
                 if !self.core.alloc.begin_header_read(s) {

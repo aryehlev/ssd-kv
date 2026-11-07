@@ -106,6 +106,7 @@ pub struct PartitionCountersAtomic {
     pub foreground_scrub_writes: AtomicU64,
     pub txn_markers: AtomicU64,
     pub txn_deletes_split: AtomicU64,
+    pub space_wait_timeouts: AtomicU64,
     pub flush_reclaim_pending_pages: AtomicU64,
     pub corrupt_pages: AtomicU64,
     pub unexpected_orphans: AtomicU64,
@@ -146,7 +147,7 @@ impl PartitionCountersAtomic {
             page_writes_update, page_writes_insert, page_writes_delete, page_writes_move,
             page_writes_scrub, page_writes_txn, extent_writes, host_bytes_written,
             user_bytes_written, sector_writes, full_page_writes, moves, fp_false_positive_reads,
-            stale_copies, foreground_scrub_writes, txn_markers, txn_deletes_split, flush_reclaim_pending_pages,
+            stale_copies, foreground_scrub_writes, txn_markers, txn_deletes_split, space_wait_timeouts, flush_reclaim_pending_pages,
             corrupt_pages, unexpected_orphans, index_bytes, alloc_state_bytes, dirty_bytes);
     }
 
@@ -161,7 +162,7 @@ impl PartitionCountersAtomic {
             page_writes_update, page_writes_insert, page_writes_delete, page_writes_move,
             page_writes_scrub, page_writes_txn, extent_writes, host_bytes_written,
             user_bytes_written, sector_writes, full_page_writes, moves, fp_false_positive_reads,
-            stale_copies, foreground_scrub_writes, txn_markers, txn_deletes_split, flush_reclaim_pending_pages,
+            stale_copies, foreground_scrub_writes, txn_markers, txn_deletes_split, space_wait_timeouts, flush_reclaim_pending_pages,
             corrupt_pages, unexpected_orphans, index_bytes, alloc_state_bytes, dirty_bytes);
         c
     }
@@ -199,7 +200,7 @@ pub fn sum_partitions(parts: &[PartitionCountersAtomic]) -> PartitionCounters {
             page_writes_insert, page_writes_delete, page_writes_move, page_writes_scrub,
             page_writes_txn, extent_writes, host_bytes_written, user_bytes_written, sector_writes,
             full_page_writes, moves, fp_false_positive_reads, stale_copies,
-            foreground_scrub_writes, txn_markers, txn_deletes_split, flush_reclaim_pending_pages, corrupt_pages,
+            foreground_scrub_writes, txn_markers, txn_deletes_split, space_wait_timeouts, flush_reclaim_pending_pages, corrupt_pages,
             unexpected_orphans, index_bytes, alloc_state_bytes, dirty_bytes);
     }
     t
@@ -380,6 +381,7 @@ pub fn render_prometheus(shared: &crate::shared::NodeShared, out: &mut Vec<u8>) 
     counter(&mut s, "kvd_kvd_foreground_scrub_writes", t.foreground_scrub_writes);
     gauge(&mut s, "kvd_kvd_txn_markers", t.txn_markers);
     gauge(&mut s, "kvd_kvd_txn_deletes_split", t.txn_deletes_split);
+    gauge(&mut s, "kvd_kvd_space_wait_timeouts", t.space_wait_timeouts);
     gauge(&mut s, "kvd_kvd_flush_reclaim_pending_pages", t.flush_reclaim_pending_pages);
     gauge(&mut s, "kvd_kvd_corrupt_pages", t.corrupt_pages);
     gauge(&mut s, "kvd_kvd_unexpected_orphans", t.unexpected_orphans);

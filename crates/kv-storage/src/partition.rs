@@ -230,6 +230,8 @@ pub struct PartitionCounters {
     pub page_writes_txn: u64,
     /// Multi-key deletes run as independent deletes for want of space for txn markers.
     pub txn_deletes_split: u64,
+    /// Writes answered `-OOM` after waiting `SPACE_WAIT_NS` for space that was refused.
+    pub space_wait_timeouts: u64,
     pub extent_writes: u64,
     pub host_bytes_written: u64,
     pub user_bytes_written: u64,
@@ -302,6 +304,10 @@ pub(crate) struct Req {
     pub(crate) queued: bool,
     /// Parked until an AG, a seq reservation or a txn id arrives.
     pub(crate) parked: bool,
+    /// Times it parked (stall trace).
+    pub(crate) parks: u32,
+    /// Parked on space since `(mono ns, refusals the allocator had counted then)`.
+    pub(crate) space_since: Option<(u64, u64)>,
     pub(crate) pins: SmallVec<[PageId; 2]>,
     pub(crate) fetched: SmallVec<[ExtFetch; 1]>,
     pub(crate) failed: Option<StoreError>,
@@ -1377,6 +1383,8 @@ impl PartitionStore {
             blocked: false,
             queued: false,
             parked: false,
+            parks: 0,
+            space_since: None,
             pins: SmallVec::new(),
             fetched: SmallVec::new(),
             failed: None,
@@ -1754,7 +1762,20 @@ impl PartitionStore {
                         ExecStatus::Requeued
                     }
                     Commit::Park => {
+                        let now_ns = cx.now.mono_ns;
+                        let refusals = self.core.alloc.refusals();
+                        let (since, refused_before) = *r.space_since.get_or_insert((now_ns, refusals));
+                        if now_ns.saturating_sub(since) >= SPACE_WAIT_NS && refusals > refused_before && self.core.retiring_ags.is_empty() {
+                            // space was refused since it parked, and it has waited long enough:
+                            // a device at its fill limit answers `-OOM` in bounded time. The AGs
+                            // a busy partition released went to other partitions' requests, the
+                            // release cleared the refusal, and the write asked again and again
+                            self.core.counters.space_wait_timeouts += 1;
+                            self.finish(cx.cache, id, r);
+                            return ExecStatus::Failed(StoreError::OutOfSpace);
+                        }
                         r.parked = true;
+                        r.parks += 1;
                         self.core.space_wait.push(id);
                         self.requeue(id, r);
                         ExecStatus::Requeued
@@ -1800,6 +1821,9 @@ fn page_ref_need(pr: &PageRef) -> Need {
         _ => Need::Extent { start: PageId::from36(pr.page36), pages: 1, chunks: false },
     }
 }
+
+/// How long a write waits for space after a refusal before it is answered `-OOM`.
+pub(crate) const SPACE_WAIT_NS: u64 = 500_000_000;
 
 /// Outcome of a commit attempt.
 enum Commit {
@@ -4225,13 +4249,23 @@ impl PartitionStore {
         }
     }
 
+    /// Parked requests run again, ahead of every request queued since (in the order they
+    /// parked). Queued at the back, a request parked on space ran after the requests that
+    /// arrived while it waited, which took the AG it had asked for: on a busy, nearly full
+    /// device it parked again and again (twenty times in three seconds) and its reply came
+    /// after five seconds and more.
     fn wake_parked(&mut self, space: bool) {
         let ids = if space { core::mem::take(&mut self.core.space_wait) } else { core::mem::take(&mut self.core.seq_wait) };
+        let before = self.reqs.ready.len();
         for id in ids {
             if let Some(r) = self.reqs.get_mut(id) {
                 r.parked = false;
             }
             self.reqs.check_ready(id);
+        }
+        let woken = self.reqs.ready.len() - before;
+        if woken > 0 && before > 0 {
+            self.reqs.ready.rotate_right(woken);
         }
     }
 

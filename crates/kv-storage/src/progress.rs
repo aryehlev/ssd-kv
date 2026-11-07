@@ -602,13 +602,15 @@ impl PartitionStore {
             }
             r.traced = true;
             lines.push(format!(
-                "request {i} kind={:?} keys={} age={}ms io={} waits={} parked={} queued={} blocked={} barrier={} failed={:?}",
+                "request {i} kind={:?} keys={} age={}ms io={} waits={} parked={} parks={} alloc=[{}] queued={} blocked={} barrier={} failed={:?}",
                 r.req.kind,
                 r.keys.len(),
                 age / 1_000_000,
                 r.io,
                 r.waits,
                 r.parked,
+                r.parks,
+                self.core.alloc.diag(now),
                 r.queued,
                 r.blocked,
                 r.barrier,

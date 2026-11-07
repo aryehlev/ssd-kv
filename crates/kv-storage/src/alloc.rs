@@ -361,7 +361,19 @@ struct SpareSlot {
     /// The partition released AGs while the request in flight was being answered: a refusal
     /// of it predates the release and is not latched (the request is sent again).
     stale_refusal: bool,
+    /// Stale refusals asked again since the last grant (`MAX_STALE_RETRIES`).
+    stale_retries: u8,
+    /// Answers so far (stall trace): grants, spare denials, stale asks again, give-back asks
+    /// again, latched refusals.
+    answers: [u32; 5],
 }
+
+/// Refusals that predate a release of this partition, asked again before one is latched. On
+/// a busy device at the fill limit the AGs a partition released went to other partitions'
+/// requests in the same meta cycle, the partition released more meanwhile, and each answer
+/// was stale again: its writes parked through twenty round trips (several seconds) instead
+/// of being answered `-OOM`.
+const MAX_STALE_RETRIES: u8 = 2;
 
 /// Why an AG is requested, least urgent first.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -404,6 +416,8 @@ pub(crate) struct Alloc {
     hdr_watch: HashMap<PageId, (u32, bool), foldhash::fast::FixedState>,
     /// An idle spare given back to the pool (taken by the partition, which releases it).
     give_back: Option<AgId>,
+    /// See [`Alloc::refusals`].
+    refusals: u64,
 }
 
 fn kind_slot(k: AgKind) -> usize {
@@ -433,6 +447,7 @@ impl Alloc {
             extent_of: HashMap::with_hasher(Default::default()),
             hdr_watch: HashMap::with_hasher(Default::default()),
             give_back: None,
+            refusals: 0,
             cached: CachedSpace::default(),
             slots: [SpareSlot::default(); 2],
         }
@@ -1048,6 +1063,35 @@ impl Alloc {
     // ---------------------------------------------------------------------------------------
     // AG acquisition and release (§11.1, §11.7)
 
+    /// The acquisition state of both AG kinds (stall trace): wanted, asked (and its class),
+    /// refused how long ago, spare held.
+    pub(crate) fn diag(&self, now_ns: u64) -> String {
+        let ms = |t: Option<u64>| t.map(|t| (now_ns.saturating_sub(t) / 1_000_000) as i64).unwrap_or(-1);
+        let mut out = String::new();
+        for (name, s) in [("small", &self.slots[0]), ("ext", &self.slots[1])] {
+            out.push_str(&format!(
+                "{name}: want={} class={:?} asked={} asked_class={:?} refused_ms={} reserve_refused_ms={} spare={} answers={:?} ",
+                s.want,
+                s.class,
+                s.asked,
+                s.asked_class,
+                ms(s.refused_at_ns),
+                ms(s.reserve_refused_at_ns),
+                s.spare.is_some(),
+                s.answers
+            ));
+        }
+        out.push_str(&format!("ags small={} ext={}", self.small.len(), self.extent.len()));
+        out
+    }
+
+    /// AG requests for space a placement needed that the meta thread refused so far (stale
+    /// ones included): a request parked on space since before one of them and for longer
+    /// than `SPACE_WAIT_NS` gets `-OOM` (`PartitionStore::exec`).
+    pub(crate) fn refusals(&self) -> u64 {
+        self.refusals
+    }
+
     /// Asks for a spare of `kind` (at startup and when a spare was consumed).
     pub(crate) fn want_spare(&mut self, kind: AgKind) {
         let s = &mut self.slots[kind_slot(kind)];
@@ -1084,11 +1128,15 @@ impl Alloc {
     /// refusal: the next placement that needs space asks for an AG of its own.
     pub(crate) fn ag_granted(&mut self, kind: AgKind, ag: Option<AgId>, now_ns: u64) {
         let ki = kind_slot(kind);
+        if ag.is_none() && self.slots[ki].asked_class != AgClass::Spare {
+            self.refusals += 1;
+        }
         self.slots[ki].asked = false;
         let stale = core::mem::take(&mut self.slots[ki].stale_refusal);
         let spare = core::mem::take(&mut self.slots[ki].asked_class) == AgClass::Spare;
         match ag {
             Some(ag) => {
+                self.slots[ki].answers[0] += 1;
                 // a spare already held (on another device) becomes an owned AG
                 if let Some(old) = self.slots[ki].spare.replace(ag) {
                     match kind {
@@ -1101,11 +1149,14 @@ impl Alloc {
                     }
                 }
                 self.slots[ki].refused_at_ns = None;
+                self.slots[ki].stale_retries = 0;
             }
-            None if spare => {}
-            None if stale => {
+            None if spare => self.slots[ki].answers[1] += 1,
+            None if stale && self.slots[ki].stale_retries < MAX_STALE_RETRIES => {
                 // answered before AGs this partition released were back in the pool: ask
                 // again (behind the releases) instead of failing writes for the retry period
+                self.slots[ki].stale_retries += 1;
+                self.slots[ki].answers[2] += 1;
                 self.slots[ki].want = true;
                 self.slots[ki].class = self.slots[ki].class.max(AgClass::Need);
             }
@@ -1115,12 +1166,15 @@ impl Alloc {
                 // release). Latched as a refusal, the write failed with -OOM for the retry
                 // period while the partition sat on a whole free AG (after a FLUSHALL every
                 // partition takes a SMALL spare first, so its first EXTENT AG was refused)
+                self.slots[ki].answers[3] += 1;
                 self.give_back = self.slots[1 - ki].spare.take();
                 self.slots[1 - ki].want = false;
                 self.slots[ki].want = true;
                 self.slots[ki].class = self.slots[ki].class.max(AgClass::Need);
             }
             None => {
+                self.slots[ki].answers[4] += 1;
+                self.slots[ki].stale_retries = 0;
                 self.slots[ki].refused_at_ns = Some(now_ns.max(1));
                 if self.slots[ki].asked_class_was_reserved {
                     self.slots[ki].reserve_refused_at_ns = Some(now_ns.max(1));
@@ -1468,6 +1522,38 @@ mod tests {
         assert!(a.ag_outstanding());
         a.take_ag_requests(&mut req);
         assert_eq!(req.as_slice(), &[(AgKind::Small, None, AgClass::Reserved)]);
+    }
+
+    /// A refusal answered while the partition released AGs is asked again, but at most
+    /// `MAX_STALE_RETRIES` times in a row: a partition that keeps releasing (overwrites on a
+    /// full device) latched no refusal at all, and its writes parked for seconds.
+    #[test]
+    fn stale_refusals_are_asked_again_a_bounded_number_of_times() {
+        let mut a = alloc(PageUpdateMode::TwoImage);
+        let cache = PageCache::new(1 << 20, false);
+        let mut req = SmallVec::new();
+        let mut asks = 0;
+        let mut now = 0;
+        loop {
+            now += 1;
+            match a.place_small(100, &cache, now, &|_| false) {
+                SmallPlace::NeedAg => {}
+                SmallPlace::Full => break,
+                other => panic!("{other:?}"),
+            }
+            req.clear();
+            a.take_ag_requests(&mut req);
+            assert_eq!(req.len(), 1, "one request");
+            asks += 1;
+            // the partition releases an AG while the request is in flight; the answer is a
+            // refusal that predates the release
+            a.clear_refusal();
+            let before = a.refusals();
+            a.ag_granted(AgKind::Small, None, now);
+            assert_eq!(a.refusals(), before + 1);
+            assert!(asks <= usize::from(MAX_STALE_RETRIES) + 1, "asked {asks} times");
+        }
+        assert_eq!(asks, usize::from(MAX_STALE_RETRIES) + 1);
     }
 
     #[test]

@@ -198,7 +198,9 @@ impl PartitionStore {
                 }
             }
         }
-        if r.parked {
+        // a read-only partition stages nothing more: a parked write waits for nothing there (it
+        // fails with `-READONLY` when it runs again, `write_failed` wakes it)
+        if r.parked && self.core.state != PartState::ReadOnly {
             if self.core.space_wait.contains(&id) && self.core.alloc.ag_outstanding() {
                 w.push(WaitFor::AgGrant);
             }

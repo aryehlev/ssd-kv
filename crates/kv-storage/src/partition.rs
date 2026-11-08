@@ -1215,7 +1215,7 @@ impl PartitionStore {
     pub fn diag(&self) -> String {
         let c = &self.core;
         format!(
-            "p{} {:?} live={} tickets={} oldest_ms={} ready={} space_wait={} seq_wait={} meta_wait={} txns={} next_seq={:#x} seq_limit={:#x} seq_asked={} dirty={} writes={} ext_w={} ext_z={} stale={} absent={} deferred={} loads={} durable_wait={} gone_wait={} retire={} missed_handoffs={}",
+            "p{} {:?} live={} tickets={} oldest_ms={} ready={} space_wait={} seq_wait={} meta_wait={} txns={} next_seq={:#x} seq_limit={:#x} seq_asked={} dirty={} writes={} ext_w={} ext_z={} stale={} absent={} deferred={} loads={} durable_wait={} gone_wait={} retire={} missed_handoffs={} reclaim_wait={} part_wait={} | {}",
             c.cfg.id,
             c.state,
             self.reqs.live,
@@ -1241,6 +1241,9 @@ impl PartitionStore {
             c.gone_wait.len(),
             c.retire.len(),
             c.counters.missed_handoffs,
+            c.reclaim_wait.len(),
+            c.part_wait.len(),
+            c.alloc.diag(c.now.mono_ns),
         )
     }
 
@@ -3583,6 +3586,18 @@ impl PartitionStore {
             self.core.state = PartState::ReadOnly;
         }
         self.core.tickets.fail_all(errno);
+        // writes parked on space, a seq reservation, a reclaim or a txn part's build run again
+        // and fail with `-READONLY`: what they wait for may never come now (a FLUSHALL's old
+        // AGs are released only once their writes are durable, and writes whose flush failed
+        // never are; a write parked on that release waited forever)
+        self.wake_parked(true);
+        self.wake_parked(false);
+        for id in core::mem::take(&mut self.core.reclaim_wait).into_iter().chain(core::mem::take(&mut self.core.part_wait)) {
+            if let Some(r) = self.reqs.get_mut(id) {
+                r.parked = false;
+            }
+            self.reqs.check_ready(id);
+        }
         // no write is issued any more: readers waiting for a staged or in-flight extent write
         // fail now instead of waiting for it
         let mut waiting: Vec<(ReqId, u32)> = Vec::new();

@@ -11,9 +11,8 @@
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap};
-
 use common::*;
+use hashbrown::HashMap;
 use kv_common::Access;
 use kv_index::VType;
 use kv_storage::engine::{LocalEngine, format_devices};
@@ -140,7 +139,7 @@ fn run_case(s: &Setup, ops: &[Op]) -> Result<(), String> {
     let mut db = Db::new(eng, T0);
     let p = db.eng.partition_of(&key(0));
     let mut model: HashMap<usize, Vec<u8>> = HashMap::new();
-    let mut open: BTreeMap<usize, Open> = BTreeMap::new();
+    let mut open: HashMap<usize, Open> = HashMap::new();
     let mut aborts: Vec<(u64, Option<TicketId>)> = Vec::new();
     let trace = std::env::var_os("XTXN_FUZZ_TRACE").is_some();
     if s.fill {
@@ -272,7 +271,9 @@ fn run_case(s: &Setup, ops: &[Op]) -> Result<(), String> {
         }
     }
     // every txn finishes
-    for (k, o) in core::mem::take(&mut open) {
+    let mut left: Vec<(usize, Open)> = core::mem::take(&mut open).into_iter().collect();
+    left.sort_by_key(|x| x.0);
+    for (k, o) in left {
         wait(&mut db, o.ticket, &format!("end: part of txn {}", o.txn))?;
         if trace {
             trace_keys(&db, p, &format!("end: part of txn {} durable", o.txn), ops);

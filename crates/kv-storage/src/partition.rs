@@ -283,6 +283,13 @@ const SCAN_EMPTY_TABLES: u16 = 4096;
 const REBASE_PERIOD_S: u64 = 3600;
 /// Records the page writer moves to another page per tick (§14.3); more wait for the next.
 const RELOCATIONS_PER_TICK: u32 = 64;
+/// Bytes of extent reads a partition keeps in flight (`Core::read_extent`).
+const EXT_READ_INFLIGHT: u64 = 8 << 20;
+/// Bytes of extent read buffers a partition keeps for reuse (`Core::take_ext_buf`), and how
+/// long it keeps them without extent reads.
+const EXT_BUF_POOL: usize = 8 << 20;
+const EXT_BUF_IDLE_NS: u64 = 1_000_000_000;
+
 /// Slot tables the expiry sweep visits per tick (empty ones cost little but are bounded too).
 const SWEEP_TABLES_PER_TICK: u32 = 256;
 
@@ -410,7 +417,7 @@ impl Requests {
 pub(crate) enum IoKind {
     PageRead { page: PageId, retried: bool },
     PageWrite { page: PageId },
-    ExtRead { req: ReqId, generation: u32, idx: usize, chunk: Option<usize> },
+    ExtRead { req: ReqId, generation: u32, idx: usize, chunk: Option<usize>, pages: u32 },
     ExtWrite { start: PageId },
     ExtZero { start: PageId },
     /// One-page header read of a background task.
@@ -595,6 +602,18 @@ pub(crate) struct Core {
     pub(crate) ext: ExtTables,
     pub(crate) io: HashMap<u64, IoKind, foldhash::fast::FixedState>,
     pub(crate) next_io: u64,
+    /// Extent reads tagged (in `io`) but not issued yet, `(tag, device, offset, pages)`, FIFO:
+    /// a partition keeps at most `EXT_READ_INFLIGHT` bytes of them in flight (one whatever its
+    /// size when none is), and a read's buffer is allocated when it is issued.
+    pub(crate) ext_read_q: VecDeque<(IoTag, u8, u64, u32)>,
+    pub(crate) ext_read_bytes: u64,
+    /// Extent read buffers of finished requests, reused by the next reads (`EXT_BUF_POOL`
+    /// bytes at most; dropped once no extent read was issued for `EXT_BUF_IDLE_NS`). A fresh
+    /// buffer of 1 MB cost about 3 ms of page faults in a VM, and a worker reading 1 MB values
+    /// at device speed spent most of each loop turn in them.
+    pub(crate) ext_bufs: Vec<AlignedBuf>,
+    pub(crate) ext_bufs_bytes: usize,
+    pub(crate) ext_read_last_ns: u64,
     pub(crate) durable_wait: HashMap<u64, Durable, foldhash::fast::FixedState>,
     pub(crate) durable_q: Vec<Durable>,
     pub(crate) next_wid: u64,
@@ -791,6 +810,77 @@ impl Core {
         if b.capacity() == PAGE && self.bufs.len() < 64 {
             b.set_visible_len(PAGE);
             self.bufs.push(b);
+        }
+    }
+
+    /// Reads `pages` pages at `start` for the extent read `tag`, now or once the partition's
+    /// extent reads in flight leave room (`ext_read_q`). Without the bound, 2000 pipelined
+    /// GETs of 1 MB values allocated 2 GB of read buffers in the submitting worker's parse
+    /// loop (every other connection of the worker waited seconds) and queued them all in the
+    /// device ahead of every page read.
+    pub(crate) fn read_extent(&mut self, cx: &mut StorageCtx<'_>, tag: IoTag, start: PageId, pages: u32) {
+        self.ext_read_q.push_back((tag, start.dev(), start.byte_offset(), pages));
+        self.issue_ext_reads(cx);
+    }
+
+    /// Issues queued extent reads while the bound leaves room.
+    pub(crate) fn issue_ext_reads(&mut self, cx: &mut StorageCtx<'_>) {
+        while let Some(&(tag, dev, off, pages)) = self.ext_read_q.front() {
+            let bytes = pages as u64 * PAGE as u64;
+            if self.ext_read_bytes > 0 && self.ext_read_bytes + bytes > EXT_READ_INFLIGHT {
+                return;
+            }
+            self.ext_read_q.pop_front();
+            self.ext_read_bytes += bytes;
+            let buf = self.take_ext_buf(pages as usize * PAGE);
+            cx.io.push(IoReq::read(tag, dev, off, buf));
+            self.counters.page_reads += u64::from(pages);
+        }
+    }
+
+    /// A zeroed buffer of `len` bytes for an extent read: a pooled one of at most twice the
+    /// size when there is one.
+    fn take_ext_buf(&mut self, len: usize) -> AlignedBuf {
+        self.ext_read_last_ns = self.now.mono_ns;
+        let best = self
+            .ext_bufs
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.capacity() >= len && b.capacity() <= len.saturating_mul(2))
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i);
+        match best {
+            Some(i) => {
+                let mut b = self.ext_bufs.swap_remove(i);
+                self.ext_bufs_bytes -= b.capacity();
+                b.set_visible_len(len);
+                b.clear();
+                b
+            }
+            None => AlignedBuf::zeroed(len),
+        }
+    }
+
+    /// Keeps the buffer of a finished extent read for the next one (`take_ext_buf`).
+    pub(crate) fn give_ext_buf(&mut self, b: AlignedBuf) {
+        let cap = b.capacity();
+        if cap > PAGE && self.ext_bufs_bytes + cap <= EXT_BUF_POOL {
+            self.ext_bufs_bytes += cap;
+            self.ext_bufs.push(b);
+        }
+    }
+
+    /// Gives back the read buffers of a request's extent fetches.
+    pub(crate) fn recycle_fetched(&mut self, fetched: &mut SmallVec<[ExtFetch; 1]>) {
+        for f in fetched.drain(..) {
+            if let Some(b) = f.buf {
+                self.give_ext_buf(b);
+            }
+            for c in f.chunks.into_iter().flatten() {
+                if let Some(b) = c.buf {
+                    self.give_ext_buf(b);
+                }
+            }
         }
     }
 
@@ -1126,6 +1216,11 @@ impl PartitionStore {
             ext: ExtTables::default(),
             io: HashMap::with_hasher(Default::default()),
             next_io: 1,
+            ext_read_q: VecDeque::new(),
+            ext_read_bytes: 0,
+            ext_bufs: Vec::new(),
+            ext_bufs_bytes: 0,
+            ext_read_last_ns: 0,
             durable_wait: HashMap::with_hasher(Default::default()),
             durable_q: Vec::new(),
             next_wid: 1,
@@ -1609,10 +1704,8 @@ impl PartitionStore {
                     }
                 };
                 r.io += 1;
-                let buf = AlignedBuf::zeroed(pages as usize * PAGE);
-                let tag = self.core.tag(IoKind::ExtRead { req: id, generation, idx, chunk: None });
-                cx.io.push(IoReq::read(tag, start.dev(), start.byte_offset(), buf));
-                self.core.counters.page_reads += u64::from(pages);
+                let tag = self.core.tag(IoKind::ExtRead { req: id, generation, idx, chunk: None, pages });
+                self.core.read_extent(cx, tag, start, pages);
             }
             Need::ExtWrite(start) => {
                 if let Some(e) = self.core.failed
@@ -1703,7 +1796,8 @@ impl PartitionStore {
         // a read of one key hands the extents it read to the key's next request: they hold
         // the key's current version (nothing ran between them on the key), so N queued reads
         // of a large value read it once instead of N times
-        let mut handed = if r.unchanged && seen.len() == 1 && wake.len() == 1 { Some(r.fetched) } else { None };
+        let mut r = r;
+        let mut handed = if r.unchanged && seen.len() == 1 && wake.len() == 1 { Some(core::mem::take(&mut r.fetched)) } else { None };
         for w in wake {
             if let Some(n) = self.reqs.get_mut(w) {
                 n.waits = n.waits.saturating_sub(1);
@@ -1718,6 +1812,10 @@ impl PartitionStore {
             }
             self.reqs.check_ready(w);
         }
+        if let Some(mut f) = handed {
+            self.core.recycle_fetched(&mut f);
+        }
+        self.core.recycle_fetched(&mut r.fetched);
         // the oldest request finished: the front barrier may run now
         if let Some(&(_, b)) = self.reqs.barriers.front() {
             self.reqs.check_ready(b);
@@ -1740,7 +1838,7 @@ impl PartitionStore {
                 cache.unpin(f);
             }
         }
-        r.fetched.clear();
+        self.core.recycle_fetched(&mut r.fetched);
         r.queued = false;
         self.reqs.slots[id.0 as usize] = Some(r);
         self.reqs.held.insert(txn, id);
@@ -3652,7 +3750,11 @@ impl PartitionStore {
         match kind {
             IoKind::PageRead { page, retried } => self.page_read_done(cx, page, retried, d),
             IoKind::PageWrite { page } => self.page_write_done(cx, page, d),
-            IoKind::ExtRead { req, generation, idx, chunk } => self.ext_read_done(cx, req, generation, idx, chunk, d),
+            IoKind::ExtRead { req, generation, idx, chunk, pages } => {
+                self.core.ext_read_bytes = self.core.ext_read_bytes.saturating_sub(pages as u64 * PAGE as u64);
+                self.core.issue_ext_reads(cx);
+                self.ext_read_done(cx, req, generation, idx, chunk, d)
+            }
             IoKind::ExtWrite { start } => self.ext_write_done(cx, start, d),
             IoKind::ExtZero { start } => self.ext_zero_done(cx, start, d),
             IoKind::HeaderRead { start, why } => self.header_read_done(cx, start, why, d),
@@ -4012,9 +4114,8 @@ impl PartitionStore {
         match next_chunk {
             // chunks are read one at a time, in order (§14.5)
             Some((page, n, ci)) => {
-                let tag = self.core.tag(IoKind::ExtRead { req, generation, idx, chunk: Some(ci) });
-                cx.io.push(IoReq::read(tag, page.dev(), page.byte_offset(), AlignedBuf::zeroed(n as usize * PAGE)));
-                self.core.counters.page_reads += u64::from(n);
+                let tag = self.core.tag(IoKind::ExtRead { req, generation, idx, chunk: Some(ci), pages: n });
+                self.core.read_extent(cx, tag, page, n);
             }
             None => {
                 let r = self.reqs.get_mut(req).expect("live");
@@ -4527,6 +4628,10 @@ impl PartitionStore {
             return;
         }
         self.process_durable(cx);
+        if !self.core.ext_bufs.is_empty() && cx.now.mono_ns.saturating_sub(self.core.ext_read_last_ns) > EXT_BUF_IDLE_NS {
+            self.core.ext_bufs.clear();
+            self.core.ext_bufs_bytes = 0;
+        }
         for page in core::mem::take(&mut self.core.load_retry) {
             if self.core.loads.contains_key(&page) {
                 let buf = self.core.take_buf(PAGE);

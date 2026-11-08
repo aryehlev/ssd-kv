@@ -97,6 +97,9 @@ pub struct MetaShared {
     ag_pressure: std::sync::atomic::AtomicBool,
     /// Txn commits that found the intent table full and waited for a later cycle.
     commits_deferred: AtomicU64,
+    /// AGs a plain request could be granted (under the fill limit and free), as of the last
+    /// acquisition or release: a partition's latched AG refusal holds only while it is 0.
+    headroom: AtomicU64,
 }
 
 impl MetaShared {
@@ -106,6 +109,7 @@ impl MetaShared {
             resolved_w: AtomicU64::new(resolved_w),
             ag_pressure: std::sync::atomic::AtomicBool::new(false),
             commits_deferred: AtomicU64::new(0),
+            headroom: AtomicU64::new(0),
         }
     }
 }
@@ -171,6 +175,12 @@ impl MetaClient {
     /// `-OOM` on a device far from its fill limit.
     pub(crate) fn ag_pressure(&self) -> bool {
         self.shared.ag_pressure.load(Ordering::Relaxed)
+    }
+
+    /// True when the pool had AGs left under the fill limit at its last acquisition or
+    /// release: an AG refusal a partition latched earlier no longer holds.
+    pub(crate) fn pool_has_room(&self) -> bool {
+        self.shared.headroom.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -569,6 +579,7 @@ impl MetaCore {
                 Held::Reply(_) => None,
             })
             .collect();
+        self.publish_headroom();
         for m in msgs {
             let done = match m.req {
                 MetaReq::AcquireAg { partition, kind } => {
@@ -935,6 +946,7 @@ impl MetaCore {
         let idx = self.pick.pick(DOMAIN_AG_PICK | u64::from(partition), &self.free[dev])? as u32;
         self.free[dev][(idx / 64) as usize] &= !(1 << (idx % 64));
         self.allocated += 1;
+        self.publish_headroom();
         if let Some(o) = self.owned.get_mut(usize::from(partition)) {
             o[kind_index(kind)] += 1;
         }
@@ -969,6 +981,14 @@ impl MetaCore {
         b.dirty = true;
         self.free[usize::from(ag.dev)][(ag.idx / 64) as usize] |= 1 << (ag.idx % 64);
         self.allocated = self.allocated.saturating_sub(1);
+        self.publish_headroom();
+    }
+
+    /// Makes the AGs a plain request could be granted now (under the fill limit and free on
+    /// some device) visible to the partitions ([`MetaClient::pool_has_room`]).
+    fn publish_headroom(&self) {
+        let free: u64 = self.free.iter().flat_map(|b| b.iter()).map(|w| u64::from(w.count_ones())).sum();
+        self.shared.headroom.store(self.headroom().min(free), Ordering::Relaxed);
     }
 
     /// Writes the commit batch into the lowest-index slots with room and flushes (E6).

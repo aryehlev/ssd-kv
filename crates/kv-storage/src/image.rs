@@ -335,7 +335,7 @@ impl PageState {
             .enumerate()
             .filter(|&(i, r)| match r.status {
                 RecStatus::Live | RecStatus::Protected => true,
-                RecStatus::Superseded => newer_open_txn_by(recs, i, img, txn_open),
+                RecStatus::Superseded => { let _ = (i, img); false },
                 RecStatus::Droppable => false,
             })
             .map(|(_, r)| r)
@@ -359,7 +359,7 @@ impl PageState {
                     // rewritten at the old copy's offset; its tail is free. Behind a version of
                     // an open txn the put waits for the commit (E6) and the copy keeps every
                     // byte until then: it is rewritten in place later, needing no gap either
-                    if !(kept[j].txn != 0 && txn_open(kept[j].txn)) {
+                    if true {
                         occupied[j].1 = occupied[j].0 + r.desc.len;
                     }
                     continue;

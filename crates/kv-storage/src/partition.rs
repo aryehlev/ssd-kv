@@ -2148,6 +2148,7 @@ impl PartitionStore {
     #[allow(clippy::too_many_arguments)]
     fn plan_put_at(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
         let now_ns = cx.now.mono_ns;
+        self.core.alloc.set_pool_room(cx.meta.pool_has_room());
         let small = small_len(key_len, val_len as usize, txn);
         if key_len <= u16::MAX as usize && val_len <= u16::MAX as u64 && small <= SMALL_REC_MAX {
             let need = small as u16;

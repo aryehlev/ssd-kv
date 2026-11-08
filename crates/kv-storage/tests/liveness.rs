@@ -823,3 +823,171 @@ fn an_update_admitted_to_its_page_is_placed_there() {
     assert_eq!(db.eng.partition(p).counters().moves_without_room, 0);
     db.quiesce();
 }
+
+/// An MSET's version of a key is staged in the key's page beside the old copy, which the
+/// build keeps while the txn's commit is not durable (§13.3 c, E6). Admission counted that
+/// copy's bytes free and let a later put into the page that its build then could not place:
+/// it had to move, and on a full device it found no page, so it and the txn (and SAVE and
+/// SHUTDOWN behind them) waited for space forever, `moves_without_room` counting every tick.
+#[test]
+fn a_put_admitted_beside_an_open_txn_version_is_placed_there() {
+    for (npump, txn2) in [(1usize, true), (1, false), (0, true), (2, true), (3, false)] {
+        let ctx = format!("{npump} pumps, second write an MSET: {txn2}");
+        let mut d = RamDev::new(20 * u64::from(kv_storage::layout::AG_PAGES), 512, 41 + npump as u64);
+        format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 41).unwrap();
+        let hold = d.hold_switch();
+        let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+        eng.recover().unwrap();
+        let mut db = Db::new(eng, T0);
+        let p = db.eng.partition_of(b"{t}a");
+        for (k, n) in [(&b"{t}a"[..], 1300usize), (b"{t}b", 1000), (b"{t}c", 600)] {
+            let t = db.set(0, k, &value(1, n), None).unwrap();
+            db.wait(k, t, TicketState::Durable);
+        }
+        let page = db.eng.locate(0, b"{t}a").expect("stored").page;
+        for k in [&b"{t}b"[..], b"{t}c"] {
+            assert_eq!(db.eng.locate(0, k).expect("stored").page, page, "{ctx}: one page");
+        }
+        // {t}e on another page, so that an MSET of {t}a and {t}e is a txn (§14.6)
+        let t = db.set(0, b"{t}e", &value(1, 10), None).unwrap();
+        db.wait(b"{t}e", t, TicketState::Durable);
+        assert_ne!(db.eng.locate(0, b"{t}e").expect("stored").page, page, "{ctx}");
+        // fill the device to -OOM with other keys of the partition: 1 MiB values take the
+        // free AGs, small ones the room left in the partition's pages
+        let t_fill = std::time::Instant::now();
+        let (mut refused, mut i) = (0, 0u64);
+        while refused < 3 {
+            let k = format!("{{t}}F{i}").into_bytes();
+            i += 1;
+            match db.set(0, &k, &value(i, 1 << 20), None) {
+                Ok(t) => {
+                    refused = 0;
+                    db.wait(&k, t, TicketState::Durable);
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        eprintln!("{ctx}: {i} large in {:?}", t_fill.elapsed());
+        let (mut refused, mut i) = (0, 0u64);
+        while refused < 100 {
+            let k = format!("{{t}}f{i}").into_bytes();
+            i += 1;
+            match db.set(0, &k, &value(9 + i, 1 + (i as usize * 37) % 1500), None) {
+                Ok(t) => {
+                    refused = 0;
+                    db.wait(&k, t, TicketState::Durable);
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        eprintln!("{ctx}: {i} small, fill took {:?}", t_fill.elapsed());
+        // the txn rewrites {t}a and {t}c in their page; the old copies stay until the commit,
+        // which a slow device delays
+        hold.store(true, std::sync::atomic::Ordering::Relaxed);
+        let t1 = db.mset(0, &[(b"{t}a", &value(2, 100)), (b"{t}e", &value(2, 10))]).unwrap();
+        for _ in 0..npump {
+            db.eng.pump();
+        }
+        // a 1080-byte record while the commit is not durable: placed in the page or refused
+        // (the MSET's put of {t}e waits behind the open txn's version, E6)
+        let (dv, cv) = (value(3, 1080), value(3, 10));
+        let req = if txn2 { keyed(0, &[b"{t}d", b"{t}e"], kv_common::Access::Write) } else { keyed(0, &[b"{t}d"], kv_common::Access::Write) };
+        let id = db.eng.submit(p, req);
+        let mut t2 = None;
+        let mut ready = Vec::new();
+        'run: for _ in 0..10_000 {
+            ready.clear();
+            db.eng.ready(&mut ready);
+            for &(rp, rid) in &ready {
+                if rp == p && rid == id {
+                    let st = db.eng.exec(p, id, &mut |ks| {
+                        ks.select(0);
+                        ks.put(b"{t}d", &dv, kv_index::VType::String, None)?;
+                        if txn2 {
+                            ks.put(b"{t}e", &cv, kv_index::VType::String, None)?;
+                        }
+                        Ok(())
+                    });
+                    match st {
+                        kv_storage::partition::ExecStatus::Done((), o) => t2 = Some(Ok(o.ticket)),
+                        kv_storage::partition::ExecStatus::Failed(e) => t2 = Some(Err(e)),
+                        kv_storage::partition::ExecStatus::Requeued => continue,
+                    }
+                    break 'run;
+                }
+            }
+            db.eng.pump();
+        }
+        let t2 = t2.expect("the second write ran");
+        eprintln!("{ctx}: t2 {:?} d {:?} a {:?} t1 {:?} page {page:?}", t2, db.eng.locate(0, b"{t}d"), db.eng.locate(0, b"{t}a"), db.eng.ticket_state(p, t1.unwrap()));
+        hold.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut tickets = vec![t1.unwrap()];
+        tickets.extend(t2.as_ref().ok().copied().flatten());
+        for _ in 0..20_000 {
+            if tickets.iter().all(|&t| matches!(db.eng.ticket_state(p, t), Some(TicketState::Durable) | None)) {
+                break;
+            }
+            db.eng.pump();
+        }
+        assert_eq!(db.eng.partition(p).counters().moves_without_room, 0, "{ctx}: a put admitted to the page had to move without room");
+        for t in tickets {
+            let got = db.eng.ticket_state(p, t);
+            assert!(matches!(got, Some(TicketState::Durable) | None), "{ctx}: {got:?}: {}", db.eng.partition(p).diag_deep(db.eng.cache()));
+        }
+        if t2.is_ok() {
+            assert_eq!(db.get(0, b"{t}d").unwrap().expect("present").1, value(3, 1080), "{ctx}");
+        }
+        assert_eq!(db.get(0, b"{t}a").unwrap().expect("present").1, value(2, 100), "{ctx}");
+        db.quiesce();
+    }
+}
+
+/// A FLUSHDB of the only database holding keys gives every partition's AGs back, one
+/// partition after another. A partition whose AG request was answered while the pool was
+/// still full (its own AGs released first and taken by other partitions) latched the refusal
+/// for the whole retry period: its writes got `-OOM` for a second after the device was
+/// emptied, while the other partitions had given back nearly every AG since.
+#[test]
+fn writes_right_after_a_flushdb_of_a_full_device_get_space() {
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    for seed in [5u64, 6, 7] {
+        let pages = 44 * u64::from(AG_PAGES);
+        let mut d = RamDev::new(pages, 4096, seed);
+        format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, seed).unwrap();
+        let mut c = cfg();
+        c.cache_bytes = 8 << 20;
+        let mut eng = LocalEngine::open(vec![d], &c).unwrap();
+        eng.recover().unwrap();
+        let mut db = Db::new(eng, T0);
+        // the device full of small records of db 0, every partition refused space
+        let (mut i, mut refused) = (0u64, 0);
+        while refused < 400 {
+            let k = format!("f{i}");
+            match db.set(0, k.as_bytes(), &value(i, 1 + (i as usize * 37) % 1500), None) {
+                Ok(t) => {
+                    refused = 0;
+                    db.wait(k.as_bytes(), t, TicketState::Written);
+                }
+                Err(StoreError::OutOfSpace) => refused += 1,
+                Err(e) => panic!("{e:?}"),
+            }
+            i += 1;
+        }
+        for (q, t) in db.flushdb(Some(0)) {
+            db.wait_in(q, t, TicketState::Durable);
+        }
+        // at once: small records and extents in every partition
+        for j in 0..400u64 {
+            let k = format!("x{j}");
+            let len = [100usize, 2100, 4096, 65536][j as usize % 4];
+            match db.set(0, k.as_bytes(), &value(j, len), None) {
+                Ok(t) => {
+                    db.wait(k.as_bytes(), t, TicketState::Written);
+                }
+                Err(e) => panic!("seed {seed}: write {j} ({len} bytes, partition {}) after FLUSHDB of {i} records: {e:?}", db.eng.partition_of(k.as_bytes())),
+            }
+        }
+        db.quiesce();
+    }
+}

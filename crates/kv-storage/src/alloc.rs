@@ -418,6 +418,9 @@ pub(crate) struct Alloc {
     give_back: Option<AgId>,
     /// See [`Alloc::refusals`].
     refusals: u64,
+    /// The pool had AGs left under the fill limit when last looked at
+    /// ([`Alloc::set_pool_room`]): a latched refusal no longer holds.
+    pool_room: bool,
 }
 
 fn kind_slot(k: AgKind) -> usize {
@@ -447,6 +450,7 @@ impl Alloc {
             extent_of: HashMap::with_hasher(Default::default()),
             hdr_watch: HashMap::with_hasher(Default::default()),
             give_back: None,
+            pool_room: false,
             refusals: 0,
             cached: CachedSpace::default(),
             slots: [SpareSlot::default(); 2],
@@ -640,7 +644,12 @@ impl Alloc {
     fn need_ag(&mut self, kind: AgKind, now_ns: u64, dev: Option<u8>) -> SmallPlace {
         let slot = &mut self.slots[kind_slot(kind)];
         if let Some(t) = slot.refused_at_ns {
-            if now_ns.saturating_sub(t) < RETRY_NS {
+            // a refusal holds while the pool has no AG left under the fill limit: other
+            // partitions' AGs given back since (a FLUSHDB or FLUSHALL of every partition releases
+            // them one partition after another) lift it. Held for the whole retry period, the
+            // extent writes of a partition whose request was answered before the others had
+            // released anything got `-OOM` for a second after a FLUSHDB had emptied the device
+            if now_ns.saturating_sub(t) < RETRY_NS && !self.pool_room {
                 return SmallPlace::Full;
             }
             slot.refused_at_ns = None;
@@ -1204,6 +1213,12 @@ impl Alloc {
         self.slots.iter().any(|s| {
             [s.refused_at_ns, s.reserve_refused_at_ns].iter().flatten().any(|&t| now_ns.saturating_sub(t) < RETRY_NS)
         })
+    }
+
+    /// Whether the pool has AGs left under the fill limit ([`crate::metastore::MetaClient::pool_has_room`]),
+    /// looked at before each placement.
+    pub(crate) fn set_pool_room(&mut self, room: bool) {
+        self.pool_room = room;
     }
 
     /// Clears the refusal so that the next need asks again (space was released).

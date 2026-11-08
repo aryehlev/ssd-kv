@@ -23,21 +23,28 @@ pub struct RamDev {
     rng: u64,
     max_per_poll: usize,
     atomic: Option<(u32, u32)>,
+    /// While set, at most one request completes per poll (a device that is slow to answer).
+    hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RamDev {
     pub fn new(pages: u64, lba: u32, seed: u64) -> Self {
-        RamDev { data: vec![0u8; pages as usize * 4096], lba, pending: Vec::new(), rng: seed | 1, max_per_poll: usize::MAX, atomic: None }
+        RamDev { data: vec![0u8; pages as usize * 4096], lba, pending: Vec::new(), rng: seed | 1, max_per_poll: usize::MAX, atomic: None, hold: None }
     }
 
     pub fn from_image(data: Vec<u8>, lba: u32, seed: u64) -> Self {
-        RamDev { data, lba, pending: Vec::new(), rng: seed | 1, max_per_poll: usize::MAX, atomic: None }
+        RamDev { data, lba, pending: Vec::new(), rng: seed | 1, max_per_poll: usize::MAX, atomic: None, hold: None }
     }
 
     /// Reports a verified atomic write unit (atomic page-update mode).
     pub fn with_atomic(mut self, unit: (u32, u32)) -> Self {
         self.atomic = Some(unit);
         self
+    }
+
+    /// Returns a switch that slows completions to one per poll while set.
+    pub fn hold_switch(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.hold.get_or_insert_with(Default::default).clone()
     }
 
     pub fn set_max_completions(&mut self, n: usize) {
@@ -74,7 +81,11 @@ impl BlockDevice for RamDev {
     }
 
     fn poll(&mut self, out: &mut Vec<IoDone>, wait: bool) {
-        let mut n = if wait { self.pending.len() } else { self.max_per_poll.min(self.pending.len()) };
+        let slow = self.hold.as_ref().is_some_and(|h| h.load(std::sync::atomic::Ordering::Relaxed));
+        let mut n = if wait && !slow { self.pending.len() } else { self.max_per_poll.min(self.pending.len()) };
+        if slow {
+            n = n.min(1);
+        }
         while n > 0 && !self.pending.is_empty() {
             n -= 1;
             let i = (self.next() % self.pending.len() as u64) as usize;

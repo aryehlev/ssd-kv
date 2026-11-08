@@ -1255,26 +1255,37 @@ impl PartitionStore {
         )
     }
 
+    /// A cached page's records, in-flight image and staged effects (diagnostics; key hashes
+    /// and lengths only).
+    pub fn diag_page(&self, cache: &PageCache, p: PageId) -> String {
+        let Some(st) = cache.page_state(p) else { return format!("{:#x}: not cached", p.0) };
+        let recs = |recs: &[crate::image::RecDesc]| {
+            recs.iter().map(|r| format!("({:?} k={:04x} seq={:#x} txn={} kind={} klen={})", r.status, r.h32 & 0xffff, r.seq.0, r.txn, r.kind, r.key_len)).collect::<Vec<_>>().join(" ")
+        };
+        let mut out = format!("{:#x}: recs=[{}]", p.0, recs(&st.recs));
+        if let Some(inf) = st.inflight.as_ref() {
+            out.push_str(&format!(" inflight=[{}]", recs(&inf.recs)));
+        }
+        out.push_str(&format!(" dirty={} scrub={} pending=[", st.dirty, st.scrub));
+        for e in st.pending.iter() {
+            let kind = match e {
+                Pending::Put(r) => format!("put(seq={:#x} txn={})", r.desc.seq.0, r.desc.txn),
+                Pending::Remove { .. } => "remove".to_string(),
+                Pending::Retire { seq, .. } => format!("retire({:#x})", seq.0),
+            };
+            out.push_str(&format!("{kind} k={:04x} klen={} tickets={} others={}; ", e.h32() & 0xffff, e.key().len(), e.tickets().len(), self.core.stale.count(e.db(), e.key())));
+        }
+        out.push(']');
+        out
+    }
+
     /// [`PartitionStore::diag`] plus the deferred pages' staged effects and the tracked copies
     /// (diagnostics; key lengths only).
     pub fn diag_deep(&self, cache: &PageCache) -> String {
         let mut out = self.diag();
         for p in &self.core.deferred {
-            if let Some(st) = cache.page_state(*p) {
-                out.push_str(&format!("\n  deferred {:#x}: recs=[", p.0));
-                for r in st.recs.iter() {
-                    out.push_str(&format!("({:?} k={:04x} seq={:#x} txn={} kind={} klen={}) ", r.status, r.h32 & 0xffff, r.seq.0, r.txn, r.kind, r.key_len));
-                }
-                out.push_str("] pending=[");
-                for e in st.pending.iter() {
-                    let kind = match e {
-                        Pending::Put(r) => format!("put(seq={:#x} txn={})", r.desc.seq.0, r.desc.txn),
-                        Pending::Remove { .. } => "remove".to_string(),
-                        Pending::Retire { seq, .. } => format!("retire({:#x})", seq.0),
-                    };
-                    out.push_str(&format!("{kind} k={:04x} klen={} tickets={} others={}; ", e.h32() & 0xffff, e.key().len(), e.tickets().len(), self.core.stale.count(e.db(), e.key())));
-                }
-                out.push(']');
+            if cache.page_state(*p).is_some() {
+                out.push_str(&format!("\n  deferred {}", self.diag_page(cache, *p)));
             }
         }
         for (db, k, e) in self.core.stale.iter() {
@@ -4649,6 +4660,13 @@ impl PartitionStore {
         } else {
             cx.cache.free_scratch(n);
             st.recs = recs;
+            // M's records are settled, as when an image becomes durable: the build's view
+            // protects an older copy beside an open txn's newer version (§13.3 c, E6), and
+            // stored as M's state that protection outlived the txn: nothing re-derives it, so
+            // after the commit every later build kept the copy (a third copy of the key then
+            // waited for it forever, E14)
+            let core = &self.core;
+            image::settle_with(&mut st.recs, cx.cache.frame(st.m_frame), &|r| core.dead(r.db, r.seq, r.txn));
             for &t in applied.iter().flat_map(|e| e.tickets().iter()) {
                 self.core.tickets.effect_resolved(t);
             }

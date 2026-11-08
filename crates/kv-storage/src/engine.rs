@@ -790,6 +790,12 @@ impl<D: BlockDevice> LocalEngine<D> {
         &self.parts[usize::from(p)]
     }
 
+    /// The client partitions send meta requests with (tests stand in for kvd's XTxn
+    /// coordinator: `CommitTxn`, `TxnAborted`).
+    pub fn meta_client(&self) -> &MetaClient {
+        &self.client
+    }
+
     pub fn meta(&self) -> &MetaCore {
         &self.meta
     }

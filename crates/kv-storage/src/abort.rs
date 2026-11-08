@@ -135,6 +135,26 @@ impl PartitionStore {
                 items.push(AbortItem::Page(*p));
             }
         }
+        // the txn's records already in an image are dead from now on: no lookup may find them
+        // (left Live, a read of the key until the scrub found the aborted version, and so did
+        // the next part of the key, which took it for the key's version, protected the real
+        // one for good and lost the key when the scrub zeroed it)
+        for it in &items {
+            if let AbortItem::Page(page) = *it
+                && let Some(f) = cx.cache.peek(page)
+                && let Some(mut st) = cx.cache.take_state(f)
+            {
+                for r in st.recs.iter_mut().filter(|r| r.txn == txn) {
+                    r.status = RecStatus::Droppable;
+                }
+                if let Some(inf) = st.inflight.as_mut() {
+                    for r in inf.recs.iter_mut().filter(|r| r.txn == txn) {
+                        r.status = RecStatus::Droppable;
+                    }
+                }
+                cx.cache.put_state(f, st);
+            }
+        }
         self.core.counters.txn_aborts += 1;
         let ticket = self.core.tickets.create(0);
         for _ in &items {
@@ -238,11 +258,12 @@ impl PartitionStore {
         self.page_holds_txn(cache, page, txn) || cache.page_state(page).is_none()
     }
 
-    /// True when `page` (cached) has a record of `txn` in M, in its image in flight or staged.
+    /// True when `page` (cached) has a record of `txn` in M, in its image in flight or staged
+    /// (a dead record is on media until a build zeroes it, whatever its status).
     fn page_holds_txn(&self, cache: &PageCache, page: PageId, txn: u64) -> bool {
         let Some(st) = cache.page_state(page) else { return false };
-        st.recs.iter().any(|r| r.txn == txn && r.status != RecStatus::Droppable)
-            || st.inflight.as_ref().is_some_and(|i| i.recs.iter().any(|r| r.txn == txn && r.status != RecStatus::Droppable))
+        st.recs.iter().any(|r| r.txn == txn)
+            || st.inflight.as_ref().is_some_and(|i| i.recs.iter().any(|r| r.txn == txn))
             || st.pending.iter().any(|p| matches!(p, crate::image::Pending::Put(r) if r.desc.txn == txn))
     }
 

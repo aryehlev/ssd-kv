@@ -283,3 +283,40 @@ fn an_aborted_part_whose_version_moved_leaves_its_key_as_it_was() {
         }
     }
 }
+
+/// A committed part whose version went to another page than the key's old copy (the old page
+/// had no room): the old copy is protected until the version is durable and committed, then
+/// zeroed. It stayed protected for good.
+#[test]
+fn a_committed_part_on_another_page_releases_the_old_copy() {
+    for (old_len, fill) in [(895usize, true), (895, false), (60, true)] {
+        let seed = 4400 + old_len as u64 + u64::from(fill);
+        let ctx = format!("old {old_len} bytes, fill {fill}");
+        let mut db = fresh(seed);
+        let (a, _) = two_keys(&db);
+        let pa = db.eng.partition_of(&a);
+        let t = db.set(0, &a, &value(seed, old_len), None).unwrap();
+        db.wait(&a, t, TicketState::Durable);
+        let page = db.eng.locate(0, &a).unwrap().page;
+        if fill {
+            // other keys of the partition fill the old copy's page
+            for i in 0..200 {
+                let k = format!("{{xa}}f{i}").into_bytes();
+                let t = db.set(0, &k, &value(seed + i, 300), None).unwrap();
+                db.wait(&k, t, TicketState::Durable);
+            }
+        }
+        let txn = db.eng.meta().txn_ids().next();
+        let new_v = value(seed + 1, 1160);
+        let t = apply_part(&mut db, &a, txn, Part::Put(1160), &new_v).unwrap();
+        assert_eq!(db.wait_in(pa, t, TicketState::Durable), TicketState::Durable, "{ctx}: part");
+        let moved = db.eng.locate(0, &a).unwrap().page != page;
+        db.eng.meta_client().request(pa, 0, kv_storage::metastore::MetaReq::CommitTxn { txn });
+        db.eng.pump();
+        assert_eq!(db.get(0, &a).unwrap().map(|x| x.1), Some(new_v.clone()), "{ctx} (moved {moved})");
+        db.quiesce();
+        let t = db.set(0, &a, &value(seed + 2, 700), None).unwrap();
+        assert_eq!(db.wait(&a, t, TicketState::Durable), TicketState::Durable, "{ctx}: a later write");
+        db.quiesce();
+    }
+}

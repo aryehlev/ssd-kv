@@ -624,7 +624,7 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                 r.status = match t {
                     CopyState::Stale => RecStatus::Superseded,
                     // the tracked (current) copy is its newest one here; older ones go (R3)
-                    CopyState::Source if newest_here(&st.recs, i, m) => RecStatus::Protected,
+                    CopyState::Source if newest_here(&st.recs, i, m, env) => RecStatus::Protected,
                     CopyState::Source => RecStatus::Superseded,
                 };
             }
@@ -640,6 +640,11 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
                     drop.push(r);
                 }
                 RecStatus::Droppable if st.scrub => drop.push(r),
+                // a record of a txn that never committed is zeroed by any build that drops it:
+                // left as free space its bytes stayed on media while the page's state forgot
+                // it, the txn's abort saw nothing of it left, and once `resolved_w` passed the
+                // id the record was valid (E10) and came back after a crash
+                RecStatus::Droppable if r.txn != 0 => drop.push(r),
                 RecStatus::Droppable => {}
                 RecStatus::Live | RecStatus::Protected => keep.push(r),
             }
@@ -931,10 +936,13 @@ pub(crate) fn build(st: &mut PageState, m: &[u8; PAGE], n: &mut [u8; PAGE], env:
     out
 }
 
-/// True when `recs[i]` has the highest seq among its key's records of the image.
-fn newest_here(recs: &[RecDesc], i: usize, img: &[u8; PAGE]) -> bool {
+/// True when `recs[i]` has the highest seq among its key's records of the image that are not
+/// dead. A dead record (of an aborted txn, waiting for its zeroing) is no copy of the key: taken
+/// as the newer one, the build zeroed the tracked source, the key's current version once the
+/// part that moved the key elsewhere was aborted too, and the key was lost.
+fn newest_here(recs: &[RecDesc], i: usize, img: &[u8; PAGE], env: &dyn BuildEnv) -> bool {
     let a = recs[i];
-    !recs.iter().enumerate().any(|(j, b)| j != i && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && b.key(img) == a.key(img))
+    !recs.iter().enumerate().any(|(j, b)| j != i && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && b.status != RecStatus::Droppable && !env.dead(b) && b.key(img) == a.key(img))
 }
 
 /// True when a newer copy of `recs[i]`'s key in the same image belongs to a txn whose commit

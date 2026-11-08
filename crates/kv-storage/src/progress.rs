@@ -520,7 +520,7 @@ impl PartitionStore {
             let img = cache.frame(st.m_frame);
             for r in st.recs.iter() {
                 match r.status {
-                    RecStatus::Protected => return fail(format!("page {:#x}: record seq {:#x} is still protected", page.0, r.seq.0)),
+                    RecStatus::Protected => return fail(format!("page {:#x}: record seq {:#x} txn {} (k={:04x}) is still protected", page.0, r.seq.0, r.txn, r.h32 & 0xffff)),
                     RecStatus::Live if !r.is_marker() && !c.dead(r.db, r.seq, r.txn) => {
                         let key = r.key(img);
                         let kh = kv_common::KeyHash::of(seed, key);

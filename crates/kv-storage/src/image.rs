@@ -323,9 +323,23 @@ impl PageState {
     /// not take it, and other staged puts take gaps first. An accepted record that found no gap
     /// at build time had to move, which on a full device found no page and waited for space
     /// forever. Ties of equal lengths do not change which lengths fit, so keys are not needed.
-    pub(crate) fn places(&self, img: &[u8; PAGE], mode: PageUpdateMode, skip: Option<(u8, u32, &[u8])>, extra: &[u16]) -> bool {
+    /// `txn_open` is the build's [`BuildEnv::txn_open`]: a superseded copy whose newer version
+    /// in the image belongs to a txn whose commit is not durable yet is kept by the build
+    /// (§13.3 c, E6), so its bytes are taken too. Counted free, they let an MSET's put in on a
+    /// full device that its build then could not place: it moved, found no page, and its txn,
+    /// SAVE and SHUTDOWN waited for space forever.
+    pub(crate) fn places(&self, img: &[u8; PAGE], mode: PageUpdateMode, skip: Option<(u8, u32, &[u8])>, extra: &[u16], txn_open: &dyn Fn(u64) -> bool) -> bool {
         let (recs, _) = self.image();
-        let kept: SmallVec<[&RecDesc; 24]> = recs.iter().filter(|r| matches!(r.status, RecStatus::Live | RecStatus::Protected)).collect();
+        let kept: SmallVec<[&RecDesc; 24]> = recs
+            .iter()
+            .enumerate()
+            .filter(|&(i, r)| match r.status {
+                RecStatus::Live | RecStatus::Protected => true,
+                RecStatus::Superseded => newer_open_txn_by(recs, i, img, txn_open),
+                RecStatus::Droppable => false,
+            })
+            .map(|(_, r)| r)
+            .collect();
         let mut occupied: SmallVec<[(u16, u16); 24]> = kept.iter().map(|r| (r.off, r.end())).collect();
         let mut lens: SmallVec<[u16; 8]> = extra.iter().copied().chain(self.phantom.iter().copied()).collect();
         for p in &self.pending {
@@ -342,8 +356,12 @@ impl PageState {
                 if let Some(j) = newest
                     && r.desc.len <= kept[j].len
                 {
-                    // rewritten at the old copy's offset; its tail is free
-                    occupied[j].1 = occupied[j].0 + r.desc.len;
+                    // rewritten at the old copy's offset; its tail is free. Behind a version of
+                    // an open txn the put waits for the commit (E6) and the copy keeps every
+                    // byte until then: it is rewritten in place later, needing no gap either
+                    if !(kept[j].txn != 0 && txn_open(kept[j].txn)) {
+                        occupied[j].1 = occupied[j].0 + r.desc.len;
+                    }
                     continue;
                 }
             }
@@ -922,9 +940,14 @@ fn newest_here(recs: &[RecDesc], i: usize, img: &[u8; PAGE]) -> bool {
 /// True when a newer copy of `recs[i]`'s key in the same image belongs to a txn whose commit
 /// is not durable yet.
 fn newer_open_txn(recs: &[RecDesc], i: usize, img: &[u8; PAGE], env: &dyn BuildEnv) -> bool {
+    newer_open_txn_by(recs, i, img, &|t| env.txn_open(t))
+}
+
+/// [`newer_open_txn`] with the txn state as a predicate (admission, `PageState::places`).
+fn newer_open_txn_by(recs: &[RecDesc], i: usize, img: &[u8; PAGE], txn_open: &dyn Fn(u64) -> bool) -> bool {
     let a = recs[i];
     recs.iter().enumerate().any(|(j, b)| {
-        j != i && b.txn != 0 && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && env.txn_open(b.txn) && b.key(img) == a.key(img)
+        j != i && b.txn != 0 && b.db == a.db && b.h32 == a.h32 && b.seq > a.seq && txn_open(b.txn) && b.key(img) == a.key(img)
     })
 }
 
@@ -985,6 +1008,8 @@ pub(crate) mod tests {
         pub(crate) mode: PageUpdateMode,
         pub(crate) lba: u32,
         pub(crate) others: HashMap<Vec<u8>, usize>,
+        /// Txns whose commit is not durable yet.
+        pub(crate) open: Vec<u64>,
     }
 
     impl BuildEnv for Env {
@@ -1021,8 +1046,8 @@ pub(crate) mod tests {
         fn dead(&self, _r: &RecDesc) -> bool {
             false
         }
-        fn txn_open(&self, _t: u64) -> bool {
-            false
+        fn txn_open(&self, t: u64) -> bool {
+            self.open.contains(&t)
         }
     }
 
@@ -1124,7 +1149,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fresh_page_first_build_is_one_full_write() {
-        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let m = [0u8; PAGE];
         let mut st = state(&m, true);
         st.pending.push(Pending::Put(encoded(b"a", b"1", 1)));
@@ -1141,7 +1166,7 @@ pub(crate) mod tests {
 
     #[test]
     fn two_image_update_keeps_old_copy_until_durable_then_zeroes_it() {
-        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut st = state(&[0; PAGE], true);
         st.pending.push(Pending::Put(encoded(b"k", b"v1", 1)));
         let (m1, b) = run(&mut st, &[0; PAGE], &env);
@@ -1166,7 +1191,7 @@ pub(crate) mod tests {
 
     #[test]
     fn atomic_update_rewrites_in_place() {
-        let env = Env { mode: PageUpdateMode::Atomic, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::Atomic, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut st = state(&[0; PAGE], true);
         st.pending.push(Pending::Put(encoded(b"k", &[1; 200], 1)));
         st.pending.push(Pending::Put(encoded(b"z", &[2; 100], 1)));
@@ -1188,7 +1213,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remove_waits_for_older_copies() {
-        let mut env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let mut env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut st = state(&[0; PAGE], true);
         st.pending.push(Pending::Put(encoded(b"k", b"v", 1)));
         let (m1, b) = run(&mut st, &[0; PAGE], &env);
@@ -1254,7 +1279,7 @@ pub(crate) mod tests {
             }
         }
         for mode in [PageUpdateMode::TwoImage, PageUpdateMode::Atomic] {
-            let base = Env { mode, lba: 512, others: HashMap::new() };
+            let base = Env { mode, lba: 512, others: HashMap::new(), open: Vec::new() };
             let mut st = state(&[0; PAGE], true);
             st.pending.push(Pending::Put(encoded(b"{t}k10xxxxxxxxxxxxxxxxxxxxxxxx", &[5; 40], 1)));
             let (m1, b) = run(&mut st, &[0; PAGE], &base);
@@ -1275,7 +1300,7 @@ pub(crate) mod tests {
 
     #[test]
     fn third_copy_is_deferred() {
-        let mut env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let mut env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut st = state(&[0; PAGE], true);
         st.pending.push(Pending::Put(encoded(b"k", b"v", 1)));
         let (m1, b) = run(&mut st, &[0; PAGE], &env);
@@ -1288,7 +1313,7 @@ pub(crate) mod tests {
 
     #[test]
     fn records_that_do_not_fit_are_relocated() {
-        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut st = state(&[0; PAGE], true);
         st.pending.push(Pending::Put(encoded(b"a", &[1; 2000], 1)));
         st.pending.push(Pending::Put(encoded(b"b", &[1; 2000], 1)));
@@ -1300,7 +1325,7 @@ pub(crate) mod tests {
 
     #[test]
     fn io_shape_rules() {
-        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut ch = Changes::default();
         ch.add(0x20, 0x60);
         ch.add(0x400, 0x410);
@@ -1311,13 +1336,13 @@ pub(crate) mod tests {
         ch.add(0x20, 0x30);
         ch.add(0xF00, 0xF10);
         assert_eq!(io_shape(&ch, &env).0.as_slice(), &[(0, 4096)], "changed span over 2048");
-        let env = Env { mode: PageUpdateMode::Atomic, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::Atomic, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut ch = Changes::default();
         ch.add(0x1F0, 0x210);
         let (s, a) = io_shape(&ch, &env);
         assert!(a);
         assert_eq!(s.as_slice(), &[(0, 1024)], "aligned power of two covering the change");
-        let env = Env { mode: PageUpdateMode::TwoImage, lba: 4096, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 4096, others: HashMap::new(), open: Vec::new() };
         let mut ch = Changes::default();
         ch.add(0x20, 0x30);
         assert_eq!(io_shape(&ch, &env).0.as_slice(), &[(0, 4096)]);
@@ -1420,7 +1445,7 @@ pub(crate) mod tests {
         fn prop_page_theorem(steps in proptest::collection::vec(proptest::collection::vec(step(), 1..5), 1..8),
                              atomic in any::<bool>(), seed in any::<u64>()) {
             let mode = if atomic { PageUpdateMode::Atomic } else { PageUpdateMode::TwoImage };
-            let env = Env { mode, lba: 512, others: HashMap::new() };
+            let env = Env { mode, lba: 512, others: HashMap::new(), open: Vec::new() };
             let mut m = [0u8; PAGE];
             let mut st = state(&m, true);
             let mut seq = 0u64;
@@ -1465,7 +1490,7 @@ pub(crate) mod tests {
     /// at build time, and with no page free anywhere the move waited forever.
     #[test]
     fn free_bytes_split_into_small_gaps_do_not_take_an_update() {
-        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let mut st = state(&[0; PAGE], true);
         let a = vec![1u8; 1000];
         st.pending.push(Pending::Put(encoded(b"a", &a, 1)));
@@ -1484,7 +1509,7 @@ pub(crate) mod tests {
         let b_new = encoded(b"b", &[3; 1000], 30);
         let need = b_new.desc.len;
         assert!(room - st.used_bytes() >= need, "the page has the free bytes ({} of {need})", room - st.used_bytes());
-        assert!(!st.places(&m2, PageUpdateMode::TwoImage, Some((0, h32(b"b"), b"b")), &[need]), "no gap takes the update");
+        assert!(!st.places(&m2, PageUpdateMode::TwoImage, Some((0, h32(b"b"), b"b")), &[need], &|x| env.txn_open(x)), "no gap takes the update");
         // what the build does with it
         let mut st2 = state(&m2, false);
         st2.pending.push(Pending::Put(b_new));
@@ -1492,7 +1517,72 @@ pub(crate) mod tests {
         assert_eq!(b.relocate.len(), 1);
         // a record the end gap takes is placed
         let small = encoded(b"d", &[4; 900], 31);
-        assert!(st.places(&m2, PageUpdateMode::TwoImage, None, &[small.desc.len]));
+        assert!(st.places(&m2, PageUpdateMode::TwoImage, None, &[small.desc.len], &|x| env.txn_open(x)));
+    }
+
+    /// `encoded` for a record of txn `txn`.
+    fn encoded_txn(key: &[u8], val: &[u8], seq: u64, txn: u64) -> EncodedRecord {
+        let len = small_len(key.len(), val.len(), true);
+        let h = RecHeader {
+            kind: REC_KIND_STRING,
+            db: 0,
+            flags: crate::record::REC_FLAG_TXN,
+            seq: Seq(seq),
+            expire_at_ms: 0,
+            key_len: key.len() as u16,
+            val_len: val.len() as u16,
+            h32: h32(key),
+            txn: Some(txn),
+        };
+        let mut b = vec![0u8; len].into_boxed_slice();
+        encode_small(&h, key, val, PageId(0), 0x20, RecordCrc::new(SALT), &mut b);
+        let mut r = encoded(key, val, seq);
+        r.bytes = b;
+        r.desc.len = len as u16;
+        r.desc.txn = txn;
+        r.desc.flags = crate::record::REC_FLAG_TXN;
+        r
+    }
+
+    /// The layout a full two-image device produced under MSETs: a 1360-byte copy of a key
+    /// superseded in M by a 192-byte version of an MSET whose commit is not durable yet, beside
+    /// records that leave no other gap. The build keeps the superseded copy while the txn is
+    /// open (§13.3 c); admission counted its bytes free and let a 1152-byte put of the next
+    /// MSET in, which then had to move, found no page, and its txn waited forever.
+    #[test]
+    fn a_copy_an_open_txn_supersedes_keeps_its_bytes_at_admission() {
+        let mut env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
+        let mut st = state(&[0; PAGE], true);
+        st.pending.push(Pending::Put(encoded(b"a", &[1; 1326], 1)));
+        st.pending.push(Pending::Put(encoded(b"b", &[2; 1326], 2)));
+        st.pending.push(Pending::Put(encoded(b"c", &[3; 1150], 3)));
+        let (m1, b) = run(&mut st, &[0; PAGE], &env);
+        assert!(b.relocate.is_empty());
+        // the MSET's version of `a` lands in the end gap; its old copy stays protected (R1)
+        let mut st = state(&m1, false);
+        st.pending.push(Pending::Put(encoded_txn(b"a", &[4; 40], 4, 7)));
+        env.open.push(7);
+        let (m2, b) = run(&mut st, &m1, &env);
+        assert!(b.relocate.is_empty());
+        let mut recs = b.recs;
+        settle(&mut recs, &m2);
+        let st = PageState::loaded(page(), FrameIdx(0), recs);
+        assert!(st.recs.iter().any(|r| r.status == RecStatus::Superseded), "the old copy of `a` is superseded in M");
+        let d = encoded(b"d", &[5; 1100], 5);
+        let need = d.desc.len;
+        assert!(!st.places(&m2, PageUpdateMode::TwoImage, None, &[need], &|x| env.txn_open(x)), "the open txn's superseded copy takes its bytes");
+        // what the build does with it while the txn is open: it has to move
+        let mut st2 = PageState::loaded(page(), FrameIdx(0), st.recs.clone());
+        st2.pending.push(Pending::Put(encoded(b"d", &[5; 1100], 5)));
+        let (_, b) = run(&mut st2, &m2, &env);
+        assert_eq!(b.relocate.len(), 1, "the build keeps the superseded copy while the txn is open");
+        // once the commit is durable the copy goes and the record is placed
+        env.open.clear();
+        assert!(st.places(&m2, PageUpdateMode::TwoImage, None, &[need], &|x| env.txn_open(x)));
+        let mut st3 = PageState::loaded(page(), FrameIdx(0), st.recs.clone());
+        st3.pending.push(Pending::Put(d));
+        let (_, b) = run(&mut st3, &m2, &env);
+        assert!(b.relocate.is_empty());
     }
 
     proptest! {
@@ -1505,7 +1595,7 @@ pub(crate) mod tests {
             prop_oneof![3 => (0u8..12, 0u16..1500).prop_map(|(k, l)| Step::Put(k, l)), 1 => (0u8..12).prop_map(Step::Del)], 1..6), 1..10),
                                            atomic in any::<bool>()) {
             let mode = if atomic { PageUpdateMode::Atomic } else { PageUpdateMode::TwoImage };
-            let env = Env { mode, lba: 512, others: HashMap::new() };
+            let env = Env { mode, lba: 512, others: HashMap::new(), open: Vec::new() };
             let mut m = [0u8; PAGE];
             let mut st = state(&m, true);
             let mut seq = 0u64;
@@ -1521,7 +1611,7 @@ pub(crate) mod tests {
                     }
                     st.pending.push(eff);
                 }
-                let predicted = st.places(&m, mode, None, &[]);
+                let predicted = st.places(&m, mode, None, &[], &|x| env.txn_open(x));
                 // a staged remove frees bytes the same build may place a record in: the
                 // prediction counts them as taken (it may only err on the safe side)
                 let removes = st.pending.iter().any(|p| matches!(p, Pending::Remove { .. }));
@@ -1547,7 +1637,7 @@ pub(crate) mod tests {
     /// build places them by the admission view instead of moving one away.
     #[test]
     fn admitted_puts_are_placed_when_a_removal_changes_the_gaps() {
-        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new() };
+        let env = Env { mode: PageUpdateMode::TwoImage, lba: 512, others: HashMap::new(), open: Vec::new() };
         let u = 128u16;
         let mut m = [0u8; PAGE];
         write_small_header(&mut m, page(), PART);
@@ -1565,7 +1655,7 @@ pub(crate) mod tests {
         st.pending.push(Pending::Remove { db: 0, h32: h32(&k0), key: k0.as_slice().into(), seq: Seq(50), tickets: SmallVec::new() });
         for (i, len) in [384u16, 384, 640].into_iter().enumerate() {
             let r = encoded(&[b'p', i as u8], &vec![7; usize::from(len) - 34], 60 + i as u64);
-            assert!(st.places(&m, PageUpdateMode::TwoImage, None, &[r.desc.len]), "put {i} admitted");
+            assert!(st.places(&m, PageUpdateMode::TwoImage, None, &[r.desc.len], &|x| env.txn_open(x)), "put {i} admitted");
             st.pending.push(Pending::Put(r));
         }
         // the plain placement over the bytes the build keeps fails
@@ -1592,7 +1682,7 @@ pub(crate) mod tests {
             prop_oneof![4 => (0u8..12, 0u16..1500).prop_map(|(k, l)| Step::Put(k, l)), 1 => (0u8..12).prop_map(Step::Del)], 1..8), 1..12),
                                          atomic in any::<bool>()) {
             let mode = if atomic { PageUpdateMode::Atomic } else { PageUpdateMode::TwoImage };
-            let env = Env { mode, lba: 512, others: HashMap::new() };
+            let env = Env { mode, lba: 512, others: HashMap::new(), open: Vec::new() };
             let mut m = [0u8; PAGE];
             let mut st = state(&m, true);
             let mut seq = 0u64;
@@ -1602,7 +1692,7 @@ pub(crate) mod tests {
                     let eff = match s {
                         Step::Put(k, l) => {
                             let r = encoded(&key(k), &vec![seq as u8; usize::from(l)], seq);
-                            if !st.places(&m, mode, Some((0, h32(&key(k)), &key(k))), &[r.desc.len]) {
+                            if !st.places(&m, mode, Some((0, h32(&key(k)), &key(k))), &[r.desc.len], &|x| env.txn_open(x)) {
                                 continue;
                             }
                             Pending::Put(r)
@@ -1626,6 +1716,67 @@ pub(crate) mod tests {
                     let mut next = PageState::loaded(page(), FrameIdx(0), recs);
                     next.pending = core::mem::take(&mut st.pending);
                     st = next;
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// `prop_admitted_puts_never_move` with MSETs: each batch may be one txn, whose
+        /// versions supersede older copies that the build keeps until its commit is durable;
+        /// commits become durable in any order, some batches later.
+        #[test]
+        fn prop_admitted_txn_puts_never_move(steps in proptest::collection::vec((proptest::collection::vec(
+            prop_oneof![4 => (0u8..12, 0u16..1500).prop_map(|(k, l)| Step::Put(k, l)), 1 => (0u8..12).prop_map(Step::Del)], 1..8), any::<bool>(), any::<u8>()), 1..14),
+                                             atomic in any::<bool>()) {
+            let mode = if atomic { PageUpdateMode::Atomic } else { PageUpdateMode::TwoImage };
+            let mut env = Env { mode, lba: 512, others: HashMap::new(), open: Vec::new() };
+            let mut m = [0u8; PAGE];
+            let mut st = state(&m, true);
+            let mut seq = 0u64;
+            for (n_batch, (batch, is_txn, commit)) in steps.into_iter().enumerate() {
+                let txn = if is_txn { 100 + n_batch as u64 } else { 0 };
+                for s in batch {
+                    seq += 1;
+                    let eff = match s {
+                        Step::Put(k, l) => {
+                            let val = vec![seq as u8; usize::from(l)];
+                            let r = if txn != 0 { encoded_txn(&key(k), &val, seq, txn) } else { encoded(&key(k), &val, seq) };
+                            if !st.places(&m, mode, Some((0, h32(&key(k)), &key(k))), &[r.desc.len], &|x| env.txn_open(x)) {
+                                continue;
+                            }
+                            Pending::Put(r)
+                        }
+                        Step::Del(k) if txn == 0 => Pending::Remove { db: 0, h32: h32(&key(k)), key: key(k).into(), seq: Seq(u64::MAX), tickets: SmallVec::new() },
+                        Step::Del(_) => continue,
+                    };
+                    if let Some(i) = st.pending.iter().position(|p| p.key() == eff.key()) {
+                        if let (Pending::Put(r), Pending::Remove { .. }) = (st.pending.remove(i), &eff) {
+                            st.phantom.push(r.desc.len);
+                        }
+                    }
+                    st.pending.push(eff);
+                }
+                if txn != 0 {
+                    env.open.push(txn);
+                }
+                let (n, b) = run(&mut st, &m, &env);
+                prop_assert!(b.relocate.is_empty(), "{} admitted records moved", b.relocate.len());
+                if b.writes() {
+                    m = n;
+                    let mut recs = b.recs;
+                    settle(&mut recs, &m);
+                    let mut next = PageState::loaded(page(), FrameIdx(0), recs);
+                    next.pending = core::mem::take(&mut st.pending);
+                    next.phantom = core::mem::take(&mut st.phantom);
+                    st = next;
+                }
+                // a commit becomes durable
+                if !env.open.is_empty() && commit % 3 != 0 {
+                    let i = usize::from(commit) % env.open.len();
+                    env.open.remove(i);
                 }
             }
         }

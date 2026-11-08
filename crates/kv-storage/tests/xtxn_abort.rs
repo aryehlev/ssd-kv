@@ -223,3 +223,63 @@ fn a_failed_commit_fails_what_waits_for_the_part() {
         assert!(db.set(0, &a, b"refused", None).is_err(), "size {size}: the partition is read-only");
     }
 }
+
+/// A part's version that its page's build could not place moves to another page (§14.3)
+/// before the txn is aborted. The abort used to undo the version where it was staged: it found
+/// no index entry there, put the old one back beside the entry naming the moved version and
+/// dropped the tracking the move gave the old copy. The key's next write then landed beside
+/// that untracked old copy while the moved, dead version was tracked as a source that no newer
+/// copy would ever release: a third copy (E14) that waited forever, its txn with it.
+#[cfg(feature = "sim")]
+#[test]
+fn an_aborted_part_whose_version_moved_leaves_its_key_as_it_was() {
+    for pumps in [0usize, 1, 2, 3, 6, 400] {
+        for old_len in [60usize, 900] {
+            let seed = 1300 + pumps as u64 * 10 + old_len as u64;
+            let ctx = format!("{pumps} pumps, old {old_len} bytes");
+            let mut db = fresh(seed);
+            let (a, _) = two_keys(&db);
+            let pa = db.eng.partition_of(&a);
+            let old_v = value(seed, old_len);
+            let t = db.set(0, &a, &old_v, None).unwrap();
+            db.wait(&a, t, TicketState::Durable);
+            let page = db.eng.locate(0, &a).unwrap().page;
+            let txn = db.eng.meta().txn_ids().next();
+            apply_part(&mut db, &a, txn, Part::Put(100), &value(seed + 1, 100)).unwrap();
+            assert_eq!(db.eng.locate(0, &a).unwrap().page, page, "{ctx}: the part's version is staged in the key's page");
+            assert_eq!(db.eng.sim_move_staged(pa, page), 1, "{ctx}");
+            assert_ne!(db.eng.locate(0, &a).unwrap().page, page, "{ctx}: the version moved");
+            for _ in 0..pumps {
+                db.eng.pump();
+            }
+            let t = db.eng.abort_txn(pa, txn);
+            assert_eq!(db.wait_in(pa, t, TicketState::Durable), TicketState::Durable, "{ctx}: abort ticket");
+            assert_eq!(db.get(0, &a).unwrap().map(|x| x.1), Some(old_v.clone()), "{ctx}: the key is back to its old version");
+            assert_eq!(db.eng.locate(0, &a).unwrap().page, page, "{ctx}: the index names the old copy again");
+            assert_eq!(db.eng.partition(pa).index().keys(0), 1, "{ctx}: one index entry for the key");
+            assert_eq!(db.eng.partition(pa).stale_copies(), 0, "{ctx}: no tracked copy is left once the abort is durable");
+            // later writes of the key complete, also cross-partition ones
+            let t = db.set(0, &a, &value(seed + 2, 700), None).unwrap();
+            assert_eq!(db.wait(&a, t, TicketState::Durable), TicketState::Durable, "{ctx}: a later write");
+            let txn2 = db.eng.meta().txn_ids().next();
+            let t = apply_part(&mut db, &a, txn2, Part::Put(300), &value(seed + 3, 300)).unwrap();
+            for _ in 0..50 {
+                db.eng.pump();
+            }
+            assert!(t.is_none() || db.eng.check_progress().is_ok(), "{ctx}: {:?}", db.eng.check_progress());
+            let t = db.eng.abort_txn(pa, txn2);
+            assert_eq!(db.wait_in(pa, t, TicketState::Durable), TicketState::Durable, "{ctx}: second abort");
+            let (_, t) = db.del(0, &a).unwrap();
+            assert_eq!(db.wait(&a, t, TicketState::Durable), TicketState::Durable, "{ctx}: a delete");
+            db.quiesce();
+            assert!(db.eng.check_progress().is_ok(), "{ctx}: {:?}", db.eng.check_progress());
+            let mut devs = db.eng.into_devices();
+            devs[0].crash();
+            let mut eng = LocalEngine::open(devs, &cfg()).unwrap();
+            eng.recover().unwrap();
+            let mut db = Db::new(eng, T0);
+            assert_eq!(db.get(0, &a).unwrap(), None, "{ctx}: after a crash the delete holds");
+            db.quiesce();
+        }
+    }
+}

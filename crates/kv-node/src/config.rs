@@ -612,6 +612,32 @@ pub fn parse_size(v: &str) -> ValueResult<u64> {
     n.checked_mul(mul).ok_or_else(|| "argument must be a memory value".to_owned())
 }
 
+/// `client-output-buffer-limit`: a size, or the Redis class form `normal <hard> <soft>
+/// <seconds> [replica|slave|pubsub ...]`, of which the `normal` class's hard limit applies
+/// (`None`: the value names no `normal` class, the limit stays). 0 means no limit, as in Redis.
+pub fn parse_output_limit(v: &str) -> ValueResult<Option<u64>> {
+    let words: Vec<&str> = v.split_whitespace().collect();
+    if words.len() <= 1 {
+        return parse_size(v.trim()).map(Some);
+    }
+    if words.len() % 4 != 0 {
+        return Err("wrong number of arguments: expected <class> <hard> <soft> <seconds> groups".to_owned());
+    }
+    let mut out = None;
+    for g in words.chunks(4) {
+        if !matches!(g[0].to_ascii_lowercase().as_str(), "normal" | "replica" | "slave" | "pubsub") {
+            return Err(format!("invalid client class '{}'", g[0]));
+        }
+        let hard = parse_size(g[1])?;
+        parse_size(g[2])?;
+        parse_uint(g[3]).map_err(|_| "argument must be a number of seconds".to_owned())?;
+        if g[0].eq_ignore_ascii_case("normal") {
+            out = Some(hard);
+        }
+    }
+    Ok(out)
+}
+
 /// `PATH[:SIZE]` as used by `kvd format --device`.
 pub fn parse_device_spec(s: &str) -> ValueResult<(PathBuf, Option<u64>)> {
     match s.rsplit_once(':') {
@@ -736,6 +762,13 @@ impl Origin<'_> {
 }
 
 impl Config {
+    /// The output limit a connection's queued replies are held against: `client-output-buffer-limit`,
+    /// where 0 means no limit (Redis). Taken as a limit of 0 bytes, every connection was held
+    /// with nothing queued, before its first command, for good.
+    pub fn output_limit(&self) -> u64 {
+        if self.client_output_buffer_limit == 0 { u64::MAX } else { self.client_output_buffer_limit }
+    }
+
     /// Applies the config file (with includes), then the command-line overrides, then validates.
     pub fn load(args: &ServeArgs) -> Result<Config, ConfigError> {
         let mut cfg = Config::default();
@@ -903,7 +936,11 @@ impl Config {
             }
             "uring-fixed-buffers" => self.uring_fixed_buffers = parse_bool(s)?,
             "max-pending-per-conn" => self.max_pending_per_conn = parse_in(s, 1, u32::MAX as u64)?,
-            "client-output-buffer-limit" => self.client_output_buffer_limit = parse_size(s)?,
+            "client-output-buffer-limit" => {
+                if let Some(n) = parse_output_limit(s)? {
+                    self.client_output_buffer_limit = n;
+                }
+            }
             "proto-max-bulk-len" => {
                 let n = parse_size(s)?;
                 if !(1024 * 1024..=512 * MIB).contains(&n) {
@@ -1176,6 +1213,22 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn output_limit_zero_is_unlimited_and_the_redis_form_parses() {
+        let mut c = Config::default();
+        assert_eq!(c.output_limit(), 64 * MIB);
+        c.client_output_buffer_limit = 0;
+        assert_eq!(c.output_limit(), u64::MAX);
+        assert_eq!(parse_output_limit("0").unwrap(), Some(0));
+        assert_eq!(parse_output_limit("32mb").unwrap(), Some(32 * MIB));
+        assert_eq!(parse_output_limit("normal 0 0 0").unwrap(), Some(0));
+        assert_eq!(parse_output_limit("normal 8mb 4mb 60 replica 256mb 64mb 60 pubsub 32mb 8mb 60").unwrap(), Some(8 * MIB));
+        assert_eq!(parse_output_limit("pubsub 32mb 8mb 60").unwrap(), None);
+        assert!(parse_output_limit("normal 0 0").is_err());
+        assert!(parse_output_limit("bogus 0 0 0").is_err());
+    }
+
     use super::*;
 
     fn cli(args: &[&str]) -> Result<Config, ConfigError> {

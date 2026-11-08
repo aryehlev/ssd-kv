@@ -510,6 +510,9 @@ pub(crate) struct ExtTables {
 // -------------------------------------------------------------------------------------------
 // Txns (§14.6)
 
+/// Open txns of a partition (their commit is not durable yet).
+pub(crate) type TxnMap = HashMap<u64, OpenTxn, foldhash::fast::FixedState>;
+
 pub(crate) struct OpenTxn {
     /// The command's ticket.
     pub(crate) ticket: Option<TicketId>,
@@ -609,7 +612,7 @@ pub(crate) struct Core {
     pub(crate) retry: Vec<PageId>,
     /// Pages whose read completed when no cache frame could be had: read again next tick.
     pub(crate) load_retry: Vec<PageId>,
-    pub(crate) txns: HashMap<u64, OpenTxn, foldhash::fast::FixedState>,
+    pub(crate) txns: TxnMap,
     /// Txns committed this boot whose ids may still be above the durable `resolved_w`.
     pub(crate) committed: HashSet<u64, foldhash::fast::FixedState>,
     /// The durable `resolved_w` last seen: every txn id at or below it is valid (§10.7).
@@ -986,12 +989,13 @@ impl Core {
 /// R2 beside what is staged there and the gaps `planned` takes on it (`PageState::places`). A
 /// page's largest gap less its staged bytes is no promise: staged puts may split the gap, and
 /// first-fit-decreasing placement is not monotone. An uncached page is checked once loaded.
-fn page_takes(cache: &PageCache, boot: &Boot, dflt: PageUpdateMode, q: PageId, need: u16, planned: &[(PageId, u16)]) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn page_takes(cache: &PageCache, boot: &Boot, dflt: PageUpdateMode, txns: &TxnMap, q: PageId, need: u16, planned: &[(PageId, u16)]) -> bool {
     let Some(st) = cache.page_state(q) else { return true };
     let mode = boot.devs.get(usize::from(q.dev())).map_or(dflt, |d| d.page_update);
     let mut extra: SmallVec<[u16; 4]> = planned.iter().filter(|(p, l)| *p == q && *l > 0).map(|&(_, l)| l).collect();
     extra.push(need);
-    st.places(cache.frame(st.image().1), mode, None, &extra)
+    st.places(cache.frame(st.image().1), mode, None, &extra, &|t| txns.contains_key(&t))
 }
 
 fn cur_seq(c: &Cur) -> Seq {
@@ -2158,10 +2162,10 @@ impl PartitionStore {
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
             let absent = stale.absent_of(s.db, &s.key).map(|a| a.page);
-            let (boot, dflt) = (&self.core.boot, self.core.cfg.page_update);
+            let (boot, dflt, txns) = (&self.core.boot, self.core.cfg.page_update, &self.core.txns);
             let pl: &[(PageId, u16)] = planned;
             let exclude = |q: PageId| {
-                stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, q, need, pl)
+                stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, txns, q, need, pl)
             };
             let place = self.core.alloc.place_small(need, cache, now_ns, &exclude);
             if let SmallPlace::Cached(q) | SmallPlace::Fresh(q) = place {
@@ -2288,7 +2292,7 @@ impl PartitionStore {
         }
         let mut extra: SmallVec<[u16; 4]> = planned.iter().filter(|(p, _)| *p == page).map(|&(_, l)| l).collect();
         extra.push(need);
-        st.places(img, mode, Some((s.db, h32, &s.key)), &extra).then_some(need)
+        st.places(img, mode, Some((s.db, h32, &s.key)), &extra, &|t| self.core.txn_open(t)).then_some(need)
     }
 
     /// Applies one planned change.
@@ -4669,6 +4673,27 @@ impl PartitionStore {
 
     /// A staged record that does not fit its page moves to another one (§14.3). At most
     /// `RELOCATIONS_PER_TICK` moves happen per tick; the rest wait for the next one.
+    /// Simulation hook: moves every staged put of `page` to another page, as a build does with
+    /// puts no gap of the page takes (§14.3); returns how many moved.
+    #[cfg(feature = "sim")]
+    pub fn sim_move_staged(&mut self, cx: &mut StorageCtx<'_>, page: PageId) -> usize {
+        let Some(st) = cx.cache.page_state_mut(page) else { return 0 };
+        let mut puts: SmallVec<[EncodedRecord; 2]> = SmallVec::new();
+        let mut kept: SmallVec<[Pending; 2]> = SmallVec::new();
+        for p in st.pending.drain(..) {
+            match p {
+                Pending::Put(r) => puts.push(r),
+                other => kept.push(other),
+            }
+        }
+        st.pending.extend(kept);
+        let n = puts.len();
+        for rec in puts {
+            self.relocate(cx, page, rec);
+        }
+        n
+    }
+
     fn relocate(&mut self, cx: &mut StorageCtx<'_>, from: PageId, rec: EncodedRecord) {
         if self.core.cutoff.get(usize::from(rec.desc.db)).is_some_and(|&c| rec.desc.seq.0 < c) {
             // staged before a FLUSHDB of its db: dead by the cutoff, nothing to move (moved,
@@ -4697,9 +4722,9 @@ impl PartitionStore {
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
             let absent = stale.absent_of(db, &key).map(|a| a.page);
-            let (boot, dflt) = (&self.core.boot, self.core.cfg.page_update);
+            let (boot, dflt, txns) = (&self.core.boot, self.core.cfg.page_update, &self.core.txns);
             let exclude = |q: PageId| {
-                q == from || stale.state_at(db, &key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, q, need, &[])
+                q == from || stale.state_at(db, &key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, txns, q, need, &[])
             };
             self.core.alloc.place_small(need, cache, now_ns, &exclude)
         };
@@ -4763,6 +4788,22 @@ impl PartitionStore {
             for m in o.markers.iter_mut() {
                 if m.0 == db && *m.1 == *key && m.3 == seq {
                     m.2 = q;
+                }
+            }
+            // an XTxn part's abort undoes the version where it is now: left naming `from`, the
+            // abort found no index entry there, inserted the old one beside the entry naming
+            // `q` and dropped the tracking this move gave `from`'s copy, so the key's next write
+            // could land beside that untracked older copy while `q`'s dead version was tracked
+            // as a source no newer copy would ever release (three copies, E14: it waited
+            // forever, and its txn, SAVE and SHUTDOWN with it)
+            for u in o.undo.iter_mut() {
+                if let crate::abort::NewLoc::Small { page, seq: s, .. } = &mut u.new
+                    && *page == from
+                    && *s == seq
+                    && u.db == db
+                    && *u.key == *key
+                {
+                    *page = q;
                 }
             }
         }

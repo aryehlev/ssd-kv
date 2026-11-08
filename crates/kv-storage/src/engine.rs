@@ -984,6 +984,17 @@ impl<D: BlockDevice> LocalEngine<D> {
         t
     }
 
+    /// Simulation hook: the staged puts of `page` (partition `p`) leave it as if its next
+    /// build found no gap for them (`PartitionStore::sim_move_staged`); returns how many.
+    #[cfg(feature = "sim")]
+    pub fn sim_move_staged(&mut self, p: u16, page: crate::layout::PageId) -> usize {
+        let now = self.now();
+        let (part, mut cx) = split(&mut self.parts, &mut self.plumb, &mut self.cache, &self.client, usize::from(p), now);
+        let n = part.sim_move_staged(&mut cx, page);
+        self.submit_io();
+        n
+    }
+
     /// [`PartitionStore::txn_commit_failed`] on partition `p`.
     pub fn txn_commit_failed(&mut self, p: u16, txn: u64, errno: i32) {
         self.parts[usize::from(p)].txn_commit_failed(txn, errno);

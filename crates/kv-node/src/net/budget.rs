@@ -27,9 +27,12 @@ impl LargeValueBudget {
         self.soft_limit.store(large_value_memory / 2, Ordering::Relaxed);
     }
 
-    /// The pre-consume check for a command holding no reservation yet.
+    /// The pre-consume check for a command holding no reservation yet. With nothing held a
+    /// command always starts: below one value's size (`large-value-memory 0` or `1`) the check
+    /// held every large write with nothing left to release, for good.
     pub fn may_start(&self) -> bool {
-        self.used.load(Ordering::Relaxed) < self.soft_limit.load(Ordering::Relaxed)
+        let used = self.used.load(Ordering::Relaxed);
+        used == 0 || used < self.soft_limit.load(Ordering::Relaxed)
     }
 
     /// Unconditional reservation of a consumed command's buffer.
@@ -104,6 +107,19 @@ mod tests {
         b.set_limit(4);
         assert!(!b.may_start());
         assert_eq!(b.used(), 4095);
+    }
+
+    /// A limit below one value still lets one large write through at a time.
+    #[test]
+    fn a_limit_below_one_value_admits_one_at_a_time() {
+        for limit in [0, 1, 4096] {
+            let b = LargeValueBudget::new(limit);
+            assert!(b.may_start(), "limit {limit}: nothing held");
+            b.reserve(8192);
+            assert!(!b.may_start(), "limit {limit}: one at a time");
+            b.release(8192);
+            assert!(b.may_start(), "limit {limit}");
+        }
     }
 
     #[test]

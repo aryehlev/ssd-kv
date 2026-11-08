@@ -50,7 +50,8 @@ pub enum MetaReq {
     /// An AG an already accepted write needs to complete (a record that moves, §14.3): served
     /// from the headroom above `max-storage-fill`, refused only when no AG is free at all.
     AcquireReserved { partition: u16, kind: AgKind },
-    ReleaseAg { ag: AgId },
+    /// `retired`: one of the AGs a FLUSHALL gave up ([`MetaClient::note_retiring`]).
+    ReleaseAg { ag: AgId, retired: bool },
     PartitionMeta { m: PartitionMeta },
     NodeMeta { m: NodeMeta },
     ReserveSeq { partition: u16, floor: Seq },
@@ -97,6 +98,14 @@ pub struct MetaShared {
     ag_pressure: std::sync::atomic::AtomicBool,
     /// Txn commits that found the intent table full and waited for a later cycle.
     commits_deferred: AtomicU64,
+    /// AGs that FLUSHALLs gave up and that are not back in the pool yet (all partitions).
+    retiring: AtomicU64,
+    /// AGs a plain request could be granted (under the fill limit and free), as of the last
+    /// acquisition or release: a partition's latched AG refusal holds only while it is 0.
+    headroom: AtomicU64,
+    /// Free AGs, as of the last acquisition or release: a partition's first AG of a kind is
+    /// granted while one is free, above the fill limit too (`MetaCore::acquire`).
+    free_ags: AtomicU64,
 }
 
 impl MetaShared {
@@ -106,6 +115,9 @@ impl MetaShared {
             resolved_w: AtomicU64::new(resolved_w),
             ag_pressure: std::sync::atomic::AtomicBool::new(false),
             commits_deferred: AtomicU64::new(0),
+            headroom: AtomicU64::new(0),
+            free_ags: AtomicU64::new(0),
+            retiring: AtomicU64::new(0),
         }
     }
 }
@@ -171,6 +183,30 @@ impl MetaClient {
     /// `-OOM` on a device far from its fill limit.
     pub(crate) fn ag_pressure(&self) -> bool {
         self.shared.ag_pressure.load(Ordering::Relaxed)
+    }
+
+    /// Whether the pool had AGs left under the fill limit, and whether it had any free AG
+    /// (what a partition's first AG of a kind needs), at its last acquisition or release: an
+    /// AG refusal a partition latched earlier no longer holds.
+    pub(crate) fn pool_room(&self) -> (bool, bool) {
+        (self.shared.headroom.load(Ordering::Relaxed) > 0, self.shared.free_ags.load(Ordering::Relaxed) > 0)
+    }
+
+    /// A partition gave up `n` AGs (FLUSHALL) that it releases once their writes are done.
+    pub(crate) fn note_retiring(&self, n: u64) {
+        self.shared.retiring.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// `n` AGs noted by [`MetaClient::note_retiring`] will never be released (the partition
+    /// turned read-only).
+    pub(crate) fn forget_retiring(&self, n: u64) {
+        let _ = self.shared.retiring.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(n)));
+    }
+
+    /// True while AGs some FLUSHALL gave up are still on their way back to the pool: a write
+    /// refused space meanwhile waits for them (bounded) instead of failing.
+    pub(crate) fn ags_retiring(&self) -> bool {
+        self.shared.retiring.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -569,6 +605,7 @@ impl MetaCore {
                 Held::Reply(_) => None,
             })
             .collect();
+        self.publish_headroom();
         for m in msgs {
             let done = match m.req {
                 MetaReq::AcquireAg { partition, kind } => {
@@ -584,8 +621,11 @@ impl MetaCore {
                     let ag = self.acquire_with(partition, kind, None, false);
                     MetaDone::Ag(self.needed(ag))
                 }
-                MetaReq::ReleaseAg { ag } => {
+                MetaReq::ReleaseAg { ag, retired } => {
                     self.release(ag);
+                    if retired {
+                        let _ = self.shared.retiring.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+                    }
                     MetaDone::Ok
                 }
                 MetaReq::PartitionMeta { m: pm } => {
@@ -935,6 +975,7 @@ impl MetaCore {
         let idx = self.pick.pick(DOMAIN_AG_PICK | u64::from(partition), &self.free[dev])? as u32;
         self.free[dev][(idx / 64) as usize] &= !(1 << (idx % 64));
         self.allocated += 1;
+        self.publish_headroom();
         if let Some(o) = self.owned.get_mut(usize::from(partition)) {
             o[kind_index(kind)] += 1;
         }
@@ -969,6 +1010,15 @@ impl MetaCore {
         b.dirty = true;
         self.free[usize::from(ag.dev)][(ag.idx / 64) as usize] |= 1 << (ag.idx % 64);
         self.allocated = self.allocated.saturating_sub(1);
+        self.publish_headroom();
+    }
+
+    /// Makes the AGs a plain request could be granted now (under the fill limit and free on
+    /// some device) visible to the partitions ([`MetaClient::pool_room`]).
+    fn publish_headroom(&self) {
+        let free: u64 = self.free.iter().flat_map(|b| b.iter()).map(|w| u64::from(w.count_ones())).sum();
+        self.shared.headroom.store(self.headroom().min(free), Ordering::Relaxed);
+        self.shared.free_ags.store(free, Ordering::Relaxed);
     }
 
     /// Writes the commit batch into the lowest-index slots with room and flushes (E6).
@@ -1318,7 +1368,7 @@ mod tests {
         }
         for _ in 0..600 {
             let old = held.pop_front().unwrap();
-            run(&mut core, &mut io, vec![MetaMsg::new(1, 2, MetaReq::ReleaseAg { ag: old })]);
+            run(&mut core, &mut io, vec![MetaMsg::new(1, 2, MetaReq::ReleaseAg { ag: old, retired: false })]);
             let a = acquire(&mut core, &mut io, 1).unwrap();
             assert!(!held.contains(&a), "an AG granted twice");
             held.push_back(a);

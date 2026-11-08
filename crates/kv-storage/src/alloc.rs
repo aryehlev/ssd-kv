@@ -418,6 +418,10 @@ pub(crate) struct Alloc {
     give_back: Option<AgId>,
     /// See [`Alloc::refusals`].
     refusals: u64,
+    /// The pool had room when last looked at ([`Alloc::set_pool_room`]): AGs under the fill
+    /// limit, and any free AG (a partition's first AG of a kind is granted above the limit
+    /// too). A latched refusal no longer holds.
+    pool_room: (bool, bool),
 }
 
 fn kind_slot(k: AgKind) -> usize {
@@ -447,6 +451,7 @@ impl Alloc {
             extent_of: HashMap::with_hasher(Default::default()),
             hdr_watch: HashMap::with_hasher(Default::default()),
             give_back: None,
+            pool_room: (false, false),
             refusals: 0,
             cached: CachedSpace::default(),
             slots: [SpareSlot::default(); 2],
@@ -638,13 +643,23 @@ impl Alloc {
     }
 
     fn need_ag(&mut self, kind: AgKind, now_ns: u64, dev: Option<u8>) -> SmallPlace {
-        let slot = &mut self.slots[kind_slot(kind)];
-        if let Some(t) = slot.refused_at_ns {
-            if now_ns.saturating_sub(t) < RETRY_NS {
+        if let Some(t) = self.slots[kind_slot(kind)].refused_at_ns {
+            // a refusal holds while the pool has no AG left under the fill limit: other
+            // partitions' AGs given back since (a FLUSHDB or FLUSHALL of every partition releases
+            // them one partition after another) lift it. Held for the whole retry period, the
+            // extent writes of a partition whose request was answered before the others had
+            // released anything got `-OOM` for a second after a FLUSHDB had emptied the device
+            let first = match kind {
+                AgKind::Small => self.small.is_empty(),
+                _ => self.extent.is_empty(),
+            };
+            let room = self.pool_room.0 || (first && self.pool_room.1);
+            if now_ns.saturating_sub(t) < RETRY_NS && !room {
                 return SmallPlace::Full;
             }
-            slot.refused_at_ns = None;
+            self.slots[kind_slot(kind)].refused_at_ns = None;
         }
+        let slot = &mut self.slots[kind_slot(kind)];
         slot.want = true;
         slot.class = slot.class.max(AgClass::Need);
         if dev.is_some() {
@@ -1206,6 +1221,12 @@ impl Alloc {
         })
     }
 
+    /// Whether the pool has AGs left under the fill limit, and whether it has any free AG
+    /// ([`crate::metastore::MetaClient::pool_room`]), looked at before each placement.
+    pub(crate) fn set_pool_room(&mut self, under_limit: bool, any_free: bool) {
+        self.pool_room = (under_limit, any_free);
+    }
+
     /// Clears the refusal so that the next need asks again (space was released).
     pub(crate) fn clear_refusal(&mut self) {
         for s in &mut self.slots {
@@ -1522,6 +1543,45 @@ mod tests {
         assert!(a.ag_outstanding());
         a.take_ag_requests(&mut req);
         assert_eq!(req.as_slice(), &[(AgKind::Small, None, AgClass::Reserved)]);
+    }
+
+    /// A latched refusal holds only while the pool has no AG left under the fill limit: once
+    /// other partitions gave AGs back (a FLUSHDB of every partition), the next need asks again
+    /// at once. Held for the retry period, extent writes got `-OOM` for a second after a
+    /// FLUSHDB had emptied the device.
+    #[test]
+    fn a_refusal_is_lifted_once_the_pool_has_room() {
+        let mut a = alloc(PageUpdateMode::TwoImage);
+        let mut req = SmallVec::new();
+        assert_eq!(a.alloc_extent(4, None, 0, None), ExtPlace::NeedAg);
+        a.take_ag_requests(&mut req);
+        assert_eq!(req.as_slice(), &[(AgKind::Extent, None, AgClass::Need)]);
+        a.ag_granted(AgKind::Extent, None, 10);
+        // the pool is full: latched
+        a.set_pool_room(false, false);
+        assert_eq!(a.alloc_extent(4, None, 20, None), ExtPlace::Full);
+        req.clear();
+        a.take_ag_requests(&mut req);
+        assert!(req.is_empty(), "the refusal is latched");
+        // AGs came back to the pool: asked again well within the retry period
+        a.set_pool_room(true, true);
+        assert_eq!(a.alloc_extent(4, None, 30, None), ExtPlace::NeedAg);
+        a.take_ag_requests(&mut req);
+        assert_eq!(req.as_slice(), &[(AgKind::Extent, None, AgClass::Need)]);
+        // refused again; only AGs above the fill limit are free: that is room for the
+        // partition's first extent AG (granted above the limit), not for a further one
+        a.ag_granted(AgKind::Extent, None, 40);
+        a.set_pool_room(false, true);
+        assert_eq!(a.alloc_extent(4, None, 50, None), ExtPlace::NeedAg, "a first AG of the kind");
+        req.clear();
+        a.take_ag_requests(&mut req);
+        a.ag_granted(AgKind::Extent, Some(AgId { dev: 0, idx: 3 }), 60);
+        assert!(matches!(a.alloc_extent(4, None, 70, None), ExtPlace::Run(_)));
+        while let ExtPlace::Run(_) = a.alloc_extent(4, None, 80, None) {}
+        req.clear();
+        a.take_ag_requests(&mut req);
+        a.ag_granted(AgKind::Extent, None, 90);
+        assert_eq!(a.alloc_extent(4, None, 100, None), ExtPlace::Full, "not a first AG: latched");
     }
 
     /// A refusal answered while the partition released AGs is asked again, but at most

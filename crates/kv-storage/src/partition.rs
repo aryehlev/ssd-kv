@@ -510,6 +510,9 @@ pub(crate) struct ExtTables {
 // -------------------------------------------------------------------------------------------
 // Txns (§14.6)
 
+/// Open txns of a partition (their commit is not durable yet).
+pub(crate) type TxnMap = HashMap<u64, OpenTxn, foldhash::fast::FixedState>;
+
 pub(crate) struct OpenTxn {
     /// The command's ticket.
     pub(crate) ticket: Option<TicketId>,
@@ -609,7 +612,7 @@ pub(crate) struct Core {
     pub(crate) retry: Vec<PageId>,
     /// Pages whose read completed when no cache frame could be had: read again next tick.
     pub(crate) load_retry: Vec<PageId>,
-    pub(crate) txns: HashMap<u64, OpenTxn, foldhash::fast::FixedState>,
+    pub(crate) txns: TxnMap,
     /// Txns committed this boot whose ids may still be above the durable `resolved_w`.
     pub(crate) committed: HashSet<u64, foldhash::fast::FixedState>,
     /// The durable `resolved_w` last seen: every txn id at or below it is valid (§10.7).
@@ -626,6 +629,9 @@ pub(crate) struct Core {
     /// `Requests::next_order` at that moment: a value read of an older request may still
     /// target them (chunk reads are issued after the chunkmap's read completes).
     pub(crate) retiring_req_mark: u64,
+    /// AGs of `retiring_ags` counted in the pool-wide retiring count
+    /// ([`crate::metastore::MetaClient::note_retiring`]).
+    pub(crate) retiring_noted: u64,
     /// FLUSHDB reclaim walk (paced): SMALL pages to load, extent starts to check.
     pub(crate) reclaim_pages: VecDeque<PageId>,
     pub(crate) reclaim_ext: VecDeque<PageId>,
@@ -986,12 +992,13 @@ impl Core {
 /// R2 beside what is staged there and the gaps `planned` takes on it (`PageState::places`). A
 /// page's largest gap less its staged bytes is no promise: staged puts may split the gap, and
 /// first-fit-decreasing placement is not monotone. An uncached page is checked once loaded.
-fn page_takes(cache: &PageCache, boot: &Boot, dflt: PageUpdateMode, q: PageId, need: u16, planned: &[(PageId, u16)]) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn page_takes(cache: &PageCache, boot: &Boot, dflt: PageUpdateMode, txns: &TxnMap, q: PageId, need: u16, planned: &[(PageId, u16)]) -> bool {
     let Some(st) = cache.page_state(q) else { return true };
     let mode = boot.devs.get(usize::from(q.dev())).map_or(dflt, |d| d.page_update);
     let mut extra: SmallVec<[u16; 4]> = planned.iter().filter(|(p, l)| *p == q && *l > 0).map(|&(_, l)| l).collect();
     extra.push(need);
-    st.places(cache.frame(st.image().1), mode, None, &extra)
+    st.places(cache.frame(st.image().1), mode, None, &extra, &|t| txns.contains_key(&t))
 }
 
 fn cur_seq(c: &Cur) -> Seq {
@@ -1133,6 +1140,7 @@ impl PartitionStore {
             flushall_wait: false,
             retiring_io_mark: 0,
             retiring_req_mark: 0,
+            retiring_noted: 0,
             reclaim_pages: VecDeque::new(),
             reclaim_ext: VecDeque::new(),
             space_wait: Vec::new(),
@@ -2131,6 +2139,14 @@ impl PartitionStore {
                 return Err(Commit::Park);
             }
         }
+        if matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && cx.meta.ags_retiring() {
+            // other partitions' FLUSHALL (or FLUSHDB of the only db with keys) gives their AGs
+            // back one partition after another: this partition's own came back first and were
+            // taken, so a write right after the reply found the pool full. It waits for the
+            // others' (bounded by SPACE_WAIT_NS, tried again as they come back) instead of
+            // getting `-OOM` on a device the flush had just emptied
+            return Err(Commit::Reclaim);
+        }
         if matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && self.core.reclaim_pending() {
             // a FLUSHDB of this partition is giving the flushed records' space back (its
             // reclaim walk starts once the cutoff is durable, which is also when the FLUSHDB is
@@ -2144,6 +2160,8 @@ impl PartitionStore {
     #[allow(clippy::too_many_arguments)]
     fn plan_put_at(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
         let now_ns = cx.now.mono_ns;
+        let (under_limit, any_free) = cx.meta.pool_room();
+        self.core.alloc.set_pool_room(under_limit, any_free);
         let small = small_len(key_len, val_len as usize, txn);
         if key_len <= u16::MAX as usize && val_len <= u16::MAX as u64 && small <= SMALL_REC_MAX {
             let need = small as u16;
@@ -2158,10 +2176,10 @@ impl PartitionStore {
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
             let absent = stale.absent_of(s.db, &s.key).map(|a| a.page);
-            let (boot, dflt) = (&self.core.boot, self.core.cfg.page_update);
+            let (boot, dflt, txns) = (&self.core.boot, self.core.cfg.page_update, &self.core.txns);
             let pl: &[(PageId, u16)] = planned;
             let exclude = |q: PageId| {
-                stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, q, need, pl)
+                stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, txns, q, need, pl)
             };
             let place = self.core.alloc.place_small(need, cache, now_ns, &exclude);
             if let SmallPlace::Cached(q) | SmallPlace::Fresh(q) = place {
@@ -2288,7 +2306,7 @@ impl PartitionStore {
         }
         let mut extra: SmallVec<[u16; 4]> = planned.iter().filter(|(p, _)| *p == page).map(|&(_, l)| l).collect();
         extra.push(need);
-        st.places(img, mode, Some((s.db, h32, &s.key)), &extra).then_some(need)
+        st.places(img, mode, Some((s.db, h32, &s.key)), &extra, &|t| self.core.txn_open(t)).then_some(need)
     }
 
     /// Applies one planned change.
@@ -3114,7 +3132,11 @@ impl PartitionStore {
         if all {
             // the partition allocator restarts from keyed draws (§16.5 step 4); the old AGs are
             // released once their writes are done and the cutoffs durable
+            let before = self.core.retiring_ags.len();
             self.core.retiring_ags.extend(self.core.alloc.release_all());
+            let added = (self.core.retiring_ags.len() - before) as u64;
+            self.core.retiring_noted += added;
+            cx.meta.note_retiring(added);
             self.core.retiring_io_mark = self.core.next_io;
             self.core.retiring_req_mark = self.reqs.next_order;
             self.core.ext.chunkmaps.clear();
@@ -4462,7 +4484,10 @@ impl PartitionStore {
         }
         // writes waiting for a FLUSHDB reclaim try again: space was freed, the reclaim ended
         // (they get `-OOM` at once if it gave back too little) or the recheck time came
-        if !self.core.reclaim_wait.is_empty() && (cx.now.mono_ns >= self.core.reclaim_recheck_ns || !self.core.reclaim_pending()) {
+        // (or AGs other partitions gave up came back to the pool, or none is on its way any more)
+        if !self.core.reclaim_wait.is_empty()
+            && (cx.now.mono_ns >= self.core.reclaim_recheck_ns || !(self.core.reclaim_pending() || cx.meta.ags_retiring()) || cx.meta.pool_room().0)
+        {
             for id in core::mem::take(&mut self.core.reclaim_wait) {
                 if let Some(r) = self.reqs.get_mut(id) {
                     r.parked = false;
@@ -4669,6 +4694,27 @@ impl PartitionStore {
 
     /// A staged record that does not fit its page moves to another one (§14.3). At most
     /// `RELOCATIONS_PER_TICK` moves happen per tick; the rest wait for the next one.
+    /// Simulation hook: moves every staged put of `page` to another page, as a build does with
+    /// puts no gap of the page takes (§14.3); returns how many moved.
+    #[cfg(feature = "sim")]
+    pub fn sim_move_staged(&mut self, cx: &mut StorageCtx<'_>, page: PageId) -> usize {
+        let Some(st) = cx.cache.page_state_mut(page) else { return 0 };
+        let mut puts: SmallVec<[EncodedRecord; 2]> = SmallVec::new();
+        let mut kept: SmallVec<[Pending; 2]> = SmallVec::new();
+        for p in st.pending.drain(..) {
+            match p {
+                Pending::Put(r) => puts.push(r),
+                other => kept.push(other),
+            }
+        }
+        st.pending.extend(kept);
+        let n = puts.len();
+        for rec in puts {
+            self.relocate(cx, page, rec);
+        }
+        n
+    }
+
     fn relocate(&mut self, cx: &mut StorageCtx<'_>, from: PageId, rec: EncodedRecord) {
         if self.core.cutoff.get(usize::from(rec.desc.db)).is_some_and(|&c| rec.desc.seq.0 < c) {
             // staged before a FLUSHDB of its db: dead by the cutoff, nothing to move (moved,
@@ -4697,9 +4743,9 @@ impl PartitionStore {
             let stale = &self.core.stale;
             let cache: &PageCache = cx.cache;
             let absent = stale.absent_of(db, &key).map(|a| a.page);
-            let (boot, dflt) = (&self.core.boot, self.core.cfg.page_update);
+            let (boot, dflt, txns) = (&self.core.boot, self.core.cfg.page_update, &self.core.txns);
             let exclude = |q: PageId| {
-                q == from || stale.state_at(db, &key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, q, need, &[])
+                q == from || stale.state_at(db, &key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, txns, q, need, &[])
             };
             self.core.alloc.place_small(need, cache, now_ns, &exclude)
         };
@@ -4763,6 +4809,22 @@ impl PartitionStore {
             for m in o.markers.iter_mut() {
                 if m.0 == db && *m.1 == *key && m.3 == seq {
                     m.2 = q;
+                }
+            }
+            // an XTxn part's abort undoes the version where it is now: left naming `from`, the
+            // abort found no index entry there, inserted the old one beside the entry naming
+            // `q` and dropped the tracking this move gave `from`'s copy, so the key's next write
+            // could land beside that untracked older copy while `q`'s dead version was tracked
+            // as a source no newer copy would ever release (three copies, E14: it waited
+            // forever, and its txn, SAVE and SHUTDOWN with it)
+            for u in o.undo.iter_mut() {
+                if let crate::abort::NewLoc::Small { page, seq: s, .. } = &mut u.new
+                    && *page == from
+                    && *s == seq
+                    && u.db == db
+                    && *u.key == *key
+                {
+                    *page = q;
                 }
             }
         }
@@ -4854,6 +4916,11 @@ impl PartitionStore {
         {
             self.ask_seq(cx.meta);
         }
+        // a read-only partition releases nothing any more: the pool stops waiting for its AGs
+        if self.core.state == PartState::ReadOnly && self.core.retiring_noted > 0 {
+            cx.meta.forget_retiring(self.core.retiring_noted);
+            self.core.retiring_noted = 0;
+        }
         // FLUSHALL: release each old AG once nothing is staged, in flight or waiting for a
         // flush in it any more (forgetting a page whose image awaits its flush would lose the
         // image's tickets: its durability event finds no page state). Each AG on its own:
@@ -4873,7 +4940,8 @@ impl PartitionStore {
                 }
                 self.core.retiring_ags.swap_remove(i);
                 self.forget_ag(cx.cache, ag);
-                self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
+                self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag, retired: true }, MetaWait::Plain);
+                self.core.retiring_noted = self.core.retiring_noted.saturating_sub(1);
                 released = true;
             }
             if released {
@@ -4941,7 +5009,7 @@ impl PartitionStore {
     fn give_back_spare(&mut self, cx: &mut StorageCtx<'_>) {
         if let Some(ag) = self.core.alloc.take_give_back() {
             self.forget_ag(cx.cache, ag);
-            self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
+            self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag, retired: false }, MetaWait::Plain);
         }
     }
 
@@ -4976,7 +5044,7 @@ impl PartitionStore {
             && let Some(ag) = self.core.alloc.take_idle_spare()
         {
             self.forget_ag(cx.cache, ag);
-            self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
+            self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag, retired: false }, MetaWait::Plain);
         }
         // AG release (§11.7)
         if self.core.buckets.release.try_take(now_ns, 1) {
@@ -4985,7 +5053,7 @@ impl PartitionStore {
             };
             if let Some(ag) = self.core.alloc.take_releasable(&busy) {
                 self.forget_ag(cx.cache, ag);
-                self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag }, MetaWait::Plain);
+                self.core.meta_req(cx.meta, MetaReq::ReleaseAg { ag, retired: false }, MetaWait::Plain);
             }
         }
         // FLUSHDB reclaim walk (§16.5). Paced, except while this partition is refused space:

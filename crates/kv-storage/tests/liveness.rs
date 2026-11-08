@@ -823,3 +823,88 @@ fn an_update_admitted_to_its_page_is_placed_there() {
     assert_eq!(db.eng.partition(p).counters().moves_without_room, 0);
     db.quiesce();
 }
+
+/// A full device must not refuse what does not grow the stored data, in any partition: a TTL
+/// change (EXPIRE, PERSIST) of an extent key needs a second run until its old copy is freed (an
+/// extent holds one image), and so does a RENAME within a partition (a put of the destination
+/// and a delete of the source in one request). On a device filled through every partition the
+/// few AGs above the fill limit went to two or three partitions as their reserve, and every
+/// other partition answered such writes `-OOM` (6356 of 7264 PEXPIREs of 70000-byte values on a
+/// 660 MB, 16-partition device); writes issued back to back also got `-OOM` while the copies the
+/// previous ones replaced were still being freed. Each partition now keeps one free run of
+/// `EXT_SLACK_PAGES` that growing writes do not take, such writes may place a small record
+/// without the usual slack, and they wait for copies being freed.
+#[test]
+fn ttl_changes_and_renames_work_in_every_partition_of_a_full_device() {
+    use kv_index::VType;
+    use kv_storage::keyspace::StoreError;
+    use kv_storage::layout::AG_PAGES;
+    let pages = 40 * u64::from(AG_PAGES) + u64::from(AG_PAGES);
+    let mut d = RamDev::new(pages, 4096, 21);
+    format_devices(&mut [&mut d as &mut dyn BlockDevice], 16, false, 0, 21).unwrap();
+    let mut eng = LocalEngine::open(vec![d], &cfg()).unwrap();
+    eng.recover().unwrap();
+    let mut db = Db::new(eng, T0);
+    // a small key in every partition first (a RENAME's txn delete marker is a small record)
+    for i in 0..256u64 {
+        let k = format!("s{i}");
+        let t = db.set(0, k.as_bytes(), b"small", None).unwrap();
+        db.wait(k.as_bytes(), t, TicketState::Written);
+    }
+    // fill every partition with values of 2-62 KiB until the device refuses
+    let mut stored = Vec::new();
+    let mut refused = 0;
+    for i in 0..40_000u64 {
+        let k = format!("k{i}");
+        match db.set(0, k.as_bytes(), &value(i, 2100 + (i as usize * 9973) % 60_000), None) {
+            Ok(t) => {
+                db.wait(k.as_bytes(), t, TicketState::Written);
+                stored.push((k, i));
+            }
+            Err(StoreError::OutOfSpace) => {
+                refused += 1;
+                if refused > 400 {
+                    break;
+                }
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(refused > 400 && stored.len() > 1000, "the device filled up ({} keys stored)", stored.len());
+    let mut parts = hashbrown::HashSet::new();
+    // TTL changes back to back, without waiting for each one's durability
+    let mut tickets = Vec::new();
+    for (j, (k, _)) in stored.iter().enumerate() {
+        let at = if j % 3 == 0 { None } else { Some(T0 + 3_600_000 + j as u64) };
+        let (hit, t) = db.expire(0, k.as_bytes(), at).unwrap_or_else(|e| panic!("TTL change {j} of {}: {e:?}", stored.len()));
+        assert!(hit);
+        parts.insert(db.eng.partition_of(k.as_bytes()));
+        tickets.push((k.clone(), t));
+    }
+    assert_eq!(parts.len(), 16, "keys in every partition");
+    for (k, t) in tickets {
+        db.wait(k.as_bytes(), t, TicketState::Written);
+    }
+    // RENAME within a partition: `{k}r` has the slot of `k`
+    for (j, (k, i)) in stored.iter().enumerate().step_by(7) {
+        let dst = format!("{{{k}}}r");
+        let p = db.eng.partition_of(k.as_bytes());
+        assert_eq!(p, db.eng.partition_of(dst.as_bytes()));
+        let (src, dstb) = (k.as_bytes(), dst.as_bytes());
+        let (_, out) = db
+            .eng
+            .run(p, keyed(0, &[src, dstb], kv_common::Access::Write), &mut |ks| {
+                ks.select(0);
+                let (m, v) = ks.get(src)?.map(|(m, v)| (m, v.to_vec())).expect("source present");
+                ks.put(dstb, &v, VType::String, m.expire_at_ms)?;
+                ks.delete(src)?;
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("RENAME {j} on a full device: {e:?}"));
+        db.wait_in(p, out.ticket, TicketState::Written);
+        let (_, v) = db.get(0, dstb).unwrap().expect("renamed");
+        assert_eq!(v, value(*i, 2100 + (*i as usize * 9973) % 60_000));
+        assert!(db.get(0, src).unwrap().is_none());
+    }
+    db.quiesce();
+}

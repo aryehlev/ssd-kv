@@ -99,7 +99,18 @@ pub(crate) mod domain {
     pub(crate) const EXTENT_TIE: u64 = 6;
     pub(crate) const CARVE: u64 = 7;
     pub(crate) const WARM: u64 = 10;
+    pub(crate) const TIGHT: u64 = 11;
 }
+
+/// The free run (pages) every partition keeps in its EXTENT AGs for writes that do not grow
+/// the stored data (`growing == false` in [`Alloc::alloc_extent`]): a TTL change, a RENAME or
+/// an overwrite of an extent value of up to 1 MiB needs a second run until its old copy is
+/// freed, and on a full device whose free AGs other partitions held as their reserve, a
+/// partition without such a run answered every EXPIRE / PERSIST / RENAME of its extent keys
+/// `-OOM` (the copy cannot go into the old run: an extent holds one image). Writes that grow
+/// the data never take the last such run while the pool can give the partition another AG,
+/// and get `-OOM` instead of taking it once the pool refuses.
+pub(crate) const EXT_SLACK_PAGES: u16 = 256;
 
 /// A 4096-bit set (one bit per page of an AG). 512 bytes, one allocation.
 #[derive(Clone)]
@@ -668,6 +679,34 @@ impl Alloc {
         SmallPlace::NeedAg
     }
 
+    /// A cached page whose largest gap holds `need` bytes, without the slack that
+    /// [`Alloc::place_small`] keeps for the page's records to grow in place (a keyed draw among
+    /// up to 16 candidates of the smallest class that has one). For writes that do not grow the
+    /// stored data on a device with no other room: such a write frees as much as it takes.
+    pub(crate) fn place_tight(&mut self, need: u16, cache: &PageCache, exclude: &dyn Fn(PageId) -> bool) -> Option<PageId> {
+        let c0 = usize::from(need / 128).min(CACHED_CLASSES - 1);
+        for c in c0..CACHED_CLASSES {
+            let mut cands: SmallVec<[PageId; 16]> = SmallVec::new();
+            for &p in &self.cached.classes[c] {
+                if !cache.contains(p) {
+                    continue;
+                }
+                let (_, _, gap) = self.cached.info.get(&p).copied().unwrap_or((0, 0, 0));
+                if gap >= need && !exclude(p) {
+                    cands.push(p);
+                    if cands.len() == 16 {
+                        break;
+                    }
+                }
+            }
+            if !cands.is_empty() {
+                let k = self.pick_index(domain::TIGHT, cands.len())?;
+                return Some(cands[k]);
+            }
+        }
+        None
+    }
+
     fn best_cached(&mut self, need: u16, cache: &PageCache, exclude: &dyn Fn(PageId) -> bool) -> Option<PageId> {
         let min = need.saturating_add(self.slack_min(need));
         let c0 = usize::from(min / 128).min(CACHED_CLASSES - 1);
@@ -829,19 +868,28 @@ impl Alloc {
     /// fit hole (ties drawn), carved at a drawn `n`-aligned offset when longer, else the spare
     /// EXTENT AG. `dev` restricts the run to one device (the chunks of a large value live on
     /// their chunkmap's device, LC-08).
-    pub(crate) fn alloc_extent(&mut self, n: u32, twin: Option<PageId>, now_ns: u64, dev: Option<u8>) -> ExtPlace {
+    pub(crate) fn alloc_extent(&mut self, n: u32, twin: Option<PageId>, now_ns: u64, dev: Option<u8>, growing: bool) -> ExtPlace {
         debug_assert!((1..=crate::layout::EXT_MAX_PAGES).contains(&n));
         let n16 = n as u16;
+        // a growing write leaves the partition's last `EXT_SLACK_PAGES` run to writes that do
+        // not grow the data; it asks for another AG instead (`-OOM` once the pool refuses)
+        let keep = growing && self.largest_run() >= EXT_SLACK_PAGES;
         if let Some(t) = twin
             && dev.is_none_or(|d| t.dev() == d)
             && let Some((ei, off)) = self.extent_slot(t)
             && self.extent[ei].alloc.all_clear(u32::from(off), n)
         {
             self.extent[ei].take(off, n16);
-            return ExtPlace::Run(t);
+            if !keep || self.largest_run() >= EXT_SLACK_PAGES {
+                return ExtPlace::Run(t);
+            }
+            self.free_extent(t, n);
         }
         if let Some(p) = self.best_fit(n16, dev) {
-            return ExtPlace::Run(p);
+            if !keep || self.largest_run() >= EXT_SLACK_PAGES {
+                return ExtPlace::Run(p);
+            }
+            self.free_extent(p, n);
         }
         let slot = &mut self.slots[1];
         if let Some(ag) = slot.spare
@@ -858,6 +906,20 @@ impl Alloc {
             SmallPlace::Full => ExtPlace::Full,
             _ => ExtPlace::NeedAg,
         }
+    }
+
+    /// The longest free run over the partition's EXTENT AGs.
+    pub(crate) fn largest_run(&self) -> u16 {
+        // a length, not a placement: it chooses no page
+        let mut longest = 0;
+        for a in &self.extent {
+            if let Some(&(l, _)) = a.runs.last()
+                && l > longest
+            {
+                longest = l;
+            }
+        }
+        longest
     }
 
     /// Runs of at least this many times the request are open space: the carve position is a
@@ -1553,35 +1615,66 @@ mod tests {
     fn a_refusal_is_lifted_once_the_pool_has_room() {
         let mut a = alloc(PageUpdateMode::TwoImage);
         let mut req = SmallVec::new();
-        assert_eq!(a.alloc_extent(4, None, 0, None), ExtPlace::NeedAg);
+        assert_eq!(a.alloc_extent(4, None, 0, None, true), ExtPlace::NeedAg);
         a.take_ag_requests(&mut req);
         assert_eq!(req.as_slice(), &[(AgKind::Extent, None, AgClass::Need)]);
         a.ag_granted(AgKind::Extent, None, 10);
         // the pool is full: latched
         a.set_pool_room(false, false);
-        assert_eq!(a.alloc_extent(4, None, 20, None), ExtPlace::Full);
+        assert_eq!(a.alloc_extent(4, None, 20, None, true), ExtPlace::Full);
         req.clear();
         a.take_ag_requests(&mut req);
         assert!(req.is_empty(), "the refusal is latched");
         // AGs came back to the pool: asked again well within the retry period
         a.set_pool_room(true, true);
-        assert_eq!(a.alloc_extent(4, None, 30, None), ExtPlace::NeedAg);
+        assert_eq!(a.alloc_extent(4, None, 30, None, true), ExtPlace::NeedAg);
         a.take_ag_requests(&mut req);
         assert_eq!(req.as_slice(), &[(AgKind::Extent, None, AgClass::Need)]);
         // refused again; only AGs above the fill limit are free: that is room for the
         // partition's first extent AG (granted above the limit), not for a further one
         a.ag_granted(AgKind::Extent, None, 40);
         a.set_pool_room(false, true);
-        assert_eq!(a.alloc_extent(4, None, 50, None), ExtPlace::NeedAg, "a first AG of the kind");
+        assert_eq!(a.alloc_extent(4, None, 50, None, true), ExtPlace::NeedAg, "a first AG of the kind");
         req.clear();
         a.take_ag_requests(&mut req);
         a.ag_granted(AgKind::Extent, Some(AgId { dev: 0, idx: 3 }), 60);
-        assert!(matches!(a.alloc_extent(4, None, 70, None), ExtPlace::Run(_)));
-        while let ExtPlace::Run(_) = a.alloc_extent(4, None, 80, None) {}
+        assert!(matches!(a.alloc_extent(4, None, 70, None, true), ExtPlace::Run(_)));
+        // (writes that do not grow the data may take the partition's last free run)
+        while let ExtPlace::Run(_) = a.alloc_extent(4, None, 80, None, false) {}
         req.clear();
         a.take_ag_requests(&mut req);
         a.ag_granted(AgKind::Extent, None, 90);
-        assert_eq!(a.alloc_extent(4, None, 100, None), ExtPlace::Full, "not a first AG: latched");
+        assert_eq!(a.alloc_extent(4, None, 100, None, false), ExtPlace::Full, "not a first AG: latched");
+    }
+
+    /// Growing writes never take the partition's last `EXT_SLACK_PAGES` run: they ask for an
+    /// AG and get `-OOM` once the pool refuses, while a write that does not grow the data
+    /// still finds that run (a TTL change of an extent key on a full device).
+    #[test]
+    fn growing_writes_leave_the_slack_run_to_writes_that_do_not_grow() {
+        let mut a = alloc(PageUpdateMode::TwoImage);
+        let mut req = SmallVec::new();
+        assert_eq!(a.alloc_extent(16, None, 0, None, true), ExtPlace::NeedAg);
+        a.take_ag_requests(&mut req);
+        a.ag_granted(AgKind::Extent, Some(AgId { dev: 0, idx: 3 }), 10);
+        let mut taken = 0u32;
+        let mut now = 20;
+        loop {
+            match a.alloc_extent(16, None, now, None, true) {
+                ExtPlace::Run(_) => taken += 16,
+                ExtPlace::NeedAg => {
+                    req.clear();
+                    a.take_ag_requests(&mut req);
+                    a.set_pool_room(false, false);
+                    a.ag_granted(AgKind::Extent, None, now);
+                }
+                ExtPlace::Full => break,
+            }
+            assert!(a.largest_run() >= EXT_SLACK_PAGES, "a growing write took the slack run");
+            now += 1;
+        }
+        assert!(taken >= AG_PAGES / 2, "growing writes filled most of the AG ({taken} pages)");
+        assert!(matches!(a.alloc_extent(16, None, now, None, false), ExtPlace::Run(_)), "a write that does not grow takes the slack run");
     }
 
     /// A refusal answered while the partition released AGs is asked again, but at most
@@ -1619,18 +1712,18 @@ mod tests {
     #[test]
     fn extent_twin_best_fit_and_carving() {
         let mut a = alloc(PageUpdateMode::TwoImage);
-        assert_eq!(a.alloc_extent(4, None, 0, None), ExtPlace::NeedAg);
+        assert_eq!(a.alloc_extent(4, None, 0, None, true), ExtPlace::NeedAg);
         a.ag_granted(AgKind::Extent, Some(AgId { dev: 0, idx: 1 }), 0);
-        let ExtPlace::Run(e1) = a.alloc_extent(4, None, 0, None) else { panic!() };
+        let ExtPlace::Run(e1) = a.alloc_extent(4, None, 0, None, true) else { panic!() };
         let first = a.ag_first(AgId { dev: 0, idx: 1 }).unwrap();
         assert_eq!((e1.page() - first) % 4, 0, "carved at an n-aligned offset");
         assert!(a.extent_allocated(e1, 4));
-        let ExtPlace::Run(e2) = a.alloc_extent(4, None, 0, None) else { panic!() };
+        let ExtPlace::Run(e2) = a.alloc_extent(4, None, 0, None, true) else { panic!() };
         assert_ne!(e1, e2);
         // free e1, then the twin preference takes exactly that run
         a.free_extent(e1, 4);
         assert!(!a.extent_allocated(e1, 4));
-        assert_eq!(a.alloc_extent(4, Some(e1), 0, None), ExtPlace::Run(e1));
+        assert_eq!(a.alloc_extent(4, Some(e1), 0, None, true), ExtPlace::Run(e1));
         // free everything: the AG is one run again and becomes releasable (kept as spare)
         a.free_extent(e1, 4);
         a.free_extent(e2, 4);

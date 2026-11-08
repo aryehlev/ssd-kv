@@ -754,6 +754,18 @@ impl Core {
     /// being zeroed (each frees its run once durable). Every part is finite: the meta thread
     /// answers, the walk advances every tick it is wanted (urgent while writes wait), I/O
     /// completes.
+    /// True while space this partition gave up is on its way to being free: an extent's
+    /// zeroing or a write (whose durability supersedes an older copy) in flight, a tracked
+    /// stale copy, a page to build or scrub. Every part completes in bounded time.
+    pub(crate) fn frees_pending(&self) -> bool {
+        !self.ext.zeros.is_empty()
+            || !self.ext.writes.is_empty()
+            || !self.stale.is_empty()
+            || !self.scrub_queue.is_empty()
+            || !self.dirty.is_empty()
+            || self.writes_in_flight > 0
+    }
+
     pub(crate) fn reclaim_pending(&self) -> bool {
         !self.reclaim_ext.is_empty()
             || !self.reclaim_pages.is_empty()
@@ -2002,13 +2014,25 @@ impl PartitionStore {
         let mut plans: SmallVec<[Plan; 2]> = SmallVec::new();
         // gap bytes each small placement planned so far takes on its page
         let mut planned: SmallVec<[(PageId, u16); 2]> = SmallVec::new();
+        // a request whose puts take no more bytes than the versions it replaces (RENAME, an
+        // overwrite of the same size, a TTL change) does not grow the stored data: each put
+        // still needs room for one more copy until the copy it replaces is freed
+        let put_bytes: u64 = staged.iter().map(|s| match &s.change {
+            Change::Put { value, .. } => (s.key.len() + value.len()) as u64,
+            _ => 0,
+        }).sum();
+        let req_no_growth = put_bytes <= staged.iter().map(|s| s.old_len).sum::<u64>();
         let mut i = 0;
         while i < staged.len() {
             let s = &staged[i];
             let p = match &s.change {
-                // a cross-partition part, a TTL change or a delete (marker) may use the reserve
-                Change::Put { value, .. } => self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some() || s.no_growth, &mut undo, &mut planned),
-                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, true, &mut undo, &mut planned),
+                // a cross-partition part, a TTL change, a write that does not grow the stored
+                // data or a delete (marker) may use the reserve
+                Change::Put { value, .. } => {
+                    let shrink = txn.is_none() && (s.no_growth || req_no_growth || (s.key.len() + value.len()) as u64 <= s.old_len);
+                    self.plan_put(cx, s, s.key.len(), value.len() as u64, is_txn, txn.is_some() || shrink, shrink, &mut undo, &mut planned)
+                }
+                Change::Delete if is_txn && !matches!(s.cur, Cur::Absent) => self.plan_put(cx, s, s.key.len(), 0, true, true, txn.is_none(), &mut undo, &mut planned),
                 _ => Ok(Plan::None),
             };
             match p {
@@ -2134,8 +2158,17 @@ impl PartitionStore {
     /// coordinator to resolve), and to writes that do not grow the key (`Staged::no_growth`:
     /// TTL changes, txn delete markers), whose old copy is freed once they are durable.
     #[allow(clippy::too_many_arguments)]
-    fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, reserve: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
-        let r = self.plan_put_at(cx, s, key_len, val_len, txn, undo, planned);
+    ///
+    /// `shrink`: the write does not grow the stored data (it replaces at least as many bytes as
+    /// it writes). It may place a small record into a page without the usual slack, an extent
+    /// into the run every partition keeps free for such writes (`Alloc::alloc_extent`), and,
+    /// refused space, it waits (bounded by `SPACE_WAIT_NS`) while copies this partition
+    /// replaced are still being freed (`Core::frees_pending`): the copy each such write needs
+    /// is transient, and on a full device each one got `-OOM` while the previous ones' old
+    /// copies were on their way to being freed.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_put(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, reserve: bool, shrink: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
+        let r = self.plan_put_at(cx, s, key_len, val_len, txn, shrink, undo, planned);
         if matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && !self.core.retiring_ags.is_empty() {
             // a FLUSHALL gave up this partition's AGs and they go back to the pool once their
             // last writes are done (each tick): the space is coming back, so the write waits
@@ -2149,6 +2182,9 @@ impl PartitionStore {
             if !self.core.alloc.reserve_refused(kind, cx.now.mono_ns) && self.core.alloc.want_reserved(kind) {
                 return Err(Commit::Park);
             }
+        }
+        if shrink && matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && self.core.frees_pending() {
+            return Err(Commit::Reclaim);
         }
         if matches!(r, Err(Commit::Err(StoreError::OutOfSpace))) && cx.meta.ags_retiring() {
             // other partitions' FLUSHALL (or FLUSHDB of the only db with keys) gives their AGs
@@ -2169,7 +2205,7 @@ impl PartitionStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn plan_put_at(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
+    fn plan_put_at(&mut self, cx: &mut StorageCtx<'_>, s: &Staged, key_len: usize, val_len: u64, txn: bool, shrink: bool, undo: &mut Undo, planned: &mut SmallVec<[(PageId, u16); 2]>) -> Result<Plan, Commit> {
         let now_ns = cx.now.mono_ns;
         let (under_limit, any_free) = cx.meta.pool_room();
         self.core.alloc.set_pool_room(under_limit, any_free);
@@ -2192,7 +2228,15 @@ impl PartitionStore {
             let exclude = |q: PageId| {
                 stale.state_at(s.db, &s.key, q).is_some() || absent == Some(q) || cache.page_state(q).is_some_and(|st| st.corrupt) || !page_takes(cache, boot, dflt, txns, q, need, pl)
             };
-            let place = self.core.alloc.place_small(need, cache, now_ns, &exclude);
+            let mut place = self.core.alloc.place_small(need, cache, now_ns, &exclude);
+            if shrink
+                && matches!(place, SmallPlace::Full)
+                && let Some(q) = self.core.alloc.place_tight(need, cache, &exclude)
+            {
+                // no page has room with the usual slack and no AG is left: a write that does
+                // not grow the stored data takes any cached page its build places it in
+                place = SmallPlace::Cached(q);
+            }
             if let SmallPlace::Cached(q) | SmallPlace::Fresh(q) = place {
                 planned.push((q, need));
             }
@@ -2233,7 +2277,7 @@ impl PartitionStore {
                 Cur::Extent { twin, .. } => twin,
                 _ => None,
             };
-            return match self.core.alloc.alloc_extent(n, twin, now_ns, None) {
+            return match self.core.alloc.alloc_extent(n, twin, now_ns, None, !shrink) {
                 ExtPlace::Run(start) => {
                     undo.ext.push((start, n));
                     Ok(Plan::Ext { start, n_pages: n, inplace: false })
@@ -2250,7 +2294,7 @@ impl PartitionStore {
             Cur::Extent { twin, kind: Kind::ChunkMap, .. } => twin,
             _ => None,
         };
-        let map = match self.core.alloc.alloc_extent(map_pages, twin, now_ns, None) {
+        let map = match self.core.alloc.alloc_extent(map_pages, twin, now_ns, None, !shrink) {
             ExtPlace::Run(p) => p,
             ExtPlace::NeedAg => return Err(Commit::Park),
             ExtPlace::Full => return Err(Commit::Err(StoreError::OutOfSpace)),
@@ -2263,7 +2307,7 @@ impl PartitionStore {
             left -= len;
             let n = class_pages(class_for(pages_for(EXT_HDR as u64 + len) as u32).ok_or(Commit::Err(StoreError::TooLarge))?);
             // every chunk on the chunkmap's device (LC-08)
-            match self.core.alloc.alloc_extent(n, None, now_ns, Some(map.dev())) {
+            match self.core.alloc.alloc_extent(n, None, now_ns, Some(map.dev()), !shrink) {
                 ExtPlace::Run(p) => {
                     undo.ext.push((p, n));
                     chunks.push((p, n));
@@ -4497,7 +4541,9 @@ impl PartitionStore {
         // (they get `-OOM` at once if it gave back too little) or the recheck time came
         // (or AGs other partitions gave up came back to the pool, or none is on its way any more)
         if !self.core.reclaim_wait.is_empty()
-            && (cx.now.mono_ns >= self.core.reclaim_recheck_ns || !(self.core.reclaim_pending() || cx.meta.ags_retiring()) || cx.meta.pool_room().0)
+            && (cx.now.mono_ns >= self.core.reclaim_recheck_ns
+                || !(self.core.reclaim_pending() || cx.meta.ags_retiring() || self.core.frees_pending())
+                || cx.meta.pool_room().0)
         {
             for id in core::mem::take(&mut self.core.reclaim_wait) {
                 if let Some(r) = self.reqs.get_mut(id) {
@@ -5316,7 +5362,7 @@ impl PartitionStore {
                     }
                     None => return,
                 };
-                let s = Staged { db, key: key.into(), kh, slot, cur, change: Change::Expired, op: None, seq: None, no_growth: true };
+                let s = Staged { db, key: key.into(), kh, slot, cur, change: Change::Expired, op: None, seq: None, no_growth: true, old_len: 0 };
                 self.apply_expired(cx, &s);
             }
             _ => {

@@ -187,6 +187,10 @@ pub(crate) struct Staged {
     /// durable, and EXPIRE / PERSIST / DEL stay available to make room (Redis never refuses
     /// them for memory).
     pub(crate) no_growth: bool,
+    /// Key plus value bytes of the stored version this change replaces (0 when the key was
+    /// absent): a request whose puts are no larger than what it replaces does not grow the
+    /// stored data either (RENAME, an overwrite of the same size).
+    pub(crate) old_len: u64,
 }
 
 /// Something `exec` needed that was not present.
@@ -387,6 +391,7 @@ impl<'p> Keyspace<'p> {
                         op: Some(Op::Expired { db, key: key.into() }),
                         seq: self.seq,
                         no_growth: true,
+                        old_len: h.len.saturating_add(key.len() as u64),
                     });
                 }
                 (cur, None)
@@ -653,12 +658,14 @@ impl<'p> Keyspace<'p> {
         Ok(hit.map(|h| (KeyMeta { vtype: h.vtype, expire_at_ms: h.expire_at, len: h.len }, self.value_of(&h))))
     }
 
-    fn stage(&mut self, db: u8, key: &[u8], cur: Cur, change: Change, op: Option<Op>) {
-        self.stage_as(db, key, cur, change, op, false);
+    fn stage(&mut self, db: u8, key: &[u8], cur: Cur, old: Option<&Hit>, change: Change, op: Option<Op>) {
+        self.stage_as(db, key, cur, old, change, op, false);
     }
 
     /// [`Keyspace::stage`] of a change that does not make the key grow (`Staged::no_growth`).
-    fn stage_as(&mut self, db: u8, key: &[u8], cur: Cur, change: Change, op: Option<Op>, no_growth: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn stage_as(&mut self, db: u8, key: &[u8], cur: Cur, old: Option<&Hit>, change: Change, op: Option<Op>, no_growth: bool) {
+        let old_len = old.map_or(0, |h| h.len.saturating_add(key.len() as u64));
         let op = if self.core.cfg.produce_groups { op } else { None };
         if let Some(i) = self.staged_idx(db, key) {
             // one change per key: the newest wins, the location found first stays
@@ -694,6 +701,7 @@ impl<'p> Keyspace<'p> {
             op,
             seq: self.seq,
             no_growth,
+            old_len,
         });
     }
 
@@ -702,7 +710,7 @@ impl<'p> Keyspace<'p> {
             return Err(StoreError::TooLarge);
         }
         let db = self.db;
-        let (cur, _) = self.find(db, key, false)?;
+        let (cur, hit) = self.find(db, key, false)?;
         let op = Op::Put {
             db,
             vtype: if vtype == VType::Hash { 2 } else { 1 },
@@ -710,7 +718,7 @@ impl<'p> Keyspace<'p> {
             key: key.into(),
             value: value.to_vec(),
         };
-        self.stage(db, key, cur, Change::Put { vtype, expire_at: expire_at_ms, value: value.to_vec() }, Some(op));
+        self.stage(db, key, cur, hit.as_ref(), Change::Put { vtype, expire_at: expire_at_ms, value: value.to_vec() }, Some(op));
         Ok(())
     }
 
@@ -729,7 +737,7 @@ impl<'p> Keyspace<'p> {
         v.extend_from_slice(data);
         let len = v.len() as u64;
         let op = Op::Append { db, key: key.into(), data: data.to_vec() };
-        self.stage(db, key, cur, Change::Put { vtype: VType::String, expire_at: expire, value: v }, Some(op));
+        self.stage(db, key, cur, hit.as_ref(), Change::Put { vtype: VType::String, expire_at: expire, value: v }, Some(op));
         Ok(len)
     }
 
@@ -756,7 +764,7 @@ impl<'p> Keyspace<'p> {
         v[off as usize..end as usize].copy_from_slice(data);
         let len = v.len() as u64;
         let op = Op::SetRange { db, key: key.into(), offset: off, data: data.to_vec() };
-        self.stage(db, key, cur, Change::Put { vtype: VType::String, expire_at: expire, value: v }, Some(op));
+        self.stage(db, key, cur, hit.as_ref(), Change::Put { vtype: VType::String, expire_at: expire, value: v }, Some(op));
         Ok(len)
     }
 
@@ -767,7 +775,7 @@ impl<'p> Keyspace<'p> {
         let Some(h) = hit else { return Ok(false) };
         let v = self.value_of(&h).to_vec();
         let op = Op::Expire { db, key: key.into(), expire_at: expire_at_ms.unwrap_or(0) };
-        self.stage_as(db, key, cur, Change::Put { vtype: h.vtype, expire_at: expire_at_ms, value: v }, Some(op), true);
+        self.stage_as(db, key, cur, Some(&h), Change::Put { vtype: h.vtype, expire_at: expire_at_ms, value: v }, Some(op), true);
         Ok(true)
     }
 
@@ -778,7 +786,7 @@ impl<'p> Keyspace<'p> {
         if hit.is_none() {
             return Ok(false);
         }
-        self.stage_as(db, key, cur, Change::Delete, Some(Op::Del { db, key: key.into() }), true);
+        self.stage_as(db, key, cur, hit.as_ref(), Change::Delete, Some(Op::Del { db, key: key.into() }), true);
         Ok(true)
     }
 
@@ -916,7 +924,7 @@ impl<'p> Keyspace<'p> {
                     };
                 if identical {
                     let (cur, _) = self.find(db, key, false)?;
-                    self.stage(db, key, cur, Change::Confirm, None);
+                    self.stage(db, key, cur, None, Change::Confirm, None);
                     return Ok(ApplyOutcome::Confirmed);
                 }
                 if newest >= seq {

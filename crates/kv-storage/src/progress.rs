@@ -29,7 +29,7 @@
 //! | barrier ticket (SAVE, SHUTDOWN drain) | the effects, open txns and tracked copies present when it executed | one dependency on each (ticket lists, `OpenTxn::barriers`, watched `stale` entries) | their events; later work never extends it |
 //! | txn (fx ticket durable) | its `COMMITTED` listing | `meta_wait` (FIFO) | `on_meta_done` |
 //! | XTxn part request (`parked`) | the build of a staged effect of its key (a part never cancels one) | `part_wait` | the end of every tick |
-//! | request (`parked`, refused space during a FLUSHDB reclaim) | space the reclaim frees | `reclaim_wait` (only while `reclaim_pending`; `-OOM` after `SPACE_WAIT_NS`) | `tick`: every `RECLAIM_RECHECK_NS`, after a dead run's zeroing is durable, and when the reclaim ends |
+//! | request (`parked`, refused space during a FLUSHDB reclaim, or a write that does not grow the stored data refused space while copies are being freed) | space the reclaim, or the zeroing and builds in flight, free | `reclaim_wait` (only while `reclaim_pending`, AGs are retiring or `frees_pending`; `-OOM` after `SPACE_WAIT_NS`) | `tick`: every `RECLAIM_RECHECK_NS`, after a run's zeroing is durable, and when nothing is pending any more |
 //! | abort ticket of an XTxn part | every page / extent still holding a record of the txn | `aborting` items (one dependency each) | `abort_progress` each tick: scrub builds, zeroing of the part's extents once written |
 //!
 //! Two rules make the table hold under every interleaving: (1) a waiter is registered before the

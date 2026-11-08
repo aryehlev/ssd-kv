@@ -900,11 +900,88 @@ fn ttl_changes_and_renames_work_in_every_partition_of_a_full_device() {
                 ks.delete(src)?;
                 Ok(())
             })
-            .unwrap_or_else(|e| panic!("RENAME {j} on a full device: {e:?}"));
+            .unwrap_or_else(|e| panic!("RENAME {j} on a full device: {e:?} {} (value {} B)", db.eng.partition(p).diag(), 2100 + (*i as usize * 9973) % 60_000));
         db.wait_in(p, out.ticket, TicketState::Written);
         let (_, v) = db.get(0, dstb).unwrap().expect("renamed");
         assert_eq!(v, value(*i, 2100 + (*i as usize * 9973) % 60_000));
         assert!(db.get(0, src).unwrap().is_none());
     }
+    db.quiesce();
+}
+
+/// Queued reads of one large value: each request queued behind another on the key used to
+/// read the whole extent at submit (into a zeroed buffer of the value's size, inside the
+/// submitting worker's parse loop), drop that read when it ran and read the value again. 600
+/// pipelined GETs of an 8 MB value held 5 GB of buffers and kept the worker busy for seconds
+/// before its first reply. Now a queued request reads nothing at submit, and a read hands the
+/// extents it read to the key's next request: the value is read once for a run of reads, and
+/// again only after a write of the key.
+#[test]
+fn queued_reads_of_a_large_value_read_it_once() {
+    use kv_common::Access;
+    use kv_index::VType;
+    use kv_storage::partition::ExecStatus;
+    let mut db = fresh(64 * 4096, 31);
+    let k: &[u8] = b"big";
+    let (v1, v2) = (value(1, 1 << 20), value(2, (1 << 20) + 77));
+    let t = db.set(0, k, &v1, None).unwrap();
+    assert_eq!(db.wait(k, t, TicketState::Durable), TicketState::Durable);
+    db.quiesce();
+    let p = db.eng.partition_of(k);
+    let reads0 = db.eng.partition(p).counters().page_reads;
+    // 40 reads, a write, 40 more reads, all queued at once
+    let mut ids = Vec::new();
+    for i in 0..81 {
+        let access = if i == 40 { Access::Write } else { Access::Read };
+        ids.push((i, db.eng.submit(p, keyed(0, &[k], access))));
+    }
+    // one read of the value: its pages (a size class) and the header
+    let one = (v2.len() / 4096 + 8) as u64;
+    let after_submit = db.eng.partition(p).counters().page_reads - reads0;
+    assert!(after_submit <= one, "requests queued behind others read at submit ({after_submit} pages)");
+    let mut got: Vec<Option<Vec<u8>>> = vec![None; 81];
+    let mut left = ids.len();
+    let mut ready = Vec::new();
+    for _ in 0..100_000 {
+        ready.clear();
+        db.eng.ready(&mut ready);
+        for &(rp, rid) in &ready {
+            let Some(&(i, _)) = ids.iter().find(|x| x.1 == rid && rp == p) else { continue };
+            let st = if i == 40 {
+                db.eng.exec(p, rid, &mut |ks| {
+                    ks.select(0);
+                    ks.put(k, &v2, VType::String, None)?;
+                    Ok(Vec::new())
+                })
+            } else {
+                db.eng.exec(p, rid, &mut |ks| {
+                    ks.select(0);
+                    Ok(ks.get(k)?.map(|(_, v)| v.to_vec()).expect("present"))
+                })
+            };
+            match st {
+                ExecStatus::Done(v, _) => {
+                    got[i] = Some(v);
+                    left -= 1;
+                }
+                ExecStatus::Failed(e) => panic!("request {i}: {e:?}"),
+                ExecStatus::Requeued => {}
+            }
+        }
+        if left == 0 {
+            break;
+        }
+        db.eng.pump();
+    }
+    assert_eq!(left, 0, "every request completed");
+    for (i, g) in got.iter().enumerate() {
+        if i != 40 {
+            let want = if i < 40 { &v1 } else { &v2 };
+            assert!(g.as_ref() == Some(want), "read {i} saw the wrong version");
+        }
+    }
+    let reads = db.eng.partition(p).counters().page_reads - reads0;
+    // one read of each version and a few page and header reads
+    assert!(reads <= 2 * one + 16, "81 queued requests read {reads} pages: the value was read again per request");
     db.quiesce();
 }

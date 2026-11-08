@@ -219,11 +219,13 @@ pub(crate) struct ExtentAg {
     pub(crate) start: Bits4096,
     /// Free runs `(len, start)`, sorted.
     runs: Vec<(u16, u16)>,
+    /// Pages in `runs`.
+    free: u32,
 }
 
 impl ExtentAg {
     fn new(ag: AgId, first: u32) -> Self {
-        ExtentAg { ag, first, alloc: Bits4096::new(), start: Bits4096::new(), runs: vec![(AG_PAGES as u16, 0)] }
+        ExtentAg { ag, first, alloc: Bits4096::new(), start: Bits4096::new(), runs: vec![(AG_PAGES as u16, 0)], free: AG_PAGES }
     }
 
     /// Recomputes the free runs from the `alloc` bits.
@@ -241,6 +243,7 @@ impl ExtentAg {
             }
             insert_run(&mut self.runs, ((i - s) as u16, s as u16));
         }
+        self.free = self.runs.iter().map(|&(l, _)| u32::from(l)).sum();
     }
 
     fn take(&mut self, off: u16, n: u16) {
@@ -258,6 +261,7 @@ impl ExtentAg {
         }
         self.alloc.set_range(u32::from(off), u32::from(n));
         self.start.set(u32::from(off));
+        self.free = self.free.saturating_sub(u32::from(n));
     }
 
     fn give_back(&mut self, off: u16, n: u16) {
@@ -274,6 +278,7 @@ impl ExtentAg {
         let (s, e) = (s as u16, e as u16);
         self.runs.retain(|&(l, rs)| !(rs >= s && rs + l <= e));
         insert_run(&mut self.runs, (e - s, s));
+        self.free += u32::from(n);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -871,25 +876,38 @@ impl Alloc {
     pub(crate) fn alloc_extent(&mut self, n: u32, twin: Option<PageId>, now_ns: u64, dev: Option<u8>, growing: bool) -> ExtPlace {
         debug_assert!((1..=crate::layout::EXT_MAX_PAGES).contains(&n));
         let n16 = n as u16;
-        // a growing write leaves the partition's last `EXT_SLACK_PAGES` run to writes that do
-        // not grow the data; it asks for another AG instead (`-OOM` once the pool refuses)
-        let keep = growing && self.largest_run() >= EXT_SLACK_PAGES;
-        if let Some(t) = twin
-            && dev.is_none_or(|d| t.dev() == d)
-            && let Some((ei, off)) = self.extent_slot(t)
-            && self.extent[ei].alloc.all_clear(u32::from(off), n)
-        {
-            self.extent[ei].take(off, n16);
-            if !keep || self.largest_run() >= EXT_SLACK_PAGES {
-                return ExtPlace::Run(t);
+        // A growing write leaves the partition's reserve to writes that do not grow the data
+        // (they need a second copy until the one they replace is freed): at least
+        // `EXT_SLACK_PAGES` free pages, and a largest run no shorter than
+        // `min(EXT_SLACK_PAGES, largest run before)`. It asks for another AG instead (`-OOM`
+        // once the pool refuses). The reserve is counted in pages, not kept as one run: a write
+        // that does not grow takes part of the run and frees its old copy elsewhere, and a
+        // rule on the run alone gave the shortened run, then every hole, to growing writes.
+        let keep = growing.then(|| (self.extent_free_pages(), self.largest_run().min(EXT_SLACK_PAGES)));
+        let kept = |a: &Self| keep.is_none_or(|(_, big)| a.extent_free_pages() >= u32::from(EXT_SLACK_PAGES) && a.largest_run() >= big);
+        if keep.is_none_or(|(free, _)| free >= n + u32::from(EXT_SLACK_PAGES)) {
+            if let Some(t) = twin
+                && dev.is_none_or(|d| t.dev() == d)
+                && let Some((ei, off)) = self.extent_slot(t)
+                && self.extent[ei].alloc.all_clear(u32::from(off), n)
+            {
+                self.extent[ei].take(off, n16);
+                if kept(self) {
+                    return ExtPlace::Run(t);
+                }
+                self.free_extent(t, n);
             }
-            self.free_extent(t, n);
-        }
-        if let Some(p) = self.best_fit(n16, dev) {
-            if !keep || self.largest_run() >= EXT_SLACK_PAGES {
+            if let Some(p) = self.best_fit(n16, dev) {
+                if kept(self) {
+                    return ExtPlace::Run(p);
+                }
+                self.free_extent(p, n);
+            }
+            if let Some((_, big)) = keep
+                && let Some(p) = self.fit_keeping(n16, dev, big)
+            {
                 return ExtPlace::Run(p);
             }
-            self.free_extent(p, n);
         }
         let slot = &mut self.slots[1];
         if let Some(ag) = slot.spare
@@ -906,6 +924,49 @@ impl Alloc {
             SmallPlace::Full => ExtPlace::Full,
             _ => ExtPlace::NeedAg,
         }
+    }
+
+    /// Free pages over the partition's EXTENT AGs.
+    pub(crate) fn extent_free_pages(&self) -> u32 {
+        self.extent.iter().map(|a| a.free).sum()
+    }
+
+    /// The start of the shortest run that holds `n` pages and whose use leaves a largest run of
+    /// at least `big` pages (a growing write beside the reserve, when the drawn placement
+    /// shortened the largest run).
+    fn fit_keeping(&mut self, n: u16, dev: Option<u8>, big: u16) -> Option<PageId> {
+        // the two longest runs: taking from the longest leaves the longer of its rest and the
+        // second
+        let (mut l1, mut l2) = (0u16, 0u16);
+        for a in &self.extent {
+            for &(l, _) in a.runs.iter().rev().take(2) {
+                if l > l1 {
+                    l2 = l1;
+                    l1 = l;
+                } else if l > l2 {
+                    l2 = l;
+                }
+            }
+        }
+        let mut best: Option<(u16, usize, u16)> = None;
+        for (ai, a) in self.extent.iter().enumerate() {
+            if dev.is_some_and(|d| a.ag.dev != d) {
+                continue;
+            }
+            let i = a.runs.partition_point(|&(l, _)| l < n);
+            for &(l, s) in &a.runs[i..] {
+                let after = if l == l1 { l2.max(l - n) } else { l1 };
+                if after >= big && best.is_none_or(|b| l < b.0) {
+                    best = Some((l, ai, s));
+                }
+                if after >= big {
+                    break;
+                }
+            }
+        }
+        let (_, ai, s) = best?;
+        self.extent[ai].take(s, n);
+        Some(PageId::new(self.extent[ai].ag.dev, self.extent[ai].first + u32::from(s)))
     }
 
     /// The longest free run over the partition's EXTENT AGs.
@@ -1158,7 +1219,13 @@ impl Alloc {
                 s.answers
             ));
         }
-        out.push_str(&format!("ags small={} ext={}", self.small.len(), self.extent.len()));
+        out.push_str(&format!(
+            "ags small={} ext={} ext_free={} ext_largest={}",
+            self.small.len(),
+            self.extent.len(),
+            self.extent_free_pages(),
+            self.largest_run()
+        ));
         out
     }
 
@@ -1659,9 +1726,13 @@ mod tests {
         a.ag_granted(AgKind::Extent, Some(AgId { dev: 0, idx: 3 }), 10);
         let mut taken = 0u32;
         let mut now = 20;
+        let mut runs = Vec::new();
         loop {
             match a.alloc_extent(16, None, now, None, true) {
-                ExtPlace::Run(_) => taken += 16,
+                ExtPlace::Run(p) => {
+                    taken += 16;
+                    runs.push(p);
+                }
                 ExtPlace::NeedAg => {
                     req.clear();
                     a.take_ag_requests(&mut req);
@@ -1675,6 +1746,23 @@ mod tests {
         }
         assert!(taken >= AG_PAGES / 2, "growing writes filled most of the AG ({taken} pages)");
         assert!(matches!(a.alloc_extent(16, None, now, None, false), ExtPlace::Run(_)), "a write that does not grow takes the slack run");
+        // rounds of TTL changes (a second copy, then the old one freed) between growing writes:
+        // the reserve is not the one run, so growing writes take neither the shortened run nor
+        // the freed holes, and every round's writes that do not grow still find room
+        a.free_extent(runs.pop().expect("runs"), 16);
+        for round in 0..64 {
+            for _ in 0..8 {
+                let ExtPlace::Run(p) = a.alloc_extent(16, None, now, None, false) else {
+                    panic!("round {round}: a write that does not grow found no room");
+                };
+                let old = runs.remove(a.pick_index(domain::CARVE, runs.len()).expect("runs"));
+                a.free_extent(old, 16);
+                runs.push(p);
+            }
+            assert!(!matches!(a.alloc_extent(16, None, now, None, true), ExtPlace::Run(_)), "round {round}: a growing write took the reserve");
+            assert!(a.extent_free_pages() >= u32::from(EXT_SLACK_PAGES));
+            now += 1;
+        }
     }
 
     /// A refusal answered while the partition released AGs is asked again, but at most

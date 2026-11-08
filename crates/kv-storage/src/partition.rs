@@ -321,6 +321,9 @@ pub(crate) struct Req {
     pub(crate) stalled: bool,
     /// Reported once by the stall trace (`KVSSD_STALL_TRACE_MS`).
     pub(crate) traced: bool,
+    /// Executed and changed nothing (a read): the extents it read still hold its key's
+    /// current version, and `finish` hands them to the next request of the key.
+    pub(crate) unchanged: bool,
 }
 
 #[derive(Default)]
@@ -1467,6 +1470,7 @@ impl PartitionStore {
             born_ns: cx.now.mono_ns,
             stalled: false,
             traced: false,
+            unchanged: false,
         };
         let id = self.reqs.insert(r);
         self.reqs.order.push_back((order, id));
@@ -1528,6 +1532,7 @@ impl PartitionStore {
             }
             ReqKind::FlushDb { .. } | ReqKind::Barrier | ReqKind::SyncPrune { .. } => {}
             ReqKind::Keyed | ReqKind::Txn { .. } => {
+                let queued_behind = r.waits > 0 || self.reqs.barriers.front().is_some_and(|&(o, _)| o < r.order);
                 for i in 0..r.keys.len() {
                     let (kh, slot) = (r.keys[i].kh, r.keys[i].slot);
                     let access = r.req.keys[i].1;
@@ -1543,7 +1548,11 @@ impl PartitionStore {
                         match c.entry.kind {
                             Kind::Small => needs.push(Need::Page(start)),
                             Kind::Extent | Kind::ChunkMap => {
-                                if self.core.ext.writes.contains_key(&start) {
+                                if self.core.ext.writes.contains_key(&start) || queued_behind {
+                                    // read once the request runs: the requests queued ahead of
+                                    // it may replace the extent (or hand it their read of it,
+                                    // `finish`), and a read now would be done again then while
+                                    // its buffer, the value's size, waits with the request
                                     continue;
                                 }
                                 let full = matches!(access, Access::Read | Access::ReadWrite);
@@ -1691,9 +1700,21 @@ impl PartitionStore {
         if r.barrier {
             self.reqs.barriers.retain(|&(_, b)| b != id);
         }
+        // a read of one key hands the extents it read to the key's next request: they hold
+        // the key's current version (nothing ran between them on the key), so N queued reads
+        // of a large value read it once instead of N times
+        let mut handed = if r.unchanged && seen.len() == 1 && wake.len() == 1 { Some(r.fetched) } else { None };
         for w in wake {
             if let Some(n) = self.reqs.get_mut(w) {
                 n.waits = n.waits.saturating_sub(1);
+                if let Some(f) = handed.take()
+                    && n.fetched.is_empty()
+                {
+                    n.fetched.extend(f.into_iter().filter(|f| f.err.is_none() && f.complete()).map(|mut f| {
+                        f.early = false;
+                        f
+                    }));
+                }
             }
             self.reqs.check_ready(w);
         }
@@ -1819,8 +1840,10 @@ impl PartitionStore {
                     ReqKind::Txn { txn_id } => Some(txn_id),
                     _ => None,
                 };
+                let unchanged = staged.is_empty();
                 match self.commit(cx, staged, txn, seqo) {
                     Commit::Done(out) => {
+                        r.unchanged = unchanged;
                         match self.core.last_local_txn.take() {
                             Some(t) => self.hold(cx.cache, id, r, t),
                             None => self.finish(cx.cache, id, r),
@@ -2014,14 +2037,16 @@ impl PartitionStore {
         let mut plans: SmallVec<[Plan; 2]> = SmallVec::new();
         // gap bytes each small placement planned so far takes on its page
         let mut planned: SmallVec<[(PageId, u16); 2]> = SmallVec::new();
-        // a request whose puts take no more bytes than the versions it replaces (RENAME, an
-        // overwrite of the same size, a TTL change) does not grow the stored data: each put
-        // still needs room for one more copy until the copy it replaces is freed
+        // a request whose puts take no more value bytes than the versions it replaces (RENAME,
+        // an overwrite of the same size, a TTL change) does not grow the stored data: each put
+        // still needs room for one more copy until the copy it replaces is freed. Values, not
+        // keys, are compared: a RENAME to a longer name (`k` to `{k}r`) counted as growing, and
+        // growing writes do not take the partition's reserve
         let put_bytes: u64 = staged.iter().map(|s| match &s.change {
-            Change::Put { value, .. } => (s.key.len() + value.len()) as u64,
+            Change::Put { value, .. } => value.len() as u64,
             _ => 0,
         }).sum();
-        let req_no_growth = put_bytes <= staged.iter().map(|s| s.old_len).sum::<u64>();
+        let req_no_growth = put_bytes <= staged.iter().map(|s| s.old_len.saturating_sub(s.key.len() as u64)).sum::<u64>();
         let mut i = 0;
         while i < staged.len() {
             let s = &staged[i];

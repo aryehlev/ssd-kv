@@ -473,7 +473,7 @@ impl<B: Backend> Worker<B> {
     /// and resumes parsing.
     pub(super) fn reconsider(&mut self, slot: u32) {
         let max_pending = self.cfg.max_pending_per_conn as usize;
-        let max_out = self.cfg.client_output_buffer_limit;
+        let max_out = self.cfg.output_limit();
         let queues_free = self.x.outbox.iter().all(VecDeque::is_empty);
         let Some(c) = self.conns[slot as usize].as_mut() else { return };
         let lift = match c.hold {
@@ -540,7 +540,7 @@ impl<B: Backend> Worker<B> {
         self.checked_out = Some(slot);
         let mut args: Vec<(u32, u32)> = Vec::with_capacity(8);
         let max_pending = self.cfg.max_pending_per_conn as usize;
-        let max_out = self.cfg.client_output_buffer_limit;
+        let max_out = self.cfg.output_limit();
         loop {
             if conn.closing() || conn.hold.is_some() {
                 break;
@@ -822,8 +822,10 @@ impl<B: Backend> Worker<B> {
         }
         self.x.flush_latency(&self.shared, self.id);
         // the staged-write limit: one threshold to stop and to resume (§6.7)
+        // (with nothing staged the limit never holds: at a limit below one write, e.g.
+        // `max-dirty-bytes 0`, connections were held with nothing left to drain, for good)
         let share = self.cfg.max_dirty_bytes / u64::from(self.router.workers.max(1));
-        let full = dirty >= share;
+        let full = dirty > 0 && dirty >= share;
         if self.dirty_full && !full {
             let held: Vec<u32> = (0..self.conns.len() as u32)
                 .filter(|&s| self.conns[s as usize].as_ref().is_some_and(|c| c.hold == Some(Hold::Dirty)))

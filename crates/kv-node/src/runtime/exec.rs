@@ -292,10 +292,16 @@ struct GateBatch {
     outstanding: usize,
 }
 
+/// The longest a loop turn runs ready requests before it sends their replies (§6.4 step 4).
+const EXEC_SLICE_NS: u64 = 2_000_000;
+
 /// The mutable execution state of a worker.
 pub struct ExecState {
     jobs: hashbrown::HashMap<(u16, u32), Job, foldhash::fast::RandomState>,
     ready: Vec<ReqId>,
+    /// Ready requests taken from their partitions and not yet run (FIFO): a loop turn runs
+    /// them for at most `EXEC_SLICE_NS`, then sends the replies and serves other connections.
+    run_q: VecDeque<(u16, ReqId)>,
     waits: hashbrown::HashMap<(u16, u64), SmallVec<[Waiter; 1]>, foldhash::fast::RandomState>,
     tickets: Vec<(kv_storage::ticket::TicketId, TicketState)>,
     /// Messages for other workers that found the queue full, FIFO per destination.
@@ -337,6 +343,7 @@ impl ExecState {
         ExecState {
             jobs: Default::default(),
             ready: Vec::new(),
+            run_q: VecDeque::new(),
             waits: Default::default(),
             tickets: Vec::new(),
             outbox: crate::runtime::worker::outboxes(workers),
@@ -377,7 +384,7 @@ impl ExecState {
 
     /// Work that the next tick can do without waiting for a completion.
     pub fn runnable(&self) -> bool {
-        !self.local.is_empty()
+        !self.local.is_empty() || !self.run_q.is_empty()
     }
 
     /// Something only time can unblock (the transaction gate, a full destination queue).
@@ -1533,30 +1540,45 @@ impl<B: Backend> Worker<B> {
         self.x.jobs.insert((p, id.0), job);
     }
 
-    /// Step 4 of the tick: executes every ready request of every owned partition, until no
-    /// partition has a ready request left.
+    /// Step 4 of the tick: executes the ready requests of the owned partitions in the order
+    /// they became ready, until none is left or the turn has run for `EXEC_SLICE_NS`; the rest
+    /// run in the next turns, first. A turn that ran every ready request (a read of a large
+    /// value hands its read to the key's next request, which is ready at once) copied 64 such
+    /// values into replies before sending any: 600 pipelined GETs of an 8 MB value held every
+    /// other connection of the worker for seconds and the first reply came last.
     pub(super) fn execute_ready(&mut self) {
         let owned: SmallVec<[u16; 32]> = self.backend.owned().iter().copied().collect();
         self.poll_gate();
+        let deadline = kv_common::clock::mono_ns().saturating_add(EXEC_SLICE_NS);
         for _round in 0..64 {
-            let mut any = false;
             for &p in &owned {
                 let mut ready = std::mem::take(&mut self.x.ready);
                 ready.clear();
                 self.backend.take_ready(p, &mut ready);
-                any |= !ready.is_empty();
-                for &id in &ready {
-                    self.run_job(p, id);
-                }
+                self.x.run_q.extend(ready.iter().map(|&id| (p, id)));
                 self.x.ready = ready;
             }
-            if !any {
+            if self.x.run_q.is_empty() {
                 break;
+            }
+            for _ in 0..self.x.run_q.len() {
+                let Some((p, id)) = self.x.run_q.pop_front() else { break };
+                self.run_job(p, id);
+                if kv_common::clock::mono_ns() >= deadline {
+                    return;
+                }
             }
         }
     }
 
     fn run_job(&mut self, p: u16, id: ReqId) {
+        if self.x.reply.capacity() == 0
+            && let Some(v) = self.spare_out.pop()
+        {
+            // a sent output buffer: a large reply is written without growing (and faulting in)
+            // a new allocation
+            self.x.reply = v;
+        }
         let Some(job) = self.x.jobs.remove(&(p, id.0)) else {
             tracing::error!(worker = self.id, partition = p, "ready request without a job");
             return;

@@ -91,7 +91,7 @@ pub struct Worker<B: Backend> {
     stopping: Option<u64>,
     /// The worker's staged-write memory reached its share of `max-dirty-bytes` (§6.7).
     dirty_full: bool,
-    spare_out: Vec<Vec<u8>>,
+    pub(crate) spare_out: Vec<Vec<u8>>,
     io_buf: Vec<(std::os::fd::RawFd, u8, kv_storage::io::IoReq)>,
     /// Cluster mode: replication streams, sync and migration endpoints of the partitions.
     pub(crate) cluster: Option<crate::cluster::repl_glue::ClusterWorker>,

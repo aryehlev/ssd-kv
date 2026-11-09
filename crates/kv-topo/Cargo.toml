@@ -1,0 +1,20 @@
+[package]
+name = "kv-topo"
+description = "kvssd versioned cluster state, transitions, topology renderers and redirects (DESIGN §23.2, §23.5, §24.10)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kv-ctrl.workspace = true
+kv-common.workspace = true
+# render.rs writes RESP replies through kv_resp::ReplyWriter (DESIGN §24.10)
+kv-resp.workspace = true
+serde.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

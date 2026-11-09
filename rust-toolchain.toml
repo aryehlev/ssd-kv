@@ -1,0 +1,6 @@
+# DESIGN §24 targets Rust 1.97 stable (workspace `rust-version = "1.97"` in Cargo.toml).
+# The channel is "stable" rather than "1.97" so that a container with stable 1.97.x already
+# installed never has to download a separately named toolchain (and its clippy/rustfmt).
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

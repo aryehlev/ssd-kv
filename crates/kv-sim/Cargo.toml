@@ -1,0 +1,22 @@
+[package]
+name = "kv-sim"
+description = "kvssd deterministic simulators: storage, cluster and coordinator models (DESIGN §25.3); test-only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kv-storage = { workspace = true, features = ["sim"] }
+kv-index.workspace = true
+kv-repl.workspace = true
+kv-topo.workspace = true
+kv-coord.workspace = true
+kv-common.workspace = true
+kv-ctrl.workspace = true
+rand.workspace = true
+stateright.workspace = true
+serde.workspace = true
+postcard.workspace = true

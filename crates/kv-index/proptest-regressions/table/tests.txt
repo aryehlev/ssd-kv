@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2c694c435a711cec31a9fb2392ef19eaa63b9a97597ae88eb4f8bf6bdf20a666 # shrinks to seed = 0, d = Uniform, ops = [Insert, Mark(0, true), Update(120333398388741896, 666509345959920208)]

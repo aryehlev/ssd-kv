@@ -1,0 +1,523 @@
+//! Tracked stale copies and the no-resurrection rule (DESIGN §14.3, §16.2, §18.5).
+//!
+//! `stale_copies` maps exact `(db, key)` (never hashes) to the older copies of the key that
+//! live on other pages or extents: populated by moves, extent updates and recovery, cleared
+//! when the copy's zeroing is durable. By I11/I12 there is at most one such copy per key.
+//!
+//! Rule D1: the newest durable copy of a key may be dropped only when it is the only valid copy
+//! (E9). A command whose completion needs older copies gone (DEL/UNLINK/GETDEL, EXPIRE-to-delete,
+//! RENAME source removal, MSET/COPY overwrites, the third-copy rule, SHUTDOWN's drain) has their
+//! zeroing built by the foreground page writer in the tick it executes, constrained only by the
+//! E1/E9 ordering edges and never by background rates (LC-15). Rule D2: a delete completes when
+//! the newest copy is durably gone or durably superseded. Zeroings no command waits for
+//! (post-move cleanup, post-recovery copies of untouched keys) are background work (§19).
+//!
+//! Each tracked copy has a state: `CopyState::Source` while no newer copy of the key is
+//! durable (the copy is protected, §13.3 d, edge E2), then `CopyState::Stale` until its zeroing
+//! is durable. Every entry counts towards the key's copies on media, which the third-copy rule
+//! (E14) bounds at two. Copies inside the page the index names are visible in that page's
+//! records and are never tracked here.
+//!
+//! Hand-off (liveness): an entry records the seq of the copy it tracks. A Source becomes Stale
+//! when a copy of the key *with a higher seq* is durable (and, for a txn record, committed):
+//! `StaleCopies::sources_superseded` takes that seq. Keying the hand-off on the seq rather than
+//! on "some copy of the key became durable" makes it independent of the order in which the
+//! events arrive: an older in-flight image of the tracked location becoming durable after the key
+//! moved on does not release the source early (E2), and a source registered after a newer copy
+//! is already durable is released by the next durable-copy event or by the page writer's check
+//! of the newest durable copy in M (`image::Built::sources_durable`). An entry with seq 0
+//! (unknown, e.g. a copy found by the expiry sweep) is released by any durable copy.
+
+use core::hash::{Hash, Hasher};
+
+use hashbrown::{Equivalent, HashMap};
+use smallvec::SmallVec;
+
+use crate::layout::{PageId, Seq};
+use crate::ticket::TicketId;
+
+/// Location of one older copy of a key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StaleRef {
+    /// A record inside a SMALL page.
+    Small { page: PageId },
+    /// A VALUE or CHUNKMAP extent (its first sector is zeroed).
+    Extent { page: PageId, n_pages: u32 },
+}
+
+impl StaleRef {
+    pub fn page(&self) -> PageId {
+        match *self {
+            StaleRef::Small { page } | StaleRef::Extent { page, .. } => page,
+        }
+    }
+}
+
+/// Lifecycle of a tracked copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CopyState {
+    /// The key's newer copy is not durable yet: this copy is protected (E2).
+    Source,
+    /// The newer copy is durable: this copy awaits its zeroing.
+    Stale,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StaleEntry {
+    pub(crate) at: StaleRef,
+    pub(crate) state: CopyState,
+    /// A received command waits for this zeroing: it is built by the foreground page writer.
+    pub(crate) foreground: bool,
+    /// The location also holds an older, superseded copy of the key whose zeroing is not
+    /// durable yet (it counts as one more copy for the third-copy rule, E14).
+    pub(crate) older: bool,
+    /// Seq of the tracked copy (the newest one at the location; `Seq::ZERO` = unknown).
+    pub(crate) seq: Seq,
+    /// A delete (or an expiry with older copies) turned this source into a copy to zero: no
+    /// newer copy shadows it, so it is zeroed only once every older tracked copy of the key is
+    /// gone (D1, E9). Zeroed first, a crash could leave an older copy as the key's newest.
+    pub(crate) fenced: bool,
+}
+
+/// Owned map key: `(db, exact key bytes)`.
+#[derive(PartialEq, Eq)]
+struct Key {
+    db: u8,
+    key: Box<[u8]>,
+}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        h.write_u8(self.db);
+        self.key.hash(h);
+    }
+}
+
+/// Borrowed lookup form of [`Key`] (hashes identically).
+struct KeyRef<'a> {
+    db: u8,
+    key: &'a [u8],
+}
+
+impl Hash for KeyRef<'_> {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        h.write_u8(self.db);
+        self.key.hash(h);
+    }
+}
+
+impl Equivalent<Key> for KeyRef<'_> {
+    fn equivalent(&self, k: &Key) -> bool {
+        self.db == k.db && *self.key == *k.key
+    }
+}
+
+/// `(db, exact key) -> older copies`.
+type StaleMap = HashMap<Key, SmallVec<[StaleEntry; 1]>, foldhash::fast::FixedState>;
+
+/// The newest copy of an absent key in a SMALL page that the index does not name: a txn
+/// delete marker that is not retired yet (its txn open or committed, §14.6, D1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AbsentCopy {
+    pub(crate) page: PageId,
+    pub(crate) seq: Seq,
+    pub(crate) txn: u64,
+}
+
+/// The partition's tracked stale copies (exact keys).
+pub(crate) struct StaleCopies {
+    map: StaleMap,
+    /// Entries per SMALL page or extent first page (eviction, AG release, snapshot rules).
+    pages: HashMap<PageId, u32, foldhash::fast::FixedState>,
+    entries: usize,
+    /// Tickets waiting for one specific tracked copy to go (a barrier, §16.2 SHUTDOWN drain):
+    /// `(ticket, db, key, location)`; released when that entry is removed.
+    watched: Vec<(TicketId, u8, Box<[u8]>, PageId)>,
+    /// Tickets whose watched copy is gone (drained by the partition).
+    released: Vec<TicketId>,
+    /// Absent newest copies the index does not name (`AbsentCopy`). They are copies of their
+    /// key like any other: a write that creates the key again turns the entry into a tracked
+    /// older copy (`StaleCopies::take_absent`), so that the write never lands on that page and
+    /// counts it towards the key's copies (E14, I11).
+    absent: HashMap<Key, AbsentCopy, foldhash::fast::FixedState>,
+}
+
+impl Default for StaleCopies {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StaleCopies {
+    pub(crate) fn new() -> Self {
+        StaleCopies {
+            map: HashMap::with_hasher(Default::default()),
+            pages: HashMap::with_hasher(Default::default()),
+            entries: 0,
+            watched: Vec::new(),
+            released: Vec::new(),
+            absent: HashMap::with_hasher(Default::default()),
+        }
+    }
+
+    /// Records the absent newest copy of `(db, key)` (a txn delete marker placed or moved at
+    /// `page`, or found by recovery). A newer one replaces an older one.
+    pub(crate) fn note_absent(&mut self, db: u8, key: &[u8], page: PageId, seq: Seq, txn: u64) {
+        let a = AbsentCopy { page, seq, txn };
+        match self.absent.get_mut(&KeyRef { db, key }) {
+            Some(e) if e.seq > seq => {}
+            Some(e) => *e = a,
+            None => {
+                self.absent.insert(Key { db, key: key.into() }, a);
+            }
+        }
+    }
+
+    /// The absent newest copy of `(db, key)`, if one is on media.
+    pub(crate) fn absent_of(&self, db: u8, key: &[u8]) -> Option<AbsentCopy> {
+        if self.absent.is_empty() {
+            return None;
+        }
+        self.absent.get(&KeyRef { db, key }).copied()
+    }
+
+    /// The key is written again: its absent newest copy becomes an ordinary older copy (the
+    /// caller tracks it). Returns it.
+    pub(crate) fn take_absent(&mut self, db: u8, key: &[u8]) -> Option<AbsentCopy> {
+        if self.absent.is_empty() {
+            return None;
+        }
+        self.absent.remove(&KeyRef { db, key })
+    }
+
+    /// The absent copy of `(db, key)` with seq `seq` at `page` left the page (retired, or
+    /// zeroed by another rule).
+    pub(crate) fn absent_gone(&mut self, db: u8, key: &[u8], page: PageId, seq: Seq) {
+        if self.absent.is_empty() {
+            return;
+        }
+        if self.absent.get(&KeyRef { db, key }).is_some_and(|a| a.page == page && a.seq == seq) {
+            self.absent.remove(&KeyRef { db, key });
+        }
+    }
+
+    /// Absent copies recorded (diagnostics).
+    pub(crate) fn absent_len(&self) -> usize {
+        self.absent.len()
+    }
+
+    /// Tracked copies (`stale_copies` counter).
+    pub(crate) fn len(&self) -> usize {
+        self.entries
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries == 0
+    }
+
+    /// Registers a copy of `(db, key)` with seq `seq` at `at` (no duplicate entries per
+    /// location).
+    pub(crate) fn add(&mut self, db: u8, key: &[u8], at: StaleRef, state: CopyState, seq: Seq) {
+        let entry = StaleEntry { at, state, foreground: false, older: false, seq, fenced: false };
+        match self.map.get_mut(&KeyRef { db, key }) {
+            Some(list) => {
+                if let Some(e) = list.iter_mut().find(|e| e.at == at) {
+                    // a stale copy never becomes a source again
+                    if e.state == CopyState::Source {
+                        e.state = state;
+                    }
+                    e.seq = e.seq.max(seq);
+                    return;
+                }
+                list.push(entry);
+            }
+            None => {
+                let mut list = SmallVec::new();
+                list.push(entry);
+                self.map.insert(Key { db, key: key.into() }, list);
+            }
+        }
+        self.entries += 1;
+        *self.pages.entry(at.page()).or_insert(0) += 1;
+    }
+
+    /// The tracked copies of `(db, key)`.
+    pub(crate) fn get(&self, db: u8, key: &[u8]) -> &[StaleEntry] {
+        self.map.get(&KeyRef { db, key }).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Number of tracked copies of `(db, key)` (copies on media besides the indexed one).
+    pub(crate) fn count(&self, db: u8, key: &[u8]) -> usize {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.get(db, key).len()
+    }
+
+    /// Copies of `(db, key)` tracked outside `except` (an older copy sharing a tracked
+    /// location counts too).
+    pub(crate) fn count_outside(&self, db: u8, key: &[u8], except: PageId) -> usize {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.get(db, key).iter().filter(|e| e.at.page() != except).map(|e| 1 + usize::from(e.older)).sum()
+    }
+
+    /// Tracked copies of `(db, key)` older than `seq` (unknown seqs count as older): the copies
+    /// a delete of seq `seq` must see gone before its newest copy goes (D1).
+    pub(crate) fn count_older(&self, db: u8, key: &[u8], seq: Seq) -> usize {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.get(db, key).iter().filter(|e| e.seq < seq || e.seq == Seq::ZERO).count()
+    }
+
+    /// Copies of `(db, key)` outside `except` that are older than `seq` (an older copy
+    /// sharing a tracked location counts too): what a page's newest copy of seq `seq` waits
+    /// for before it may be dropped (D1).
+    pub(crate) fn count_older_outside(&self, db: u8, key: &[u8], except: PageId, seq: Seq) -> usize {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.get(db, key).iter().filter(|e| e.at.page() != except && (e.seq < seq || e.seq == Seq::ZERO)).map(|e| 1 + usize::from(e.older)).sum()
+    }
+
+    /// True when the copy tracked at `at` is still a source (no newer copy is durable) and an
+    /// older copy of the key is tracked elsewhere: dropping the copy at `at` must wait (D1).
+    pub(crate) fn older_than_source_at(&self, db: u8, key: &[u8], at: PageId) -> bool {
+        let list = self.get(db, key);
+        let Some(here) = list.iter().find(|e| e.at.page() == at) else { return false };
+        (here.state == CopyState::Source || here.fenced) && list.iter().any(|e| e.at.page() != at && (e.seq < here.seq || e.seq == Seq::ZERO || here.seq == Seq::ZERO))
+    }
+
+    /// Sets or clears the older-copy flag of the copy of `(db, key)` at `at`.
+    pub(crate) fn set_older(&mut self, db: u8, key: &[u8], at: PageId, on: bool) {
+        if let Some(list) = self.map.get_mut(&KeyRef { db, key })
+            && let Some(e) = list.iter_mut().find(|e| e.at.page() == at)
+        {
+            e.older = on;
+        }
+    }
+
+    /// The state of the copy of `(db, key)` at `at`, if tracked.
+    pub(crate) fn state_at(&self, db: u8, key: &[u8], at: PageId) -> Option<CopyState> {
+        if self.entries == 0 {
+            return None;
+        }
+        self.get(db, key).iter().find(|e| e.at.page() == at).map(|e| e.state)
+    }
+
+    /// A copy of the key with seq `newer` is durable (and committed): the sources it shadows
+    /// (seq below `newer`) become stale. Returns the key's stale copies (whose zeroing may now
+    /// be built) and how many sources changed state.
+    pub(crate) fn sources_superseded(&mut self, db: u8, key: &[u8], newer: Seq) -> (SmallVec<[StaleEntry; 1]>, usize) {
+        if self.entries == 0 {
+            return (SmallVec::new(), 0);
+        }
+        let Some(list) = self.map.get_mut(&KeyRef { db, key }) else { return (SmallVec::new(), 0) };
+        let mut changed = 0;
+        for e in list.iter_mut() {
+            if e.state == CopyState::Source && e.seq < newer {
+                e.state = CopyState::Stale;
+                changed += 1;
+            }
+            if e.fenced && e.seq < newer {
+                // shadowed by a durable newer copy: the order of the zeroings is free again
+                e.fenced = false;
+            }
+        }
+        (list.iter().filter(|e| e.state == CopyState::Stale).copied().collect(), changed)
+    }
+
+    /// A command waits for the key's copies to be zeroed: marks them foreground and returns
+    /// them (sources included: a delete turns them into copies to drop).
+    pub(crate) fn require(&mut self, db: u8, key: &[u8], sources_too: bool) -> SmallVec<[StaleEntry; 1]> {
+        if self.entries == 0 {
+            return SmallVec::new();
+        }
+        let Some(list) = self.map.get_mut(&KeyRef { db, key }) else { return SmallVec::new() };
+        for e in list.iter_mut() {
+            if sources_too && e.state == CopyState::Source {
+                e.state = CopyState::Stale;
+                e.fenced = true;
+            }
+            if e.state == CopyState::Stale {
+                e.foreground = true;
+            }
+        }
+        list.clone()
+    }
+
+    /// True when the copy of `(db, key)` at `at` is fenced (a deleted key's newest copies) and
+    /// an older tracked copy of the key is still on media: its zeroing waits (D1).
+    pub(crate) fn fenced_by_older(&self, db: u8, key: &[u8], at: PageId) -> bool {
+        if self.entries == 0 {
+            return false;
+        }
+        let list = self.get(db, key);
+        let Some(here) = list.iter().find(|e| e.at.page() == at) else { return false };
+        here.fenced && list.iter().any(|e| e.at.page() != at && (e.seq < here.seq || e.seq == Seq::ZERO || here.seq == Seq::ZERO))
+    }
+
+    /// The zeroing of the copy at `at` is durable: forget it.
+    pub(crate) fn remove_at(&mut self, db: u8, key: &[u8], at: PageId) -> bool {
+        if self.entries == 0 {
+            return false;
+        }
+        let Some(list) = self.map.get_mut(&KeyRef { db, key }) else { return false };
+        let Some(i) = list.iter().position(|e| e.at.page() == at) else { return false };
+        list.remove(i);
+        if list.is_empty() {
+            self.map.remove(&KeyRef { db, key });
+        }
+        self.release_watchers(|w| w.1 == db && w.3 == at && *w.2 == *key);
+        self.entries -= 1;
+        if let Some(c) = self.pages.get_mut(&at) {
+            *c -= 1;
+            if *c == 0 {
+                self.pages.remove(&at);
+            }
+        }
+        true
+    }
+
+    /// Keys with a tracked copy located at `page` (O(1) when the page holds none).
+    pub(crate) fn keys_at(&self, page: PageId) -> SmallVec<[(u8, Box<[u8]>); 2]> {
+        if self.at_page(page) == 0 {
+            return SmallVec::new();
+        }
+        self.map.iter().filter(|(_, v)| v.iter().any(|e| e.at.page() == page)).map(|(k, _)| (k.db, k.key.clone())).collect()
+    }
+
+    /// Tracked copies located at `page` (SMALL page or extent first page).
+    pub(crate) fn at_page(&self, page: PageId) -> u32 {
+        if self.entries == 0 {
+            return 0;
+        }
+        self.pages.get(&page).copied().unwrap_or(0)
+    }
+
+    /// Every tracked copy (paced scrub scheduling, SHUTDOWN drain).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u8, &[u8], &StaleEntry)> + '_ {
+        self.map.iter().flat_map(|(k, v)| v.iter().map(move |e| (k.db, &*k.key, e)))
+    }
+
+    /// Drops every entry of `db` (FLUSHDB: the copies are dead by the durable cutoff).
+    pub(crate) fn drop_db(&mut self, db: u8) {
+        self.absent.retain(|k, _| k.db != db);
+        let mut removed: SmallVec<[PageId; 8]> = SmallVec::new();
+        self.map.retain(|k, v| {
+            if k.db == db {
+                removed.extend(v.iter().map(|e| e.at.page()));
+                false
+            } else {
+                true
+            }
+        });
+        for p in removed {
+            self.entries -= 1;
+            if let Some(c) = self.pages.get_mut(&p) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pages.remove(&p);
+                }
+            }
+        }
+        self.release_watchers(|w| w.1 == db);
+    }
+
+    /// Ticket `t` waits until every copy tracked now is gone (one dependency per copy; the
+    /// caller counts them); returns how many copies it watches.
+    pub(crate) fn watch_all(&mut self, t: TicketId) -> u32 {
+        let mut n = 0;
+        for (k, list) in &self.map {
+            for e in list {
+                self.watched.push((t, k.db, k.key.clone(), e.at.page()));
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Tickets whose watched copy went since the last call (one entry per dependency).
+    pub(crate) fn take_released(&mut self, out: &mut Vec<TicketId>) {
+        out.append(&mut self.released);
+    }
+
+    /// Watched copies: `(ticket, location)` (liveness checks).
+    pub(crate) fn watched(&self) -> impl Iterator<Item = (TicketId, PageId)> + '_ {
+        self.watched.iter().map(|w| (w.0, w.3))
+    }
+
+    fn release_watchers(&mut self, gone: impl Fn(&(TicketId, u8, Box<[u8]>, PageId)) -> bool) {
+        if self.watched.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.watched.len() {
+            if gone(&self.watched[i]) {
+                let w = self.watched.swap_remove(i);
+                self.released.push(w.0);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.pages.clear();
+        self.absent.clear();
+        self.entries = 0;
+        self.release_watchers(|_| true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small(n: u64) -> StaleRef {
+        StaleRef::Small { page: PageId(n) }
+    }
+
+    #[test]
+    fn lifecycle_source_stale_removed() {
+        let mut s = StaleCopies::new();
+        assert_eq!(s.count(0, b"k"), 0);
+        s.add(0, b"k", small(7), CopyState::Source, Seq(5));
+        s.add(0, b"k", small(7), CopyState::Source, Seq(5));
+        assert_eq!(s.len(), 1, "one entry per location");
+        assert_eq!(s.count(0, b"k"), 1);
+        assert_eq!(s.count(1, b"k"), 0, "db is part of the key");
+        assert_eq!(s.state_at(0, b"k", PageId(7)), Some(CopyState::Source));
+        // an equal or older durable copy does not shadow the tracked one (E2)
+        assert_eq!(s.sources_superseded(0, b"k", Seq(5)).1, 0);
+        assert_eq!(s.state_at(0, b"k", PageId(7)), Some(CopyState::Source));
+        let (st, changed) = s.sources_superseded(0, b"k", Seq(6));
+        assert_eq!((st.len(), changed), (1, 1));
+        assert_eq!(s.state_at(0, b"k", PageId(7)), Some(CopyState::Stale));
+        assert_eq!(s.at_page(PageId(7)), 1);
+        assert!(s.remove_at(0, b"k", PageId(7)));
+        assert!(!s.remove_at(0, b"k", PageId(7)));
+        assert!(s.is_empty());
+        assert_eq!(s.at_page(PageId(7)), 0);
+    }
+
+    #[test]
+    fn require_marks_foreground() {
+        let mut s = StaleCopies::new();
+        s.add(2, b"a", small(1), CopyState::Stale, Seq::ZERO);
+        s.add(2, b"a", StaleRef::Extent { page: PageId(9), n_pages: 4 }, CopyState::Source, Seq(3));
+        let r = s.require(2, b"a", false);
+        assert_eq!(r.iter().filter(|e| e.foreground).count(), 1, "sources stay protected");
+        let r = s.require(2, b"a", true);
+        assert!(r.iter().all(|e| e.foreground && e.state == CopyState::Stale));
+        s.add(3, b"b", small(1), CopyState::Stale, Seq::ZERO);
+        assert_eq!(s.at_page(PageId(1)), 2);
+        s.drop_db(2);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.at_page(PageId(1)), 1);
+        assert_eq!(s.iter().count(), 1);
+    }
+}

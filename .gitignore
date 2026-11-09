@@ -1,2 +1,7 @@
 /target
 /operator/operator
+tests/compat/.venv/
+__pycache__/
+tests/compat/.pytest_cache/
+# Private notes: never commit.
+/docs/legal/

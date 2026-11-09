@@ -1,0 +1,611 @@
+//! The per-partition sync decision (DESIGN §23.7, §23.9, LC-25, LC-39).
+//!
+//! 1. `last_term == term` and the backlog covers `applied + 1` -> `Continue { from: applied + 1 }`
+//!    (current-term frames only).
+//! 2. `last_term < term`, not a learner, and the needed key sets are known -> `Repair { at }`:
+//!    keys of the member's own groups after its term's takeover point (its received ring, or its
+//!    post-scan divergent set sent as `RepairKeys`), keys of `(applied, takeover]` from the
+//!    primary's received ring of that term, keys of whole intermediate terms and of the current
+//!    term up to `at` from the primary's backlog; then one image per key stamped `at`.
+//! 3. Learner (`replica add`) or operator `replica resync` -> `Full { at }` (in-place merge).
+//! 4. Otherwise (including `SyncInterrupted`) -> `Reject(NeedOperatorResync)`. There is no
+//!    automatic path to a full sync.
+//!
+//! The decision reads only the handshake, the shard's committed history and the primary's two
+//! RAM rings; it never compares a lag or a ring size against a constant (LC-36): coverage is a
+//! position test (`seq >= floor`), and a ring that was never started covers nothing (a primary
+//! without a received ring of the term it took over refuses members behind its takeover point
+//! instead of repairing them with an empty key set). A range whose groups hold a partition-wide op (`FlushDb`,
+//! `FlushSlot`) cannot be described by keys and counts as not covered.
+
+use crate::Seq;
+use crate::backlog::Backlog;
+use crate::codec::KeySet;
+use crate::frame::{Hello, Recovered, RejectReason};
+
+/// What the primary knows when a member says Hello.
+pub struct PrimaryView<'a> {
+    pub term: u32,
+    /// `(term, takeover seq per partition)` of past terms.
+    pub history: &'a [(u32, Vec<u64>)],
+    pub backlog: &'a Backlog,
+    pub received: &'a Backlog,
+    pub is_member: bool,
+    /// replica add/resync only
+    pub operator_full_sync: bool,
+    pub last_executed: Seq,
+}
+
+pub enum SyncDecision {
+    Continue {
+        from: Seq,
+    },
+    Repair {
+        at: Seq,
+        primary_keys: Vec<(u8, Box<[u8]>)>,
+        want_member_keys: bool,
+    },
+    Full {
+        at: Seq,
+    },
+    Reject(RejectReason),
+}
+
+impl SyncDecision {
+    /// Short name for diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SyncDecision::Continue { .. } => "continue",
+            SyncDecision::Repair { .. } => "repair",
+            SyncDecision::Full { .. } => "full",
+            SyncDecision::Reject(_) => "reject",
+        }
+    }
+}
+
+/// The takeover seq of `term` for partition `p`, if the history still records that term.
+pub fn takeover(history: &[(u32, Vec<u64>)], term: u32, p: u16) -> Option<Seq> {
+    history
+        .iter()
+        .find(|(t, _)| *t == term)
+        .and_then(|(_, v)| v.get(usize::from(p)).copied())
+        .map(Seq)
+}
+
+/// The term before `term` in the shard's history and its takeover seq for partition `p`: the
+/// closing point of the term the current primary took over. Usually `term - 1`; a term raise
+/// (§23.12) skips the terms in between (no group carries them).
+pub fn prev_takeover(history: &[(u32, Vec<u64>)], term: u32, p: u16) -> Option<(u32, Seq)> {
+    history
+        .iter()
+        .filter(|(t, _)| *t < term)
+        .max_by_key(|(t, _)| *t)
+        .and_then(|(t, v)| v.get(usize::from(p)).map(|s| (*t, Seq(*s))))
+}
+
+/// A member whose handshake shows records of a term above the shard's `term` while its
+/// fence is not (it held another shard's data before, whose terms count separately, §23.2):
+/// the term its records reach. Such a member cannot sync at this term (every seq of the shard
+/// would sort below its records); the primary asks the coordinator to raise the shard's term
+/// above it (`TermRaise`) and refuses the handshake meanwhile.
+pub fn member_term_above(h: &Hello, term: u32) -> Option<u32> {
+    (h.fence_term <= term && h.last_term > term).then_some(h.last_term)
+}
+
+/// The seq the next group after `s` carries at the earliest (`from` of a `Continue`).
+fn after(s: Seq) -> Seq {
+    Seq(s.0.saturating_add(1))
+}
+
+/// The lowest position from which a member at `applied` can lack groups of partition `p`: a
+/// member that holds the closing point of its term (as the shard's history records it) lacks
+/// nothing until the next term of the history begins, since no group carries a seq between a
+/// term's closing point and the next term's start (the terms a raise skipped carry none at
+/// all). Without this a member behind a term raise (its positions still in the term before
+/// the raise) needed the raised term's ring to reach back into the earlier term, which no ring
+/// started at the raised term does, and was sent to the operator.
+fn past_closed_terms(history: &[(u32, Vec<u64>)], applied: Seq, p: u16, term: u32) -> Seq {
+    let mut s = applied;
+    loop {
+        let t = s.term();
+        let Some(end) = takeover(history, t, p) else {
+            return s;
+        };
+        if s < end {
+            return s;
+        }
+        // the next term of the history below the current one (the current term's groups are
+        // in this primary's own backlog, read from `Seq::new(term, 0)` on)
+        let Some(next) = history
+            .iter()
+            .map(|(u, _)| *u)
+            .filter(|u| *u > t && *u < term)
+            .min()
+        else {
+            return s;
+        };
+        s = Seq::new(next, 0);
+    }
+}
+
+pub fn decide(h: &Hello, v: &PrimaryView<'_>) -> SyncDecision {
+    // Both sides reject peers whose term is below their fence: a member that saw a newer term
+    // than ours talks to a primary that has been superseded.
+    if h.fence_term > v.term || h.last_term > v.term {
+        return SyncDecision::Reject(RejectReason::StaleTerm);
+    }
+    if !v.is_member {
+        return SyncDecision::Reject(RejectReason::NotMember);
+    }
+    // the only start of a full sync: the operator's replica add or replica resync (LC-25)
+    let start = Seq::new(v.term, 0);
+    let at = v.last_executed.max(start);
+    if v.operator_full_sync {
+        return SyncDecision::Full { at };
+    }
+    if h.recovered == Recovered::SyncInterrupted {
+        return SyncDecision::Reject(RejectReason::NeedOperatorResync);
+    }
+    if h.last_term == v.term {
+        // frames of the current term only, i.e. produced by this primary
+        if h.applied <= at && v.backlog.covers_after(h.applied) {
+            return SyncDecision::Continue {
+                from: after(h.applied),
+            };
+        }
+        return SyncDecision::Reject(RejectReason::NeedOperatorResync);
+    }
+    if h.learner {
+        return SyncDecision::Reject(RejectReason::NeedOperatorResync);
+    }
+    let mut keys = KeySet::default();
+    // (b) + (c): groups of earlier terms the member may lack, up to the end of the previous
+    // term as this primary took it over; they are in this primary's received ring
+    let Some((_, prev_end)) = prev_takeover(v.history, v.term, h.partition) else {
+        return SyncDecision::Reject(RejectReason::NeedOperatorResync);
+    };
+    let from = past_closed_terms(v.history, h.applied, h.partition, v.term);
+    if from < prev_end {
+        match v.received.keys_between_into(from, prev_end, &mut keys) {
+            Some(false) => {}
+            // not covered, or a partition-wide op a key set cannot describe
+            _ => return SyncDecision::Reject(RejectReason::NeedOperatorResync),
+        }
+    }
+    // the groups of earlier terms this primary received after the position it reported when it
+    // was fenced (in flight then, applied after): its state holds them, so a member that lacks
+    // them (the old primary, restarted below them) gets their keys' images too
+    let received_more = v.received.last().is_some_and(|l| l > prev_end);
+    if let Some(end) = v.received.end().filter(|e| received_more && e.term() < v.term && *e > prev_end) {
+        let from = from.max(prev_end);
+        if from < end {
+            match v.received.keys_between_into(from, end, &mut keys) {
+                Some(false) => {}
+                _ => return SyncDecision::Reject(RejectReason::NeedOperatorResync),
+            }
+        }
+    }
+    // (d): the current term's groups up to `at`, from this primary's own backlog
+    if at > start {
+        match v.backlog.keys_between_into(start, at, &mut keys) {
+            Some(false) => {}
+            _ => return SyncDecision::Reject(RejectReason::NeedOperatorResync),
+        }
+    }
+    // (a) comes from the member itself (its ring, or its post-recovery divergent set)
+    SyncDecision::Repair {
+        at,
+        primary_keys: keys.into_vec(),
+        want_member_keys: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::encode_group;
+    use crate::{Group, Op};
+
+    fn put(seq: Seq, key: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        encode_group(
+            &Group {
+                seq,
+                ops: vec![Op::Put {
+                    db: 0,
+                    vtype: 1,
+                    expire_at: 0,
+                    key: key.into(),
+                    value: b"v".to_vec(),
+                }],
+            },
+            &mut b,
+        );
+        b
+    }
+
+    fn hello(last_term: u32, applied: Seq) -> Hello {
+        Hello {
+            cluster_id: [1; 16],
+            auth: b"t".to_vec(),
+            node_id: [2; 20],
+            shard: 1,
+            partition: 3,
+            fence_term: last_term,
+            last_term,
+            applied,
+            recovered: Recovered::Clean,
+            learner: false,
+            migration: None,
+        }
+    }
+
+    struct Rings {
+        backlog: Backlog,
+        received: Backlog,
+        history: Vec<(u32, Vec<u64>)>,
+    }
+
+    /// A primary of term 3 that was a member in term 2 (received (2,1)..=(2,10)), took over
+    /// at (2, 8), and produced (3,1)..=(3,4).
+    fn rings() -> Rings {
+        let mut received = Backlog::new(1 << 16);
+        received.start_after(Seq::new(2, 0));
+        for i in 1..=8 {
+            let s = Seq::new(2, i);
+            received.push(s, &put(s, format!("old{i}").as_bytes()));
+        }
+        let mut backlog = Backlog::new(1 << 16);
+        backlog.start_after(Seq::new(3, 0));
+        for i in 1..=4 {
+            let s = Seq::new(3, i);
+            backlog.push(s, &put(s, format!("new{i}").as_bytes()));
+        }
+        let mut takeover = vec![0u64; 16];
+        takeover[3] = Seq::new(2, 8).0;
+        Rings {
+            backlog,
+            received,
+            history: vec![(2, takeover)],
+        }
+    }
+
+    fn view<'a>(r: &'a Rings) -> PrimaryView<'a> {
+        PrimaryView {
+            term: 3,
+            history: &r.history,
+            backlog: &r.backlog,
+            received: &r.received,
+            is_member: true,
+            operator_full_sync: false,
+            last_executed: Seq::new(3, 4),
+        }
+    }
+
+    fn keys(d: &SyncDecision) -> Vec<String> {
+        match d {
+            SyncDecision::Repair { primary_keys, .. } => primary_keys
+                .iter()
+                .map(|(_, k)| String::from_utf8_lossy(k).into_owned())
+                .collect(),
+            _ => panic!("expected repair, got {}", d.kind()),
+        }
+    }
+
+    #[test]
+    fn same_term_continues_from_the_backlog() {
+        let r = rings();
+        let d = decide(&hello(3, Seq::new(3, 2)), &view(&r));
+        assert!(matches!(d, SyncDecision::Continue { from } if from == Seq::new(3, 3)));
+        // the very start of the term is covered too
+        let d = decide(&hello(3, Seq::new(3, 0)), &view(&r));
+        assert!(matches!(d, SyncDecision::Continue { from } if from == Seq::new(3, 1)));
+        // a member reporting more than this primary executed is not continued
+        let d = decide(&hello(3, Seq::new(3, 9)), &view(&r));
+        assert!(matches!(
+            d,
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+    }
+
+    #[test]
+    fn older_terms_repair_with_the_keys_of_every_needed_range() {
+        let r = rings();
+        // behind in term 2: (2,5]..(2,8] from the received ring, plus the current term
+        let d = decide(&hello(2, Seq::new(2, 5)), &view(&r));
+        assert_eq!(
+            keys(&d),
+            ["old6", "old7", "old8", "new1", "new2", "new3", "new4"]
+        );
+        let SyncDecision::Repair {
+            at,
+            want_member_keys,
+            ..
+        } = d
+        else {
+            unreachable!()
+        };
+        assert_eq!(at, Seq::new(3, 4));
+        assert!(
+            want_member_keys,
+            "the member's own groups after the takeover come from it"
+        );
+        // ahead of the takeover point (an old primary): only the current term's keys here
+        let d = decide(&hello(2, Seq::new(2, 30)), &view(&r));
+        assert_eq!(keys(&d), ["new1", "new2", "new3", "new4"]);
+    }
+
+    #[test]
+    fn groups_received_after_the_takeover_point_are_repaired_too() {
+        // the new primary received (2,9) and (2,10) after the position it reported at its
+        // fence: its state holds them, so a member below them (the old primary restarted at
+        // (2,8), or behind it) gets their keys as images
+        let mut r = rings();
+        for i in 9..=10 {
+            let s = Seq::new(2, i);
+            r.received.push(s, &put(s, format!("old{i}").as_bytes()));
+        }
+        let v = view(&r);
+        let d = decide(&hello(2, Seq::new(2, 8)), &v);
+        assert_eq!(keys(&d), ["old9", "old10", "new1", "new2", "new3", "new4"]);
+        let d = decide(&hello(2, Seq::new(2, 9)), &v);
+        assert_eq!(keys(&d), ["old10", "new1", "new2", "new3", "new4"]);
+        let d = decide(&hello(2, Seq::new(2, 6)), &v);
+        assert_eq!(
+            keys(&d),
+            ["old7", "old8", "old9", "old10", "new1", "new2", "new3", "new4"]
+        );
+        // a member that holds them already gets the current term's keys only
+        let d = decide(&hello(2, Seq::new(2, 10)), &v);
+        assert_eq!(keys(&d), ["new1", "new2", "new3", "new4"]);
+    }
+
+    #[test]
+    fn a_member_holding_its_terms_closing_point_needs_no_ring_of_that_term() {
+        // shard history: term 4 closed at (4,10); a raise skipped 5 and 6; term 7 (the same
+        // primary after the raise) closed at (7,3); this primary of term 8 was a member in term
+        // 7 and its received ring starts at that term's stream
+        let mut received = Backlog::new(1 << 16);
+        received.start_after(Seq::new(7, 0));
+        for i in 1..=3 {
+            let s = Seq::new(7, i);
+            received.push(s, &put(s, format!("t7-{i}").as_bytes()));
+        }
+        let mut backlog = Backlog::new(1 << 16);
+        backlog.start_after(Seq::new(8, 0));
+        let s = Seq::new(8, 1);
+        backlog.push(s, &put(s, b"t8-1"));
+        let end = |seq: Seq| {
+            let mut v = vec![0u64; 16];
+            v[3] = seq.0;
+            v
+        };
+        let history = vec![(4, end(Seq::new(4, 10))), (7, end(Seq::new(7, 3)))];
+        let v = PrimaryView {
+            term: 8,
+            history: &history,
+            backlog: &backlog,
+            received: &received,
+            is_member: true,
+            operator_full_sync: false,
+            last_executed: Seq::new(8, 1),
+        };
+        // the primary of term 4, restarted after the raise with nothing of term 7 on this
+        // partition: it holds all of term 4, so it lacks only term 7's and term 8's groups
+        let d = decide(&hello(4, Seq::new(4, 10)), &v);
+        assert_eq!(keys(&d), ["t7-1", "t7-2", "t7-3", "t8-1"]);
+        // with groups of its own beyond term 4's closing point (they come from the member)
+        let d = decide(&hello(4, Seq::new(4, 12)), &v);
+        assert_eq!(keys(&d), ["t7-1", "t7-2", "t7-3", "t8-1"]);
+        // behind term 4's closing point: (4,9]..(4,10] is in no ring here
+        let d = decide(&hello(4, Seq::new(4, 9)), &v);
+        assert!(matches!(d, SyncDecision::Reject(RejectReason::NeedOperatorResync)));
+        // a ring started later in term 7 does not cover the term's start
+        let mut late = Backlog::new(1 << 16);
+        late.start_after(Seq::new(7, 2));
+        let v2 = PrimaryView { received: &late, ..v };
+        let d = decide(&hello(4, Seq::new(4, 10)), &v2);
+        assert!(matches!(d, SyncDecision::Reject(RejectReason::NeedOperatorResync)));
+    }
+
+    #[test]
+    fn a_ring_with_nothing_after_the_takeover_point_needs_no_coverage_before_it() {
+        // term 2 produced nothing on this partition (closed where term 1 did, (1,52)); this
+        // primary of term 3 took the term-2 stream over with an empty ring started at (2,0):
+        // a member holding term 1's closing point lacks only the current term's groups
+        let mut received = Backlog::new(1 << 16);
+        received.start_after(Seq::new(2, 0));
+        let mut backlog = Backlog::new(1 << 16);
+        backlog.start_after(Seq::new(3, 0));
+        let s = Seq::new(3, 1);
+        backlog.push(s, &put(s, b"t3-1"));
+        let end = |seq: Seq| {
+            let mut v = vec![0u64; 16];
+            v[3] = seq.0;
+            v
+        };
+        let history = vec![(1, end(Seq::new(1, 52))), (2, end(Seq::new(1, 52)))];
+        let v = PrimaryView {
+            term: 3,
+            history: &history,
+            backlog: &backlog,
+            received: &received,
+            is_member: true,
+            operator_full_sync: false,
+            last_executed: Seq::new(3, 1),
+        };
+        assert_eq!(keys(&decide(&hello(1, Seq::new(1, 52)), &v)), ["t3-1"]);
+        // behind term 1's closing point: not covered here
+        assert!(matches!(
+            decide(&hello(1, Seq::new(1, 40)), &v),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+    }
+
+    #[test]
+    fn uncovered_ranges_need_the_operator() {
+        let r = rings();
+        // applied before the received ring's start
+        let d = decide(&hello(1, Seq::new(1, 7)), &view(&r));
+        assert!(matches!(
+            d,
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+        // a flush inside a needed range cannot be described by keys
+        let mut r2 = rings();
+        let mut b = Vec::new();
+        encode_group(
+            &Group {
+                seq: Seq::new(3, 5),
+                ops: vec![Op::FlushDb { db: None }],
+            },
+            &mut b,
+        );
+        r2.backlog.push(Seq::new(3, 5), &b);
+        let v = PrimaryView {
+            last_executed: Seq::new(3, 5),
+            ..view(&r2)
+        };
+        assert!(matches!(
+            decide(&hello(2, Seq::new(2, 8)), &v),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+        // no history entry for the previous term
+        let r3 = Rings {
+            history: Vec::new(),
+            ..rings()
+        };
+        assert!(matches!(
+            decide(&hello(2, Seq::new(2, 8)), &view(&r3)),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+        // interrupted full sync
+        let mut h = hello(3, Seq::new(3, 2));
+        h.recovered = Recovered::SyncInterrupted;
+        assert!(matches!(
+            decide(&h, &view(&r)),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+        // a learner without the operator's full sync
+        let mut h = hello(0, Seq::ZERO);
+        h.learner = true;
+        assert!(matches!(
+            decide(&h, &view(&r)),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+    }
+
+    /// A primary that holds no received ring of the term it took over (it restarted, or it was
+    /// that term's primary) uses a ring that was never started: it covers nothing, so a member
+    /// behind the takeover point is refused rather than repaired with an empty key set (an
+    /// acknowledged write it never received would stay missing).
+    #[test]
+    fn a_received_ring_that_was_never_started_repairs_nothing() {
+        let r = Rings {
+            received: Backlog::new(4096),
+            ..rings()
+        };
+        assert!(matches!(
+            decide(&hello(2, Seq::new(2, 5)), &view(&r)),
+            SyncDecision::Reject(RejectReason::NeedOperatorResync)
+        ));
+        // a member at or past the takeover point needs nothing from that ring
+        assert!(matches!(
+            decide(&hello(2, Seq::new(2, 8)), &view(&r)),
+            SyncDecision::Repair { .. }
+        ));
+    }
+
+    #[test]
+    fn full_sync_only_for_operator_members_and_stale_peers_are_refused() {
+        let r = rings();
+        let v = PrimaryView {
+            operator_full_sync: true,
+            ..view(&r)
+        };
+        assert!(
+            matches!(decide(&hello(0, Seq::ZERO), &v), SyncDecision::Full { at } if at == Seq::new(3, 4))
+        );
+        let v = PrimaryView {
+            is_member: false,
+            ..view(&r)
+        };
+        assert!(matches!(
+            decide(&hello(3, Seq::new(3, 1)), &v),
+            SyncDecision::Reject(RejectReason::NotMember)
+        ));
+        let mut h = hello(3, Seq::new(3, 1));
+        h.fence_term = 4;
+        assert!(matches!(
+            decide(&h, &view(&r)),
+            SyncDecision::Reject(RejectReason::StaleTerm)
+        ));
+        assert!(matches!(
+            decide(&hello(5, Seq::new(5, 1)), &view(&r)),
+            SyncDecision::Reject(RejectReason::StaleTerm)
+        ));
+        // a fresh term without writes yet: the decision position is the term's start
+        let mut fresh = rings();
+        fresh.backlog = Backlog::new(4096);
+        fresh.backlog.start_after(Seq::new(3, 0));
+        let v = PrimaryView {
+            last_executed: Seq::new(2, 8),
+            ..view(&fresh)
+        };
+        assert!(
+            matches!(decide(&hello(2, Seq::new(2, 8)), &v), SyncDecision::Repair { at, .. } if at == Seq::new(3, 0))
+        );
+        assert_eq!(takeover(&r.history, 2, 3), Some(Seq::new(2, 8)));
+        assert_eq!(takeover(&r.history, 1, 3), None);
+    }
+
+    /// After a term raise (the primary handed off to itself at a term past the next one,
+    /// §23.12) the previous term is the history's last term below the current one; a member
+    /// that brought records of a term above the shard's (from another shard) is told apart
+    /// from one that saw a newer term of this shard (its fence).
+    #[test]
+    fn a_raised_term_repairs_from_the_term_before_it() {
+        let mut r = rings();
+        r.history = vec![(1, vec![Seq::new(1, 3).0; 16]), (2, vec![Seq::new(2, 8).0; 16])];
+        let mut backlog = Backlog::new(1 << 16);
+        backlog.start_after(Seq::new(7, 0));
+        for i in 1..=2 {
+            let s = Seq::new(7, i);
+            backlog.push(s, &put(s, format!("new{i}").as_bytes()));
+        }
+        r.backlog = backlog;
+        let v = PrimaryView {
+            term: 7,
+            last_executed: Seq::new(7, 2),
+            ..view(&r)
+        };
+        assert_eq!(prev_takeover(&r.history, 7, 3), Some((2, Seq::new(2, 8))));
+        assert_eq!(prev_takeover(&r.history, 2, 3), Some((1, Seq::new(1, 3))));
+        assert_eq!(prev_takeover(&r.history, 1, 3), None);
+        match decide(&hello(2, Seq::new(2, 6)), &v) {
+            SyncDecision::Repair { at, primary_keys, .. } => {
+                assert_eq!(at, Seq::new(7, 2));
+                let mut keys: Vec<_> = primary_keys.into_iter().map(|(_, k)| k).collect();
+                keys.sort();
+                let want: Vec<Box<[u8]>> = ["new1", "new2", "old7", "old8"]
+                    .iter()
+                    .map(|k| k.as_bytes().into())
+                    .collect();
+                assert_eq!(keys, want);
+            }
+            _ => panic!("repair across the raised term"),
+        }
+        // a member whose records reach term 9 of another shard, fenced at this shard's term
+        let mut h = hello(9, Seq::new(9, 4));
+        h.fence_term = 7;
+        assert_eq!(member_term_above(&h, 7), Some(9));
+        assert!(matches!(
+            decide(&h, &v),
+            SyncDecision::Reject(RejectReason::StaleTerm)
+        ));
+        // a member that saw a newer term of this shard: this primary is superseded
+        h.fence_term = 9;
+        assert_eq!(member_term_above(&h, 7), None);
+        assert_eq!(member_term_above(&hello(7, Seq::new(7, 1)), 7), None);
+    }
+}

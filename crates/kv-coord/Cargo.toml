@@ -1,0 +1,40 @@
+[package]
+name = "kv-coord"
+description = "kvssd coordinator (kvc): whole-state replication, leases, failover, client topology service, admin API (DESIGN §23, §24.12)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvc"
+path = "src/main.rs"
+
+[dependencies]
+kv-common.workspace = true
+kv-resp.workspace = true
+kv-cmd.workspace = true
+kv-ctrl.workspace = true
+kv-topo.workspace = true
+tokio.workspace = true
+serde.workspace = true
+postcard.workspace = true
+rand.workspace = true
+hashbrown.workspace = true
+foldhash.workspace = true
+# O_DIRECT open flag for the A/B state files (DESIGN §23.3)
+libc.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+mimalloc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

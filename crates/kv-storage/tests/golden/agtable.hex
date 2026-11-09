@@ -1,0 +1,8 @@
+# kvssd golden vector: AG table block (DESIGN §10.4)
+len 4096
+0000: 4b 56 41 47 54 42 4c 31 16 0e 78 98 01 00 00 00 07 00 00 00 00 00 00 00 00 00 00 00 46 00 00 00
+0020: 01 00 02 00 01 3f 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff
+0040: 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff
+0060: 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff
+0080: 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff
+00a0: 00 ff 00 ff 00 ff 00 ff 00 ff 02 11 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

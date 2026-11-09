@@ -1,0 +1,25 @@
+[package]
+name = "kv-index"
+description = "kvssd RAM index: per-slot extendible-hash tables of ordered linear-probing segments (DESIGN §9, §24.6)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kv-common.workspace = true
+smallvec.workspace = true
+# anonymous mappings for large segment arrays (sysbuf.rs, DESIGN §9.3)
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+hashbrown.workspace = true
+criterion.workspace = true
+
+# probe/insert micro-benchmark (criterion provides its own harness)
+[[bench]]
+name = "index"
+harness = false

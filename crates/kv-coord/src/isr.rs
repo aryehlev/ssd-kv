@@ -1,0 +1,186 @@
+//! ISR changes (DESIGN §23.8).
+//!
+//! `IsrShrink { shard, term, member }` from the shard's primary is committed even when the ISR
+//! falls below `min_isr`; the primary stops waiting for that member only after the committed
+//! assignment arrives. A shrink is accepted only from a primary that holds its lease in the
+//! leader's table and is not suspected ([`shrink_accepted`]): a primary that missed its
+//! renewals (stopped, cut off, or being failed over) cannot acknowledge writes, so dropping a
+//! member never helps it, and its view of who lags is the stale one; committing it could leave
+//! the failover with no promotable member. `IsrExpand` is sent by the primary once it counts a caught-up member's
+//! acks; after the commit the member is promotable and advertised. Requests of a stale term are
+//! ignored. Membership itself never changes here (LC-25).
+//!
+//! `MemberReady` closes a member's catch-up: a repaired ISR member (Reconciling) becomes InSync
+//! and is advertised again; a member that finished an operator-started full sync (Syncing)
+//! becomes CatchingUp until its primary's `IsrExpand`.
+//!
+//! `MemberNeedsResync` from the primary records that a member cannot catch up by Continue or
+//! Repair (§23.7 case 4): its state becomes NeedsFullSync (it leaves the ISR through this
+//! committed change, so the primary stops waiting for it only once the assignment arrives),
+//! shown by `kvadm status`; only `kvadm replica resync` starts its full sync (LC-25).
+
+use kv_ctrl::{MemberState, NodeId, ShardId};
+use kv_topo::{ClusterState, Transition};
+
+/// The transition for an ISR request, or `None` when it is stale or already applied.
+pub fn isr_transition(s: &ClusterState, shard: ShardId, term: u32, member: NodeId, add: bool) -> Option<Transition> {
+    let sh = s.shard(shard)?;
+    if sh.term != term || sh.primary == Some(member) {
+        return None;
+    }
+    let m = sh.member(&member)?;
+    if add {
+        if m.state == MemberState::NeedsFullSync || (m.in_isr && m.state == MemberState::InSync) {
+            return None;
+        }
+    } else if !m.in_isr {
+        return None;
+    }
+    Some(Transition::Isr {
+        shard,
+        term,
+        node: member,
+        add,
+    })
+}
+
+/// A shrink request of the shard's primary is acted on only while the leader holds the
+/// primary's lease and does not suspect it (it is re-sent while the member still lags, so a
+/// refused one is retried once the primary renews again).
+pub fn shrink_accepted(lease_held: bool, suspected: bool) -> bool {
+    lease_held && !suspected
+}
+
+/// An ISR request is accepted only from the shard's current primary.
+pub fn from_primary(s: &ClusterState, shard: ShardId, from: &NodeId) -> bool {
+    s.shard(shard).is_some_and(|sh| sh.primary == Some(*from))
+}
+
+/// The transition for `MemberReady { shard, term, member }` sent by `from` (the member itself
+/// or its primary), or `None` when stale or nothing changes.
+pub fn member_ready_transition(
+    s: &ClusterState,
+    from: &NodeId,
+    shard: ShardId,
+    term: u32,
+    member: NodeId,
+) -> Option<Transition> {
+    let sh = s.shard(shard)?;
+    if sh.term != term || (*from != member && sh.primary != Some(*from)) || sh.primary == Some(member) {
+        return None;
+    }
+    let m = sh.member(&member)?;
+    let state = match m.state {
+        MemberState::Reconciling if m.in_isr => MemberState::InSync,
+        MemberState::Syncing => MemberState::CatchingUp,
+        _ => return None,
+    };
+    // `Syncing -> CatchingUp` ends a full sync the operator started; nothing here starts one.
+    Some(Transition::MemberState {
+        shard,
+        node: member,
+        state,
+    })
+}
+
+/// The transition for `MemberNeedsResync { shard, term, member }` sent by `from` (only the
+/// shard's primary of `term` decides that), or `None` when stale or already recorded.
+pub fn needs_resync_transition(
+    s: &ClusterState,
+    from: &NodeId,
+    shard: ShardId,
+    term: u32,
+    member: NodeId,
+) -> Option<Transition> {
+    let sh = s.shard(shard)?;
+    if sh.term != term || sh.primary != Some(*from) || sh.primary == Some(member) {
+        return None;
+    }
+    let m = sh.member(&member)?;
+    if matches!(m.state, MemberState::NeedsFullSync | MemberState::Syncing) {
+        // already recorded, or the operator's full sync runs (its handshake is a Full)
+        return None;
+    }
+    Some(Transition::MemberState {
+        shard,
+        node: member,
+        state: MemberState::NeedsFullSync,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use kv_topo::{AdminOp, ClusterParams};
+
+    use super::*;
+
+    fn nid(i: u8) -> NodeId {
+        NodeId([i; 20])
+    }
+
+    fn state() -> ClusterState {
+        let s = ClusterState::initial(ClusterParams::default(), [1; 16]);
+        let mut b = Vec::new();
+        for i in 1..=3u8 {
+            let base = 9000 + u16::from(i) * 10;
+            b.push(crate::failover::test_support::node_add(nid(i), base, s.params.partitions));
+        }
+        b.push(Transition::Admin(AdminOp::ShardCreate {
+            id: ShardId(1),
+            primary: nid(1),
+            min_isr: 1,
+        }));
+        b.push(Transition::Admin(AdminOp::ReplicaAdd {
+            shard: ShardId(1),
+            node: nid(2),
+        }));
+        s.apply(&b).unwrap()
+    }
+
+    #[test]
+    fn sync_ready_expand_shrink() {
+        let s = state();
+        let sh = ShardId(1);
+        assert!(isr_transition(&s, sh, 1, nid(2), false).is_none(), "not in the ISR yet");
+        assert!(isr_transition(&s, sh, 1, nid(1), true).is_none(), "the primary");
+        assert!(isr_transition(&s, sh, 2, nid(2), true).is_none(), "wrong term");
+        assert!(isr_transition(&s, sh, 1, nid(3), true).is_none(), "not a member");
+        let t = member_ready_transition(&s, &nid(2), sh, 1, nid(2)).unwrap();
+        let s = s.apply(&[t]).unwrap();
+        assert_eq!(s.shard(sh).unwrap().member(&nid(2)).unwrap().state, MemberState::CatchingUp);
+        assert!(member_ready_transition(&s, &nid(3), sh, 1, nid(2)).is_none(), "a stranger");
+        assert!(from_primary(&s, sh, &nid(1)) && !from_primary(&s, sh, &nid(2)));
+        let t = isr_transition(&s, sh, 1, nid(2), true).unwrap();
+        let s = s.apply(&[t]).unwrap();
+        let m = s.shard(sh).unwrap().member(&nid(2)).unwrap();
+        assert!(m.in_isr && m.state == MemberState::InSync);
+        assert!(isr_transition(&s, sh, 1, nid(2), true).is_none(), "already applied");
+        let t = isr_transition(&s, sh, 1, nid(2), false).unwrap();
+        let s = s.apply(&[t]).unwrap();
+        assert!(!s.shard(sh).unwrap().member(&nid(2)).unwrap().in_isr);
+        // membership is unchanged by ISR changes
+        assert_eq!(s.shard(sh).unwrap().members.len(), 2);
+        assert_eq!(s.nodes.len(), 3);
+    }
+
+    /// The primary records a member it refused with NeedOperatorResync: the member leaves the
+    /// ISR as NeedsFullSync (the precondition of `replica resync`); nothing else starts a sync.
+    #[test]
+    fn needs_resync_is_recorded_from_the_primary_only() {
+        let s = state();
+        let sh = ShardId(1);
+        let t = isr_transition(&s, sh, 1, nid(2), true).unwrap();
+        let s = s.apply(&[t]).unwrap();
+        assert!(needs_resync_transition(&s, &nid(2), sh, 1, nid(2)).is_none(), "not the primary");
+        assert!(needs_resync_transition(&s, &nid(1), sh, 2, nid(2)).is_none(), "wrong term");
+        assert!(needs_resync_transition(&s, &nid(1), sh, 1, nid(1)).is_none(), "the primary itself");
+        let t = needs_resync_transition(&s, &nid(1), sh, 1, nid(2)).unwrap();
+        let s = s.apply(&[t]).unwrap();
+        let m = s.shard(sh).unwrap().member(&nid(2)).unwrap();
+        assert_eq!(m.state, MemberState::NeedsFullSync);
+        assert!(!m.in_isr);
+        assert!(needs_resync_transition(&s, &nid(1), sh, 1, nid(2)).is_none(), "recorded once");
+        assert!(s.resync_allowed(&nid(2), false).is_ok(), "replica resync is accepted now");
+        assert!(isr_transition(&s, sh, 1, nid(2), true).is_none(), "never expanded by itself");
+    }
+}

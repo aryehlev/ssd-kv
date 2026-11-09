@@ -985,3 +985,91 @@ fn queued_reads_of_a_large_value_read_it_once() {
     assert!(reads <= 2 * one + 16, "81 queued requests read {reads} pages: the value was read again per request");
     db.quiesce();
 }
+
+/// GETs of a value read from extents give the read buffers themselves (`Keyspace::get_shared`):
+/// every queued GET of one version shares the one buffer the read filled (no copy per GET; the
+/// copies were what kept a SET of a 24 MB key waiting 3.5 s behind 64 queued GETs of it), a
+/// buffer still held by a reply is not handed to a later read (the held bytes stay those of the
+/// version it was read for), and a chunked value comes as its chunks in order.
+#[test]
+fn queued_gets_of_a_large_value_share_its_read_buffer() {
+    use kv_common::Access;
+    use kv_index::VType;
+    use kv_storage::keyspace::SharedValue;
+    use kv_storage::partition::ExecStatus;
+    let mut db = fresh(64 * 4096, 37);
+    for (k, n1, n2) in [(&b"one"[..], 1 << 20, (1 << 20) + 77), (&b"chunked"[..], 20 << 20, (20 << 20) + 4099)] {
+        let (v1, v2) = (value(1, n1), value(2, n2));
+        let t = db.set(0, k, &v1, None).unwrap();
+        assert_eq!(db.wait(k, t, TicketState::Durable), TicketState::Durable);
+        db.quiesce();
+        let p = db.eng.partition_of(k);
+        // 10 reads, a write, 10 more reads, all queued at once
+        let mut ids = Vec::new();
+        for i in 0..21 {
+            let access = if i == 10 { Access::Write } else { Access::Read };
+            ids.push((i, db.eng.submit(p, keyed(0, &[k], access))));
+        }
+        let mut got: Vec<Option<Vec<SharedValue>>> = vec![None; 21];
+        let mut left = ids.len();
+        let mut ready = Vec::new();
+        for _ in 0..100_000 {
+            ready.clear();
+            db.eng.ready(&mut ready);
+            for &(rp, rid) in &ready {
+                let Some(&(i, _)) = ids.iter().find(|x| x.1 == rid && rp == p) else { continue };
+                let st = if i == 10 {
+                    db.eng.exec(p, rid, &mut |ks| {
+                        ks.select(0);
+                        ks.put(k, &v2, VType::String, None)?;
+                        Ok(Vec::new())
+                    })
+                } else {
+                    db.eng.exec(p, rid, &mut |ks| {
+                        ks.select(0);
+                        let (m, _, parts) = ks.get_shared(k)?.expect("present");
+                        assert_eq!(m.len, parts.iter().map(|p| p.len() as u64).sum::<u64>(), "the parts are the whole value");
+                        Ok(parts.into_vec())
+                    })
+                };
+                match st {
+                    ExecStatus::Done(v, _) => {
+                        got[i] = Some(v);
+                        left -= 1;
+                    }
+                    ExecStatus::Failed(e) => panic!("request {i}: {e:?}"),
+                    ExecStatus::Requeued => {}
+                }
+            }
+            if left == 0 {
+                break;
+            }
+            db.eng.pump();
+        }
+        assert_eq!(left, 0, "every request completed");
+        // more reads and writes of the key while the first replies are still held
+        let t = db.set(0, k, &value(3, n1 + 5), None).unwrap();
+        assert_eq!(db.wait(k, t, TicketState::Durable), TicketState::Durable);
+        assert!(db.get(0, k).unwrap().map(|(_, v)| v) == Some(value(3, n1 + 5)), "the newest version");
+        for (i, g) in got.iter().enumerate() {
+            if i == 10 {
+                continue;
+            }
+            let parts = g.as_ref().expect("read");
+            if n1 > 8 << 20 {
+                assert!(parts.len() > 1, "a chunked value comes as its chunks");
+            }
+            let want = if i < 10 { &v1 } else { &v2 };
+            let bytes: Vec<u8> = parts.iter().flat_map(|p| p.as_bytes().iter().copied()).collect();
+            assert!(&bytes == want, "{}: read {i} holds the wrong bytes", String::from_utf8_lossy(k));
+            let first = if i < 10 { 0 } else { 11 };
+            let base = got[first].as_ref().expect("read");
+            assert!(
+                parts.iter().zip(base).all(|(a, b)| a.as_bytes().as_ptr() == b.as_bytes().as_ptr()),
+                "{}: read {i} did not share the buffer of the first read of its version",
+                String::from_utf8_lossy(k)
+            );
+        }
+        db.quiesce();
+    }
+}

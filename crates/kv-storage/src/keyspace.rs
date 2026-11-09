@@ -17,6 +17,8 @@
 
 use kv_common::{KeyHash, key_slot};
 use kv_index::{Kind, VType};
+use std::sync::Arc;
+
 use smallvec::SmallVec;
 
 use crate::cache::{FrameIdx, PageCache};
@@ -208,14 +210,16 @@ pub(crate) struct ChunkFetch {
     pub(crate) page: PageId,
     pub(crate) n_pages: u32,
     pub(crate) crc: u32,
-    pub(crate) buf: Option<AlignedBuf>,
+    /// Shared with the replies that carry the chunk's bytes ([`Keyspace::get_shared`]).
+    pub(crate) buf: Option<Arc<AlignedBuf>>,
 }
 
 /// An extent read for one request (prefetch or `NeedMore`).
 pub(crate) struct ExtFetch {
     pub(crate) start: PageId,
     pub(crate) pages: u32,
-    pub(crate) buf: Option<AlignedBuf>,
+    /// Shared with the replies that carry the value's bytes ([`Keyspace::get_shared`]).
+    pub(crate) buf: Option<Arc<AlignedBuf>>,
     pub(crate) err: Option<i32>,
     /// Chunkmap reads: the chunks, read one at a time in order.
     pub(crate) chunks: Option<SmallVec<[ChunkFetch; 4]>>,
@@ -235,6 +239,47 @@ impl ExtFetch {
         self.err.is_some()
             || (self.buf.is_some()
                 && (!self.want_chunks || self.chunks.as_ref().is_some_and(|c| c.iter().all(|c| c.buf.is_some()))))
+    }
+}
+
+/// Bytes of a value in an extent read buffer, shared with the reply that carries them
+/// ([`Keyspace::get_shared`]): a GET of a large value sends the buffer it was read into instead
+/// of a copy, and every queued GET of the same version shares that one buffer (the read is handed
+/// down the key's queue). The buffer is freed when the last holder drops it.
+#[derive(Clone)]
+pub struct SharedValue {
+    buf: Arc<AlignedBuf>,
+    off: usize,
+    len: usize,
+}
+
+impl SharedValue {
+    /// `part` must lie inside `buf`.
+    fn of(buf: &Arc<AlignedBuf>, part: &[u8]) -> Self {
+        let off = part.as_ptr() as usize - buf.as_slice().as_ptr() as usize;
+        debug_assert!(off + part.len() <= buf.as_slice().len());
+        SharedValue { buf: Arc::clone(buf), off, len: part.len() }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf.as_slice()[self.off..self.off + self.len]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl AsRef<[u8]> for SharedValue {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
@@ -656,6 +701,50 @@ impl<'p> Keyspace<'p> {
         let (_, hit) = self.find(db, key, true)?;
         self.count_lookup(hit.is_some());
         Ok(hit.map(|h| (KeyMeta { vtype: h.vtype, expire_at_ms: h.expire_at, len: h.len }, self.value_of(&h))))
+    }
+
+    /// [`Keyspace::get`] that also gives the value's bytes as shared extent read buffers when it
+    /// was read from extents (empty otherwise: the value is in a page or staged). The parts are in
+    /// value order and together are the whole value.
+    pub fn get_shared(&mut self, key: &[u8]) -> Result<Option<(KeyMeta, Value<'_>, SmallVec<[SharedValue; 4]>)>, StoreError> {
+        let db = self.db;
+        let (_, hit) = self.find(db, key, true)?;
+        self.count_lookup(hit.is_some());
+        Ok(hit.map(|h| {
+            let shared = self.shared_of(&h);
+            (KeyMeta { vtype: h.vtype, expire_at_ms: h.expire_at, len: h.len }, self.value_of(&h), shared)
+        }))
+    }
+
+    fn shared_of(&self, h: &Hit) -> SmallVec<[SharedValue; 4]> {
+        let mut out: SmallVec<[SharedValue; 4]> = SmallVec::new();
+        match h.src {
+            Src::Fetched(fi) => {
+                if let Some(b) = &self.fetched[fi].buf
+                    && let Some(eh) = extent::parse_extent_header(b, self.fetched[fi].start)
+                    && let Some((_, v)) = extent::value_parts(b, &eh)
+                {
+                    out.push(SharedValue::of(b, v));
+                }
+            }
+            Src::Chunks(fi) => {
+                for c in self.fetched[fi].chunks.iter().flatten() {
+                    match &c.buf {
+                        Some(b) => match extent::parse_extent_header(b, c.page).and_then(|ch| extent::chunk_payload(b, &ch)) {
+                            Some(p) => out.push(SharedValue::of(b, p)),
+                            None => return SmallVec::new(),
+                        },
+                        None => return SmallVec::new(),
+                    }
+                }
+            }
+            _ => {}
+        }
+        if out.iter().map(|p| p.len() as u64).sum::<u64>() != h.len {
+            // not the whole value: the caller copies it from `value_of`
+            out.clear();
+        }
+        out
     }
 
     fn stage(&mut self, db: u8, key: &[u8], cur: Cur, old: Option<&Hit>, change: Change, op: Option<Op>) {

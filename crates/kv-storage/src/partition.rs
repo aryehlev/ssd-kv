@@ -873,11 +873,12 @@ impl Core {
     /// Gives back the read buffers of a request's extent fetches.
     pub(crate) fn recycle_fetched(&mut self, fetched: &mut SmallVec<[ExtFetch; 1]>) {
         for f in fetched.drain(..) {
-            if let Some(b) = f.buf {
+            // a buffer still shared with a reply is freed when the reply is sent
+            if let Some(b) = f.buf.and_then(|b| Arc::into_inner(b)) {
                 self.give_ext_buf(b);
             }
             for c in f.chunks.into_iter().flatten() {
-                if let Some(b) = c.buf {
+                if let Some(b) = c.buf.and_then(|b| Arc::into_inner(b)) {
                     self.give_ext_buf(b);
                 }
             }
@@ -4080,7 +4081,7 @@ impl PartitionStore {
         match chunk {
             None => {
                 match d.res {
-                    Ok(_) => fe.buf = d.buf,
+                    Ok(_) => fe.buf = d.buf.map(Arc::new),
                     Err(e) => fe.err = Some(e),
                 }
                 if fe.err.is_none() && fe.want_chunks {
@@ -4103,7 +4104,7 @@ impl PartitionStore {
             Some(ci) => {
                 let cs = fe.chunks.as_mut().expect("chunk read of a chunkmap");
                 match d.res {
-                    Ok(_) => cs[ci].buf = d.buf,
+                    Ok(_) => cs[ci].buf = d.buf.map(Arc::new),
                     Err(e) => fe.err = Some(e),
                 }
                 if fe.err.is_none() && ci + 1 < cs.len() {

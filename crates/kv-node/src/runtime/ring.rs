@@ -39,6 +39,8 @@ const MAX_IOV: usize = 1024;
 pub enum OutSeg {
     Bytes(Vec<u8>, usize),
     Shared(SharedBuf, usize),
+    /// Part of a value in an extent read buffer (`ReplyBody::Ext`).
+    Ext(kv_storage::keyspace::SharedValue, usize),
 }
 
 impl OutSeg {
@@ -48,13 +50,14 @@ impl OutSeg {
         match self {
             OutSeg::Bytes(v, s) => &v[*s..],
             OutSeg::Shared(b, s) => &b.as_bytes()[*s..],
+            OutSeg::Ext(b, s) => &b.as_bytes()[*s..],
         }
     }
 
     #[inline]
     fn advance(&mut self, n: usize) {
         match self {
-            OutSeg::Bytes(_, s) | OutSeg::Shared(_, s) => *s += n,
+            OutSeg::Bytes(_, s) | OutSeg::Shared(_, s) | OutSeg::Ext(_, s) => *s += n,
         }
     }
 }

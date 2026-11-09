@@ -22,7 +22,7 @@ use kv_storage::cache::PageCache;
 use kv_storage::effect::Op;
 use kv_storage::flush::FlushTracker;
 use kv_storage::io::{IoDone, IoReq};
-use kv_storage::keyspace::{ApplyMode, ApplyOutcome, StoreError};
+use kv_storage::keyspace::{ApplyMode, ApplyOutcome, SharedValue, StoreError};
 use kv_storage::layout::Seq;
 use smallvec::SmallVec;
 use kv_storage::metastore::{MetaClient, MetaDone, MetaReq};
@@ -436,6 +436,12 @@ pub trait Backend {
     fn set_imaging(&mut self, _on: bool) {}
     /// The key images the last `exec` read (empty unless imaging was on).
     fn take_images(&mut self, _out: &mut Vec<(u8, Box<[u8]>, KeyImage)>) {}
+    /// The shared value parts of the last `exec`'s reply: when not empty, the reply bytes are a
+    /// bulk header and the value follows in these parts (`ReplyBody::Ext`, GET of a value read
+    /// from extents, sent without a copy).
+    fn take_shared(&mut self) -> SmallVec<[SharedValue; 4]> {
+        SmallVec::new()
+    }
 }
 
 /// Storage resources of one worker for the page store.
@@ -464,6 +470,8 @@ pub struct PageBackend {
     imaging: bool,
     /// The key images of the last `exec`.
     images: Vec<(u8, Box<[u8]>, KeyImage)>,
+    /// The shared value parts of the last `exec`'s reply (`Backend::take_shared`).
+    shared: SmallVec<[SharedValue; 4]>,
 }
 
 impl PageBackend {
@@ -501,6 +509,7 @@ impl PageBackend {
             touched: vec![true; usize::from(partitions)],
             imaging: false,
             images: Vec::new(),
+            shared: SmallVec::new(),
         }
     }
 
@@ -556,11 +565,31 @@ impl Backend for PageBackend {
         let imaging = self.imaging;
         let mut images = std::mem::take(&mut self.images);
         images.clear();
+        let mut shared = std::mem::take(&mut self.shared);
+        shared.clear();
         let (part, mut cx) = self.split(p, now);
         let status = part.exec(&mut cx, id, &mut |ks| {
             reply.truncate(base);
             images.clear();
+            shared.clear();
             match work {
+                Work::Cmd(c) if c.id == CmdId::Get && c.argc() == 2 && base == 0 => {
+                    // GET: a value read from extents is sent from its read buffers
+                    let mut w = ReplyWriter::new(reply, env.proto);
+                    match ks.get_shared(c.arg(1))? {
+                        None => w.null(),
+                        Some((m, _, _)) if m.vtype != VType::String => w.error(crate::cmd::err::WRONGTYPE),
+                        Some((m, v, parts)) => {
+                            if parts.is_empty() {
+                                crate::cmd::write_value(&mut w, &v);
+                            } else {
+                                w.bulk_len(m.len as usize);
+                                shared.extend(parts);
+                            }
+                        }
+                    }
+                    Ok(WorkOut::None)
+                }
                 Work::Repl(w) => {
                     let out = run_repl(ks, w)?;
                     if imaging && let ReplWork::Own { ops } = w {
@@ -584,8 +613,10 @@ impl Backend for PageBackend {
         if !matches!(status, ExecStatus::Done(..)) {
             reply.truncate(base);
             images.clear();
+            shared.clear();
         }
         self.images = images;
+        self.shared = shared;
         status
     }
 
@@ -595,6 +626,10 @@ impl Backend for PageBackend {
 
     fn take_images(&mut self, out: &mut Vec<(u8, Box<[u8]>, KeyImage)>) {
         out.append(&mut self.images);
+    }
+
+    fn take_shared(&mut self) -> SmallVec<[SharedValue; 4]> {
+        std::mem::take(&mut self.shared)
     }
 
     fn scan(&mut self, p: u16, now: Now, id: ReqId, matcher: &dyn Fn(&[u8]) -> bool, out: &mut Vec<Box<[u8]>>) -> ExecStatus<u64> {

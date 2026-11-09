@@ -15,6 +15,7 @@
 use std::sync::atomic::{Ordering, fence};
 
 use kv_common::shared_buf::SharedBuf;
+use kv_storage::keyspace::SharedValue;
 use kv_storage::keyspace::StoreError;
 use kv_storage::metastore::MetaDone;
 use smallvec::SmallVec;
@@ -142,6 +143,10 @@ pub enum ReplyBody {
     /// header bytes, then the shared body: a bulk string whose `$<len>\r\n` header (and any
     /// bytes before it) is in the first field; the terminating CRLF after the body is implied.
     Shared(Vec<u8>, SharedBuf),
+    /// header bytes, then a bulk value held in extent read buffers (GET of a value stored in
+    /// extents, `kv_storage::keyspace::Keyspace::get_shared`): sent from those buffers, never
+    /// copied; the terminating CRLF after the parts is implied.
+    Ext(Vec<u8>, SmallVec<[SharedValue; 4]>),
 }
 
 impl ReplyBody {
@@ -150,6 +155,7 @@ impl ReplyBody {
         match self {
             ReplyBody::Bytes(b) => b.len(),
             ReplyBody::Shared(h, b) => h.len() + b.len() + 2,
+            ReplyBody::Ext(h, parts) => h.len() + parts.iter().map(SharedValue::len).sum::<usize>() + 2,
         }
     }
 
@@ -164,6 +170,15 @@ impl ReplyBody {
             ReplyBody::Shared(h, b) => {
                 let mut v = h.clone();
                 v.extend_from_slice(b.as_bytes());
+                v.extend_from_slice(b"\r\n");
+                v
+            }
+            ReplyBody::Ext(h, parts) => {
+                let mut v = Vec::with_capacity(self.len());
+                v.extend_from_slice(h);
+                for p in parts {
+                    v.extend_from_slice(p.as_bytes());
+                }
                 v.extend_from_slice(b"\r\n");
                 v
             }

@@ -1703,8 +1703,13 @@ impl<B: Backend> Worker<B> {
         match job.kind {
             JobKind::Cmd(_) | JobKind::Multi(_) => {
                 self.record(job.id, job.start_ns, reply.first() == Some(&b'-'));
+                let shared = self.backend.take_shared();
                 let Some(to) = job.to else { return };
-                let body = ReplyBody::Bytes(std::mem::take(reply));
+                let body = if shared.is_empty() {
+                    ReplyBody::Bytes(std::mem::take(reply))
+                } else {
+                    ReplyBody::Ext(std::mem::take(reply), shared)
+                };
                 match (ticket_need(mode, job.id, ticket.is_some()), ticket) {
                     (Some(need), Some(t)) => self.wait(p, t.0, Waiter { what: WaitFor::Reply { to, body, commit }, need }),
                     _ => match commit {

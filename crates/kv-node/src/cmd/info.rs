@@ -422,6 +422,8 @@ fn render(shared: &NodeShared, sel: Selection) -> String {
                     "large_value_backpressured_conns",
                     workers.large_value_backpressured_conns
                 );
+                f!("client_reply_bytes_held", crate::net::conn::node_reply_bytes());
+                f!("client_output_limit_disconnections", crate::net::conn::evicted());
                 f!(
                     "flush_reclaim_pending_pages",
                     parts.flush_reclaim_pending_pages

@@ -365,6 +365,8 @@ impl<B: Backend> Worker<B> {
         conn.sent(n, segs);
         self.counters.total_net_output_bytes += n as u64;
         let was_held = conn.hold == Some(Hold::Output);
+        // a window held on the node's reply bytes opens when the connection's own output drains
+        let window_held = conn.hold == Some(Hold::Pending);
         let more = conn.has_output();
         if was_held {
             conn.hold = None;
@@ -374,6 +376,9 @@ impl<B: Backend> Worker<B> {
         }
         if was_held {
             self.queue_parse(slot);
+        }
+        if window_held {
+            self.reconsider(slot);
         }
         self.maybe_close(slot);
     }
@@ -447,7 +452,15 @@ impl<B: Backend> Worker<B> {
     /// Closes `slot` once a close was requested, its output is flushed (or it was killed) and no
     /// ring operation references its buffers.
     pub(super) fn maybe_close(&mut self, slot: u32) {
+        let max_out = self.cfg.output_limit();
         let Some(c) = self.conns[slot as usize].as_mut() else { return };
+        if c.flags & flags::KILLED == 0 && c.over_hard_limit(max_out) {
+            // its unsent replies are past the hard limit (`Conn::over_hard_limit`): closed, which
+            // frees them; its commands in flight still complete, their replies are dropped
+            tracing::warn!(worker = self.id, conn = c.id, held = c.held, "closing a client whose unsent replies passed the output limit");
+            crate::net::conn::note_evicted();
+            c.flags |= flags::KILLED;
+        }
         let killed = c.flags & flags::KILLED != 0;
         let quitting = c.flags & flags::CLOSE_AFTER_REPLY != 0;
         if !killed && !(quitting && !c.has_output() && c.pending() == 0) {

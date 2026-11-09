@@ -17,6 +17,7 @@
 //! as iovecs, never copied.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::net::SocketAddr;
 
 use kv_cmd::CmdId;
@@ -29,7 +30,39 @@ use crate::runtime::xmsg::{OwnedCmd, ReplyBody};
 /// Initial (and idle) size of `read_buf`.
 pub const READ_BUF_INITIAL: usize = 16 * 1024;
 /// Unreplied commands a connection may have before its first reply ([`Conn::reply_window`]).
-pub const INITIAL_WINDOW: u64 = 16;
+pub const INITIAL_WINDOW: u64 = 4;
+/// What a command of a connection that has had no reply yet is expected to reply, for the
+/// node's in-flight estimate ([`node_reply_bytes`]).
+const FIRST_REPLY_EST: u64 = 64 * 1024;
+/// Reply bytes held by all connections of the node (produced, not sent yet) above which a
+/// connection reads its next command only once it has no reply unproduced or unsent
+/// ([`Conn::reply_window`]), and above half of which a new connection starts with a window of
+/// one. A connection whose replies were all sent always reads its next command, so every
+/// connection that reads its replies makes progress.
+pub const NODE_REPLY_BUDGET: u64 = 1 << 30;
+
+/// Reply bytes held by every connection of the process (`Conn::held`), plus the estimated
+/// replies of their commands in flight (`Conn::inflight_est`).
+static NODE_HELD: AtomicU64 = AtomicU64::new(0);
+/// Connections closed for holding more than [`Conn::over_hard_limit`] allows.
+static EVICTED: AtomicU64 = AtomicU64::new(0);
+
+/// Reply bytes held by the node's connections and expected for their commands in flight (INFO
+/// `client_reply_bytes_held`).
+pub fn node_reply_bytes() -> u64 {
+    NODE_HELD.load(AtomicOrdering::Relaxed)
+}
+
+/// Connections closed because their unsent replies passed the hard limit (INFO
+/// `client_output_limit_disconnections`).
+pub fn evicted() -> u64 {
+    EVICTED.load(AtomicOrdering::Relaxed)
+}
+
+/// Counts a connection closed by [`Conn::over_hard_limit`].
+pub fn note_evicted() {
+    EVICTED.fetch_add(1, AtomicOrdering::Relaxed);
+}
 /// Replies at least this long are queued as their own output segment (no copy into `out`).
 const SEG_MIN: usize = 64 * 1024;
 /// An idle `read_buf` larger than this shrinks back to [`READ_BUF_INITIAL`].
@@ -162,6 +195,21 @@ pub struct Conn {
     /// Running estimate of this connection's reply size in bytes (1/8 weight to each new
     /// reply), for [`Conn::reply_window`]; `0` until the first reply.
     pub(crate) reply_est: u64,
+    /// Reply bytes this connection holds: produced (ready in the reorder buffer, gathered
+    /// parts, queued output) and not sent yet; counted in [`node_reply_bytes`].
+    pub(crate) held: u64,
+    /// Estimated reply bytes of the commands in flight (`unproduced` of them), counted in
+    /// [`node_reply_bytes`] until their replies arrive.
+    pub(crate) inflight_est: u64,
+    pub(crate) unproduced: u64,
+    /// The largest reply this connection was sent (for [`Conn::over_hard_limit`]).
+    pub(crate) reply_max: u64,
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        NODE_HELD.fetch_sub(self.held + self.inflight_est, AtomicOrdering::Relaxed);
+    }
 }
 
 impl Conn {
@@ -206,7 +254,42 @@ impl Conn {
             queued_for_parse: false,
             queued_for_send: false,
             reply_est: 0,
+            held: 0,
+            inflight_est: 0,
+            unproduced: 0,
+            reply_max: 0,
         }
+    }
+
+    /// One command's reply was produced: its share of the in-flight estimate is dropped.
+    fn produced(&mut self) {
+        if self.unproduced == 0 {
+            return;
+        }
+        let d = if self.unproduced == 1 { self.inflight_est } else { self.inflight_est / self.unproduced };
+        self.unproduced -= 1;
+        self.inflight_est -= d;
+        NODE_HELD.fetch_sub(d, AtomicOrdering::Relaxed);
+    }
+
+    /// Whether the connection's unsent replies are past the hard limit: more than four times
+    /// the output limit beyond its largest reply. Its reply window keeps a connection that
+    /// reads its replies well below that; a client that pipelines commands whose replies grow
+    /// (small GETs, then thousands of GETs of large values) and does not read them is closed,
+    /// as Redis closes a client past its hard `client-output-buffer-limit`.
+    pub fn over_hard_limit(&self, output_limit: u64) -> bool {
+        self.held > output_limit.saturating_mul(4).saturating_add(self.reply_max)
+    }
+
+    fn hold_add(&mut self, n: usize) {
+        self.held += n as u64;
+        NODE_HELD.fetch_add(n as u64, AtomicOrdering::Relaxed);
+    }
+
+    fn hold_sub(&mut self, n: u64) {
+        let n = n.min(self.held);
+        self.held -= n;
+        NODE_HELD.fetch_sub(n, AtomicOrdering::Relaxed);
     }
 
     /// Unreplied commands (§6.7 `max-pending-per-conn`).
@@ -228,14 +311,32 @@ impl Conn {
     /// the replies made the server hold 16 GiB of replies and abort on a failed allocation.
     /// The window is `output_limit` over the connection's estimated reply size, between 1 and
     /// `max_pending`; before the first reply it is [`INITIAL_WINDOW`].
+    ///
+    /// The estimate lags a change of reply size (a connection that saw small replies may have
+    /// thousands of GETs of large values in flight), so the node also bounds what connections
+    /// hold together: above [`NODE_REPLY_BUDGET`] held reply bytes the window is one, and zero
+    /// while the connection holds unsent replies (it reads its next command once its earlier
+    /// replies are produced and sent); above half of it a new connection's window is one. 150
+    /// connections pipelining 20 GETs each of distinct 2 MB values made the server hold 4.8 GB.
     pub fn reply_window(&self, output_limit: u64, max_pending: usize) -> usize {
-        let est = if self.reply_est == 0 { output_limit / INITIAL_WINDOW } else { self.reply_est };
+        let node = node_reply_bytes();
+        if node >= NODE_REPLY_BUDGET {
+            // one command at a time, and only once everything before it was sent: a client that
+            // does not read keeps at most one reply
+            return usize::from(self.held == 0);
+        }
+        let initial = if node >= NODE_REPLY_BUDGET / 2 { 1 } else { INITIAL_WINDOW };
+        let est = if self.reply_est == 0 { output_limit / initial } else { self.reply_est };
         let w = output_limit / est.max(1);
         (w.min(max_pending as u64) as usize).max(1)
     }
 
+    /// A reply of `n` bytes went to the output: the estimate follows with 1/8 weight down and at
+    /// once up to half of a larger reply (a connection whose replies grow gets a small window
+    /// after its first large reply).
     fn note_reply(&mut self, n: u64) {
-        self.reply_est = if self.reply_est == 0 { n.max(1) } else { (self.reply_est - self.reply_est / 8 + n / 8).max(1) };
+        self.reply_max = self.reply_max.max(n);
+        self.reply_est = if self.reply_est == 0 { n.max(1) } else { (self.reply_est - self.reply_est / 8 + n / 8).max(n / 2).max(1) };
     }
 
     /// Unparsed input bytes (CLIENT LIST `qbuf=`).
@@ -276,6 +377,10 @@ impl Conn {
             self.base_seq = seq;
         }
         self.slots.push_back(Slot::Pending);
+        let e = if self.reply_est == 0 { FIRST_REPLY_EST } else { self.reply_est };
+        self.unproduced += 1;
+        self.inflight_est += e;
+        NODE_HELD.fetch_add(e, AtomicOrdering::Relaxed);
         seq
     }
 
@@ -284,6 +389,7 @@ impl Conn {
     pub fn reply_now(&mut self, body: ReplyBody) {
         let seq = self.next_req_seq;
         self.next_req_seq += 1;
+        self.hold_add(body.len());
         if self.slots.is_empty() {
             self.base_seq = seq + 1;
             self.push_output(body);
@@ -304,15 +410,19 @@ impl Conn {
         self.base_seq = self.next_req_seq;
         self.out_queued += n as u64;
         self.note_reply(n as u64);
+        self.hold_add(n);
     }
 
     /// Delivers the reply of `req_seq`; returns whether output became ready.
     pub fn deliver(&mut self, req_seq: u64, body: ReplyBody) -> bool {
         let Some(i) = req_seq.checked_sub(self.base_seq) else { return false };
+        let n = body.len();
         match self.slots.get_mut(i as usize) {
             Some(s @ Slot::Pending) => *s = Slot::Ready(body),
             _ => return false,
         }
+        self.produced();
+        self.hold_add(n);
         self.release()
     }
 
@@ -335,13 +445,20 @@ impl Conn {
         if p.is_some() {
             return false;
         }
+        let n = body.len();
         *p = Some(body);
         g.remaining -= 1;
         if g.remaining > 0 {
+            self.hold_add(n);
             return false;
         }
         let merged = merge(g);
+        let parts: usize = g.parts.iter().flatten().map(ReplyBody::len).sum::<usize>() - n;
+        let m = merged.len();
         *slot = Slot::Ready(ReplyBody::Bytes(merged));
+        self.hold_sub(parts as u64);
+        self.hold_add(m);
+        self.produced();
         self.release()
     }
 
@@ -387,6 +504,15 @@ impl Conn {
                 // the bulk terminator after the shared body (counted in `body.len()`)
                 self.out.extend_from_slice(b"\r\n");
             }
+            ReplyBody::Ext(head, parts) => {
+                self.out.extend_from_slice(&head);
+                let o = std::mem::take(&mut self.out);
+                self.out_segs.push_back(OutSeg::Bytes(o, 0));
+                for p in parts {
+                    self.out_segs.push_back(OutSeg::Ext(p, 0));
+                }
+                self.out.extend_from_slice(b"\r\n");
+            }
         }
     }
 
@@ -411,6 +537,7 @@ impl Conn {
     /// segments) goes back in front of newer output.
     pub fn sent(&mut self, sent: usize, rest: Vec<OutSeg>) {
         self.out_queued = self.out_queued.saturating_sub(sent as u64);
+        self.hold_sub(sent as u64);
         for seg in rest.into_iter().rev() {
             self.out_segs.push_front(seg);
         }
@@ -466,6 +593,36 @@ mod tests {
             c.push_output(bytes(b"+OK\r\n"));
         }
         assert_eq!(c.reply_window(limit, 4096), 4096, "small replies: max-pending-per-conn");
+    }
+
+    /// Held reply bytes and the in-flight estimate return to zero once every reply is sent, and
+    /// a connection holding far more than its output limit is past the hard limit.
+    #[test]
+    fn held_reply_bytes_follow_replies_until_sent() {
+        let limit = 1 << 20;
+        let mut c = conn();
+        let a = c.reserve_slot();
+        let b = c.reserve_slot();
+        assert_eq!((c.unproduced, c.inflight_est), (2, 2 * FIRST_REPLY_EST));
+        c.reply_now(bytes(b"+3\r\n"));
+        assert!(!c.deliver(b, ReplyBody::Bytes(vec![b'x'; 1000])));
+        assert_eq!(c.held, 1004);
+        assert!(c.deliver(a, bytes(b"+1\r\n")));
+        assert_eq!((c.unproduced, c.inflight_est), (0, 0));
+        let out = drain(&mut c);
+        assert_eq!(out.len(), 1008);
+        assert_eq!(c.held, 0);
+        assert!(!c.over_hard_limit(limit));
+        for _ in 0..5 {
+            let s = c.reserve_slot();
+            c.deliver(s, ReplyBody::Bytes(vec![b'y'; 1 << 20]));
+        }
+        assert!(!c.over_hard_limit(limit), "four times the limit beyond the largest reply");
+        let s = c.reserve_slot();
+        c.deliver(s, ReplyBody::Bytes(vec![b'y'; 1 << 20]));
+        assert!(c.over_hard_limit(limit));
+        drain(&mut c);
+        assert_eq!(c.held, 0);
     }
 
     fn drain(c: &mut Conn) -> Vec<u8> {
